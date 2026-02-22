@@ -129,10 +129,7 @@ impl EscapeProcessor {
 fn suspend(raw_guard: &RawModeGuard, nb_guard: &NonBlockGuard) -> anyhow::Result<()> {
     // Restore cooked mode and blocking stdin so the parent shell works normally
     termios::tcsetattr(raw_guard.fd, SetArg::TCSAFLUSH, &raw_guard.original)?;
-    let _ = nix::fcntl::fcntl(
-        nb_guard.fd,
-        nix::fcntl::FcntlArg::F_SETFL(nb_guard.original_flags),
-    );
+    let _ = nix::fcntl::fcntl(nb_guard.fd, nix::fcntl::FcntlArg::F_SETFL(nb_guard.original_flags));
 
     nix::sys::signal::kill(nix::unistd::Pid::from_raw(0), nix::sys::signal::Signal::SIGTSTP)?;
 
