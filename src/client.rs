@@ -134,12 +134,12 @@ fn suspend() -> anyhow::Result<()> {
 const SEND_TIMEOUT: Duration = Duration::from_secs(5);
 
 struct NonBlockGuard {
-    fd: std::os::fd::RawFd,
+    fd: BorrowedFd<'static>,
     original_flags: nix::fcntl::OFlag,
 }
 
 impl NonBlockGuard {
-    fn set(fd: std::os::fd::RawFd) -> nix::Result<Self> {
+    fn set(fd: BorrowedFd<'static>) -> nix::Result<Self> {
         let flags = nix::fcntl::fcntl(fd, nix::fcntl::FcntlArg::F_GETFL)?;
         let original_flags = nix::fcntl::OFlag::from_bits_truncate(flags);
         nix::fcntl::fcntl(
@@ -372,8 +372,7 @@ pub async fn run(
 
     // Set stdin to non-blocking for AsyncFd — guard restores on drop.
     // Declared BEFORE async_stdin so it drops AFTER AsyncFd (reverse drop order).
-    let raw_fd = stdin_fd.as_raw_fd();
-    let _nb_guard = NonBlockGuard::set(raw_fd)?;
+    let _nb_guard = NonBlockGuard::set(stdin_borrowed)?;
     let async_stdin = AsyncFd::new(io::stdin())?;
     let mut sigwinch = signal(SignalKind::window_change())?;
     let mut buf = vec![0u8; 4096];

@@ -23,7 +23,7 @@ bytes = "1"
 clap = { version = "4", features = ["derive"] }
 futures-util = { version = "0.3", features = ["sink"] }
 libc = "0.2"
-nix = { version = "0.29", features = ["term", "process", "signal", "fs"] }
+nix = { version = "0.31", features = ["term", "process", "signal", "fs"] }
 tokio = { version = "1", features = ["full"] }
 tokio-util = { version = "0.7", features = ["codec"] }
 tracing = "0.1"

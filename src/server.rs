@@ -73,11 +73,10 @@ pub async fn run(
     drop(slave);
 
     // Set master to non-blocking for AsyncFd
-    let raw_master = master.as_raw_fd();
-    let flags = nix::fcntl::fcntl(raw_master, nix::fcntl::FcntlArg::F_GETFL)?;
+    let flags = nix::fcntl::fcntl(&master, nix::fcntl::FcntlArg::F_GETFL)?;
     let mut oflags = nix::fcntl::OFlag::from_bits_truncate(flags);
     oflags |= nix::fcntl::OFlag::O_NONBLOCK;
-    nix::fcntl::fcntl(raw_master, nix::fcntl::FcntlArg::F_SETFL(oflags))?;
+    nix::fcntl::fcntl(&master, nix::fcntl::FcntlArg::F_SETFL(oflags))?;
 
     let async_master = AsyncFd::new(master)?;
     let mut buf = vec![0u8; 4096];
@@ -234,7 +233,7 @@ pub async fn run(
                 ready = async_master.readable() => {
                     let mut guard = ready?;
                     match guard.try_io(|inner| {
-                        nix::unistd::read(inner.as_raw_fd(), &mut buf).map_err(io::Error::from)
+                        nix::unistd::read(inner, &mut buf).map_err(io::Error::from)
                     }) {
                         Ok(Ok(0)) => {
                             debug!("pty EOF");

@@ -1,5 +1,5 @@
 use clap::{Parser, Subcommand};
-use std::os::fd::OwnedFd;
+use std::os::fd::{AsRawFd, OwnedFd};
 use std::path::PathBuf;
 use tracing_subscriber::EnvFilter;
 
@@ -117,7 +117,7 @@ fn init_tracing(verbose: bool) {
 /// Gets EOF → child died (exits 1).
 /// Child: returns Ok(OwnedFd) for the write end of the pipe.
 fn daemonize() -> anyhow::Result<OwnedFd> {
-    use nix::unistd::{ForkResult, dup2, fork, pipe, setsid};
+    use nix::unistd::{ForkResult, fork, pipe, setsid};
     let (read_fd, write_fd) = pipe()?;
 
     // Safety: fork before any threads (tokio runtime not yet created)
@@ -154,12 +154,12 @@ fn daemonize() -> anyhow::Result<OwnedFd> {
                 nix::fcntl::OFlag::O_RDWR,
                 nix::sys::stat::Mode::empty(),
             )?;
-            dup2(devnull, 0)?;
-            dup2(devnull, 1)?;
-            dup2(devnull, 2)?;
-            if devnull > 2 {
-                nix::unistd::close(devnull)?;
+            unsafe {
+                libc::dup2(devnull.as_raw_fd(), 0);
+                libc::dup2(devnull.as_raw_fd(), 1);
+                libc::dup2(devnull.as_raw_fd(), 2);
             }
+            // devnull drops here, closing the original fd (always >2 post-fork)
 
             Ok(write_fd)
         }
