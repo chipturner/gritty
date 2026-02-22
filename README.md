@@ -66,18 +66,27 @@ ID  Name  PTY         PID    Created              Status
 
 The real value of gritty is remote sessions that survive network interruptions.
 
-`gritty connect` sets up an SSH tunnel to a remote host, auto-starts the remote daemon if needed, and prints a local socket path. You then use that socket to create and attach to sessions:
+`gritty connect` sets up an SSH tunnel to a remote host, auto-starts the remote daemon if needed, and names the connection by hostname. You then use the hostname to create and attach to sessions:
 
 ```bash
 # Terminal 1: start the tunnel (stays running)
 gritty connect user@remote-host
-# stdout: /run/user/1000/gritty/connect-12345.sock
-# stderr: tunnel ready. to use:
-#           gritty new --ctl-socket /run/user/1000/gritty/connect-12345.sock
-#           gritty attach -t <name> --ctl-socket /run/user/1000/gritty/connect-12345.sock
+# stdout: /run/user/1000/gritty/connect-remote-host.sock
+# stderr: tunnel ready (name: remote-host). to use:
+#           gritty new remote-host
+#           gritty attach remote-host -t <name>
 
 # Terminal 2: create a session through the tunnel
-gritty new -t project --ctl-socket /run/user/1000/gritty/connect-12345.sock
+gritty new remote-host -t project
+
+# Attach from any terminal
+gritty attach remote-host -t project
+
+# List remote sessions
+gritty ls remote-host
+
+# Custom connection name
+gritty connect user@remote-host -n prod
 
 # Custom SSH port
 gritty connect user@remote-host:2222
@@ -90,6 +99,8 @@ gritty connect user@remote-host --no-daemon-start
 ```
 
 Close your laptop, switch networks, lose your SSH tunnel — gritty detects the dead connection via heartbeat, the tunnel monitor respawns SSH, and your client auto-reconnects. Use `~.` to detach cleanly, or Ctrl-C the tunnel process to tear everything down.
+
+The `--ctl-socket` flag still works as a manual override on any command (e.g., `gritty ls --ctl-socket /path/to/socket`).
 
 ### Manual SSH tunnel
 
@@ -117,22 +128,25 @@ gritty attach -t project --ctl-socket /tmp/gritty-remote.sock
 | Command | Aliases | Description |
 |---------|---------|-------------|
 | `gritty daemon` | `d` | Start the daemon (self-backgrounds by default) |
-| `gritty new-session` | `new` | Create a session and auto-attach |
-| `gritty attach -t <id\|name>` | `a` | Attach to a session (detaches other clients) |
+| `gritty new-session [host]` | `new` | Create a session and auto-attach |
+| `gritty attach [host] -t <id\|name>` | `a` | Attach to a session (detaches other clients) |
 | `gritty connect user@host` | `c` | SSH tunnel to remote host (prints socket path, stays running) |
-| `gritty list-sessions` | `ls`, `list` | List active sessions |
-| `gritty kill-session -t <id\|name>` | | Kill a session |
-| `gritty kill-server` | | Kill the daemon and all sessions |
+| `gritty list-sessions [host]` | `ls`, `list` | List active sessions |
+| `gritty kill-session [host] -t <id\|name>` | | Kill a session |
+| `gritty kill-server [host]` | | Kill the daemon and all sessions |
 | `gritty socket-path` | `socket` | Print the default socket path |
+
+The optional `[host]` argument is a connection name from `gritty connect` — it resolves to the connect socket for that host (e.g., `gritty ls devbox` instead of `gritty ls --ctl-socket /run/.../connect-devbox.sock`). Omit it to use the local daemon.
 
 **Options:**
 - `-t <name>` on `new-session`/`attach`: session name (or auto-assigned integer ID)
 - `--foreground` on `daemon`: run in foreground instead of self-backgrounding
+- `-n <name>` on `connect`: override connection name (defaults to hostname)
 - `--no-daemon-start` on `connect`: don't auto-start remote daemon
 - `-o <option>` on `connect`: extra SSH options (repeatable)
 - `--no-redraw` on `attach`: skip Ctrl-L redraw after attaching
 - `--no-escape` on `new-session`/`attach`: disable `~` escape sequences
-- `--ctl-socket <path>` (global): override the daemon socket path
+- `--ctl-socket <path>` (global): override the daemon socket path (errors if combined with `[host]`)
 
 ## Escape Sequences
 
@@ -186,6 +200,11 @@ alias gn='gritty new -t'
 alias ga='gritty attach -t'
 alias gl='gritty ls'
 alias gk='gritty kill-session -t'
+
+# Remote aliases (after `gritty connect user@devbox`)
+alias gn-dev='gritty new devbox -t'
+alias ga-dev='gritty attach devbox -t'
+alias gl-dev='gritty ls devbox'
 ```
 
 ### Debugging

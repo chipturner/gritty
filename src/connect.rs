@@ -334,10 +334,12 @@ pub struct ConnectOpts {
     pub destination: String,
     pub no_daemon_start: bool,
     pub ssh_options: Vec<String>,
+    pub name: Option<String>,
 }
 
 pub async fn run(opts: ConnectOpts) -> anyhow::Result<i32> {
     let dest = Destination::parse(&opts.destination)?;
+    let connection_name = opts.name.unwrap_or_else(|| dest.host.clone());
 
     // 1. Ensure remote daemon is running and get socket path
     eprintln!("starting remote daemon...");
@@ -345,7 +347,7 @@ pub async fn run(opts: ConnectOpts) -> anyhow::Result<i32> {
     debug!(remote_sock, "remote socket path");
 
     // 2. Compute local socket path
-    let local_sock = local_socket_path(&opts.destination);
+    let local_sock = local_socket_path(&connection_name);
     debug!("local socket: {}", local_sock.display());
     if let Some(parent) = local_sock.parent() {
         crate::security::secure_create_dir_all(parent)?;
@@ -380,9 +382,9 @@ pub async fn run(opts: ConnectOpts) -> anyhow::Result<i32> {
 
     // 6. Print socket path and usage hints
     println!("{}", local_sock.display());
-    eprintln!("tunnel ready. to use:");
-    eprintln!("  gritty new --ctl-socket {}", local_sock.display());
-    eprintln!("  gritty attach -t <name> --ctl-socket {}", local_sock.display());
+    eprintln!("tunnel ready (name: {connection_name}). to use:");
+    eprintln!("  gritty new {connection_name}");
+    eprintln!("  gritty attach {connection_name} -t <name>");
 
     // 7. Wait for signal or monitor death
     let mut sigterm = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
@@ -492,14 +494,16 @@ mod tests {
 
     #[test]
     fn local_socket_path_format() {
-        let path = local_socket_path("user@host");
-        assert_eq!(path.file_name().unwrap().to_string_lossy(), "connect-user@host.sock");
+        // With hostname-based naming, connect uses just the host part
+        let path = local_socket_path("devbox");
+        assert_eq!(path.file_name().unwrap().to_string_lossy(), "connect-devbox.sock");
 
-        let path = local_socket_path("host:2222");
-        assert_eq!(path.file_name().unwrap().to_string_lossy(), "connect-host:2222.sock");
+        let path = local_socket_path("example.com");
+        assert_eq!(path.file_name().unwrap().to_string_lossy(), "connect-example.com.sock");
 
-        let path = local_socket_path("user@host:2222");
-        assert_eq!(path.file_name().unwrap().to_string_lossy(), "connect-user@host:2222.sock");
+        // Custom name override
+        let path = local_socket_path("myproject");
+        assert_eq!(path.file_name().unwrap().to_string_lossy(), "connect-myproject.sock");
     }
 
     #[test]

@@ -30,6 +30,9 @@ enum Command {
     /// Create a new persistent session (auto-attaches)
     #[command(alias = "new")]
     NewSession {
+        /// Remote host (connection name from `gritty connect`)
+        host: Option<String>,
+
         /// Session name (optional; sessions always get an auto-incrementing id)
         #[arg(short = 't', long = "target")]
         target: Option<String>,
@@ -41,6 +44,9 @@ enum Command {
     /// Attach to an existing session (detaches other clients)
     #[command(alias = "a")]
     Attach {
+        /// Remote host (connection name from `gritty connect`)
+        host: Option<String>,
+
         /// Session id or name
         #[arg(short = 't', long = "target")]
         target: String,
@@ -55,15 +61,24 @@ enum Command {
     },
     /// List active sessions
     #[command(alias = "ls", alias = "list")]
-    ListSessions,
+    ListSessions {
+        /// Remote host (connection name from `gritty connect`)
+        host: Option<String>,
+    },
     /// Kill a specific session
     KillSession {
+        /// Remote host (connection name from `gritty connect`)
+        host: Option<String>,
+
         /// Session id or name
         #[arg(short = 't', long = "target")]
         target: String,
     },
     /// Kill the daemon and all sessions
-    KillServer,
+    KillServer {
+        /// Remote host (connection name from `gritty connect`)
+        host: Option<String>,
+    },
     /// Print the default socket path
     #[command(alias = "socket")]
     SocketPath,
@@ -72,6 +87,10 @@ enum Command {
     Connect {
         /// Remote destination ([user@]host[:port])
         destination: String,
+
+        /// Connection name (defaults to hostname from destination)
+        #[arg(short = 'n', long)]
+        name: Option<String>,
 
         /// Don't auto-start remote daemon
         #[arg(long)]
@@ -204,26 +223,50 @@ fn main() {
     }
 }
 
+fn resolve_ctl_path(
+    ctl_socket: Option<PathBuf>,
+    host: Option<&str>,
+) -> anyhow::Result<PathBuf> {
+    match (ctl_socket, host) {
+        (Some(_), Some(_)) => anyhow::bail!("cannot specify both --ctl-socket and a host argument"),
+        (Some(p), None) => Ok(p),
+        (None, Some(h)) => Ok(gritty::daemon::socket_dir().join(format!("connect-{h}.sock"))),
+        (None, None) => Ok(gritty::daemon::control_socket_path()),
+    }
+}
+
 async fn run(cli: Cli) -> anyhow::Result<()> {
-    let ctl_path = cli
-        .ctl_socket
-        .unwrap_or_else(gritty::daemon::control_socket_path);
     match cli.command {
         Command::Daemon { .. } => unreachable!(),
-        Command::NewSession { target, no_escape } => new_session(target, no_escape, ctl_path).await,
-        Command::Attach { target, no_redraw, no_escape } => {
+        Command::NewSession { host, target, no_escape } => {
+            let ctl_path = resolve_ctl_path(cli.ctl_socket, host.as_deref())?;
+            new_session(target, no_escape, ctl_path).await
+        }
+        Command::Attach { host, target, no_redraw, no_escape } => {
+            let ctl_path = resolve_ctl_path(cli.ctl_socket, host.as_deref())?;
             let code = attach(target, !no_redraw, no_escape, ctl_path).await?;
             std::process::exit(code);
         }
-        Command::ListSessions => list_sessions(ctl_path).await,
-        Command::KillSession { target } => kill_session(target, ctl_path).await,
-        Command::KillServer => kill_server(ctl_path).await,
+        Command::ListSessions { host } => {
+            let ctl_path = resolve_ctl_path(cli.ctl_socket, host.as_deref())?;
+            list_sessions(ctl_path).await
+        }
+        Command::KillSession { host, target } => {
+            let ctl_path = resolve_ctl_path(cli.ctl_socket, host.as_deref())?;
+            kill_session(target, ctl_path).await
+        }
+        Command::KillServer { host } => {
+            let ctl_path = resolve_ctl_path(cli.ctl_socket, host.as_deref())?;
+            kill_server(ctl_path).await
+        }
         Command::SocketPath => {
+            let ctl_path = cli.ctl_socket.unwrap_or_else(gritty::daemon::control_socket_path);
             println!("{}", ctl_path.display());
             Ok(())
         }
         Command::Connect {
             destination,
+            name,
             no_daemon_start,
             ssh_options,
         } => {
@@ -231,6 +274,7 @@ async fn run(cli: Cli) -> anyhow::Result<()> {
                 destination,
                 no_daemon_start,
                 ssh_options,
+                name,
             })
             .await?;
             std::process::exit(code);
