@@ -8,7 +8,7 @@ SSH sessions die when your connection drops. gritty keeps your shell running on 
 
 - **Persistent sessions** — shells survive client disconnect, network failure, laptop sleep
 - **Auto-reconnect** — heartbeat detection with transparent reconnection, no manual intervention
-- **SSH tunneling** — one command sets up the tunnel, starts the remote daemon, and forwards the socket
+- **SSH tunneling** — one command sets up the tunnel, starts the remote server, and forwards the socket
 - **Single binary, zero config** — no server config files, no port allocation, no root required
 - **No network protocol** — sessions live on Unix domain sockets; SSH handles encryption and auth
 - **SSH-style escape sequences** — `~.` detach, `~^Z` suspend, `~?` help
@@ -35,8 +35,8 @@ SSH sessions die when your connection drops. gritty keeps your shell running on 
 cargo build --release
 cp target/release/gritty ~/.local/bin/  # or somewhere in your PATH
 
-# Start the daemon (self-backgrounds, prints PID)
-gritty daemon
+# Start the server (self-backgrounds, prints PID)
+gritty server
 
 # Create a named session (auto-attaches)
 gritty new -t work
@@ -66,7 +66,7 @@ ID  Name  PTY         PID    Created              Status
 
 The real value of gritty is remote sessions that survive network interruptions.
 
-`gritty connect` sets up an SSH tunnel to a remote host, auto-starts the remote daemon if needed, and names the connection by hostname. You then use the hostname to create and attach to sessions:
+`gritty connect` sets up an SSH tunnel to a remote host, auto-starts the remote server if needed, and names the connection by hostname. You then use the hostname to create and attach to sessions:
 
 ```bash
 # Terminal 1: start the tunnel (stays running)
@@ -94,8 +94,8 @@ gritty connect user@remote-host:2222
 # Extra SSH options (repeatable)
 gritty connect user@remote-host -o "ProxyJump=bastion"
 
-# Don't auto-start the remote daemon
-gritty connect user@remote-host --no-daemon-start
+# Don't auto-start the remote server
+gritty connect user@remote-host --no-server-start
 ```
 
 Close your laptop, switch networks, lose your SSH tunnel — gritty detects the dead connection via heartbeat, the tunnel monitor respawns SSH, and your client auto-reconnects. Use `~.` to detach cleanly, or Ctrl-C the tunnel process to tear everything down.
@@ -108,7 +108,7 @@ If you prefer to manage the tunnel yourself:
 
 ```bash
 # On the remote host
-gritty daemon
+gritty server
 
 # From your laptop: get the socket path and forward it
 REMOTE_SOCK=$(ssh user@remote-host gritty socket-path)
@@ -127,27 +127,27 @@ gritty attach -t project --ctl-socket /tmp/gritty-remote.sock
 
 | Command | Aliases | Description |
 |---------|---------|-------------|
-| `gritty daemon` | `d` | Start the daemon (self-backgrounds by default) |
+| `gritty server` | `s` | Start the server (self-backgrounds by default) |
 | `gritty new-session [host]` | `new` | Create a session and auto-attach |
 | `gritty attach [host] -t <id\|name>` | `a` | Attach to a session (detaches other clients) |
 | `gritty connect user@host` | `c` | SSH tunnel to remote host (prints socket path, stays running) |
 | `gritty list-sessions [host]` | `ls`, `list` | List active sessions |
 | `gritty kill-session [host] -t <id\|name>` | | Kill a session |
-| `gritty kill-server [host]` | | Kill the daemon and all sessions |
+| `gritty kill-server [host]` | | Kill the server and all sessions |
 | `gritty socket-path` | `socket` | Print the default socket path |
 
-The optional `[host]` argument is a connection name from `gritty connect` — it resolves to the connect socket for that host (e.g., `gritty ls devbox` instead of `gritty ls --ctl-socket /run/.../connect-devbox.sock`). Omit it to use the local daemon.
+The optional `[host]` argument is a connection name from `gritty connect` — it resolves to the connect socket for that host (e.g., `gritty ls devbox` instead of `gritty ls --ctl-socket /run/.../connect-devbox.sock`). Omit it to use the local server.
 
 **Options:**
 - `-t <name>` on `new-session`/`attach`: session name (or auto-assigned integer ID)
-- `--foreground` on `daemon`: run in foreground instead of self-backgrounding
+- `--foreground` on `server`: run in foreground instead of self-backgrounding
 - `-n <name>` on `connect`: override connection name (defaults to hostname)
-- `--no-daemon-start` on `connect`: don't auto-start remote daemon
+- `--no-server-start` on `connect`: don't auto-start remote server
 - `-o <option>` on `connect`: extra SSH options (repeatable)
 - `--dry-run` on `connect`: print the SSH commands instead of running them
 - `--no-redraw` on `attach`: skip Ctrl-L redraw after attaching
 - `--no-escape` on `new-session`/`attach`: disable `~` escape sequences
-- `--ctl-socket <path>` (global): override the daemon socket path (errors if combined with `[host]`)
+- `--ctl-socket <path>` (global): override the server socket path (errors if combined with `[host]`)
 
 ## Escape Sequences
 
@@ -176,7 +176,7 @@ gritty delegates encryption and authentication to SSH rather than reimplementing
 
 ### Single-Socket Architecture
 
-All communication — control messages and session relay — flows through one daemon socket. When a client connects to a session, the daemon hands off the raw connection and gets out of the loop. No per-session sockets, no port allocation, no cleanup races.
+All communication — control messages and session relay — flows through one server socket. When a client connects to a session, the server hands off the raw connection and gets out of the loop. No per-session sockets, no port allocation, no cleanup races.
 
 ### Persistence Model
 
@@ -184,9 +184,9 @@ The PTY and shell process keep running when the client disconnects. While discon
 
 ## How It Works
 
-A background daemon listens on a single Unix domain socket. Each session owns a PTY with a login shell. Communication uses a simple framed protocol: `[type: u8][length: u32 BE][payload]`.
+A background server listens on a single Unix domain socket. Each session owns a PTY with a login shell. Communication uses a simple framed protocol: `[type: u8][length: u32 BE][payload]`.
 
-When a client connects, it sends a control frame declaring intent (new session, attach, list, etc.). For session operations, the daemon transfers the socket connection to the session task via an in-process channel — the daemon is out of the loop after that.
+When a client connects, it sends a control frame declaring intent (new session, attach, list, etc.). For session operations, the server transfers the socket connection to the session task via an in-process channel — the server is out of the loop after that.
 
 The client sends a Ping frame every 5 seconds; the server replies with Pong. If no Pong arrives within 15 seconds, the client treats the connection as dead and enters a reconnect loop — retrying every second until it succeeds or the user hits Ctrl-C.
 
@@ -211,8 +211,8 @@ alias gl-dev='gritty ls devbox'
 ### Debugging
 
 ```bash
-# Run daemon in foreground with debug logging
-RUST_LOG=debug gritty daemon --foreground
+# Run server in foreground with debug logging
+RUST_LOG=debug gritty server --foreground
 ```
 
 ### Reconnect Behavior
@@ -236,8 +236,8 @@ gritty differs by having no network protocol of its own. Where mosh and ET imple
 Early stage. Works on Linux. Not yet packaged for distribution.
 
 **Planned:**
-- **Daemon auto-start** — start the daemon on demand (systemd socket activation, launchd, or on first `new-session`)
-- **Zero-downtime upgrades** — daemon re-execs itself with a new binary, preserving sessions and child processes across upgrades
+- **Server auto-start** — start the server on demand (systemd socket activation, launchd, or on first `new-session`)
+- **Zero-downtime upgrades** — server re-execs itself with a new binary, preserving sessions and child processes across upgrades
 - **Read-only attach** — multiple clients viewing the same session for pair programming or demos
 - **Better remote PATH resolution** — `connect` currently prepends common paths (`~/bin`, `~/.local/bin`, `~/.cargo/bin`) to find gritty on the remote host; needs a more robust solution (login shell invocation or user-configurable remote binary path)
 

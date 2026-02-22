@@ -6,7 +6,7 @@ use tracing_subscriber::EnvFilter;
 #[derive(Parser)]
 #[command(name = "gritty", about = "Persistent TTY sessions over Unix domain sockets")]
 struct Cli {
-    /// Path to the daemon control socket (overrides default)
+    /// Path to the server control socket (overrides default)
     #[arg(long, global = true)]
     ctl_socket: Option<PathBuf>,
 
@@ -20,9 +20,9 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Command {
-    /// Start the daemon (backgrounds by default, use --foreground to stay in foreground)
-    #[command(alias = "d")]
-    Daemon {
+    /// Start the server (backgrounds by default, use --foreground to stay in foreground)
+    #[command(alias = "s")]
+    Server {
         /// Run in the foreground instead of daemonizing
         #[arg(long, short = 'f')]
         foreground: bool,
@@ -74,7 +74,7 @@ enum Command {
         #[arg(short = 't', long = "target")]
         target: String,
     },
-    /// Kill the daemon and all sessions
+    /// Kill the server and all sessions
     KillServer {
         /// Remote host (connection name from `gritty connect`)
         host: Option<String>,
@@ -92,9 +92,9 @@ enum Command {
         #[arg(short = 'n', long)]
         name: Option<String>,
 
-        /// Don't auto-start remote daemon
+        /// Don't auto-start remote server
         #[arg(long)]
-        no_daemon_start: bool,
+        no_server_start: bool,
 
         /// Extra SSH options (can be repeated)
         #[arg(long = "ssh-option", short = 'o')]
@@ -136,11 +136,11 @@ fn daemonize() -> anyhow::Result<OwnedFd> {
             use std::io::Read;
             match read_file.read(&mut buf) {
                 Ok(1) => {
-                    eprintln!("daemon started (pid {child})");
+                    eprintln!("server started (pid {child})");
                     std::process::exit(0);
                 }
                 _ => {
-                    eprintln!("error: daemon failed to start");
+                    eprintln!("error: server failed to start");
                     std::process::exit(1);
                 }
             }
@@ -175,7 +175,7 @@ fn main() {
     let verbose = cli.verbose;
 
     match cli.command {
-        Command::Daemon { foreground } => {
+        Command::Server { foreground } => {
             let ctl_path = cli.ctl_socket.unwrap_or_else(gritty::daemon::control_socket_path);
 
             let ready_fd = if foreground {
@@ -190,7 +190,7 @@ fn main() {
                 }
             };
 
-            // Init tracing AFTER fork (stderr may be /dev/null in daemon mode)
+            // Init tracing AFTER fork (stderr may be /dev/null in server mode)
             init_tracing(verbose);
 
             let rt = match tokio::runtime::Runtime::new() {
@@ -233,7 +233,7 @@ fn resolve_ctl_path(ctl_socket: Option<PathBuf>, host: Option<&str>) -> anyhow::
 
 async fn run(cli: Cli) -> anyhow::Result<()> {
     match cli.command {
-        Command::Daemon { .. } => unreachable!(),
+        Command::Server { .. } => unreachable!(),
         Command::NewSession { host, target, no_escape } => {
             let ctl_path = resolve_ctl_path(cli.ctl_socket, host.as_deref())?;
             new_session(target, no_escape, ctl_path).await
@@ -260,10 +260,10 @@ async fn run(cli: Cli) -> anyhow::Result<()> {
             println!("{}", ctl_path.display());
             Ok(())
         }
-        Command::Connect { destination, name, no_daemon_start, ssh_options, dry_run } => {
+        Command::Connect { destination, name, no_server_start, ssh_options, dry_run } => {
             let code = gritty::connect::run(gritty::connect::ConnectOpts {
                 destination,
-                no_daemon_start,
+                no_server_start,
                 ssh_options,
                 name,
                 dry_run,
@@ -287,7 +287,7 @@ async fn new_session(
     let session_name = name.clone().unwrap_or_default();
 
     let stream = UnixStream::connect(&ctl_path).await.map_err(|_| {
-        anyhow::anyhow!("no daemon running (could not connect to {})", ctl_path.display())
+        anyhow::anyhow!("no server running (could not connect to {})", ctl_path.display())
     })?;
     let mut framed = Framed::new(stream, FrameCodec);
     framed.send(Frame::NewSession { name: session_name }).await?;
@@ -304,7 +304,7 @@ async fn new_session(
             std::process::exit(code);
         }
         Frame::Error { message } => anyhow::bail!("{message}"),
-        other => anyhow::bail!("unexpected response from daemon: {other:?}"),
+        other => anyhow::bail!("unexpected response from server: {other:?}"),
     }
 }
 
@@ -323,7 +323,7 @@ async fn attach(
         match UnixStream::connect(&ctl_path).await {
             Ok(s) => break s,
             Err(_) => {
-                eprintln!("waiting for daemon ({})... ctrl-c to abort", ctl_path.display());
+                eprintln!("waiting for server ({})... ctrl-c to abort", ctl_path.display());
                 tokio::time::sleep(std::time::Duration::from_secs(1)).await;
             }
         }
@@ -339,12 +339,12 @@ async fn attach(
             Ok(code)
         }
         Frame::Error { message } => anyhow::bail!("{message}"),
-        other => anyhow::bail!("unexpected response from daemon: {other:?}"),
+        other => anyhow::bail!("unexpected response from server: {other:?}"),
     }
 }
 
-/// Send a control frame to the daemon and return the response.
-async fn daemon_request(
+/// Send a control frame to the server and return the response.
+async fn server_request(
     ctl_path: &PathBuf,
     frame: gritty::protocol::Frame,
 ) -> anyhow::Result<gritty::protocol::Frame> {
@@ -354,7 +354,7 @@ async fn daemon_request(
     use tokio_util::codec::Framed;
 
     let stream = UnixStream::connect(ctl_path).await.map_err(|_| {
-        anyhow::anyhow!("no daemon running (could not connect to {})", ctl_path.display())
+        anyhow::anyhow!("no server running (could not connect to {})", ctl_path.display())
     })?;
     let mut framed = Framed::new(stream, FrameCodec);
     framed.send(frame).await?;
@@ -364,7 +364,7 @@ async fn daemon_request(
 async fn list_sessions(ctl_path: PathBuf) -> anyhow::Result<()> {
     use gritty::protocol::Frame;
 
-    let resp = daemon_request(&ctl_path, Frame::ListSessions).await?;
+    let resp = server_request(&ctl_path, Frame::ListSessions).await?;
     match resp {
         Frame::SessionInfo { sessions } => {
             if sessions.is_empty() {
@@ -430,7 +430,7 @@ async fn list_sessions(ctl_path: PathBuf) -> anyhow::Result<()> {
             Ok(())
         }
         other => {
-            anyhow::bail!("unexpected response from daemon: {other:?}");
+            anyhow::bail!("unexpected response from server: {other:?}");
         }
     }
 }
@@ -456,25 +456,25 @@ fn format_timestamp(epoch_secs: u64) -> String {
 async fn kill_session(target: String, ctl_path: PathBuf) -> anyhow::Result<()> {
     use gritty::protocol::Frame;
 
-    match daemon_request(&ctl_path, Frame::KillSession { session: target.clone() }).await? {
+    match server_request(&ctl_path, Frame::KillSession { session: target.clone() }).await? {
         Frame::Ok => {
             eprintln!("session killed: {target}");
             Ok(())
         }
         Frame::Error { message } => anyhow::bail!("{message}"),
-        other => anyhow::bail!("unexpected response from daemon: {other:?}"),
+        other => anyhow::bail!("unexpected response from server: {other:?}"),
     }
 }
 
 async fn kill_server(ctl_path: PathBuf) -> anyhow::Result<()> {
     use gritty::protocol::Frame;
 
-    match daemon_request(&ctl_path, Frame::KillServer).await? {
+    match server_request(&ctl_path, Frame::KillServer).await? {
         Frame::Ok => {
             eprintln!("server killed");
             Ok(())
         }
         Frame::Error { message } => anyhow::bail!("{message}"),
-        other => anyhow::bail!("unexpected response from daemon: {other:?}"),
+        other => anyhow::bail!("unexpected response from server: {other:?}"),
     }
 }

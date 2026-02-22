@@ -91,11 +91,7 @@ const SSH_TUNNEL_OPTS: &[&str] = &[
 const REMOTE_PATH_PREFIX: &str = "$HOME/bin:$HOME/.local/bin:$HOME/.cargo/bin:$PATH";
 
 /// Build the SSH command for remote execution (without stdio config).
-fn remote_exec_command(
-    dest: &Destination,
-    remote_cmd: &str,
-    extra_ssh_opts: &[String],
-) -> Command {
+fn remote_exec_command(dest: &Destination, remote_cmd: &str, extra_ssh_opts: &[String]) -> Command {
     let wrapped_cmd = format!("PATH=\"{REMOTE_PATH_PREFIX}\"; {remote_cmd}");
     let mut cmd = Command::new("ssh");
     cmd.args(dest.port_args());
@@ -154,13 +150,8 @@ fn shell_quote(s: &str) -> String {
 fn format_command(cmd: &Command) -> String {
     let std_cmd = cmd.as_std();
     let prog = std_cmd.get_program().to_string_lossy();
-    let args: Vec<_> =
-        std_cmd.get_args().map(|a| shell_quote(&a.to_string_lossy())).collect();
-    if args.is_empty() {
-        prog.to_string()
-    } else {
-        format!("{prog} {}", args.join(" "))
-    }
+    let args: Vec<_> = std_cmd.get_args().map(|a| shell_quote(&a.to_string_lossy())).collect();
+    if args.is_empty() { prog.to_string() } else { format!("{prog} {}", args.join(" ")) }
 }
 
 /// Build the SSH tunnel command with hardened options.
@@ -287,23 +278,23 @@ async fn tunnel_monitor(
 }
 
 // ---------------------------------------------------------------------------
-// Remote daemon management
+// Remote server management
 // ---------------------------------------------------------------------------
 
 const REMOTE_ENSURE_CMD: &str = "\
     SOCK=$(gritty socket-path) && \
     (gritty ls >/dev/null 2>&1 || \
-     { gritty daemon && sleep 0.3; }) && \
+     { gritty server && sleep 0.3; }) && \
     echo \"$SOCK\"";
 
-/// Get the remote socket path and optionally auto-start the daemon.
+/// Get the remote socket path and optionally auto-start the server.
 async fn ensure_remote_ready(
     dest: &Destination,
-    no_daemon_start: bool,
+    no_server_start: bool,
     extra_ssh_opts: &[String],
 ) -> anyhow::Result<String> {
-    let remote_cmd = if no_daemon_start { "gritty socket-path" } else { REMOTE_ENSURE_CMD };
-    debug!("ensuring remote daemon (no_daemon_start={no_daemon_start})");
+    let remote_cmd = if no_server_start { "gritty socket-path" } else { REMOTE_ENSURE_CMD };
+    debug!("ensuring remote server (no_server_start={no_server_start})");
 
     let sock_path = remote_exec(dest, remote_cmd, extra_ssh_opts).await?;
 
@@ -365,7 +356,7 @@ impl Drop for ConnectGuard {
 
 pub struct ConnectOpts {
     pub destination: String,
-    pub no_daemon_start: bool,
+    pub no_server_start: bool,
     pub ssh_options: Vec<String>,
     pub name: Option<String>,
     pub dry_run: bool,
@@ -378,13 +369,13 @@ pub async fn run(opts: ConnectOpts) -> anyhow::Result<i32> {
 
     if opts.dry_run {
         let remote_cmd =
-            if opts.no_daemon_start { "gritty socket-path" } else { REMOTE_ENSURE_CMD };
+            if opts.no_server_start { "gritty socket-path" } else { REMOTE_ENSURE_CMD };
         let ensure_cmd = remote_exec_command(&dest, remote_cmd, &opts.ssh_options);
         let tunnel_cmd = tunnel_command(&dest, &local_sock, "$REMOTE_SOCK", &opts.ssh_options);
 
         println!(
             "# Get remote socket path{}",
-            if opts.no_daemon_start { "" } else { " and start daemon if needed" }
+            if opts.no_server_start { "" } else { " and start server if needed" }
         );
         println!("REMOTE_SOCK=$({})", format_command(&ensure_cmd));
         println!();
@@ -419,9 +410,9 @@ pub async fn run(opts: ConnectOpts) -> anyhow::Result<i32> {
     // Socket is stale or absent — clean up
     let _ = std::fs::remove_file(&local_sock);
 
-    // 2. Ensure remote daemon is running and get socket path
-    eprintln!("starting remote daemon...");
-    let remote_sock = ensure_remote_ready(&dest, opts.no_daemon_start, &opts.ssh_options).await?;
+    // 2. Ensure remote server is running and get socket path
+    eprintln!("starting remote server...");
+    let remote_sock = ensure_remote_ready(&dest, opts.no_server_start, &opts.ssh_options).await?;
     debug!(remote_sock, "remote socket path");
 
     // 3. Spawn SSH tunnel
@@ -620,7 +611,10 @@ mod tests {
         assert_eq!(shell_quote("-N"), "-N");
         assert_eq!(shell_quote("ServerAliveInterval=3"), "ServerAliveInterval=3");
         assert_eq!(shell_quote("user@host"), "user@host");
-        assert_eq!(shell_quote("/tmp/local.sock:/tmp/remote.sock"), "/tmp/local.sock:/tmp/remote.sock");
+        assert_eq!(
+            shell_quote("/tmp/local.sock:/tmp/remote.sock"),
+            "/tmp/local.sock:/tmp/remote.sock"
+        );
         assert_eq!(shell_quote("$REMOTE_SOCK"), "$REMOTE_SOCK");
     }
 
@@ -644,12 +638,7 @@ mod tests {
     #[test]
     fn format_command_tunnel() {
         let dest = Destination::parse("user@host").unwrap();
-        let cmd = tunnel_command(
-            &dest,
-            Path::new("/tmp/local.sock"),
-            "$REMOTE_SOCK",
-            &[],
-        );
+        let cmd = tunnel_command(&dest, Path::new("/tmp/local.sock"), "$REMOTE_SOCK", &[]);
         let formatted = format_command(&cmd);
         // Uses the same SSH_TUNNEL_OPTS
         assert!(formatted.contains("ServerAliveInterval=3"));
@@ -676,14 +665,10 @@ mod tests {
     #[test]
     fn format_command_remote_exec_with_extra_opts() {
         let dest = Destination::parse("user@host").unwrap();
-        let cmd = remote_exec_command(
-            &dest,
-            REMOTE_ENSURE_CMD,
-            &["ProxyJump=bastion".to_string()],
-        );
+        let cmd = remote_exec_command(&dest, REMOTE_ENSURE_CMD, &["ProxyJump=bastion".to_string()]);
         let formatted = format_command(&cmd);
         assert!(formatted.contains("ProxyJump=bastion"));
         assert!(formatted.contains("gritty socket-path"));
-        assert!(formatted.contains("gritty daemon"));
+        assert!(formatted.contains("gritty server"));
     }
 }
