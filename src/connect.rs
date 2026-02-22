@@ -291,10 +291,13 @@ async fn ensure_remote_ready(
 // Local socket path
 // ---------------------------------------------------------------------------
 
-/// Compute a PID-based local socket path for the tunnel endpoint.
-fn local_socket_path() -> PathBuf {
-    let pid = std::process::id();
-    crate::daemon::socket_dir().join(format!("connect-{pid}.sock"))
+/// Compute a deterministic local socket path based on the destination.
+///
+/// Using the raw destination string means re-running `gritty connect user@host`
+/// produces the same socket path, so sessions that used `--ctl-socket` can
+/// auto-reconnect after a tunnel restart.
+fn local_socket_path(destination: &str) -> PathBuf {
+    crate::daemon::socket_dir().join(format!("connect-{destination}.sock"))
 }
 
 // ---------------------------------------------------------------------------
@@ -342,7 +345,7 @@ pub async fn run(opts: ConnectOpts) -> anyhow::Result<i32> {
     debug!(remote_sock, "remote socket path");
 
     // 2. Compute local socket path
-    let local_sock = local_socket_path();
+    let local_sock = local_socket_path(&opts.destination);
     debug!("local socket: {}", local_sock.display());
     if let Some(parent) = local_sock.parent() {
         crate::security::secure_create_dir_all(parent)?;
@@ -489,13 +492,14 @@ mod tests {
 
     #[test]
     fn local_socket_path_format() {
-        let path = local_socket_path();
-        let filename = path.file_name().unwrap().to_string_lossy();
-        assert!(filename.starts_with("connect-"));
-        assert!(filename.ends_with(".sock"));
-        // Parent should be a gritty directory
-        let parent = path.parent().unwrap().file_name().unwrap().to_string_lossy();
-        assert!(parent.contains("gritty"));
+        let path = local_socket_path("user@host");
+        assert_eq!(path.file_name().unwrap().to_string_lossy(), "connect-user@host.sock");
+
+        let path = local_socket_path("host:2222");
+        assert_eq!(path.file_name().unwrap().to_string_lossy(), "connect-host:2222.sock");
+
+        let path = local_socket_path("user@host:2222");
+        assert_eq!(path.file_name().unwrap().to_string_lossy(), "connect-user@host:2222.sock");
     }
 
     #[test]
