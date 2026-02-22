@@ -10,7 +10,7 @@ gritty provides persistent TTY sessions over Unix domain sockets. Single binary,
 - `gritty new-session` — creates a persistent session and auto-attaches (requires running daemon). Alias: `new`
 - `gritty new-session -t <name>` — creates a named session and auto-attaches
 - `gritty attach -t <id|name>` — attaches to a session, detaches other clients. Alias: `a`
-- `gritty connect user@host` — SSH tunnel: auto-starts remote daemon, sets up tunnel, prints socket path. Alias: `c`. Optional `-n <name>` overrides connection name (defaults to hostname).
+- `gritty connect user@host` — SSH tunnel: auto-starts remote daemon, sets up tunnel, prints socket path. Alias: `c`. Optional `-n <name>` overrides connection name (defaults to hostname). `--dry-run` prints the SSH commands instead of running them.
 - `gritty list-sessions` — lists active sessions with id/name/PTY/PID/status. Aliases: `ls`, `list`
 - `gritty kill-session -t <id|name>` — kills a specific session
 - `gritty socket-path` — prints the default daemon socket path. Alias: `socket`
@@ -93,7 +93,7 @@ Six modules behind a lib crate (`src/lib.rs`) with a thin binary entry point (`s
 
 ## Current Status
 
-Full CLI with tmux-like ergonomics. Single-socket architecture. Self-daemonizing daemon with `--foreground` option. PID file and clean signal handling (SIGTERM/SIGINT). Ping/Pong heartbeat with auto-reconnect. Login shell with client environment forwarding. SSH-style escape sequences (`~.` detach, `~^Z` suspend, `~?` help). Tunnel-only SSH connect (`gritty connect user@host` prints socket path, use `--ctl-socket` for sessions). All modules implemented and tested (109 tests: 17 escape processor + 14 connect + 39 protocol codec + 18 e2e session + 21 daemon integration).
+Full CLI with tmux-like ergonomics. Single-socket architecture. Self-daemonizing daemon with `--foreground` option. PID file and clean signal handling (SIGTERM/SIGINT). Ping/Pong heartbeat with auto-reconnect. Login shell with client environment forwarding. SSH-style escape sequences (`~.` detach, `~^Z` suspend, `~?` help). Tunnel-only SSH connect (`gritty connect user@host` prints socket path, use `--ctl-socket` for sessions). All modules implemented and tested (116 tests: 17 escape processor + 21 connect + 39 protocol codec + 18 e2e session + 21 daemon integration).
 
 ## Development Notes
 
@@ -103,7 +103,7 @@ Full CLI with tmux-like ergonomics. Single-socket architecture. Self-daemonizing
 - **`client::run()` signature** — takes `session: &str` + `Framed<UnixStream, FrameCodec>` + `redraw: bool` + `ctl_path: &Path` + `env_vars: Vec<(String, String)>` + `no_escape: bool`. Called from `new_session()` (redraw=false, env_vars=[TERM,LANG,COLORTERM], no_escape from CLI) and `attach()` (redraw=!no_redraw, env_vars=[], no_escape from CLI) in main.rs. The `ctl_path` enables auto-reconnect.
 - **`server::run()` signature** — takes `mpsc::UnboundedReceiver<Framed<UnixStream, FrameCodec>>` + `Arc<OnceLock<SessionMetadata>>`. Called directly by e2e tests (via `UnixStream::pair()` + channel) and spawned by daemon. Changing its signature requires updating both.
 - **`connect::run()` signature** — takes `ConnectOpts` struct with `destination`, `no_daemon_start`, `ssh_options`, `name`. Returns `anyhow::Result<i32>`. Tunnel-only: does not negotiate sessions or run the client relay.
-- **`ConnectOpts` fields** — `destination: String`, `no_daemon_start: bool`, `ssh_options: Vec<String>`, `name: Option<String>`. The `name` field overrides the connection name (defaults to hostname from destination).
+- **`ConnectOpts` fields** — `destination: String`, `no_daemon_start: bool`, `ssh_options: Vec<String>`, `name: Option<String>`, `dry_run: bool`. The `name` field overrides the connection name (defaults to hostname from destination). `dry_run` prints the SSH commands instead of running them.
 - **`resolve_ctl_path()` in main.rs** — resolves control socket path from `(ctl_socket: Option<PathBuf>, host: Option<&str>)`. Four-arm match: both = error, ctl_socket only = use it, host only = `socket_dir()/connect-{host}.sock`, neither = default daemon socket. Called per command arm in `run()`.
 - **`REMOTE_ENSURE_CMD`** — runs `gritty socket-path` to get the socket path, probes `gritty ls` to check if a daemon is already running, conditionally starts one with `gritty daemon && sleep 0.3` (self-daemonizing, no `nohup` needed), then echoes the socket path.
 - **`Frame` enum changes** — adding variants requires updating: encoder, decoder, protocol tests, and all `match frame` sites in server.rs, client.rs, daemon.rs, main.rs.

@@ -144,6 +144,7 @@ The optional `[host]` argument is a connection name from `gritty connect` — it
 - `-n <name>` on `connect`: override connection name (defaults to hostname)
 - `--no-daemon-start` on `connect`: don't auto-start remote daemon
 - `-o <option>` on `connect`: extra SSH options (repeatable)
+- `--dry-run` on `connect`: print the SSH commands instead of running them
 - `--no-redraw` on `attach`: skip Ctrl-L redraw after attaching
 - `--no-escape` on `new-session`/`attach`: disable `~` escape sequences
 - `--ctl-socket <path>` (global): override the daemon socket path (errors if combined with `[host]`)

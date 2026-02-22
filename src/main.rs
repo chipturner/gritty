@@ -99,6 +99,10 @@ enum Command {
         /// Extra SSH options (can be repeated)
         #[arg(long = "ssh-option", short = 'o')]
         ssh_options: Vec<String>,
+
+        /// Print the SSH commands instead of running them
+        #[arg(long)]
+        dry_run: bool,
     },
 }
 
@@ -256,12 +260,13 @@ async fn run(cli: Cli) -> anyhow::Result<()> {
             println!("{}", ctl_path.display());
             Ok(())
         }
-        Command::Connect { destination, name, no_daemon_start, ssh_options } => {
+        Command::Connect { destination, name, no_daemon_start, ssh_options, dry_run } => {
             let code = gritty::connect::run(gritty::connect::ConnectOpts {
                 destination,
                 no_daemon_start,
                 ssh_options,
                 name,
+                dry_run,
             })
             .await?;
             std::process::exit(code);

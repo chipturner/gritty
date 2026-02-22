@@ -86,19 +86,17 @@ const SSH_TUNNEL_OPTS: &[&str] = &[
     "-T",
 ];
 
-/// Run a command on the remote host via SSH, returning stdout.
-async fn remote_exec(
+/// PATH prefix prepended to remote commands so gritty is discoverable
+/// in non-interactive SSH shells.
+const REMOTE_PATH_PREFIX: &str = "$HOME/bin:$HOME/.local/bin:$HOME/.cargo/bin:$PATH";
+
+/// Build the SSH command for remote execution (without stdio config).
+fn remote_exec_command(
     dest: &Destination,
     remote_cmd: &str,
     extra_ssh_opts: &[String],
-) -> anyhow::Result<String> {
-    // Prepend common binary paths — SSH non-interactive shells don't source
-    // .bashrc/.zshrc, so ~/bin etc. won't be in PATH by default.
-    let wrapped_cmd =
-        format!("PATH=\"$HOME/bin:$HOME/.local/bin:$HOME/.cargo/bin:$PATH\"; {remote_cmd}");
-
-    debug!("ssh {}: {remote_cmd}", dest.ssh_dest());
-
+) -> Command {
+    let wrapped_cmd = format!("PATH=\"{REMOTE_PATH_PREFIX}\"; {remote_cmd}");
     let mut cmd = Command::new("ssh");
     cmd.args(dest.port_args());
     for opt in extra_ssh_opts {
@@ -107,6 +105,18 @@ async fn remote_exec(
     cmd.arg("-o").arg("ConnectTimeout=5");
     cmd.arg(dest.ssh_dest());
     cmd.arg(&wrapped_cmd);
+    cmd
+}
+
+/// Run a command on the remote host via SSH, returning stdout.
+async fn remote_exec(
+    dest: &Destination,
+    remote_cmd: &str,
+    extra_ssh_opts: &[String],
+) -> anyhow::Result<String> {
+    debug!("ssh {}: {remote_cmd}", dest.ssh_dest());
+
+    let mut cmd = remote_exec_command(dest, remote_cmd, extra_ssh_opts);
     cmd.stdout(Stdio::piped());
     cmd.stderr(Stdio::piped());
     cmd.stdin(Stdio::null());
@@ -126,6 +136,31 @@ async fn remote_exec(
     let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
     debug!("ssh output: {stdout}");
     Ok(stdout)
+}
+
+/// Shell-quote a string if it contains characters that need quoting.
+/// Used only for display (--dry-run output), never for command execution.
+fn shell_quote(s: &str) -> String {
+    if s.is_empty() {
+        return "''".to_string();
+    }
+    if s.bytes().all(|b| b.is_ascii_alphanumeric() || b"-_./=:@$+%,".contains(&b)) {
+        return s.to_string();
+    }
+    format!("'{}'", s.replace('\'', "'\\''"))
+}
+
+/// Format a tokio Command as a shell string for display.
+fn format_command(cmd: &Command) -> String {
+    let std_cmd = cmd.as_std();
+    let prog = std_cmd.get_program().to_string_lossy();
+    let args: Vec<_> =
+        std_cmd.get_args().map(|a| shell_quote(&a.to_string_lossy())).collect();
+    if args.is_empty() {
+        prog.to_string()
+    } else {
+        format!("{prog} {}", args.join(" "))
+    }
 }
 
 /// Build the SSH tunnel command with hardened options.
@@ -333,14 +368,32 @@ pub struct ConnectOpts {
     pub no_daemon_start: bool,
     pub ssh_options: Vec<String>,
     pub name: Option<String>,
+    pub dry_run: bool,
 }
 
 pub async fn run(opts: ConnectOpts) -> anyhow::Result<i32> {
     let dest = Destination::parse(&opts.destination)?;
     let connection_name = opts.name.unwrap_or_else(|| dest.host.clone());
-
-    // 1. Compute local socket path and check for existing tunnel
     let local_sock = local_socket_path(&connection_name);
+
+    if opts.dry_run {
+        let remote_cmd =
+            if opts.no_daemon_start { "gritty socket-path" } else { REMOTE_ENSURE_CMD };
+        let ensure_cmd = remote_exec_command(&dest, remote_cmd, &opts.ssh_options);
+        let tunnel_cmd = tunnel_command(&dest, &local_sock, "$REMOTE_SOCK", &opts.ssh_options);
+
+        println!(
+            "# Get remote socket path{}",
+            if opts.no_daemon_start { "" } else { " and start daemon if needed" }
+        );
+        println!("REMOTE_SOCK=$({})", format_command(&ensure_cmd));
+        println!();
+        println!("# Start SSH tunnel");
+        println!("{}", format_command(&tunnel_cmd));
+        return Ok(0);
+    }
+
+    // 1. Check for existing tunnel
     let pid_file = connect_pid_path(&connection_name);
     debug!("local socket: {}", local_sock.display());
     if let Some(parent) = local_sock.parent() {
@@ -559,5 +612,78 @@ mod tests {
     fn port_args_without_port() {
         let d = Destination::parse("host").unwrap();
         assert!(d.port_args().is_empty());
+    }
+
+    #[test]
+    fn shell_quote_simple() {
+        assert_eq!(shell_quote("hello"), "hello");
+        assert_eq!(shell_quote("-N"), "-N");
+        assert_eq!(shell_quote("ServerAliveInterval=3"), "ServerAliveInterval=3");
+        assert_eq!(shell_quote("user@host"), "user@host");
+        assert_eq!(shell_quote("/tmp/local.sock:/tmp/remote.sock"), "/tmp/local.sock:/tmp/remote.sock");
+        assert_eq!(shell_quote("$REMOTE_SOCK"), "$REMOTE_SOCK");
+    }
+
+    #[test]
+    fn shell_quote_needs_quoting() {
+        assert_eq!(shell_quote("hello world"), "'hello world'");
+        assert_eq!(shell_quote(""), "''");
+        assert_eq!(shell_quote("it's"), "'it'\\''s'");
+    }
+
+    #[test]
+    fn shell_quote_remote_cmd() {
+        // The wrapped remote command contains spaces, quotes, semicolons —
+        // must be single-quoted so $HOME expands on the remote side.
+        let cmd = format!("PATH=\"{REMOTE_PATH_PREFIX}\"; gritty socket-path");
+        let quoted = shell_quote(&cmd);
+        assert!(quoted.starts_with('\''));
+        assert!(quoted.ends_with('\''));
+    }
+
+    #[test]
+    fn format_command_tunnel() {
+        let dest = Destination::parse("user@host").unwrap();
+        let cmd = tunnel_command(
+            &dest,
+            Path::new("/tmp/local.sock"),
+            "$REMOTE_SOCK",
+            &[],
+        );
+        let formatted = format_command(&cmd);
+        // Uses the same SSH_TUNNEL_OPTS
+        assert!(formatted.contains("ServerAliveInterval=3"));
+        assert!(formatted.contains("-N"));
+        assert!(formatted.contains("-T"));
+        // Forward arg references $REMOTE_SOCK unquoted (no spaces, $ is safe)
+        assert!(formatted.contains("/tmp/local.sock:$REMOTE_SOCK"));
+        assert!(formatted.contains("user@host"));
+    }
+
+    #[test]
+    fn format_command_remote_exec() {
+        let dest = Destination::parse("user@host:2222").unwrap();
+        let cmd = remote_exec_command(&dest, "gritty socket-path", &[]);
+        let formatted = format_command(&cmd);
+        assert!(formatted.starts_with("ssh "));
+        assert!(formatted.contains("-p 2222"));
+        assert!(formatted.contains("ConnectTimeout=5"));
+        assert!(formatted.contains("user@host"));
+        // The wrapped command should be single-quoted (contains spaces)
+        assert!(formatted.contains(&format!("PATH=\"{REMOTE_PATH_PREFIX}\"")));
+    }
+
+    #[test]
+    fn format_command_remote_exec_with_extra_opts() {
+        let dest = Destination::parse("user@host").unwrap();
+        let cmd = remote_exec_command(
+            &dest,
+            REMOTE_ENSURE_CMD,
+            &["ProxyJump=bastion".to_string()],
+        );
+        let formatted = format_command(&cmd);
+        assert!(formatted.contains("ProxyJump=bastion"));
+        assert!(formatted.contains("gritty socket-path"));
+        assert!(formatted.contains("gritty daemon"));
     }
 }
