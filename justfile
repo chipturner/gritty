@@ -81,6 +81,13 @@ coverage-clean:
     rm -f lcov.info coverage.json coverage.xml
     rm -f **/*.profraw(N) **/*.profdata(N)
 
+# Upgrade dependencies, update lockfile, and validate
+cargo-upgrade *args:
+    cargo-upgrade upgrade {{ args }}
+    cargo update
+    cargo clippy -- -D warnings
+    cargo test
+
 # Clean all build artifacts
 clean:
     cargo clean
