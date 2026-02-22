@@ -126,8 +126,24 @@ impl EscapeProcessor {
     }
 }
 
-fn suspend() -> anyhow::Result<()> {
+fn suspend(raw_guard: &RawModeGuard, nb_guard: &NonBlockGuard) -> anyhow::Result<()> {
+    // Restore cooked mode and blocking stdin so the parent shell works normally
+    termios::tcsetattr(raw_guard.fd, SetArg::TCSAFLUSH, &raw_guard.original)?;
+    let _ = nix::fcntl::fcntl(
+        nb_guard.fd,
+        nix::fcntl::FcntlArg::F_SETFL(nb_guard.original_flags),
+    );
+
     nix::sys::signal::kill(nix::unistd::Pid::from_raw(0), nix::sys::signal::Signal::SIGTSTP)?;
+
+    // After resume (fg): re-enter raw mode and non-blocking stdin
+    let _ = nix::fcntl::fcntl(
+        nb_guard.fd,
+        nix::fcntl::FcntlArg::F_SETFL(nb_guard.original_flags | nix::fcntl::OFlag::O_NONBLOCK),
+    );
+    let mut raw = raw_guard.original.clone();
+    termios::cfmakeraw(&mut raw);
+    termios::tcsetattr(raw_guard.fd, SetArg::TCSAFLUSH, &raw)?;
     Ok(())
 }
 
@@ -239,6 +255,8 @@ async fn relay(
     redraw: bool,
     env_vars: &[(String, String)],
     mut escape: Option<&mut EscapeProcessor>,
+    raw_guard: &RawModeGuard,
+    nb_guard: &NonBlockGuard,
 ) -> anyhow::Result<Option<i32>> {
     // Send env vars before resize (server reads Env frame before spawning shell)
     if !env_vars.is_empty() && !timed_send(framed, Frame::Env { vars: env_vars.to_vec() }).await {
@@ -282,7 +300,7 @@ async fn relay(
                                         return Ok(Some(0));
                                     }
                                     EscapeAction::Suspend => {
-                                        suspend()?;
+                                        suspend(raw_guard, nb_guard)?;
                                         // Re-sync terminal size after resume
                                         let (cols, rows) = get_terminal_size();
                                         if !timed_send(framed, Frame::Resize { cols, rows }).await {
@@ -368,11 +386,11 @@ pub async fn run(
     // Safety: stdin lives for the duration of the program
     let stdin_borrowed: BorrowedFd<'static> =
         unsafe { BorrowedFd::borrow_raw(stdin_fd.as_raw_fd()) };
-    let _guard = RawModeGuard::enter(stdin_borrowed)?;
+    let raw_guard = RawModeGuard::enter(stdin_borrowed)?;
 
     // Set stdin to non-blocking for AsyncFd — guard restores on drop.
     // Declared BEFORE async_stdin so it drops AFTER AsyncFd (reverse drop order).
-    let _nb_guard = NonBlockGuard::set(stdin_borrowed)?;
+    let nb_guard = NonBlockGuard::set(stdin_borrowed)?;
     let async_stdin = AsyncFd::new(io::stdin())?;
     let mut sigwinch = signal(SignalKind::window_change())?;
     let mut buf = vec![0u8; 4096];
@@ -389,6 +407,8 @@ pub async fn run(
             current_redraw,
             &current_env,
             escape.as_mut(),
+            &raw_guard,
+            &nb_guard,
         )
         .await?
         {
