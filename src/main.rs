@@ -82,7 +82,7 @@ enum Command {
     /// Print the default socket path
     #[command(alias = "socket")]
     SocketPath,
-    /// SSH tunnel to a remote host (prints socket path, stays running)
+    /// SSH tunnel to a remote host (backgrounds by default, prints socket path)
     #[command(alias = "c")]
     Connect {
         /// Remote destination ([user@]host[:port])
@@ -103,7 +103,20 @@ enum Command {
         /// Print the SSH commands instead of running them
         #[arg(long)]
         dry_run: bool,
+
+        /// Run in the foreground instead of backgrounding
+        #[arg(long, short = 'f')]
+        foreground: bool,
     },
+    /// Disconnect an SSH tunnel by connection name
+    #[command(alias = "dc")]
+    Disconnect {
+        /// Connection name (as shown in `gritty tunnels`)
+        name: String,
+    },
+    /// List active SSH tunnels
+    #[command(alias = "tun")]
+    Tunnels,
 }
 
 fn init_tracing(verbose: bool) {
@@ -117,10 +130,10 @@ fn init_tracing(verbose: bool) {
 
 /// Fork into background, returning the write end of the readiness pipe.
 ///
-/// Parent: blocks reading the pipe. Gets a byte → child is ready (prints PID, exits 0).
+/// Parent: blocks reading the pipe. Gets a byte → child is ready, runs `on_ready`, exits 0.
 /// Gets EOF → child died (exits 1).
 /// Child: returns Ok(OwnedFd) for the write end of the pipe.
-fn daemonize() -> anyhow::Result<OwnedFd> {
+fn daemonize(on_ready: impl FnOnce(nix::unistd::Pid)) -> anyhow::Result<OwnedFd> {
     use nix::unistd::{ForkResult, fork, pipe, setsid};
     let (read_fd, write_fd) = pipe()?;
 
@@ -136,11 +149,11 @@ fn daemonize() -> anyhow::Result<OwnedFd> {
             use std::io::Read;
             match read_file.read(&mut buf) {
                 Ok(1) => {
-                    eprintln!("server started (pid {child})");
+                    on_ready(child);
                     std::process::exit(0);
                 }
                 _ => {
-                    eprintln!("error: server failed to start");
+                    eprintln!("error: failed to start");
                     std::process::exit(1);
                 }
             }
@@ -181,7 +194,7 @@ fn main() {
             let ready_fd = if foreground {
                 None
             } else {
-                match daemonize() {
+                match daemonize(|child| eprintln!("server started (pid {child})")) {
                     Ok(fd) => Some(fd),
                     Err(e) => {
                         eprintln!("error: failed to daemonize: {e}");
@@ -203,6 +216,68 @@ fn main() {
             if let Err(e) = rt.block_on(gritty::daemon::run(&ctl_path, ready_fd)) {
                 eprintln!("error: {e}");
                 std::process::exit(1);
+            }
+        }
+        Command::Connect { destination, name, no_server_start, ssh_options, dry_run, foreground } => {
+            // Compute connection name before fork so parent can print socket path
+            let connection_name = name.clone().unwrap_or_else(|| {
+                // Parse destination to extract host (same logic as connect::run)
+                destination.find('@').map_or_else(
+                    || destination.rfind(':').map_or(destination.clone(), |c| destination[..c].to_string()),
+                    |at| {
+                        let rest = &destination[at + 1..];
+                        rest.rfind(':').map_or(rest.to_string(), |c| rest[..c].to_string())
+                    },
+                )
+            });
+            let local_sock = gritty::connect::connection_socket_path(&connection_name);
+
+            let ready_fd = if foreground || dry_run {
+                None
+            } else {
+                let sock_display = local_sock.display().to_string();
+                let conn_name = connection_name.clone();
+                match daemonize(move |_child| {
+                    println!("{sock_display}");
+                    eprintln!("tunnel started (name: {conn_name}). to use:");
+                    eprintln!("  gritty new {conn_name}");
+                    eprintln!("  gritty attach {conn_name} -t <name>");
+                }) {
+                    Ok(fd) => Some(fd),
+                    Err(e) => {
+                        eprintln!("error: failed to daemonize: {e}");
+                        std::process::exit(1);
+                    }
+                }
+            };
+
+            // In the parent process, daemonize() exits via std::process::exit.
+            // If we're here, we're either the child or running in foreground.
+
+            init_tracing(verbose);
+
+            let rt = match tokio::runtime::Runtime::new() {
+                Ok(rt) => rt,
+                Err(e) => {
+                    eprintln!("error: {e}");
+                    std::process::exit(1);
+                }
+            };
+
+            let opts = gritty::connect::ConnectOpts {
+                destination,
+                no_server_start,
+                ssh_options,
+                name,
+                dry_run,
+            };
+
+            match rt.block_on(gritty::connect::run(opts, ready_fd)) {
+                Ok(code) => std::process::exit(code),
+                Err(e) => {
+                    eprintln!("error: {e}");
+                    std::process::exit(1);
+                }
             }
         }
         _ => {
@@ -233,7 +308,7 @@ fn resolve_ctl_path(ctl_socket: Option<PathBuf>, host: Option<&str>) -> anyhow::
 
 async fn run(cli: Cli) -> anyhow::Result<()> {
     match cli.command {
-        Command::Server { .. } => unreachable!(),
+        Command::Server { .. } | Command::Connect { .. } => unreachable!(),
         Command::NewSession { host, target, no_escape } => {
             let ctl_path = resolve_ctl_path(cli.ctl_socket, host.as_deref())?;
             new_session(target, no_escape, ctl_path).await
@@ -260,16 +335,10 @@ async fn run(cli: Cli) -> anyhow::Result<()> {
             println!("{}", ctl_path.display());
             Ok(())
         }
-        Command::Connect { destination, name, no_server_start, ssh_options, dry_run } => {
-            let code = gritty::connect::run(gritty::connect::ConnectOpts {
-                destination,
-                no_server_start,
-                ssh_options,
-                name,
-                dry_run,
-            })
-            .await?;
-            std::process::exit(code);
+        Command::Disconnect { name } => gritty::connect::disconnect(&name).await,
+        Command::Tunnels => {
+            gritty::connect::list_tunnels();
+            Ok(())
         }
     }
 }

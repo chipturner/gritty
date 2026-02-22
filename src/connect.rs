@@ -1,4 +1,7 @@
 use anyhow::{Context, bail};
+use std::os::fd::OwnedFd;
+use std::os::unix::fs::OpenOptionsExt;
+use std::os::unix::io::{AsRawFd, FromRawFd};
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::time::{Duration, Instant};
@@ -322,6 +325,119 @@ fn connect_pid_path(connection_name: &str) -> PathBuf {
     crate::daemon::socket_dir().join(format!("connect-{connection_name}.pid"))
 }
 
+fn connect_lock_path(connection_name: &str) -> PathBuf {
+    crate::daemon::socket_dir().join(format!("connect-{connection_name}.lock"))
+}
+
+fn connect_dest_path(connection_name: &str) -> PathBuf {
+    crate::daemon::socket_dir().join(format!("connect-{connection_name}.dest"))
+}
+
+/// Compute the local socket path for a given connection name.
+/// Public so main.rs can compute the path in the parent process after daemonize.
+pub fn connection_socket_path(connection_name: &str) -> PathBuf {
+    local_socket_path(connection_name)
+}
+
+// ---------------------------------------------------------------------------
+// Lockfile-based liveness
+// ---------------------------------------------------------------------------
+
+/// Acquire an exclusive flock on the lockfile. Returns the locked fd on success.
+/// The lock is held for the lifetime of the returned `OwnedFd`.
+fn acquire_lock(lock_path: &Path) -> anyhow::Result<OwnedFd> {
+    use std::fs::OpenOptions;
+    let file = OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .write(true)
+        .mode(0o600)
+        .open(lock_path)
+        .with_context(|| format!("failed to open lockfile: {}", lock_path.display()))?;
+    let fd = OwnedFd::from(file);
+    if unsafe { libc::flock(fd.as_raw_fd(), libc::LOCK_EX) } != 0 {
+        bail!("failed to acquire lock on {}", lock_path.display());
+    }
+    Ok(fd)
+}
+
+/// Probe whether a lockfile is held by a live process.
+/// Returns true if the lock is held (process alive), false if free (process dead).
+fn is_lock_held(lock_path: &Path) -> bool {
+    use std::fs::OpenOptions;
+    let file = match OpenOptions::new().read(true).open(lock_path) {
+        Ok(f) => f,
+        Err(_) => return false,
+    };
+    // Non-blocking exclusive lock attempt: if it succeeds, the old process is dead
+    if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } == 0 {
+        // We got the lock — old process is gone. Release it immediately (fd drop).
+        false
+    } else {
+        true // Lock held by another process
+    }
+}
+
+/// Tunnel health status.
+#[derive(Debug, PartialEq, Eq)]
+pub enum TunnelStatus {
+    Healthy,
+    Reconnecting,
+    Stale,
+}
+
+/// Probe a tunnel's status using lockfile + socket connectivity.
+fn probe_tunnel_status(name: &str) -> TunnelStatus {
+    let lock_path = connect_lock_path(name);
+    if is_lock_held(&lock_path) {
+        let sock_path = local_socket_path(name);
+        if std::os::unix::net::UnixStream::connect(&sock_path).is_ok() {
+            TunnelStatus::Healthy
+        } else {
+            TunnelStatus::Reconnecting
+        }
+    } else {
+        TunnelStatus::Stale
+    }
+}
+
+/// Clean up files for a stale tunnel (process already dead).
+/// Attempts killpg on the old PID to reap orphaned SSH children.
+fn cleanup_stale_files(name: &str) {
+    let pid_file = connect_pid_path(name);
+    if let Ok(contents) = std::fs::read_to_string(&pid_file) {
+        if let Ok(pid) = contents.trim().parse::<i32>() {
+            // Safe: PGID won't be recycled to a different group while files exist
+            unsafe {
+                libc::killpg(pid, libc::SIGTERM);
+            }
+        }
+    }
+    let _ = std::fs::remove_file(local_socket_path(name));
+    let _ = std::fs::remove_file(pid_file);
+    let _ = std::fs::remove_file(connect_lock_path(name));
+    let _ = std::fs::remove_file(connect_dest_path(name));
+}
+
+/// Extract tunnel connection names by globbing lock files in the socket dir.
+fn enumerate_tunnels() -> Vec<String> {
+    let dir = crate::daemon::socket_dir();
+    let Ok(entries) = std::fs::read_dir(&dir) else {
+        return Vec::new();
+    };
+    entries
+        .filter_map(|e| e.ok())
+        .filter_map(|e| {
+            let name = e.file_name().to_string_lossy().to_string();
+            if name.starts_with("connect-") && name.ends_with(".lock") {
+                Some(name["connect-".len()..name.len() - ".lock".len()].to_string())
+            } else {
+                None
+            }
+        })
+        .collect()
+}
+
 // ---------------------------------------------------------------------------
 // Cleanup guard
 // ---------------------------------------------------------------------------
@@ -330,6 +446,9 @@ struct ConnectGuard {
     child: Option<Child>,
     local_sock: PathBuf,
     pid_file: PathBuf,
+    lock_file: PathBuf,
+    dest_file: PathBuf,
+    _lock_fd: Option<OwnedFd>,
     stop: tokio_util::sync::CancellationToken,
 }
 
@@ -347,6 +466,9 @@ impl Drop for ConnectGuard {
 
         let _ = std::fs::remove_file(&self.local_sock);
         let _ = std::fs::remove_file(&self.pid_file);
+        let _ = std::fs::remove_file(&self.lock_file);
+        let _ = std::fs::remove_file(&self.dest_file);
+        // _lock_fd drops here, releasing the flock
     }
 }
 
@@ -362,7 +484,7 @@ pub struct ConnectOpts {
     pub dry_run: bool,
 }
 
-pub async fn run(opts: ConnectOpts) -> anyhow::Result<i32> {
+pub async fn run(opts: ConnectOpts, ready_fd: Option<OwnedFd>) -> anyhow::Result<i32> {
     let dest = Destination::parse(&opts.destination)?;
     let connection_name = opts.name.unwrap_or_else(|| dest.host.clone());
     let local_sock = local_socket_path(&connection_name);
@@ -384,38 +506,65 @@ pub async fn run(opts: ConnectOpts) -> anyhow::Result<i32> {
         return Ok(0);
     }
 
-    // 1. Check for existing tunnel
+    // 1. Ensure socket directory exists
     let pid_file = connect_pid_path(&connection_name);
+    let lock_path = connect_lock_path(&connection_name);
+    let dest_file = connect_dest_path(&connection_name);
     debug!("local socket: {}", local_sock.display());
     if let Some(parent) = local_sock.parent() {
         crate::security::secure_create_dir_all(parent)?;
     }
 
-    if std::os::unix::net::UnixStream::connect(&local_sock).is_ok() {
-        let pid_hint =
-            std::fs::read_to_string(&pid_file).ok().and_then(|s| s.trim().parse::<u32>().ok());
-        println!("{}", local_sock.display());
-        eprint!("tunnel already running (name: {connection_name})");
-        if let Some(pid) = pid_hint {
-            eprintln!(" (pid {pid})");
-            eprintln!("  to stop: kill {pid}");
-        } else {
-            eprintln!();
+    // 2. Check for existing tunnel via lockfile (authoritative)
+    match probe_tunnel_status(&connection_name) {
+        TunnelStatus::Healthy => {
+            println!("{}", local_sock.display());
+            let pid_hint = std::fs::read_to_string(&pid_file)
+                .ok()
+                .and_then(|s| s.trim().parse::<u32>().ok());
+            eprint!("tunnel already running (name: {connection_name})");
+            if let Some(pid) = pid_hint {
+                eprintln!(" (pid {pid})");
+                eprintln!("  to stop: gritty disconnect {connection_name}");
+            } else {
+                eprintln!();
+            }
+            eprintln!("  to use:");
+            eprintln!("    gritty new {connection_name}");
+            eprintln!("    gritty attach {connection_name} -t <name>");
+            // Signal readiness to parent even for already-running case
+            signal_ready(&ready_fd);
+            return Ok(0);
         }
-        eprintln!("  to use:");
-        eprintln!("    gritty new {connection_name}");
-        eprintln!("    gritty attach {connection_name} -t <name>");
-        return Ok(0);
+        TunnelStatus::Reconnecting => {
+            let pid_hint = std::fs::read_to_string(&pid_file)
+                .ok()
+                .and_then(|s| s.trim().parse::<u32>().ok());
+            eprint!("tunnel exists but is reconnecting (name: {connection_name})");
+            if let Some(pid) = pid_hint {
+                eprintln!(" (pid {pid})");
+            } else {
+                eprintln!();
+            }
+            eprintln!("  wait for it, or: gritty disconnect {connection_name}");
+            // Signal readiness to parent so it doesn't hang
+            signal_ready(&ready_fd);
+            return Ok(0);
+        }
+        TunnelStatus::Stale => {
+            debug!("cleaning stale tunnel files for {connection_name}");
+            cleanup_stale_files(&connection_name);
+        }
     }
-    // Socket is stale or absent — clean up
-    let _ = std::fs::remove_file(&local_sock);
 
-    // 2. Ensure remote server is running and get socket path
-    eprintln!("starting remote server...");
+    // 3. Acquire lockfile (held for entire lifetime of this process)
+    let lock_fd = acquire_lock(&lock_path)?;
+
+    // 4. Ensure remote server is running and get socket path
     let remote_sock = ensure_remote_ready(&dest, opts.no_server_start, &opts.ssh_options).await?;
     debug!(remote_sock, "remote socket path");
 
-    // 3. Spawn SSH tunnel
+    // 5. Spawn SSH tunnel
     let child = spawn_tunnel(&dest, &local_sock, &remote_sock, &opts.ssh_options).await?;
     let stop = tokio_util::sync::CancellationToken::new();
 
@@ -423,17 +572,24 @@ pub async fn run(opts: ConnectOpts) -> anyhow::Result<i32> {
         child: Some(child),
         local_sock: local_sock.clone(),
         pid_file: pid_file.clone(),
+        lock_file: lock_path,
+        dest_file: dest_file.clone(),
+        _lock_fd: Some(lock_fd),
         stop: stop.clone(),
     };
 
-    // 4. Wait for local socket to become connectable
+    // 6. Wait for local socket to become connectable
     wait_for_socket(&local_sock).await?;
     debug!("tunnel socket ready");
 
-    // Write PID file so subsequent connects can report it
+    // Write PID + dest files
     let _ = std::fs::write(&pid_file, std::process::id().to_string());
+    let _ = std::fs::write(&dest_file, &opts.destination);
 
-    // 5. Hand off the child to the tunnel monitor background task
+    // 7. Signal readiness to parent (or print if foreground)
+    signal_ready(&ready_fd);
+
+    // 8. Hand off the child to the tunnel monitor background task
     let original_child = guard.child.take().unwrap();
     let monitor_handle = tokio::spawn(tunnel_monitor(
         original_child,
@@ -444,26 +600,126 @@ pub async fn run(opts: ConnectOpts) -> anyhow::Result<i32> {
         stop.clone(),
     ));
 
-    // 6. Print socket path and usage hints
-    println!("{}", local_sock.display());
-    eprintln!("tunnel ready (name: {connection_name}). to use:");
-    eprintln!("  gritty new {connection_name}");
-    eprintln!("  gritty attach {connection_name} -t <name>");
-
-    // 7. Wait for signal or monitor death
+    // 9. Wait for signal or monitor death
     let mut sigterm = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
     tokio::select! {
-        _ = tokio::signal::ctrl_c() => {}
         _ = sigterm.recv() => {}
-        _ = monitor_handle => {
-            eprintln!("tunnel lost");
-        }
+        _ = monitor_handle => {}
     }
 
-    // 8. Cleanup (guard Drop handles ssh kill + socket removal)
+    // 10. Cleanup (guard Drop handles ssh kill + file removal + lock release)
     drop(guard);
 
     Ok(0)
+}
+
+/// Write one readiness byte to the pipe fd (if present).
+fn signal_ready(ready_fd: &Option<OwnedFd>) {
+    if let Some(fd) = ready_fd {
+        use std::io::Write;
+        let mut f = std::io::BufWriter::new(unsafe {
+            // Safety: we're borrowing the fd, not taking ownership
+            std::fs::File::from_raw_fd(fd.as_raw_fd())
+        });
+        let _ = f.write_all(b"\x01");
+        let _ = f.flush();
+        // Don't drop the File — it doesn't own the fd. Leak it.
+        std::mem::forget(f);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Disconnect
+// ---------------------------------------------------------------------------
+
+pub async fn disconnect(name: &str) -> anyhow::Result<()> {
+    match probe_tunnel_status(name) {
+        TunnelStatus::Stale => {
+            cleanup_stale_files(name);
+            eprintln!("tunnel already stopped: {name}");
+            return Ok(());
+        }
+        TunnelStatus::Healthy | TunnelStatus::Reconnecting => {}
+    }
+
+    // Read PID and send SIGTERM (let the process handle graceful shutdown)
+    let pid_file = connect_pid_path(name);
+    let pid = std::fs::read_to_string(&pid_file)
+        .ok()
+        .and_then(|s| s.trim().parse::<i32>().ok())
+        .ok_or_else(|| anyhow::anyhow!("cannot read PID for tunnel {name}"))?;
+
+    unsafe {
+        libc::kill(pid, libc::SIGTERM);
+    }
+
+    // Poll lock for up to 2s to confirm exit
+    let deadline = Instant::now() + Duration::from_secs(2);
+    loop {
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        if !is_lock_held(&connect_lock_path(name)) {
+            cleanup_stale_files(name);
+            eprintln!("tunnel stopped: {name}");
+            return Ok(());
+        }
+        if Instant::now() >= deadline {
+            break;
+        }
+    }
+
+    // Still alive after timeout — escalate to SIGKILL + killpg
+    unsafe {
+        libc::kill(pid, libc::SIGKILL);
+        libc::killpg(pid, libc::SIGTERM);
+    }
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    cleanup_stale_files(name);
+    eprintln!("tunnel killed: {name}");
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// List tunnels
+// ---------------------------------------------------------------------------
+
+pub fn list_tunnels() {
+    let names = enumerate_tunnels();
+    if names.is_empty() {
+        println!("no active tunnels");
+        return;
+    }
+
+    // Probe each, clean stale ones, collect live entries
+    let mut rows: Vec<(String, String, String)> = Vec::new();
+    for name in &names {
+        let status = probe_tunnel_status(name);
+        if status == TunnelStatus::Stale {
+            debug!("cleaning stale tunnel: {name}");
+            cleanup_stale_files(name);
+            continue;
+        }
+        let dest = std::fs::read_to_string(connect_dest_path(name))
+            .unwrap_or_else(|_| "-".to_string());
+        let status_str = match status {
+            TunnelStatus::Healthy => "healthy".to_string(),
+            TunnelStatus::Reconnecting => "reconnecting".to_string(),
+            TunnelStatus::Stale => unreachable!(),
+        };
+        rows.push((name.clone(), dest.trim().to_string(), status_str));
+    }
+
+    if rows.is_empty() {
+        println!("no active tunnels");
+        return;
+    }
+
+    let w_name = rows.iter().map(|r| r.0.len()).max().unwrap().max(4);
+    let w_dest = rows.iter().map(|r| r.1.len()).max().unwrap().max(11);
+
+    println!("{:<w_name$}  {:<w_dest$}  Status", "Name", "Destination");
+    for (name, dest, status) in &rows {
+        println!("{:<w_name$}  {:<w_dest$}  {status}", name, dest);
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -670,5 +926,76 @@ mod tests {
         assert!(formatted.contains("ProxyJump=bastion"));
         assert!(formatted.contains("gritty socket-path"));
         assert!(formatted.contains("gritty server"));
+    }
+
+    // -----------------------------------------------------------------------
+    // Lockfile and tunnel lifecycle tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn connect_lock_path_format() {
+        let path = connect_lock_path("devbox");
+        assert_eq!(path.file_name().unwrap().to_string_lossy(), "connect-devbox.lock");
+    }
+
+    #[test]
+    fn connect_dest_path_format() {
+        let path = connect_dest_path("devbox");
+        assert_eq!(path.file_name().unwrap().to_string_lossy(), "connect-devbox.dest");
+    }
+
+    #[test]
+    fn acquire_and_probe_lock() {
+        let dir = tempfile::tempdir().unwrap();
+        let lock_path = dir.path().join("test.lock");
+
+        // Lock not held initially (file doesn't exist)
+        assert!(!is_lock_held(&lock_path));
+
+        // Acquire the lock
+        let _fd = acquire_lock(&lock_path).unwrap();
+
+        // Now it should be held
+        assert!(is_lock_held(&lock_path));
+
+        // Drop the lock
+        drop(_fd);
+
+        // Should be free again
+        assert!(!is_lock_held(&lock_path));
+    }
+
+    #[test]
+    fn probe_stale_no_files() {
+        // No files at all → stale
+        let status = probe_tunnel_status("nonexistent-test-tunnel-xyz");
+        assert_eq!(status, TunnelStatus::Stale);
+    }
+
+    #[test]
+    fn cleanup_stale_files_removes_all() {
+        let dir = tempfile::tempdir().unwrap();
+        // Override socket_dir by creating files manually in a temp location
+        // We can't easily override socket_dir(), so test that cleanup_stale_files
+        // at least doesn't panic on nonexistent files
+        cleanup_stale_files("nonexistent-cleanup-test-xyz");
+        // No panic = success
+    }
+
+    #[test]
+    fn enumerate_tunnels_empty_dir() {
+        // If socket dir doesn't have any lock files, should return empty
+        // This tests the function doesn't crash on various filesystem states
+        let names = enumerate_tunnels();
+        // We can't control what's in socket_dir during tests, but at minimum
+        // the function should not panic
+        let _ = names;
+    }
+
+    #[test]
+    fn connection_socket_path_matches_local() {
+        let public_path = connection_socket_path("myhost");
+        let internal_path = local_socket_path("myhost");
+        assert_eq!(public_path, internal_path);
     }
 }
