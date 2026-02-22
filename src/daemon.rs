@@ -213,11 +213,7 @@ pub async fn run(ctl_path: &Path, ready_fd: Option<OwnedFd>) -> anyhow::Result<(
 
                 info!(id, name = ?name_opt, "session created");
 
-                let _ = framed
-                    .send(Frame::SessionCreated {
-                        id: id.to_string(),
-                    })
-                    .await;
+                let _ = framed.send(Frame::SessionCreated { id: id.to_string() }).await;
 
                 // Hand off connection to session for auto-attach
                 let _ = client_tx.send(framed);
@@ -229,9 +225,7 @@ pub async fn run(ctl_path: &Path, ready_fd: Option<OwnedFd>) -> anyhow::Result<(
                     if state.client_tx.is_closed() {
                         sessions.remove(&id);
                         let _ = framed
-                            .send(Frame::Error {
-                                message: format!("no such session: {session}"),
-                            })
+                            .send(Frame::Error { message: format!("no such session: {session}") })
                             .await;
                     } else {
                         let _ = framed.send(Frame::Ok).await;
@@ -239,9 +233,7 @@ pub async fn run(ctl_path: &Path, ready_fd: Option<OwnedFd>) -> anyhow::Result<(
                     }
                 } else {
                     let _ = framed
-                        .send(Frame::Error {
-                            message: format!("no such session: {session}"),
-                        })
+                        .send(Frame::Error { message: format!("no such session: {session}") })
                         .await;
                 }
             }
@@ -259,9 +251,7 @@ pub async fn run(ctl_path: &Path, ready_fd: Option<OwnedFd>) -> anyhow::Result<(
                     let _ = framed.send(Frame::Ok).await;
                 } else {
                     let _ = framed
-                        .send(Frame::Error {
-                            message: format!("no such session: {session}"),
-                        })
+                        .send(Frame::Error { message: format!("no such session: {session}") })
                         .await;
                 }
             }
@@ -274,9 +264,7 @@ pub async fn run(ctl_path: &Path, ready_fd: Option<OwnedFd>) -> anyhow::Result<(
             other => {
                 error!(?other, "unexpected frame on control socket");
                 let _ = framed
-                    .send(Frame::Error {
-                        message: "unexpected frame type".to_string(),
-                    })
+                    .send(Frame::Error { message: "unexpected frame type".to_string() })
                     .await;
             }
         }

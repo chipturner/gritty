@@ -108,10 +108,7 @@ fn init_tracing(verbose: bool) {
     } else {
         EnvFilter::from_default_env()
     };
-    tracing_subscriber::fmt()
-        .with_env_filter(filter)
-        .with_writer(std::io::stderr)
-        .init();
+    tracing_subscriber::fmt().with_env_filter(filter).with_writer(std::io::stderr).init();
 }
 
 /// Fork into background, returning the write end of the readiness pipe.
@@ -175,9 +172,7 @@ fn main() {
 
     match cli.command {
         Command::Daemon { foreground } => {
-            let ctl_path = cli
-                .ctl_socket
-                .unwrap_or_else(gritty::daemon::control_socket_path);
+            let ctl_path = cli.ctl_socket.unwrap_or_else(gritty::daemon::control_socket_path);
 
             let ready_fd = if foreground {
                 None
@@ -223,10 +218,7 @@ fn main() {
     }
 }
 
-fn resolve_ctl_path(
-    ctl_socket: Option<PathBuf>,
-    host: Option<&str>,
-) -> anyhow::Result<PathBuf> {
+fn resolve_ctl_path(ctl_socket: Option<PathBuf>, host: Option<&str>) -> anyhow::Result<PathBuf> {
     match (ctl_socket, host) {
         (Some(_), Some(_)) => anyhow::bail!("cannot specify both --ctl-socket and a host argument"),
         (Some(p), None) => Ok(p),
@@ -264,12 +256,7 @@ async fn run(cli: Cli) -> anyhow::Result<()> {
             println!("{}", ctl_path.display());
             Ok(())
         }
-        Command::Connect {
-            destination,
-            name,
-            no_daemon_start,
-            ssh_options,
-        } => {
+        Command::Connect { destination, name, no_daemon_start, ssh_options } => {
             let code = gritty::connect::run(gritty::connect::ConnectOpts {
                 destination,
                 no_daemon_start,
@@ -282,23 +269,23 @@ async fn run(cli: Cli) -> anyhow::Result<()> {
     }
 }
 
-async fn new_session(name: Option<String>, no_escape: bool, ctl_path: PathBuf) -> anyhow::Result<()> {
+async fn new_session(
+    name: Option<String>,
+    no_escape: bool,
+    ctl_path: PathBuf,
+) -> anyhow::Result<()> {
     use futures_util::{SinkExt, StreamExt};
+    use gritty::protocol::{Frame, FrameCodec};
     use tokio::net::UnixStream;
     use tokio_util::codec::Framed;
-    use gritty::protocol::{Frame, FrameCodec};
 
     let session_name = name.clone().unwrap_or_default();
 
-    let stream = UnixStream::connect(&ctl_path)
-        .await
-        .map_err(|_| anyhow::anyhow!("no daemon running (could not connect to {})", ctl_path.display()))?;
+    let stream = UnixStream::connect(&ctl_path).await.map_err(|_| {
+        anyhow::anyhow!("no daemon running (could not connect to {})", ctl_path.display())
+    })?;
     let mut framed = Framed::new(stream, FrameCodec);
-    framed
-        .send(Frame::NewSession {
-            name: session_name,
-        })
-        .await?;
+    framed.send(Frame::NewSession { name: session_name }).await?;
 
     match Frame::expect_from(framed.next().await)? {
         Frame::SessionCreated { id } => {
@@ -307,7 +294,8 @@ async fn new_session(name: Option<String>, no_escape: bool, ctl_path: PathBuf) -
                 None => eprintln!("session created: id {id}"),
             }
             let env_vars = gritty::collect_env_vars();
-            let code = gritty::client::run(&id, framed, false, &ctl_path, env_vars, no_escape).await?;
+            let code =
+                gritty::client::run(&id, framed, false, &ctl_path, env_vars, no_escape).await?;
             std::process::exit(code);
         }
         Frame::Error { message } => anyhow::bail!("{message}"),
@@ -315,11 +303,16 @@ async fn new_session(name: Option<String>, no_escape: bool, ctl_path: PathBuf) -
     }
 }
 
-async fn attach(target: String, redraw: bool, no_escape: bool, ctl_path: PathBuf) -> anyhow::Result<i32> {
+async fn attach(
+    target: String,
+    redraw: bool,
+    no_escape: bool,
+    ctl_path: PathBuf,
+) -> anyhow::Result<i32> {
     use futures_util::{SinkExt, StreamExt};
+    use gritty::protocol::{Frame, FrameCodec};
     use tokio::net::UnixStream;
     use tokio_util::codec::Framed;
-    use gritty::protocol::{Frame, FrameCodec};
 
     let stream = loop {
         match UnixStream::connect(&ctl_path).await {
@@ -331,16 +324,13 @@ async fn attach(target: String, redraw: bool, no_escape: bool, ctl_path: PathBuf
         }
     };
     let mut framed = Framed::new(stream, FrameCodec);
-    framed
-        .send(Frame::Attach {
-            session: target.clone(),
-        })
-        .await?;
+    framed.send(Frame::Attach { session: target.clone() }).await?;
 
     match Frame::expect_from(framed.next().await)? {
         Frame::Ok => {
             eprintln!("[attached]");
-            let code = gritty::client::run(&target, framed, redraw, &ctl_path, vec![], no_escape).await?;
+            let code =
+                gritty::client::run(&target, framed, redraw, &ctl_path, vec![], no_escape).await?;
             Ok(code)
         }
         Frame::Error { message } => anyhow::bail!("{message}"),
@@ -354,13 +344,13 @@ async fn daemon_request(
     frame: gritty::protocol::Frame,
 ) -> anyhow::Result<gritty::protocol::Frame> {
     use futures_util::{SinkExt, StreamExt};
+    use gritty::protocol::{Frame, FrameCodec};
     use tokio::net::UnixStream;
     use tokio_util::codec::Framed;
-    use gritty::protocol::{Frame, FrameCodec};
 
-    let stream = UnixStream::connect(ctl_path)
-        .await
-        .map_err(|_| anyhow::anyhow!("no daemon running (could not connect to {})", ctl_path.display()))?;
+    let stream = UnixStream::connect(ctl_path).await.map_err(|_| {
+        anyhow::anyhow!("no daemon running (could not connect to {})", ctl_path.display())
+    })?;
     let mut framed = Framed::new(stream, FrameCodec);
     framed.send(frame).await?;
     Frame::expect_from(framed.next().await)
@@ -384,11 +374,7 @@ async fn list_sessions(ctl_path: PathBuf) -> anyhow::Result<()> {
                 let rows: Vec<_> = sessions
                     .iter()
                     .map(|s| {
-                        let name = if s.name.is_empty() {
-                            "-".to_string()
-                        } else {
-                            s.name.clone()
-                        };
+                        let name = if s.name.is_empty() { "-".to_string() } else { s.name.clone() };
                         let (pty, pid, created, status) = if s.shell_pid == 0 {
                             (
                                 "-".to_string(),
@@ -465,14 +451,7 @@ fn format_timestamp(epoch_secs: u64) -> String {
 async fn kill_session(target: String, ctl_path: PathBuf) -> anyhow::Result<()> {
     use gritty::protocol::Frame;
 
-    match daemon_request(
-        &ctl_path,
-        Frame::KillSession {
-            session: target.clone(),
-        },
-    )
-    .await?
-    {
+    match daemon_request(&ctl_path, Frame::KillSession { session: target.clone() }).await? {
         Frame::Ok => {
             eprintln!("session killed: {target}");
             Ok(())

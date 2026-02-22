@@ -1,5 +1,6 @@
 use bytes::Bytes;
 use futures_util::{SinkExt, StreamExt};
+use gritty::protocol::{Frame, FrameCodec};
 use std::sync::{Arc, LazyLock, OnceLock};
 use std::time::Duration;
 use tokio::net::UnixStream;
@@ -7,7 +8,6 @@ use tokio::sync::{Semaphore, mpsc};
 use tokio::task::JoinHandle;
 use tokio::time::timeout;
 use tokio_util::codec::Framed;
-use gritty::protocol::{Frame, FrameCodec};
 
 /// Limit concurrent e2e tests to avoid PTY/CPU exhaustion under parallel load.
 static CONCURRENCY: LazyLock<Semaphore> = LazyLock::new(|| Semaphore::new(4));
@@ -26,9 +26,7 @@ async fn setup_session() -> (
     let handle = tokio::spawn(async move { gritty::server::run(client_rx, meta_clone).await });
 
     let (server_stream, client_stream) = UnixStream::pair().unwrap();
-    client_tx
-        .send(Framed::new(server_stream, FrameCodec))
-        .unwrap();
+    client_tx.send(Framed::new(server_stream, FrameCodec)).unwrap();
 
     let framed = Framed::new(client_stream, FrameCodec);
     (client_tx, framed, handle, meta)
@@ -50,16 +48,11 @@ async fn setup_session_with_env(
     let handle = tokio::spawn(async move { gritty::server::run(client_rx, meta_clone).await });
 
     let (server_stream, client_stream) = UnixStream::pair().unwrap();
-    client_tx
-        .send(Framed::new(server_stream, FrameCodec))
-        .unwrap();
+    client_tx.send(Framed::new(server_stream, FrameCodec)).unwrap();
 
     let mut framed = Framed::new(client_stream, FrameCodec);
     // Send Env frame so server reads it before spawning shell
-    framed
-        .send(Frame::Env { vars: env_vars })
-        .await
-        .unwrap();
+    framed.send(Frame::Env { vars: env_vars }).await.unwrap();
 
     (client_tx, framed, handle, meta)
 }
@@ -67,10 +60,7 @@ async fn setup_session_with_env(
 /// Wait for shell to produce initial output (confirms it's alive).
 async fn wait_for_shell(framed: &mut Framed<UnixStream, FrameCodec>) {
     // Send initial resize
-    framed
-        .send(Frame::Resize { cols: 80, rows: 24 })
-        .await
-        .unwrap();
+    framed.send(Frame::Resize { cols: 80, rows: 24 }).await.unwrap();
 
     let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
     loop {
@@ -128,10 +118,7 @@ async fn server_relays_command_output() {
     wait_for_shell(&mut framed).await;
     read_available_data(&mut framed, Duration::from_secs(1)).await;
 
-    framed
-        .send(Frame::Data(Bytes::from("echo TTYLEPORT_TEST_OK\n")))
-        .await
-        .unwrap();
+    framed.send(Frame::Data(Bytes::from("echo TTYLEPORT_TEST_OK\n"))).await.unwrap();
 
     let output = read_available_data(&mut framed, Duration::from_secs(2)).await;
     let output_str = String::from_utf8_lossy(&output);
@@ -151,10 +138,7 @@ async fn server_sends_exit_frame_on_shell_exit() {
     wait_for_shell(&mut framed).await;
     read_available_data(&mut framed, Duration::from_secs(1)).await;
 
-    framed
-        .send(Frame::Data(Bytes::from("exit 42\n")))
-        .await
-        .unwrap();
+    framed.send(Frame::Data(Bytes::from("exit 42\n"))).await.unwrap();
 
     let code = expect_exit_frame(&mut framed, Duration::from_secs(5)).await;
     assert_eq!(code, Some(42), "expected exit code 42");
@@ -167,10 +151,7 @@ async fn reconnect_preserves_shell_session() {
     wait_for_shell(&mut framed).await;
     read_available_data(&mut framed, Duration::from_secs(1)).await;
 
-    framed
-        .send(Frame::Data(Bytes::from("export TTYLEPORT_MARKER=alive\n")))
-        .await
-        .unwrap();
+    framed.send(Frame::Data(Bytes::from("export TTYLEPORT_MARKER=alive\n"))).await.unwrap();
     read_available_data(&mut framed, Duration::from_millis(500)).await;
 
     // Disconnect by dropping the framed stream
@@ -181,22 +162,14 @@ async fn reconnect_preserves_shell_session() {
 
     // Second connection via socketpair through channel
     let (server_stream, client_stream) = UnixStream::pair().unwrap();
-    client_tx
-        .send(Framed::new(server_stream, FrameCodec))
-        .unwrap();
+    client_tx.send(Framed::new(server_stream, FrameCodec)).unwrap();
     let mut framed = Framed::new(client_stream, FrameCodec);
-    framed
-        .send(Frame::Resize { cols: 80, rows: 24 })
-        .await
-        .unwrap();
+    framed.send(Frame::Resize { cols: 80, rows: 24 }).await.unwrap();
 
     // Drain any buffered output
     read_available_data(&mut framed, Duration::from_secs(1)).await;
 
-    framed
-        .send(Frame::Data(Bytes::from("echo $TTYLEPORT_MARKER\n")))
-        .await
-        .unwrap();
+    framed.send(Frame::Data(Bytes::from("echo $TTYLEPORT_MARKER\n"))).await.unwrap();
 
     let output = read_available_data(&mut framed, Duration::from_secs(2)).await;
     let output_str = String::from_utf8_lossy(&output);
@@ -216,10 +189,7 @@ async fn server_exits_when_shell_dies_while_disconnected() {
     wait_for_shell(&mut framed).await;
     read_available_data(&mut framed, Duration::from_secs(1)).await;
 
-    framed
-        .send(Frame::Data(Bytes::from("sleep 0.5 && exit 0\n")))
-        .await
-        .unwrap();
+    framed.send(Frame::Data(Bytes::from("sleep 0.5 && exit 0\n"))).await.unwrap();
     read_available_data(&mut framed, Duration::from_millis(200)).await;
 
     // Disconnect
@@ -227,10 +197,7 @@ async fn server_exits_when_shell_dies_while_disconnected() {
 
     // Server should exit once the shell dies
     let result = timeout(Duration::from_secs(5), server).await;
-    assert!(
-        result.is_ok(),
-        "server should exit after shell dies while disconnected"
-    );
+    assert!(result.is_ok(), "server should exit after shell dies while disconnected");
 }
 
 #[tokio::test]
@@ -242,14 +209,9 @@ async fn second_client_detaches_first() {
 
     // Second client connects via channel — should take over the session
     let (server_stream2, client_stream2) = UnixStream::pair().unwrap();
-    client_tx
-        .send(Framed::new(server_stream2, FrameCodec))
-        .unwrap();
+    client_tx.send(Framed::new(server_stream2, FrameCodec)).unwrap();
     let mut client2 = Framed::new(client_stream2, FrameCodec);
-    client2
-        .send(Frame::Resize { cols: 80, rows: 24 })
-        .await
-        .unwrap();
+    client2.send(Frame::Resize { cols: 80, rows: 24 }).await.unwrap();
 
     // First client should receive Detached
     let mut got_detached = false;
@@ -268,10 +230,7 @@ async fn second_client_detaches_first() {
     // Second client should be able to interact with the shell
     read_available_data(&mut client2, Duration::from_secs(1)).await;
 
-    client2
-        .send(Frame::Data(Bytes::from("echo TAKEOVER_OK\n")))
-        .await
-        .unwrap();
+    client2.send(Frame::Data(Bytes::from("echo TAKEOVER_OK\n"))).await.unwrap();
 
     let output = read_available_data(&mut client2, Duration::from_secs(2)).await;
     let output_str = String::from_utf8_lossy(&output);
@@ -291,10 +250,7 @@ async fn exit_code_zero_sends_exit_frame() {
     wait_for_shell(&mut framed).await;
     read_available_data(&mut framed, Duration::from_secs(1)).await;
 
-    framed
-        .send(Frame::Data(Bytes::from("exit 0\n")))
-        .await
-        .unwrap();
+    framed.send(Frame::Data(Bytes::from("exit 0\n"))).await.unwrap();
 
     let code = expect_exit_frame(&mut framed, Duration::from_secs(5)).await;
     assert_eq!(code, Some(0), "expected exit code 0");
@@ -327,12 +283,7 @@ async fn rapid_reconnect_cycles() {
     wait_for_shell(&mut framed).await;
     read_available_data(&mut framed, Duration::from_secs(1)).await;
 
-    framed
-        .send(Frame::Data(Bytes::from(
-            "export RAPID_TEST_MARKER=survived\n",
-        )))
-        .await
-        .unwrap();
+    framed.send(Frame::Data(Bytes::from("export RAPID_TEST_MARKER=survived\n"))).await.unwrap();
     read_available_data(&mut framed, Duration::from_millis(500)).await;
 
     // Rapidly disconnect and reconnect 3 times
@@ -341,21 +292,13 @@ async fn rapid_reconnect_cycles() {
         tokio::time::sleep(Duration::from_millis(200)).await;
 
         let (server_stream, client_stream) = UnixStream::pair().unwrap();
-        client_tx
-            .send(Framed::new(server_stream, FrameCodec))
-            .unwrap();
+        client_tx.send(Framed::new(server_stream, FrameCodec)).unwrap();
         framed = Framed::new(client_stream, FrameCodec);
-        framed
-            .send(Frame::Resize { cols: 80, rows: 24 })
-            .await
-            .unwrap();
+        framed.send(Frame::Resize { cols: 80, rows: 24 }).await.unwrap();
         read_available_data(&mut framed, Duration::from_millis(500)).await;
     }
 
-    framed
-        .send(Frame::Data(Bytes::from("echo $RAPID_TEST_MARKER\n")))
-        .await
-        .unwrap();
+    framed.send(Frame::Data(Bytes::from("echo $RAPID_TEST_MARKER\n"))).await.unwrap();
     let output = read_available_data(&mut framed, Duration::from_secs(2)).await;
     let output_str = String::from_utf8_lossy(&output);
     assert!(
@@ -377,19 +320,11 @@ async fn control_frame_on_session_is_ignored() {
     // Send various control frames that make no sense on a session connection
     framed.send(Frame::ListSessions).await.unwrap();
     framed.send(Frame::KillServer).await.unwrap();
-    framed
-        .send(Frame::NewSession {
-            name: "bogus".to_string(),
-        })
-        .await
-        .unwrap();
+    framed.send(Frame::NewSession { name: "bogus".to_string() }).await.unwrap();
 
     tokio::time::sleep(Duration::from_millis(200)).await;
 
-    framed
-        .send(Frame::Data(Bytes::from("echo STILL_ALIVE\n")))
-        .await
-        .unwrap();
+    framed.send(Frame::Data(Bytes::from("echo STILL_ALIVE\n"))).await.unwrap();
 
     let output = read_available_data(&mut framed, Duration::from_secs(2)).await;
     let output_str = String::from_utf8_lossy(&output);
@@ -410,9 +345,7 @@ async fn pty_buffer_saturation_and_resume() {
     read_available_data(&mut framed, Duration::from_secs(1)).await;
 
     framed
-        .send(Frame::Data(Bytes::from(
-            "{ sleep 0.3; seq 1 2000; echo PTY_DRAINED_OK; } &\n",
-        )))
+        .send(Frame::Data(Bytes::from("{ sleep 0.3; seq 1 2000; echo PTY_DRAINED_OK; } &\n")))
         .await
         .unwrap();
     read_available_data(&mut framed, Duration::from_millis(200)).await;
@@ -425,14 +358,9 @@ async fn pty_buffer_saturation_and_resume() {
 
     // Reconnect via socketpair
     let (server_stream, client_stream) = UnixStream::pair().unwrap();
-    client_tx
-        .send(Framed::new(server_stream, FrameCodec))
-        .unwrap();
+    client_tx.send(Framed::new(server_stream, FrameCodec)).unwrap();
     let mut framed = Framed::new(client_stream, FrameCodec);
-    framed
-        .send(Frame::Resize { cols: 80, rows: 24 })
-        .await
-        .unwrap();
+    framed.send(Frame::Resize { cols: 80, rows: 24 }).await.unwrap();
 
     let output = read_available_data(&mut framed, Duration::from_secs(3)).await;
     let output_str = String::from_utf8_lossy(&output);
@@ -453,19 +381,10 @@ async fn resize_propagates_to_pty() {
     wait_for_shell(&mut framed).await;
     read_available_data(&mut framed, Duration::from_secs(1)).await;
 
-    framed
-        .send(Frame::Resize {
-            cols: 132,
-            rows: 43,
-        })
-        .await
-        .unwrap();
+    framed.send(Frame::Resize { cols: 132, rows: 43 }).await.unwrap();
     tokio::time::sleep(Duration::from_millis(100)).await;
 
-    framed
-        .send(Frame::Data(Bytes::from("stty size\n")))
-        .await
-        .unwrap();
+    framed.send(Frame::Data(Bytes::from("stty size\n"))).await.unwrap();
     let output = read_available_data(&mut framed, Duration::from_secs(2)).await;
     let output_str = String::from_utf8_lossy(&output);
     assert!(
@@ -484,9 +403,7 @@ async fn metadata_reflects_attached_state() {
 
     // Wait for metadata to be set
     tokio::time::sleep(Duration::from_millis(300)).await;
-    let m = meta
-        .get()
-        .expect("metadata should be set after server starts");
+    let m = meta.get().expect("metadata should be set after server starts");
 
     // The first client was already sent via setup_session, so attached should be true after shell starts
     wait_for_shell(&mut framed).await;
@@ -506,14 +423,9 @@ async fn metadata_reflects_attached_state() {
 
     // Reconnect and clean up
     let (server_stream, client_stream) = UnixStream::pair().unwrap();
-    client_tx
-        .send(Framed::new(server_stream, FrameCodec))
-        .unwrap();
+    client_tx.send(Framed::new(server_stream, FrameCodec)).unwrap();
     let mut framed = Framed::new(client_stream, FrameCodec);
-    framed
-        .send(Frame::Resize { cols: 80, rows: 24 })
-        .await
-        .unwrap();
+    framed.send(Frame::Resize { cols: 80, rows: 24 }).await.unwrap();
     let _ = framed.send(Frame::Data(Bytes::from("exit\n"))).await;
     let _ = timeout(Duration::from_secs(3), server).await;
 }
@@ -534,20 +446,12 @@ async fn client_explicit_exit_frame() {
     // Server should still be running (it treats Exit as client disconnect).
     // Reconnect to verify shell is alive.
     let (server_stream, client_stream) = UnixStream::pair().unwrap();
-    client_tx
-        .send(Framed::new(server_stream, FrameCodec))
-        .unwrap();
+    client_tx.send(Framed::new(server_stream, FrameCodec)).unwrap();
     let mut framed = Framed::new(client_stream, FrameCodec);
-    framed
-        .send(Frame::Resize { cols: 80, rows: 24 })
-        .await
-        .unwrap();
+    framed.send(Frame::Resize { cols: 80, rows: 24 }).await.unwrap();
     read_available_data(&mut framed, Duration::from_secs(1)).await;
 
-    framed
-        .send(Frame::Data(Bytes::from("echo EXIT_FRAME_OK\n")))
-        .await
-        .unwrap();
+    framed.send(Frame::Data(Bytes::from("echo EXIT_FRAME_OK\n"))).await.unwrap();
     let output = read_available_data(&mut framed, Duration::from_secs(2)).await;
     let output_str = String::from_utf8_lossy(&output);
     assert!(
@@ -599,11 +503,7 @@ async fn high_throughput_data_relay() {
         &output_str[output_str.len().saturating_sub(100)..],
     );
 
-    assert!(
-        total.len() > 1_000_000,
-        "expected >1MB of output, got {} bytes",
-        total.len(),
-    );
+    assert!(total.len() > 1_000_000, "expected >1MB of output, got {} bytes", total.len(),);
 
     let _ = framed.send(Frame::Data(Bytes::from("exit\n"))).await;
     let _ = timeout(Duration::from_secs(3), server).await;
@@ -634,9 +534,7 @@ async fn ping_pong_heartbeat() {
     // Verify last_heartbeat was updated in metadata
     tokio::time::sleep(Duration::from_millis(100)).await;
     let m = meta.get().expect("metadata should be set");
-    let hb = m
-        .last_heartbeat
-        .load(std::sync::atomic::Ordering::Relaxed);
+    let hb = m.last_heartbeat.load(std::sync::atomic::Ordering::Relaxed);
     assert!(hb > 0, "last_heartbeat should be updated after Ping");
 
     let _ = framed.send(Frame::Data(Bytes::from("exit\n"))).await;
@@ -646,17 +544,12 @@ async fn ping_pong_heartbeat() {
 #[tokio::test]
 async fn env_vars_forwarded() {
     let _permit = CONCURRENCY.acquire().await.unwrap();
-    let (_tx, mut framed, server, _meta) = setup_session_with_env(vec![
-        ("TERM".to_string(), "xterm-test-42".to_string()),
-    ])
-    .await;
+    let (_tx, mut framed, server, _meta) =
+        setup_session_with_env(vec![("TERM".to_string(), "xterm-test-42".to_string())]).await;
     wait_for_shell(&mut framed).await;
     read_available_data(&mut framed, Duration::from_secs(1)).await;
 
-    framed
-        .send(Frame::Data(Bytes::from("echo $TERM\n")))
-        .await
-        .unwrap();
+    framed.send(Frame::Data(Bytes::from("echo $TERM\n"))).await.unwrap();
 
     let output = read_available_data(&mut framed, Duration::from_secs(2)).await;
     let output_str = String::from_utf8_lossy(&output);
@@ -676,18 +569,12 @@ async fn login_shell_starts_in_home() {
     wait_for_shell(&mut framed).await;
     read_available_data(&mut framed, Duration::from_secs(1)).await;
 
-    framed
-        .send(Frame::Data(Bytes::from("pwd\n")))
-        .await
-        .unwrap();
+    framed.send(Frame::Data(Bytes::from("pwd\n"))).await.unwrap();
 
     let output = read_available_data(&mut framed, Duration::from_secs(2)).await;
     let output_str = String::from_utf8_lossy(&output);
     let home = std::env::var("HOME").unwrap();
-    assert!(
-        output_str.contains(&home),
-        "expected CWD to be $HOME ({home}), got: {output_str}"
-    );
+    assert!(output_str.contains(&home), "expected CWD to be $HOME ({home}), got: {output_str}");
 
     let _ = framed.send(Frame::Data(Bytes::from("exit\n"))).await;
     let _ = timeout(Duration::from_secs(3), server).await;

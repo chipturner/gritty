@@ -1,2 +1,14 @@
 /target
 .claude/settings.local.json
+
+# Coverage
+/coverage/
+lcov.info
+*.profraw
+*.profdata
+coverage.json
+coverage.xml
+
+# Performance profiling
+perf.data
+perf.data.old

@@ -32,10 +32,7 @@ struct ManagedChild {
 impl ManagedChild {
     fn new(child: tokio::process::Child) -> Self {
         let pid = child.id().expect("child should have pid") as i32;
-        Self {
-            child,
-            pgid: nix::unistd::Pid::from_raw(pid),
-        }
+        Self { child, pgid: nix::unistd::Pid::from_raw(pid) }
     }
 }
 
@@ -64,9 +61,8 @@ pub async fn run(
     let slave: OwnedFd = pty.slave;
 
     // Get PTY slave name before we drop the slave fd
-    let pty_path = nix::unistd::ttyname(&slave)
-        .map(|p| p.display().to_string())
-        .unwrap_or_default();
+    let pty_path =
+        nix::unistd::ttyname(&slave).map(|p| p.display().to_string()).unwrap_or_default();
 
     // Dup slave fds for shell stdio (before dropping slave)
     let slave_fd = slave.as_raw_fd();
@@ -99,18 +95,14 @@ pub async fn run(
     };
 
     // Read optional Env frame from first client (100ms timeout)
-    let env_vars = match tokio::time::timeout(
-        std::time::Duration::from_millis(100),
-        framed.next(),
-    )
-    .await
-    {
-        Ok(Some(Ok(Frame::Env { vars }))) => {
-            debug!(count = vars.len(), "received env vars from client");
-            vars
-        }
-        _ => Vec::new(),
-    };
+    let env_vars =
+        match tokio::time::timeout(std::time::Duration::from_millis(100), framed.next()).await {
+            Ok(Some(Ok(Frame::Env { vars }))) => {
+                debug!(count = vars.len(), "received env vars from client");
+                vars
+            }
+            _ => Vec::new(),
+        };
 
     // Spawn login shell on slave PTY
     let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/sh".to_string());
@@ -150,11 +142,7 @@ pub async fn run(
     });
 
     // First client is already connected — enter relay directly
-    metadata_slot
-        .get()
-        .unwrap()
-        .attached
-        .store(true, Ordering::Relaxed);
+    metadata_slot.get().unwrap().attached.store(true, Ordering::Relaxed);
 
     // Outer loop: accept clients via channel. PTY persists across reconnects.
     // First iteration skips client-wait (first client already connected above).

@@ -43,9 +43,7 @@ struct EscapeProcessor {
 
 impl EscapeProcessor {
     fn new() -> Self {
-        Self {
-            state: EscapeState::AfterNewline,
-        }
+        Self { state: EscapeState::AfterNewline }
     }
 
     fn process(&mut self, input: &[u8]) -> Vec<EscapeAction> {
@@ -243,9 +241,7 @@ async fn relay(
     mut escape: Option<&mut EscapeProcessor>,
 ) -> anyhow::Result<Option<i32>> {
     // Send env vars before resize (server reads Env frame before spawning shell)
-    if !env_vars.is_empty()
-        && !timed_send(framed, Frame::Env { vars: env_vars.to_vec() }).await
-    {
+    if !env_vars.is_empty() && !timed_send(framed, Frame::Env { vars: env_vars.to_vec() }).await {
         return Ok(None);
     }
     // Send initial window size
@@ -386,7 +382,17 @@ pub async fn run(
     let mut escape = if no_escape { None } else { Some(EscapeProcessor::new()) };
 
     loop {
-        match relay(&mut framed, &async_stdin, &mut sigwinch, &mut buf, current_redraw, &current_env, escape.as_mut()).await? {
+        match relay(
+            &mut framed,
+            &async_stdin,
+            &mut sigwinch,
+            &mut buf,
+            current_redraw,
+            &current_env,
+            escape.as_mut(),
+        )
+        .await?
+        {
             Some(code) => return Ok(code),
             None => {
                 // Env vars only sent on first connection; clear for reconnect
@@ -416,9 +422,7 @@ pub async fn run(
 
                     let mut new_framed = Framed::new(stream, FrameCodec);
                     if new_framed
-                        .send(Frame::Attach {
-                            session: session.to_string(),
-                        })
+                        .send(Frame::Attach { session: session.to_string() })
                         .await
                         .is_err()
                     {
@@ -461,20 +465,14 @@ mod tests {
     fn tilde_after_newline_detach() {
         let mut ep = EscapeProcessor { state: EscapeState::Normal };
         let actions = ep.process(b"\n~.");
-        assert_eq!(actions, vec![
-            EscapeAction::Data(b"\n".to_vec()),
-            EscapeAction::Detach,
-        ]);
+        assert_eq!(actions, vec![EscapeAction::Data(b"\n".to_vec()), EscapeAction::Detach,]);
     }
 
     #[test]
     fn tilde_after_cr_detach() {
         let mut ep = EscapeProcessor { state: EscapeState::Normal };
         let actions = ep.process(b"\r~.");
-        assert_eq!(actions, vec![
-            EscapeAction::Data(b"\r".to_vec()),
-            EscapeAction::Detach,
-        ]);
+        assert_eq!(actions, vec![EscapeAction::Data(b"\r".to_vec()), EscapeAction::Detach,]);
     }
 
     #[test]
@@ -495,30 +493,24 @@ mod tests {
     fn tilde_suspend() {
         let mut ep = EscapeProcessor { state: EscapeState::Normal };
         let actions = ep.process(b"\n~\x1a");
-        assert_eq!(actions, vec![
-            EscapeAction::Data(b"\n".to_vec()),
-            EscapeAction::Suspend,
-        ]);
+        assert_eq!(actions, vec![EscapeAction::Data(b"\n".to_vec()), EscapeAction::Suspend,]);
     }
 
     #[test]
     fn tilde_help() {
         let mut ep = EscapeProcessor { state: EscapeState::Normal };
         let actions = ep.process(b"\n~?");
-        assert_eq!(actions, vec![
-            EscapeAction::Data(b"\n".to_vec()),
-            EscapeAction::Help,
-        ]);
+        assert_eq!(actions, vec![EscapeAction::Data(b"\n".to_vec()), EscapeAction::Help,]);
     }
 
     #[test]
     fn double_tilde() {
         let mut ep = EscapeProcessor { state: EscapeState::Normal };
         let actions = ep.process(b"\n~~");
-        assert_eq!(actions, vec![
-            EscapeAction::Data(b"\n".to_vec()),
-            EscapeAction::Data(b"~".to_vec()),
-        ]);
+        assert_eq!(
+            actions,
+            vec![EscapeAction::Data(b"\n".to_vec()), EscapeAction::Data(b"~".to_vec()),]
+        );
         assert_eq!(ep.state, EscapeState::Normal);
     }
 
@@ -526,10 +518,10 @@ mod tests {
     fn tilde_unknown_char() {
         let mut ep = EscapeProcessor { state: EscapeState::Normal };
         let actions = ep.process(b"\n~x");
-        assert_eq!(actions, vec![
-            EscapeAction::Data(b"\n".to_vec()),
-            EscapeAction::Data(b"~x".to_vec()),
-        ]);
+        assert_eq!(
+            actions,
+            vec![EscapeAction::Data(b"\n".to_vec()), EscapeAction::Data(b"~x".to_vec()),]
+        );
     }
 
     #[test]
@@ -558,42 +550,39 @@ mod tests {
     fn multiple_escapes_one_buffer() {
         let mut ep = EscapeProcessor { state: EscapeState::Normal };
         let actions = ep.process(b"\n~?\n~.");
-        assert_eq!(actions, vec![
-            EscapeAction::Data(b"\n".to_vec()),
-            EscapeAction::Help,
-            EscapeAction::Data(b"\n".to_vec()),
-            EscapeAction::Detach,
-        ]);
+        assert_eq!(
+            actions,
+            vec![
+                EscapeAction::Data(b"\n".to_vec()),
+                EscapeAction::Help,
+                EscapeAction::Data(b"\n".to_vec()),
+                EscapeAction::Detach,
+            ]
+        );
     }
 
     #[test]
     fn consecutive_newlines() {
         let mut ep = EscapeProcessor { state: EscapeState::Normal };
         let actions = ep.process(b"\n\n\n~.");
-        assert_eq!(actions, vec![
-            EscapeAction::Data(b"\n\n\n".to_vec()),
-            EscapeAction::Detach,
-        ]);
+        assert_eq!(actions, vec![EscapeAction::Data(b"\n\n\n".to_vec()), EscapeAction::Detach,]);
     }
 
     #[test]
     fn detach_stops_processing() {
         let mut ep = EscapeProcessor { state: EscapeState::Normal };
         let actions = ep.process(b"\n~.remaining");
-        assert_eq!(actions, vec![
-            EscapeAction::Data(b"\n".to_vec()),
-            EscapeAction::Detach,
-        ]);
+        assert_eq!(actions, vec![EscapeAction::Data(b"\n".to_vec()), EscapeAction::Detach,]);
     }
 
     #[test]
     fn tilde_then_newline() {
         let mut ep = EscapeProcessor { state: EscapeState::Normal };
         let actions = ep.process(b"\n~\n");
-        assert_eq!(actions, vec![
-            EscapeAction::Data(b"\n".to_vec()),
-            EscapeAction::Data(b"~\n".to_vec()),
-        ]);
+        assert_eq!(
+            actions,
+            vec![EscapeAction::Data(b"\n".to_vec()), EscapeAction::Data(b"~\n".to_vec()),]
+        );
         assert_eq!(ep.state, EscapeState::AfterNewline);
     }
 

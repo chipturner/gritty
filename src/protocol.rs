@@ -51,7 +51,9 @@ pub enum Frame {
     /// Heartbeat reply (server → client).
     Pong,
     /// Environment variables (client → server, sent before first Resize on new session).
-    Env { vars: Vec<(String, String)> },
+    Env {
+        vars: Vec<(String, String)>,
+    },
     // Control requests
     NewSession {
         name: String,
@@ -242,11 +244,8 @@ impl Encoder<Frame> for FrameCodec {
             Frame::Ping => encode_empty(dst, TYPE_PING),
             Frame::Pong => encode_empty(dst, TYPE_PONG),
             Frame::Env { vars } => {
-                let text: String = vars
-                    .iter()
-                    .map(|(k, v)| format!("{k}={v}"))
-                    .collect::<Vec<_>>()
-                    .join("\n");
+                let text: String =
+                    vars.iter().map(|(k, v)| format!("{k}={v}")).collect::<Vec<_>>().join("\n");
                 dst.put_u8(TYPE_ENV);
                 dst.put_u32(text.len() as u32);
                 dst.extend_from_slice(text.as_bytes());

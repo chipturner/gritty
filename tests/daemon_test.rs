@@ -1,5 +1,6 @@
 use bytes::Bytes;
 use futures_util::{SinkExt, StreamExt};
+use gritty::protocol::{Frame, FrameCodec};
 use std::sync::LazyLock;
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::time::Duration;
@@ -7,7 +8,6 @@ use tokio::net::UnixStream;
 use tokio::sync::Semaphore;
 use tokio::time::timeout;
 use tokio_util::codec::Framed;
-use gritty::protocol::{Frame, FrameCodec};
 
 static TEST_COUNTER: AtomicU32 = AtomicU32::new(0);
 
@@ -40,13 +40,7 @@ async fn drain_data(framed: &mut Framed<UnixStream, FrameCodec>, wait: Duration)
 
 /// Create a session via NewSession, return the session id.
 async fn create_session(ctl_path: &std::path::Path, name: &str) -> String {
-    let resp = control_request(
-        ctl_path,
-        Frame::NewSession {
-            name: name.to_string(),
-        },
-    )
-    .await;
+    let resp = control_request(ctl_path, Frame::NewSession { name: name.to_string() }).await;
     match resp {
         Frame::SessionCreated { id } => {
             tokio::time::sleep(Duration::from_millis(200)).await;
@@ -63,12 +57,7 @@ async fn attach_session(
 ) -> Framed<UnixStream, FrameCodec> {
     let stream = UnixStream::connect(ctl_path).await.unwrap();
     let mut framed = Framed::new(stream, FrameCodec);
-    framed
-        .send(Frame::Attach {
-            session: session.to_string(),
-        })
-        .await
-        .unwrap();
+    framed.send(Frame::Attach { session: session.to_string() }).await.unwrap();
     let resp = timeout(Duration::from_secs(3), framed.next())
         .await
         .expect("timed out")
@@ -77,10 +66,7 @@ async fn attach_session(
     assert_eq!(resp, Frame::Ok, "expected Ok for attach, got {resp:?}");
 
     // Send resize and wait for shell output
-    framed
-        .send(Frame::Resize { cols: 80, rows: 24 })
-        .await
-        .unwrap();
+    framed.send(Frame::Resize { cols: 80, rows: 24 }).await.unwrap();
     let deadline = tokio::time::Instant::now() + Duration::from_secs(15);
     loop {
         match timeout(Duration::from_secs(1), framed.next()).await {
@@ -97,13 +83,7 @@ async fn attach_session(
 
 /// Kill a session by id or name.
 async fn kill_cleanup(ctl_path: &std::path::Path, session: &str) {
-    let _ = control_request(
-        ctl_path,
-        Frame::KillSession {
-            session: session.to_string(),
-        },
-    )
-    .await;
+    let _ = control_request(ctl_path, Frame::KillSession { session: session.to_string() }).await;
     tokio::time::sleep(Duration::from_millis(100)).await;
 }
 
@@ -147,17 +127,8 @@ async fn daemon_rejects_duplicate_name() {
     let id = create_session(&ctl_path, "dupname").await;
 
     // Try to create session with same name again
-    let resp = control_request(
-        &ctl_path,
-        Frame::NewSession {
-            name: "dupname".to_string(),
-        },
-    )
-    .await;
-    assert!(
-        matches!(resp, Frame::Error { .. }),
-        "expected Error for duplicate name, got {resp:?}"
-    );
+    let resp = control_request(&ctl_path, Frame::NewSession { name: "dupname".to_string() }).await;
+    assert!(matches!(resp, Frame::Error { .. }), "expected Error for duplicate name, got {resp:?}");
 
     kill_cleanup(&ctl_path, &id).await;
     let _ = std::fs::remove_file(&ctl_path);
@@ -203,13 +174,7 @@ async fn daemon_kills_session() {
 
     let id = create_session(&ctl_path, "killme").await;
 
-    let resp = control_request(
-        &ctl_path,
-        Frame::KillSession {
-            session: id.clone(),
-        },
-    )
-    .await;
+    let resp = control_request(&ctl_path, Frame::KillSession { session: id.clone() }).await;
     assert_eq!(resp, Frame::Ok);
 
     // List should be empty
@@ -238,13 +203,8 @@ async fn daemon_kills_session_by_name() {
     let _id = create_session(&ctl_path, "named-kill").await;
 
     // Kill by name
-    let resp = control_request(
-        &ctl_path,
-        Frame::KillSession {
-            session: "named-kill".to_string(),
-        },
-    )
-    .await;
+    let resp =
+        control_request(&ctl_path, Frame::KillSession { session: "named-kill".to_string() }).await;
     assert_eq!(resp, Frame::Ok);
 
     tokio::time::sleep(Duration::from_millis(200)).await;
@@ -293,13 +253,7 @@ async fn create_after_kill_same_name() {
     let id1 = create_session(&ctl_path, "reuse").await;
 
     // Kill it
-    let resp = control_request(
-        &ctl_path,
-        Frame::KillSession {
-            session: id1.clone(),
-        },
-    )
-    .await;
+    let resp = control_request(&ctl_path, Frame::KillSession { session: id1.clone() }).await;
     assert_eq!(resp, Frame::Ok);
     tokio::time::sleep(Duration::from_millis(200)).await;
 
@@ -313,9 +267,7 @@ async fn create_after_kill_same_name() {
         tokio::time::sleep(Duration::from_millis(200)).await;
         let resp = control_request(&ctl_path, Frame::ListSessions).await;
         match &resp {
-            Frame::SessionInfo { sessions }
-                if sessions.len() == 1 && sessions[0].shell_pid > 0 =>
-            {
+            Frame::SessionInfo { sessions } if sessions.len() == 1 && sessions[0].shell_pid > 0 => {
                 assert_eq!(sessions[0].id, id2);
                 assert_eq!(sessions[0].name, "reuse");
                 break;
@@ -424,10 +376,7 @@ async fn kill_server_no_sessions() {
     assert_eq!(resp, Frame::Ok);
 
     let result = timeout(Duration::from_secs(3), daemon).await;
-    assert!(
-        result.is_ok(),
-        "daemon should exit after kill-server with no sessions"
-    );
+    assert!(result.is_ok(), "daemon should exit after kill-server with no sessions");
 
     assert!(!ctl_path.exists(), "control socket should be removed");
 }
@@ -442,13 +391,7 @@ async fn kill_nonexistent_session() {
     let _daemon = tokio::spawn(async move { gritty::daemon::run(&ctl, None).await });
     tokio::time::sleep(Duration::from_millis(200)).await;
 
-    let resp = control_request(
-        &ctl_path,
-        Frame::KillSession {
-            session: "999".to_string(),
-        },
-    )
-    .await;
+    let resp = control_request(&ctl_path, Frame::KillSession { session: "999".to_string() }).await;
     assert!(
         matches!(resp, Frame::Error { .. }),
         "expected Error for nonexistent session, got {resp:?}"
@@ -476,9 +419,7 @@ async fn session_natural_exit_reaps_from_list() {
         tokio::time::sleep(Duration::from_millis(200)).await;
         let resp = control_request(&ctl_path, Frame::ListSessions).await;
         match &resp {
-            Frame::SessionInfo { sessions }
-                if sessions.len() == 1 && sessions[0].shell_pid > 0 =>
-            {
+            Frame::SessionInfo { sessions } if sessions.len() == 1 && sessions[0].shell_pid > 0 => {
                 shell_pid = sessions[0].shell_pid;
                 break;
             }
@@ -521,13 +462,7 @@ async fn list_before_session_ready() {
     tokio::time::sleep(Duration::from_millis(200)).await;
 
     // Create session via NewSession (don't wait the usual 200ms from helper)
-    let resp = control_request(
-        &ctl_path,
-        Frame::NewSession {
-            name: "early".to_string(),
-        },
-    )
-    .await;
+    let resp = control_request(&ctl_path, Frame::NewSession { name: "early".to_string() }).await;
     let id = match resp {
         Frame::SessionCreated { id } => id,
         other => panic!("expected SessionCreated, got {other:?}"),
@@ -537,11 +472,7 @@ async fn list_before_session_ready() {
     let resp = control_request(&ctl_path, Frame::ListSessions).await;
     match &resp {
         Frame::SessionInfo { sessions } => {
-            assert_eq!(
-                sessions.len(),
-                1,
-                "session should appear in list immediately"
-            );
+            assert_eq!(sessions.len(), 1, "session should appear in list immediately");
             assert_eq!(sessions[0].id, id);
         }
         other => panic!("expected SessionInfo, got {other:?}"),
@@ -569,13 +500,7 @@ async fn kill_session_while_client_connected() {
     drain_data(&mut framed, Duration::from_millis(500)).await;
 
     // Kill the session via daemon while client is connected
-    let resp = control_request(
-        &ctl_path,
-        Frame::KillSession {
-            session: id.clone(),
-        },
-    )
-    .await;
+    let resp = control_request(&ctl_path, Frame::KillSession { session: id.clone() }).await;
     assert_eq!(resp, Frame::Ok);
 
     // Client should see the stream end
@@ -614,9 +539,7 @@ async fn session_metadata_has_pty_and_pid() {
         tokio::time::sleep(Duration::from_millis(200)).await;
         let resp = control_request(&ctl_path, Frame::ListSessions).await;
         match &resp {
-            Frame::SessionInfo { sessions }
-                if sessions.len() == 1 && sessions[0].shell_pid > 0 =>
-            {
+            Frame::SessionInfo { sessions } if sessions.len() == 1 && sessions[0].shell_pid > 0 => {
                 let s = &sessions[0];
                 assert!(
                     s.pty_path.starts_with("/dev/pts/") || s.pty_path.starts_with("/dev/tty"),
@@ -651,10 +574,7 @@ async fn attach_to_session() {
     let mut framed = attach_session(&ctl_path, &id).await;
     drain_data(&mut framed, Duration::from_millis(500)).await;
 
-    framed
-        .send(Frame::Data(Bytes::from("echo ATTACH_OK\n")))
-        .await
-        .unwrap();
+    framed.send(Frame::Data(Bytes::from("echo ATTACH_OK\n"))).await.unwrap();
     let mut output = Vec::new();
     while let Ok(Some(Ok(Frame::Data(data)))) = timeout(Duration::from_secs(2), framed.next()).await
     {
@@ -686,10 +606,7 @@ async fn attach_by_name() {
     let mut framed = attach_session(&ctl_path, "namedattach").await;
     drain_data(&mut framed, Duration::from_millis(500)).await;
 
-    framed
-        .send(Frame::Data(Bytes::from("echo NAME_ATTACH_OK\n")))
-        .await
-        .unwrap();
+    framed.send(Frame::Data(Bytes::from("echo NAME_ATTACH_OK\n"))).await.unwrap();
     let mut output = Vec::new();
     while let Ok(Some(Ok(Frame::Data(data)))) = timeout(Duration::from_secs(2), framed.next()).await
     {
@@ -715,13 +632,8 @@ async fn attach_nonexistent_returns_error() {
     let _daemon = tokio::spawn(async move { gritty::daemon::run(&ctl, None).await });
     tokio::time::sleep(Duration::from_millis(200)).await;
 
-    let resp = control_request(
-        &ctl_path,
-        Frame::Attach {
-            session: "nonexistent".to_string(),
-        },
-    )
-    .await;
+    let resp =
+        control_request(&ctl_path, Frame::Attach { session: "nonexistent".to_string() }).await;
     assert!(
         matches!(resp, Frame::Error { .. }),
         "expected Error for nonexistent attach, got {resp:?}"
@@ -751,9 +663,7 @@ async fn attach_dead_session_returns_error() {
         tokio::time::sleep(Duration::from_millis(200)).await;
         let resp = control_request(&ctl_path, Frame::ListSessions).await;
         match &resp {
-            Frame::SessionInfo { sessions }
-                if sessions.len() == 1 && sessions[0].shell_pid > 0 =>
-            {
+            Frame::SessionInfo { sessions } if sessions.len() == 1 && sessions[0].shell_pid > 0 => {
                 shell_pid = sessions[0].shell_pid;
                 break;
             }
@@ -771,13 +681,7 @@ async fn attach_dead_session_returns_error() {
     tokio::time::sleep(Duration::from_secs(1)).await;
 
     // Attach should get an error, not Ok + disconnect
-    let resp = control_request(
-        &ctl_path,
-        Frame::Attach {
-            session: id.clone(),
-        },
-    )
-    .await;
+    let resp = control_request(&ctl_path, Frame::Attach { session: id.clone() }).await;
     assert!(
         matches!(resp, Frame::Error { .. }),
         "expected Error for dead session attach, got {resp:?}"
@@ -807,9 +711,7 @@ async fn kill_dead_session_returns_error() {
         tokio::time::sleep(Duration::from_millis(200)).await;
         let resp = control_request(&ctl_path, Frame::ListSessions).await;
         match &resp {
-            Frame::SessionInfo { sessions }
-                if sessions.len() == 1 && sessions[0].shell_pid > 0 =>
-            {
+            Frame::SessionInfo { sessions } if sessions.len() == 1 && sessions[0].shell_pid > 0 => {
                 shell_pid = sessions[0].shell_pid;
                 break;
             }
@@ -827,13 +729,7 @@ async fn kill_dead_session_returns_error() {
     tokio::time::sleep(Duration::from_secs(1)).await;
 
     // Kill should get an error, not Ok for a stale entry
-    let resp = control_request(
-        &ctl_path,
-        Frame::KillSession {
-            session: id.clone(),
-        },
-    )
-    .await;
+    let resp = control_request(&ctl_path, Frame::KillSession { session: id.clone() }).await;
     assert!(
         matches!(resp, Frame::Error { .. }),
         "expected Error for dead session kill, got {resp:?}"

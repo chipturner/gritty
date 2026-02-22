@@ -1,4 +1,4 @@
-use anyhow::{bail, Context};
+use anyhow::{Context, bail};
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::time::{Duration, Instant};
@@ -72,12 +72,18 @@ impl Destination {
 
 /// Hardened SSH options embedded in every tunnel.
 const SSH_TUNNEL_OPTS: &[&str] = &[
-    "-o", "ServerAliveInterval=3",
-    "-o", "ServerAliveCountMax=2",
-    "-o", "StreamLocalBindUnlink=yes",
-    "-o", "ExitOnForwardFailure=yes",
-    "-o", "ConnectTimeout=5",
-    "-N", "-T",
+    "-o",
+    "ServerAliveInterval=3",
+    "-o",
+    "ServerAliveCountMax=2",
+    "-o",
+    "StreamLocalBindUnlink=yes",
+    "-o",
+    "ExitOnForwardFailure=yes",
+    "-o",
+    "ConnectTimeout=5",
+    "-N",
+    "-T",
 ];
 
 /// Run a command on the remote host via SSH, returning stdout.
@@ -88,9 +94,8 @@ async fn remote_exec(
 ) -> anyhow::Result<String> {
     // Prepend common binary paths — SSH non-interactive shells don't source
     // .bashrc/.zshrc, so ~/bin etc. won't be in PATH by default.
-    let wrapped_cmd = format!(
-        "PATH=\"$HOME/bin:$HOME/.local/bin:$HOME/.cargo/bin:$PATH\"; {remote_cmd}"
-    );
+    let wrapped_cmd =
+        format!("PATH=\"$HOME/bin:$HOME/.local/bin:$HOME/.cargo/bin:$PATH\"; {remote_cmd}");
 
     debug!("ssh {}: {remote_cmd}", dest.ssh_dest());
 
@@ -136,11 +141,7 @@ fn tunnel_command(
     for opt in extra_ssh_opts {
         cmd.arg("-o").arg(opt);
     }
-    let forward = format!(
-        "{}:{}",
-        local_sock.display(),
-        remote_sock
-    );
+    let forward = format!("{}:{}", local_sock.display(), remote_sock);
     cmd.arg("-L").arg(forward);
     cmd.arg(dest.ssh_dest());
     cmd.stdout(Stdio::null());
@@ -156,12 +157,7 @@ async fn spawn_tunnel(
     remote_sock: &str,
     extra_ssh_opts: &[String],
 ) -> anyhow::Result<Child> {
-    debug!(
-        "tunnel: {} -> {}:{}",
-        local_sock.display(),
-        dest.ssh_dest(),
-        remote_sock,
-    );
+    debug!("tunnel: {} -> {}:{}", local_sock.display(), dest.ssh_dest(), remote_sock,);
     let mut cmd = tunnel_command(dest, local_sock, remote_sock, extra_ssh_opts);
     let child = cmd.spawn().context("failed to spawn ssh tunnel")?;
     debug!("ssh tunnel pid: {:?}", child.id());
@@ -271,11 +267,7 @@ async fn ensure_remote_ready(
     no_daemon_start: bool,
     extra_ssh_opts: &[String],
 ) -> anyhow::Result<String> {
-    let remote_cmd = if no_daemon_start {
-        "gritty socket-path"
-    } else {
-        REMOTE_ENSURE_CMD
-    };
+    let remote_cmd = if no_daemon_start { "gritty socket-path" } else { REMOTE_ENSURE_CMD };
     debug!("ensuring remote daemon (no_daemon_start={no_daemon_start})");
 
     let sock_path = remote_exec(dest, remote_cmd, extra_ssh_opts).await?;
@@ -356,9 +348,8 @@ pub async fn run(opts: ConnectOpts) -> anyhow::Result<i32> {
     }
 
     if std::os::unix::net::UnixStream::connect(&local_sock).is_ok() {
-        let pid_hint = std::fs::read_to_string(&pid_file)
-            .ok()
-            .and_then(|s| s.trim().parse::<u32>().ok());
+        let pid_hint =
+            std::fs::read_to_string(&pid_file).ok().and_then(|s| s.trim().parse::<u32>().ok());
         println!("{}", local_sock.display());
         eprint!("tunnel already running (name: {connection_name})");
         if let Some(pid) = pid_hint {
@@ -495,7 +486,8 @@ mod tests {
             "/run/user/1000/gritty/ctl.sock",
             &[],
         );
-        let args: Vec<_> = cmd.as_std().get_args().map(|a| a.to_string_lossy().to_string()).collect();
+        let args: Vec<_> =
+            cmd.as_std().get_args().map(|a| a.to_string_lossy().to_string()).collect();
         assert!(args.contains(&"ServerAliveInterval=3".to_string()));
         assert!(args.contains(&"StreamLocalBindUnlink=yes".to_string()));
         assert!(args.contains(&"ExitOnForwardFailure=yes".to_string()));
@@ -515,7 +507,8 @@ mod tests {
             "/tmp/remote.sock",
             &["ProxyJump=bastion".to_string()],
         );
-        let args: Vec<_> = cmd.as_std().get_args().map(|a| a.to_string_lossy().to_string()).collect();
+        let args: Vec<_> =
+            cmd.as_std().get_args().map(|a| a.to_string_lossy().to_string()).collect();
         assert!(args.contains(&"ProxyJump=bastion".to_string()));
         assert!(args.contains(&"-p".to_string()));
         assert!(args.contains(&"2222".to_string()));

@@ -61,10 +61,7 @@ pub fn verify_peer_uid(stream: &tokio::net::UnixStream) -> io::Result<()> {
     if cred.uid() != my_uid {
         return Err(io::Error::new(
             io::ErrorKind::PermissionDenied,
-            format!(
-                "rejecting connection from uid {} (expected {my_uid})",
-                cred.uid()
-            ),
+            format!("rejecting connection from uid {} (expected {my_uid})", cred.uid()),
         ));
     }
     Ok(())
@@ -92,9 +89,7 @@ fn is_trusted_root(path: &Path) -> bool {
     if matches!(path.to_str(), Some("/" | "/tmp" | "/run")) {
         return true;
     }
-    std::env::var("XDG_RUNTIME_DIR")
-        .ok()
-        .is_some_and(|xdg| path == Path::new(&xdg))
+    std::env::var("XDG_RUNTIME_DIR").ok().is_some_and(|xdg| path == Path::new(&xdg))
 }
 
 fn validate_dir(path: &Path) -> io::Result<()> {

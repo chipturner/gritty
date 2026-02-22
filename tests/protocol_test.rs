@@ -1,14 +1,12 @@
 use bytes::{BufMut, Bytes, BytesMut};
-use tokio_util::codec::{Decoder, Encoder};
 use gritty::protocol::{Frame, FrameCodec, SessionEntry};
+use tokio_util::codec::{Decoder, Encoder};
 
 #[test]
 fn encode_data_frame() {
     let mut codec = FrameCodec;
     let mut buf = BytesMut::new();
-    codec
-        .encode(Frame::Data(Bytes::from("hello")), &mut buf)
-        .unwrap();
+    codec.encode(Frame::Data(Bytes::from("hello")), &mut buf).unwrap();
     // type(1) + len(4) + payload(5) = 10
     assert_eq!(buf.len(), 10);
     assert_eq!(buf[0], 0x01);
@@ -19,9 +17,7 @@ fn encode_data_frame() {
 fn encode_resize_frame() {
     let mut codec = FrameCodec;
     let mut buf = BytesMut::new();
-    codec
-        .encode(Frame::Resize { cols: 80, rows: 24 }, &mut buf)
-        .unwrap();
+    codec.encode(Frame::Resize { cols: 80, rows: 24 }, &mut buf).unwrap();
     // type(1) + len(4) + payload(4) = 9
     assert_eq!(buf.len(), 9);
     assert_eq!(buf[0], 0x02);
@@ -50,10 +46,7 @@ fn roundtrip_data() {
 fn roundtrip_resize() {
     let mut codec = FrameCodec;
     let mut buf = BytesMut::new();
-    let original = Frame::Resize {
-        cols: 120,
-        rows: 40,
-    };
+    let original = Frame::Resize { cols: 120, rows: 40 };
     codec.encode(original.clone(), &mut buf).unwrap();
     let decoded = codec.decode(&mut buf).unwrap().unwrap();
     assert_eq!(original, decoded);
@@ -95,9 +88,7 @@ fn decode_invalid_type_returns_error() {
 fn roundtrip_new_session() {
     let mut codec = FrameCodec;
     let mut buf = BytesMut::new();
-    let original = Frame::NewSession {
-        name: "myproject".to_string(),
-    };
+    let original = Frame::NewSession { name: "myproject".to_string() };
     codec.encode(original.clone(), &mut buf).unwrap();
     let decoded = codec.decode(&mut buf).unwrap().unwrap();
     assert_eq!(original, decoded);
@@ -107,9 +98,7 @@ fn roundtrip_new_session() {
 fn roundtrip_new_session_empty_name() {
     let mut codec = FrameCodec;
     let mut buf = BytesMut::new();
-    let original = Frame::NewSession {
-        name: String::new(),
-    };
+    let original = Frame::NewSession { name: String::new() };
     codec.encode(original.clone(), &mut buf).unwrap();
     let decoded = codec.decode(&mut buf).unwrap().unwrap();
     assert_eq!(original, decoded);
@@ -119,9 +108,7 @@ fn roundtrip_new_session_empty_name() {
 fn roundtrip_attach() {
     let mut codec = FrameCodec;
     let mut buf = BytesMut::new();
-    let original = Frame::Attach {
-        session: "0".to_string(),
-    };
+    let original = Frame::Attach { session: "0".to_string() };
     codec.encode(original.clone(), &mut buf).unwrap();
     let decoded = codec.decode(&mut buf).unwrap().unwrap();
     assert_eq!(original, decoded);
@@ -131,9 +118,7 @@ fn roundtrip_attach() {
 fn roundtrip_attach_by_name() {
     let mut codec = FrameCodec;
     let mut buf = BytesMut::new();
-    let original = Frame::Attach {
-        session: "myproject".to_string(),
-    };
+    let original = Frame::Attach { session: "myproject".to_string() };
     codec.encode(original.clone(), &mut buf).unwrap();
     let decoded = codec.decode(&mut buf).unwrap().unwrap();
     assert_eq!(original, decoded);
@@ -143,9 +128,7 @@ fn roundtrip_attach_by_name() {
 fn roundtrip_session_created() {
     let mut codec = FrameCodec;
     let mut buf = BytesMut::new();
-    let original = Frame::SessionCreated {
-        id: "42".to_string(),
-    };
+    let original = Frame::SessionCreated { id: "42".to_string() };
     codec.encode(original.clone(), &mut buf).unwrap();
     let decoded = codec.decode(&mut buf).unwrap().unwrap();
     assert_eq!(original, decoded);
@@ -214,9 +197,7 @@ fn roundtrip_ok() {
 fn roundtrip_error() {
     let mut codec = FrameCodec;
     let mut buf = BytesMut::new();
-    let original = Frame::Error {
-        message: "something failed".to_string(),
-    };
+    let original = Frame::Error { message: "something failed".to_string() };
     codec.encode(original.clone(), &mut buf).unwrap();
     let decoded = codec.decode(&mut buf).unwrap().unwrap();
     assert_eq!(original, decoded);
@@ -235,9 +216,7 @@ fn roundtrip_detached() {
 fn roundtrip_kill_session() {
     let mut codec = FrameCodec;
     let mut buf = BytesMut::new();
-    let original = Frame::KillSession {
-        session: "0".to_string(),
-    };
+    let original = Frame::KillSession { session: "0".to_string() };
     codec.encode(original.clone(), &mut buf).unwrap();
     let decoded = codec.decode(&mut buf).unwrap().unwrap();
     assert_eq!(original, decoded);
@@ -247,9 +226,7 @@ fn roundtrip_kill_session() {
 fn roundtrip_kill_session_by_name() {
     let mut codec = FrameCodec;
     let mut buf = BytesMut::new();
-    let original = Frame::KillSession {
-        session: "myproject".to_string(),
-    };
+    let original = Frame::KillSession { session: "myproject".to_string() };
     codec.encode(original.clone(), &mut buf).unwrap();
     let decoded = codec.decode(&mut buf).unwrap().unwrap();
     assert_eq!(original, decoded);
@@ -269,27 +246,14 @@ fn multi_frame_decode() {
     let mut codec = FrameCodec;
     let mut buf = BytesMut::new();
     // Encode three different frames into one buffer
-    codec
-        .encode(Frame::Data(Bytes::from("abc")), &mut buf)
-        .unwrap();
-    codec
-        .encode(Frame::Resize { cols: 80, rows: 24 }, &mut buf)
-        .unwrap();
+    codec.encode(Frame::Data(Bytes::from("abc")), &mut buf).unwrap();
+    codec.encode(Frame::Resize { cols: 80, rows: 24 }, &mut buf).unwrap();
     codec.encode(Frame::Exit { code: 7 }, &mut buf).unwrap();
 
     // Decode them one by one from the same buffer
-    assert_eq!(
-        codec.decode(&mut buf).unwrap().unwrap(),
-        Frame::Data(Bytes::from("abc"))
-    );
-    assert_eq!(
-        codec.decode(&mut buf).unwrap().unwrap(),
-        Frame::Resize { cols: 80, rows: 24 }
-    );
-    assert_eq!(
-        codec.decode(&mut buf).unwrap().unwrap(),
-        Frame::Exit { code: 7 }
-    );
+    assert_eq!(codec.decode(&mut buf).unwrap().unwrap(), Frame::Data(Bytes::from("abc")));
+    assert_eq!(codec.decode(&mut buf).unwrap().unwrap(), Frame::Resize { cols: 80, rows: 24 });
+    assert_eq!(codec.decode(&mut buf).unwrap().unwrap(), Frame::Exit { code: 7 });
     // Buffer should be empty now
     assert!(codec.decode(&mut buf).unwrap().is_none());
 }
@@ -318,9 +282,7 @@ fn roundtrip_exit_negative_code() {
 fn roundtrip_error_empty_message() {
     let mut codec = FrameCodec;
     let mut buf = BytesMut::new();
-    let original = Frame::Error {
-        message: String::new(),
-    };
+    let original = Frame::Error { message: String::new() };
     codec.encode(original.clone(), &mut buf).unwrap();
     let decoded = codec.decode(&mut buf).unwrap().unwrap();
     assert_eq!(original, decoded);
@@ -397,12 +359,8 @@ fn decode_empty_buffer_returns_none() {
 fn decode_consumes_only_one_frame() {
     let mut codec = FrameCodec;
     let mut buf = BytesMut::new();
-    codec
-        .encode(Frame::Data(Bytes::from("first")), &mut buf)
-        .unwrap();
-    codec
-        .encode(Frame::Data(Bytes::from("second")), &mut buf)
-        .unwrap();
+    codec.encode(Frame::Data(Bytes::from("first")), &mut buf).unwrap();
+    codec.encode(Frame::Data(Bytes::from("second")), &mut buf).unwrap();
     let total_len = buf.len();
 
     let first = codec.decode(&mut buf).unwrap().unwrap();
