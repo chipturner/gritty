@@ -66,17 +66,17 @@ ID  Name  PTY         PID    Created              Status
 
 The real value of gritty is remote sessions that survive network interruptions.
 
-`gritty connect` sets up an SSH tunnel to a remote host, auto-starts the remote server if needed, and names the connection by hostname. You then use the hostname to create and attach to sessions:
+`gritty connect` sets up an SSH tunnel to a remote host, auto-starts the remote server if needed, and returns immediately — the tunnel runs in the background. You then use the hostname to create and attach to sessions:
 
 ```bash
-# Terminal 1: start the tunnel (stays running)
+# Start the tunnel (backgrounds, prints socket path, returns)
 gritty connect user@remote-host
-# stdout: /run/user/1000/gritty/connect-remote-host.sock
-# stderr: tunnel ready (name: remote-host). to use:
-#           gritty new remote-host
-#           gritty attach remote-host -t <name>
+# /run/user/1000/gritty/connect-remote-host.sock
+# tunnel started (name: remote-host). to use:
+#   gritty new remote-host
+#   gritty attach remote-host -t <name>
 
-# Terminal 2: create a session through the tunnel
+# Create a session through the tunnel
 gritty new remote-host -t project
 
 # Attach from any terminal
@@ -85,8 +85,19 @@ gritty attach remote-host -t project
 # List remote sessions
 gritty ls remote-host
 
+# List active tunnels
+gritty tunnels
+# Name         Destination      Status
+# remote-host  user@remote-host healthy
+
+# Tear down the tunnel
+gritty disconnect remote-host
+
 # Custom connection name
 gritty connect user@remote-host -n prod
+
+# Run tunnel in foreground (for debugging)
+gritty connect user@remote-host --foreground
 
 # Custom SSH port
 gritty connect user@remote-host:2222
@@ -98,7 +109,7 @@ gritty connect user@remote-host -o "ProxyJump=bastion"
 gritty connect user@remote-host --no-server-start
 ```
 
-Close your laptop, switch networks, lose your SSH tunnel — gritty detects the dead connection via heartbeat, the tunnel monitor respawns SSH, and your client auto-reconnects. Use `~.` to detach cleanly, or Ctrl-C the tunnel process to tear everything down.
+Close your laptop, switch networks, lose your SSH tunnel — gritty detects the dead connection via heartbeat, the tunnel monitor respawns SSH, and your client auto-reconnects. Use `~.` to detach cleanly, or `gritty disconnect` to tear down the tunnel.
 
 The `--ctl-socket` flag still works as a manual override on any command (e.g., `gritty ls --ctl-socket /path/to/socket`).
 
@@ -130,7 +141,9 @@ gritty attach -t project --ctl-socket /tmp/gritty-remote.sock
 | `gritty server` | `s` | Start the server (self-backgrounds by default) |
 | `gritty new-session [host]` | `new` | Create a session and auto-attach |
 | `gritty attach [host] -t <id\|name>` | `a` | Attach to a session (detaches other clients) |
-| `gritty connect user@host` | `c` | SSH tunnel to remote host (prints socket path, stays running) |
+| `gritty connect user@host` | `c` | SSH tunnel to remote host (backgrounds, prints socket path) |
+| `gritty disconnect <name>` | `dc` | Tear down an SSH tunnel |
+| `gritty tunnels` | `tun` | List active SSH tunnels |
 | `gritty list-sessions [host]` | `ls`, `list` | List active sessions |
 | `gritty kill-session [host] -t <id\|name>` | | Kill a session |
 | `gritty kill-server [host]` | | Kill the server and all sessions |
@@ -140,7 +153,7 @@ The optional `[host]` argument is a connection name from `gritty connect` — it
 
 **Options:**
 - `-t <name>` on `new-session`/`attach`: session name (or auto-assigned integer ID)
-- `--foreground` on `server`: run in foreground instead of self-backgrounding
+- `--foreground` on `server`/`connect`: run in foreground instead of self-backgrounding
 - `-n <name>` on `connect`: override connection name (defaults to hostname)
 - `--no-server-start` on `connect`: don't auto-start remote server
 - `-o <option>` on `connect`: extra SSH options (repeatable)
