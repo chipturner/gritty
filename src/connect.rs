@@ -300,6 +300,10 @@ fn local_socket_path(destination: &str) -> PathBuf {
     crate::daemon::socket_dir().join(format!("connect-{destination}.sock"))
 }
 
+fn connect_pid_path(connection_name: &str) -> PathBuf {
+    crate::daemon::socket_dir().join(format!("connect-{connection_name}.pid"))
+}
+
 // ---------------------------------------------------------------------------
 // Cleanup guard
 // ---------------------------------------------------------------------------
@@ -307,6 +311,7 @@ fn local_socket_path(destination: &str) -> PathBuf {
 struct ConnectGuard {
     child: Option<Child>,
     local_sock: PathBuf,
+    pid_file: PathBuf,
     stop: tokio_util::sync::CancellationToken,
 }
 
@@ -323,6 +328,7 @@ impl Drop for ConnectGuard {
         }
 
         let _ = std::fs::remove_file(&self.local_sock);
+        let _ = std::fs::remove_file(&self.pid_file);
     }
 }
 
@@ -341,19 +347,38 @@ pub async fn run(opts: ConnectOpts) -> anyhow::Result<i32> {
     let dest = Destination::parse(&opts.destination)?;
     let connection_name = opts.name.unwrap_or_else(|| dest.host.clone());
 
-    // 1. Ensure remote daemon is running and get socket path
-    eprintln!("starting remote daemon...");
-    let remote_sock = ensure_remote_ready(&dest, opts.no_daemon_start, &opts.ssh_options).await?;
-    debug!(remote_sock, "remote socket path");
-
-    // 2. Compute local socket path
+    // 1. Compute local socket path and check for existing tunnel
     let local_sock = local_socket_path(&connection_name);
+    let pid_file = connect_pid_path(&connection_name);
     debug!("local socket: {}", local_sock.display());
     if let Some(parent) = local_sock.parent() {
         crate::security::secure_create_dir_all(parent)?;
     }
-    // Remove stale socket if it exists
+
+    if std::os::unix::net::UnixStream::connect(&local_sock).is_ok() {
+        let pid_hint = std::fs::read_to_string(&pid_file)
+            .ok()
+            .and_then(|s| s.trim().parse::<u32>().ok());
+        println!("{}", local_sock.display());
+        eprint!("tunnel already running (name: {connection_name})");
+        if let Some(pid) = pid_hint {
+            eprintln!(" (pid {pid})");
+            eprintln!("  to stop: kill {pid}");
+        } else {
+            eprintln!();
+        }
+        eprintln!("  to use:");
+        eprintln!("    gritty new {connection_name}");
+        eprintln!("    gritty attach {connection_name} -t <name>");
+        return Ok(0);
+    }
+    // Socket is stale or absent — clean up
     let _ = std::fs::remove_file(&local_sock);
+
+    // 2. Ensure remote daemon is running and get socket path
+    eprintln!("starting remote daemon...");
+    let remote_sock = ensure_remote_ready(&dest, opts.no_daemon_start, &opts.ssh_options).await?;
+    debug!(remote_sock, "remote socket path");
 
     // 3. Spawn SSH tunnel
     let child = spawn_tunnel(&dest, &local_sock, &remote_sock, &opts.ssh_options).await?;
@@ -362,12 +387,16 @@ pub async fn run(opts: ConnectOpts) -> anyhow::Result<i32> {
     let mut guard = ConnectGuard {
         child: Some(child),
         local_sock: local_sock.clone(),
+        pid_file: pid_file.clone(),
         stop: stop.clone(),
     };
 
     // 4. Wait for local socket to become connectable
     wait_for_socket(&local_sock).await?;
     debug!("tunnel socket ready");
+
+    // Write PID file so subsequent connects can report it
+    let _ = std::fs::write(&pid_file, std::process::id().to_string());
 
     // 5. Hand off the child to the tunnel monitor background task
     let original_child = guard.child.take().unwrap();
@@ -504,6 +533,15 @@ mod tests {
         // Custom name override
         let path = local_socket_path("myproject");
         assert_eq!(path.file_name().unwrap().to_string_lossy(), "connect-myproject.sock");
+    }
+
+    #[test]
+    fn connect_pid_path_format() {
+        let path = connect_pid_path("devbox");
+        assert_eq!(path.file_name().unwrap().to_string_lossy(), "connect-devbox.pid");
+
+        let path = connect_pid_path("example.com");
+        assert_eq!(path.file_name().unwrap().to_string_lossy(), "connect-example.com.pid");
     }
 
     #[test]
