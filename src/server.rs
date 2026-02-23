@@ -2,7 +2,7 @@ use crate::protocol::{Frame, FrameCodec};
 use bytes::Bytes;
 use futures_util::{SinkExt, StreamExt};
 use nix::pty::openpty;
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::io;
 use std::os::fd::{AsRawFd, OwnedFd};
 use std::path::{Path, PathBuf};
@@ -178,6 +178,9 @@ pub async fn run(
 
     let async_master = AsyncFd::new(master)?;
     let mut buf = vec![0u8; 4096];
+    let mut ring_buf: VecDeque<Bytes> = VecDeque::new();
+    let mut ring_buf_size: usize = 0;
+    const RING_BUF_CAP: usize = 1 << 20; // 1 MB
 
     // Agent event channel persists across acceptor lifetimes
     let (agent_event_tx, mut agent_event_rx) = mpsc::unbounded_channel::<AgentEvent>();
@@ -285,31 +288,75 @@ pub async fn run(
     let mut first_client = true;
     loop {
         if !first_client {
-            framed = tokio::select! {
-                client = client_rx.recv() => {
-                    match client {
-                        Some(f) => {
-                            info!("client connected via channel");
-                            f
+            let got_client = 'drain: loop {
+                tokio::select! {
+                    client = client_rx.recv() => {
+                        match client {
+                            Some(f) => {
+                                info!("client connected via channel");
+                                framed = f;
+                                break 'drain true;
+                            }
+                            None => {
+                                info!("client channel closed");
+                                break 'drain false;
+                            }
                         }
-                        None => {
-                            info!("client channel closed");
-                            break;
+                    }
+                    status = managed.child.wait() => {
+                        let code = status?.code().unwrap_or(1);
+                        info!(code, "shell exited while awaiting client");
+                        break 'drain false;
+                    }
+                    ready = async_master.readable() => {
+                        let mut guard = ready?;
+                        match guard.try_io(|inner| {
+                            nix::unistd::read(inner, &mut buf).map_err(io::Error::from)
+                        }) {
+                            Ok(Ok(0)) => {
+                                debug!("pty EOF while disconnected");
+                                break 'drain false;
+                            }
+                            Ok(Ok(n)) => {
+                                let chunk = Bytes::copy_from_slice(&buf[..n]);
+                                ring_buf_size += chunk.len();
+                                ring_buf.push_back(chunk);
+                                while ring_buf_size > RING_BUF_CAP {
+                                    if let Some(old) = ring_buf.pop_front() {
+                                        ring_buf_size -= old.len();
+                                    }
+                                }
+                            }
+                            Ok(Err(e)) => {
+                                if e.raw_os_error() == Some(libc::EIO) {
+                                    debug!("pty EIO while disconnected");
+                                    break 'drain false;
+                                }
+                                return Err(e.into());
+                            }
+                            Err(_would_block) => continue,
                         }
                     }
                 }
-                status = managed.child.wait() => {
-                    let code = status?.code().unwrap_or(1);
-                    info!(code, "shell exited while awaiting client");
-                    break;
-                }
             };
+            if !got_client {
+                break;
+            }
 
             if let Some(meta) = metadata_slot.get() {
                 meta.attached.store(true, Ordering::Relaxed);
             }
         }
         first_client = false;
+
+        // Flush any buffered PTY output to the new client
+        if !ring_buf.is_empty() {
+            debug!(chunks = ring_buf.len(), bytes = ring_buf_size, "flushing ring buffer");
+            while let Some(chunk) = ring_buf.pop_front() {
+                framed.send(Frame::Data(chunk)).await?;
+            }
+            ring_buf_size = 0;
+        }
 
         // Inner loop: relay between socket and PTY
         let exit = loop {
