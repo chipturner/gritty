@@ -158,4 +158,114 @@ mod tests {
         assert_eq!(clamp_winsize(0, 80), (1, 80));
         assert_eq!(clamp_winsize(20_000, 5), (10_000, 5));
     }
+
+    // --- secure_create_dir_all ---
+
+    #[test]
+    fn secure_create_dir_all_fresh_hierarchy() {
+        let tmp = tempfile::tempdir().unwrap();
+        let deep = tmp.path().join("a").join("b").join("c");
+        secure_create_dir_all(&deep).unwrap();
+        assert!(deep.is_dir());
+        let mode = std::fs::metadata(&deep).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o700);
+    }
+
+    #[test]
+    fn secure_create_dir_all_idempotent() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join("mydir");
+        secure_create_dir_all(&dir).unwrap();
+        secure_create_dir_all(&dir).unwrap(); // second call succeeds
+    }
+
+    #[test]
+    fn secure_create_dir_all_rejects_symlink() {
+        let tmp = tempfile::tempdir().unwrap();
+        let real = tmp.path().join("real");
+        std::fs::create_dir(&real).unwrap();
+        let link = tmp.path().join("link");
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+        let err = secure_create_dir_all(&link).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
+    }
+
+    #[test]
+    fn secure_create_dir_all_rejects_regular_file() {
+        let tmp = tempfile::tempdir().unwrap();
+        let file = tmp.path().join("not_a_dir");
+        std::fs::write(&file, b"").unwrap();
+        let err = secure_create_dir_all(&file).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
+    }
+
+    #[test]
+    fn secure_create_dir_all_trusted_roots() {
+        // These should succeed without ownership checks
+        secure_create_dir_all(Path::new("/")).unwrap();
+        secure_create_dir_all(Path::new("/tmp")).unwrap();
+    }
+
+    // --- bind_unix_listener ---
+
+    #[tokio::test]
+    async fn bind_unix_listener_fresh() {
+        let tmp = tempfile::tempdir().unwrap();
+        let sock = tmp.path().join("test.sock");
+        let _listener = bind_unix_listener(&sock).unwrap();
+        let mode = std::fs::metadata(&sock).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600);
+    }
+
+    #[tokio::test]
+    async fn bind_unix_listener_stale_socket() {
+        let tmp = tempfile::tempdir().unwrap();
+        let sock = tmp.path().join("stale.sock");
+        // Create and immediately drop a listener (stale socket)
+        {
+            let _l = bind_unix_listener(&sock).unwrap();
+        }
+        // Socket file remains but nobody is listening
+        assert!(sock.exists());
+        // Re-bind should clean up stale socket and succeed
+        let _listener = bind_unix_listener(&sock).unwrap();
+    }
+
+    #[tokio::test]
+    async fn bind_unix_listener_live_socket_errors() {
+        let tmp = tempfile::tempdir().unwrap();
+        let sock = tmp.path().join("live.sock");
+        let _listener = bind_unix_listener(&sock).unwrap();
+        // Try to bind again while listener is alive
+        let err = bind_unix_listener(&sock).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::AddrInUse);
+    }
+
+    #[tokio::test]
+    async fn bind_unix_listener_nonexistent_dir() {
+        let err = bind_unix_listener(Path::new("/no/such/dir/test.sock")).unwrap_err();
+        assert!(err.kind() == io::ErrorKind::NotFound || err.kind() == io::ErrorKind::Other);
+    }
+
+    // --- verify_peer_uid ---
+
+    #[tokio::test]
+    async fn verify_peer_uid_same_process() {
+        let (a, _b) = tokio::net::UnixStream::pair().unwrap();
+        verify_peer_uid(&a).unwrap();
+    }
+
+    // --- checked_dup ---
+
+    #[test]
+    fn checked_dup_stdout() {
+        use std::os::fd::AsRawFd;
+        let fd = checked_dup(1).unwrap();
+        assert!(fd.as_raw_fd() > 2);
+    }
+
+    #[test]
+    fn checked_dup_invalid_fd() {
+        assert!(checked_dup(-1).is_err());
+    }
 }
