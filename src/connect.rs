@@ -339,6 +339,11 @@ pub fn connection_socket_path(connection_name: &str) -> PathBuf {
     local_socket_path(connection_name)
 }
 
+/// Extract the host component from a destination string (`[user@]host[:port]`).
+pub fn parse_host(destination: &str) -> anyhow::Result<String> {
+    Ok(Destination::parse(destination)?.host)
+}
+
 // ---------------------------------------------------------------------------
 // Lockfile-based liveness
 // ---------------------------------------------------------------------------
@@ -404,6 +409,12 @@ fn probe_tunnel_status(name: &str) -> TunnelStatus {
 /// Clean up files for a stale tunnel (process already dead).
 /// No signals sent — the process is confirmed dead (lockfile released).
 /// Orphaned SSH children self-terminate via ServerAliveInterval/ServerAliveCountMax.
+fn read_pid_hint(name: &str) -> Option<u32> {
+    std::fs::read_to_string(connect_pid_path(name))
+        .ok()
+        .and_then(|s| s.trim().parse().ok())
+}
+
 fn cleanup_stale_files(name: &str) {
     let _ = std::fs::remove_file(local_socket_path(name));
     let _ = std::fs::remove_file(connect_pid_path(name));
@@ -511,8 +522,7 @@ pub async fn run(opts: ConnectOpts, ready_fd: Option<OwnedFd>) -> anyhow::Result
     match probe_tunnel_status(&connection_name) {
         TunnelStatus::Healthy => {
             println!("{}", local_sock.display());
-            let pid_hint =
-                std::fs::read_to_string(&pid_file).ok().and_then(|s| s.trim().parse::<u32>().ok());
+            let pid_hint = read_pid_hint(&connection_name);
             eprint!("tunnel already running (name: {connection_name})");
             if let Some(pid) = pid_hint {
                 eprintln!(" (pid {pid})");
@@ -528,8 +538,7 @@ pub async fn run(opts: ConnectOpts, ready_fd: Option<OwnedFd>) -> anyhow::Result
             return Ok(0);
         }
         TunnelStatus::Reconnecting => {
-            let pid_hint =
-                std::fs::read_to_string(&pid_file).ok().and_then(|s| s.trim().parse::<u32>().ok());
+            let pid_hint = read_pid_hint(&connection_name);
             eprint!("tunnel exists but is reconnecting (name: {connection_name})");
             if let Some(pid) = pid_hint {
                 eprintln!(" (pid {pid})");

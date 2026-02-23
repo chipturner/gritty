@@ -8,7 +8,6 @@ use std::os::fd::{AsFd, AsRawFd, BorrowedFd};
 use std::path::Path;
 use std::time::Duration;
 use tokio::io::unix::AsyncFd;
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::UnixStream;
 use tokio::signal::unix::{SignalKind, signal};
 use tokio::sync::mpsc;
@@ -366,38 +365,17 @@ async fn relay(
                         if let Some(sock_path) = agent_socket {
                             match tokio::net::UnixStream::connect(sock_path).await {
                                 Ok(stream) => {
-                                    let (writer_tx, mut writer_rx) = mpsc::unbounded_channel::<Bytes>();
+                                    let (read_half, write_half) = stream.into_split();
+                                    let data_tx = agent_event_tx.clone();
+                                    let close_tx = agent_event_tx.clone();
+                                    let writer_tx = crate::spawn_channel_relay(
+                                        channel_id,
+                                        read_half,
+                                        write_half,
+                                        move |id, data| data_tx.send(AgentEvent::Data { channel_id: id, data }).is_ok(),
+                                        move |id| { let _ = close_tx.send(AgentEvent::Closed { channel_id: id }); },
+                                    );
                                     agent_channels.insert(channel_id, writer_tx);
-                                    let (mut read_half, mut write_half) = stream.into_split();
-
-                                    // Reader: local agent → AgentEvent::Data
-                                    let etx = agent_event_tx.clone();
-                                    tokio::spawn(async move {
-                                        let mut buf = vec![0u8; 8192];
-                                        loop {
-                                            match read_half.read(&mut buf).await {
-                                                Ok(0) | Err(_) => {
-                                                    let _ = etx.send(AgentEvent::Closed { channel_id });
-                                                    break;
-                                                }
-                                                Ok(n) => {
-                                                    let data = Bytes::copy_from_slice(&buf[..n]);
-                                                    if etx.send(AgentEvent::Data { channel_id, data }).is_err() {
-                                                        break;
-                                                    }
-                                                }
-                                            }
-                                        }
-                                    });
-
-                                    // Writer: mpsc → local agent
-                                    tokio::spawn(async move {
-                                        while let Some(data) = writer_rx.recv().await {
-                                            if write_half.write_all(&data).await.is_err() {
-                                                break;
-                                            }
-                                        }
-                                    });
                                 }
                                 Err(e) => {
                                     debug!("failed to connect to local agent: {e}");

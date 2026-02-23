@@ -248,20 +248,16 @@ fn main() {
             foreground,
         } => {
             // Compute connection name before fork so parent can print socket path
-            let connection_name = name.clone().unwrap_or_else(|| {
-                // Parse destination to extract host (same logic as connect::run)
-                destination.find('@').map_or_else(
-                    || {
-                        destination
-                            .rfind(':')
-                            .map_or(destination.clone(), |c| destination[..c].to_string())
-                    },
-                    |at| {
-                        let rest = &destination[at + 1..];
-                        rest.rfind(':').map_or(rest.to_string(), |c| rest[..c].to_string())
-                    },
-                )
-            });
+            let connection_name = match name.clone() {
+                Some(n) => n,
+                None => match gritty::connect::parse_host(&destination) {
+                    Ok(h) => h,
+                    Err(e) => {
+                        eprintln!("error: {e}");
+                        std::process::exit(1);
+                    }
+                },
+            };
             let local_sock = gritty::connect::connection_socket_path(&connection_name);
 
             let ready_fd = if foreground || dry_run {

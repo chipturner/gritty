@@ -10,7 +10,7 @@ use std::process::Stdio;
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, OnceLock};
 use tokio::io::unix::AsyncFd;
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::io::AsyncReadExt;
 use tokio::net::{UnixListener, UnixStream};
 use tokio::process::Command;
 use tokio::sync::mpsc;
@@ -85,44 +85,21 @@ fn spawn_agent_acceptor(
 
             let channel_id = next_channel_id.fetch_add(1, Ordering::Relaxed);
 
-            let (writer_tx, mut writer_rx) = mpsc::unbounded_channel::<Bytes>();
+            let (read_half, write_half) = stream.into_split();
+            let data_tx = event_tx.clone();
+            let close_tx = event_tx.clone();
+            let writer_tx = crate::spawn_channel_relay(
+                channel_id,
+                read_half,
+                write_half,
+                move |id, data| data_tx.send(AgentEvent::Data { channel_id: id, data }).is_ok(),
+                move |id| { let _ = close_tx.send(AgentEvent::Closed { channel_id: id }); },
+            );
 
             // Notify the relay loop about the new connection
             if event_tx.send(AgentEvent::Accepted { channel_id, writer_tx }).is_err() {
                 break; // relay loop is gone
             }
-
-            let reader_event_tx = event_tx.clone();
-            let (mut read_half, mut write_half) = stream.into_split();
-
-            // Reader task: agent socket → AgentEvent::Data
-            tokio::spawn(async move {
-                let mut buf = vec![0u8; 8192];
-                loop {
-                    match read_half.read(&mut buf).await {
-                        Ok(0) | Err(_) => {
-                            let _ = reader_event_tx.send(AgentEvent::Closed { channel_id });
-                            break;
-                        }
-                        Ok(n) => {
-                            let data = Bytes::copy_from_slice(&buf[..n]);
-                            if reader_event_tx.send(AgentEvent::Data { channel_id, data }).is_err()
-                            {
-                                break;
-                            }
-                        }
-                    }
-                }
-            });
-
-            // Writer task: mpsc → agent socket
-            tokio::spawn(async move {
-                while let Some(data) = writer_rx.recv().await {
-                    if write_half.write_all(&data).await.is_err() {
-                        break;
-                    }
-                }
-            });
         }
     })
 }
@@ -283,6 +260,26 @@ pub async fn run(
     let mut open_acceptor: Option<tokio::task::JoinHandle<()>> = None;
     let (open_event_tx, mut open_event_rx) = mpsc::unbounded_channel::<OpenEvent>();
 
+    let teardown_forwarding = |
+        agent_channels: &mut HashMap<u32, mpsc::UnboundedSender<Bytes>>,
+        agent_forward_enabled: &mut bool,
+        agent_acceptor: &mut Option<tokio::task::JoinHandle<()>>,
+        open_forward_enabled: &mut bool,
+        open_acceptor: &mut Option<tokio::task::JoinHandle<()>>,
+    | {
+        agent_channels.clear();
+        *agent_forward_enabled = false;
+        if let Some(handle) = agent_acceptor.take() {
+            handle.abort();
+        }
+        cleanup_socket(&agent_socket_path);
+        *open_forward_enabled = false;
+        if let Some(handle) = open_acceptor.take() {
+            handle.abort();
+        }
+        cleanup_socket(&open_socket_path);
+    };
+
     // Outer loop: accept clients via channel. PTY persists across reconnects.
     // First iteration skips client-wait (first client already connected above).
     let mut first_client = true;
@@ -427,19 +424,13 @@ pub async fn run(
                     if let Some(new_framed) = new_client {
                         info!("new client via channel, detaching old client");
                         let _ = framed.send(Frame::Detached).await;
-                        // Tear down agent forwarding — new client must re-enable
-                        agent_channels.clear();
-                        agent_forward_enabled = false;
-                        if let Some(handle) = agent_acceptor.take() {
-                            handle.abort();
-                        }
-                        cleanup_socket(&agent_socket_path);
-                        // Tear down open forwarding — new client must re-enable
-                        open_forward_enabled = false;
-                        if let Some(handle) = open_acceptor.take() {
-                            handle.abort();
-                        }
-                        cleanup_socket(&open_socket_path);
+                        teardown_forwarding(
+                            &mut agent_channels,
+                            &mut agent_forward_enabled,
+                            &mut agent_acceptor,
+                            &mut open_forward_enabled,
+                            &mut open_acceptor,
+                        );
                         framed = new_framed;
                     }
                 }
@@ -498,19 +489,13 @@ pub async fn run(
                 if let Some(meta) = metadata_slot.get() {
                     meta.attached.store(false, Ordering::Relaxed);
                 }
-                // Tear down agent forwarding — next client must re-enable
-                agent_channels.clear();
-                agent_forward_enabled = false;
-                if let Some(handle) = agent_acceptor.take() {
-                    handle.abort();
-                }
-                cleanup_socket(&agent_socket_path);
-                // Tear down open forwarding — next client must re-enable
-                open_forward_enabled = false;
-                if let Some(handle) = open_acceptor.take() {
-                    handle.abort();
-                }
-                cleanup_socket(&open_socket_path);
+                teardown_forwarding(
+                    &mut agent_channels,
+                    &mut agent_forward_enabled,
+                    &mut agent_acceptor,
+                    &mut open_forward_enabled,
+                    &mut open_acceptor,
+                );
                 info!("client disconnected, waiting for reconnect");
                 continue;
             }
