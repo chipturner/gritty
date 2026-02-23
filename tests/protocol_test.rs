@@ -458,6 +458,30 @@ fn roundtrip_env() {
 }
 
 #[test]
+fn decode_oversized_frame_rejected() {
+    let mut codec = FrameCodec;
+    let mut buf = BytesMut::new();
+    // Header claiming payload of 1 MB + 1 byte (exceeds MAX_FRAME_SIZE)
+    buf.put_u8(0x01); // TYPE_DATA
+    buf.put_u32((1 << 20) + 1); // 1_048_577 bytes
+    let err = codec.decode(&mut buf).unwrap_err();
+    assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
+    assert!(err.to_string().contains("too large"));
+}
+
+#[test]
+fn decode_exactly_max_frame_size_accepted() {
+    let mut codec = FrameCodec;
+    let mut buf = BytesMut::new();
+    let payload = vec![0x42u8; 1 << 20]; // exactly 1 MB
+    buf.put_u8(0x01); // TYPE_DATA
+    buf.put_u32(1 << 20);
+    buf.put_slice(&payload);
+    let decoded = codec.decode(&mut buf).unwrap().unwrap();
+    assert_eq!(decoded, Frame::Data(Bytes::from(payload)));
+}
+
+#[test]
 fn roundtrip_env_empty() {
     let mut codec = FrameCodec;
     let mut buf = BytesMut::new();

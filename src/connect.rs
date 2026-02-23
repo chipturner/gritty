@@ -1,7 +1,7 @@
 use anyhow::{Context, bail};
 use std::os::fd::OwnedFd;
 use std::os::unix::fs::OpenOptionsExt;
-use std::os::unix::io::{AsRawFd, FromRawFd};
+use std::os::unix::io::AsRawFd;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::time::{Duration, Instant};
@@ -614,15 +614,7 @@ pub async fn run(opts: ConnectOpts, ready_fd: Option<OwnedFd>) -> anyhow::Result
 /// Write one readiness byte to the pipe fd (if present).
 fn signal_ready(ready_fd: &Option<OwnedFd>) {
     if let Some(fd) = ready_fd {
-        use std::io::Write;
-        let mut f = std::io::BufWriter::new(unsafe {
-            // Safety: we're borrowing the fd, not taking ownership
-            std::fs::File::from_raw_fd(fd.as_raw_fd())
-        });
-        let _ = f.write_all(b"\x01");
-        let _ = f.flush();
-        // Don't drop the File — it doesn't own the fd. Leak it.
-        std::mem::forget(f);
+        let _ = nix::unistd::write(fd, b"\x01");
     }
 }
 

@@ -244,6 +244,7 @@ const HEARTBEAT_TIMEOUT: Duration = Duration::from_secs(15);
 
 /// Relay between stdin/stdout and the framed socket.
 /// Returns `Some(code)` on clean shell exit or detach, `None` on server disconnect / heartbeat timeout.
+#[allow(clippy::too_many_arguments)]
 async fn relay(
     framed: &mut Framed<UnixStream, FrameCodec>,
     async_stdin: &AsyncFd<io::Stdin>,
