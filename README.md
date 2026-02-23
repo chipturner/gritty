@@ -144,8 +144,8 @@ flowchart LR
         T2["Terminal"] <--> C2["gritty client"]
     end
 
-    C1 <-->|"socket or<br/>SSH tunnel"| D
-    C2 <-->|"socket or<br/>SSH tunnel"| D
+    C1 <-->|"SSH tunnel"| D
+    C2 <-->|"SSH tunnel"| D
 
     subgraph remote["Remote Host"]
         D["gritty daemon<br/>ctl.sock"]
@@ -154,7 +154,14 @@ flowchart LR
         S1["Session 1 'deploy'<br/>● attached"] <--> P1["PTY + bash"]
         S2["Session 2 'docs'<br/>○ disconnected"] <--> P2["PTY + bash"]
     end
+
+    linkStyle 0,1 stroke:#2080c0
+    linkStyle 2,3 stroke:#e07020,stroke-width:2px
+    linkStyle 4,5,6 stroke:#2080c0,stroke-dasharray:5 5
+    linkStyle 7,8,9 stroke:#2080c0
 ```
+
+<sub>Orange = SSH tunnel (TCP) · Blue = Unix domain socket</sub>
 
 A daemon listens on a single Unix socket (`ctl.sock`). Clients send a control frame declaring intent (new session, attach, list); the daemon hands off the raw socket connection to the target session and gets out of the loop. Each session owns a PTY with a login shell that persists across disconnects — while no client is attached, the shell blocks on its kernel PTY buffer (~4KB) and resumes instantly on reconnect.
 
@@ -195,42 +202,32 @@ The client pings every 5 seconds; no pong within 15 seconds means dead connectio
 ### Agent & URL Forwarding
 
 ```mermaid
-sequenceDiagram
-    box Remote Host
-    participant P as Remote Process
-    participant S as gritty session
-    end
-    participant C as gritty client
-    box Local Machine
-    participant L as SSH Agent / Browser
-    end
-
-    rect rgb(240, 248, 255)
-    Note over P,L: SSH Agent Forwarding (-A)
-    P->>S: connect to agent socket<br/>(SSH_AUTH_SOCK)
-    S->>C: AgentOpen
-    C->>L: connect to local SSH agent
-    P-->>S: agent request
-    S-->>C: AgentData
-    C-->>L: forward
-    L-->>C: response
-    C-->>S: AgentData
-    S-->>P: response
+flowchart LR
+    subgraph remote["Remote Host"]
+        direction LR
+        agent_sock["agent-N.sock<br/>(SSH_AUTH_SOCK)"]
+        open_sock["open-N.sock<br/>(GRITTY_OPEN_SOCK)"]
+        S["gritty session"]
+        agent_sock <-->|"-A"| S
+        open_sock -->|"-O"| S
     end
 
-    rect rgb(255, 248, 240)
-    Note over P,L: URL Open Forwarding (-O)
-    P->>S: gritty open URL<br/>(via GRITTY_OPEN_SOCK)
-    S->>C: OpenUrl
-    C->>L: xdg-open / open
+    S <-->|"relayed over<br/>session connection"| C
+
+    subgraph local["Local Machine"]
+        C["gritty client"]
+        ssh_agent["ssh-agent"]
+        browser["browser"]
+        C <--> ssh_agent
+        C --> browser
     end
 ```
 
-Both features multiplex over the existing session connection — no extra sockets or tunnels.
+Forwarding multiplexes over the existing session connection — no extra tunnels.
 
-**SSH agent forwarding** (`-A`): a per-session agent socket on the remote host (`SSH_AUTH_SOCK`) relays requests back to your local SSH agent via bidirectional channel IDs. Commands like `git push` and `ssh` work as if you were local.
+**SSH agent** (`-A`): the session creates `agent-N.sock` and sets `SSH_AUTH_SOCK`. When a remote process (e.g. `git push`) connects, the request is relayed to the client's local SSH agent and back.
 
-**URL open forwarding** (`-O`): `GRITTY_OPEN_SOCK` and `BROWSER=gritty open` are set in the shell. When `gritty open <url>` runs (directly or via `$BROWSER`), the URL is relayed to the client which opens it with the local browser.
+**URL open** (`-O`): the session creates `open-N.sock` and sets `GRITTY_OPEN_SOCK` + `BROWSER=gritty open`. When `gritty open <url>` runs, the URL is relayed to the client which opens it locally.
 
 ## Prior Art
 
