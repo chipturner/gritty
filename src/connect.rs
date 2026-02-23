@@ -519,9 +519,8 @@ pub async fn run(opts: ConnectOpts, ready_fd: Option<OwnedFd>) -> anyhow::Result
     match probe_tunnel_status(&connection_name) {
         TunnelStatus::Healthy => {
             println!("{}", local_sock.display());
-            let pid_hint = std::fs::read_to_string(&pid_file)
-                .ok()
-                .and_then(|s| s.trim().parse::<u32>().ok());
+            let pid_hint =
+                std::fs::read_to_string(&pid_file).ok().and_then(|s| s.trim().parse::<u32>().ok());
             eprint!("tunnel already running (name: {connection_name})");
             if let Some(pid) = pid_hint {
                 eprintln!(" (pid {pid})");
@@ -537,9 +536,8 @@ pub async fn run(opts: ConnectOpts, ready_fd: Option<OwnedFd>) -> anyhow::Result
             return Ok(0);
         }
         TunnelStatus::Reconnecting => {
-            let pid_hint = std::fs::read_to_string(&pid_file)
-                .ok()
-                .and_then(|s| s.trim().parse::<u32>().ok());
+            let pid_hint =
+                std::fs::read_to_string(&pid_file).ok().and_then(|s| s.trim().parse::<u32>().ok());
             eprint!("tunnel exists but is reconnecting (name: {connection_name})");
             if let Some(pid) = pid_hint {
                 eprintln!(" (pid {pid})");
@@ -698,8 +696,8 @@ pub fn list_tunnels() {
             cleanup_stale_files(name);
             continue;
         }
-        let dest = std::fs::read_to_string(connect_dest_path(name))
-            .unwrap_or_else(|_| "-".to_string());
+        let dest =
+            std::fs::read_to_string(connect_dest_path(name)).unwrap_or_else(|_| "-".to_string());
         let status_str = match status {
             TunnelStatus::Healthy => "healthy".to_string(),
             TunnelStatus::Reconnecting => "reconnecting".to_string(),

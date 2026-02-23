@@ -218,12 +218,23 @@ fn main() {
                 std::process::exit(1);
             }
         }
-        Command::Connect { destination, name, no_server_start, ssh_options, dry_run, foreground } => {
+        Command::Connect {
+            destination,
+            name,
+            no_server_start,
+            ssh_options,
+            dry_run,
+            foreground,
+        } => {
             // Compute connection name before fork so parent can print socket path
             let connection_name = name.clone().unwrap_or_else(|| {
                 // Parse destination to extract host (same logic as connect::run)
                 destination.find('@').map_or_else(
-                    || destination.rfind(':').map_or(destination.clone(), |c| destination[..c].to_string()),
+                    || {
+                        destination
+                            .rfind(':')
+                            .map_or(destination.clone(), |c| destination[..c].to_string())
+                    },
                     |at| {
                         let rest = &destination[at + 1..];
                         rest.rfind(':').map_or(rest.to_string(), |c| rest[..c].to_string())
