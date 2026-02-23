@@ -7,7 +7,7 @@ use std::io;
 use std::os::fd::{AsRawFd, OwnedFd};
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, OnceLock};
 use tokio::io::unix::AsyncFd;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -71,9 +71,9 @@ enum OpenEvent {
 fn spawn_agent_acceptor(
     listener: UnixListener,
     event_tx: mpsc::UnboundedSender<AgentEvent>,
+    next_channel_id: Arc<AtomicU32>,
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
-        let mut next_channel_id: u32 = 0;
         loop {
             let (stream, _) = match listener.accept().await {
                 Ok(conn) => conn,
@@ -83,8 +83,7 @@ fn spawn_agent_acceptor(
                 }
             };
 
-            let channel_id = next_channel_id;
-            next_channel_id = next_channel_id.wrapping_add(1);
+            let channel_id = next_channel_id.fetch_add(1, Ordering::Relaxed);
 
             let (writer_tx, mut writer_rx) = mpsc::unbounded_channel::<Bytes>();
 
@@ -277,6 +276,7 @@ pub async fn run(
     let mut agent_forward_enabled = false;
     let mut agent_channels: HashMap<u32, mpsc::UnboundedSender<Bytes>> = HashMap::new();
     let mut agent_acceptor: Option<tokio::task::JoinHandle<()>> = None;
+    let next_agent_channel_id = Arc::new(AtomicU32::new(0));
 
     // Open forwarding state
     let mut open_forward_enabled = false;
@@ -366,7 +366,7 @@ pub async fn run(
                             // Bind agent socket so SSH_AUTH_SOCK points to a live file
                             if agent_acceptor.is_none() {
                                 if let Some(listener) = bind_agent_listener(&agent_socket_path) {
-                                    agent_acceptor = Some(spawn_agent_acceptor(listener, agent_event_tx.clone()));
+                                    agent_acceptor = Some(spawn_agent_acceptor(listener, agent_event_tx.clone(), next_agent_channel_id.clone()));
                                 }
                             }
                         }

@@ -402,19 +402,11 @@ fn probe_tunnel_status(name: &str) -> TunnelStatus {
 }
 
 /// Clean up files for a stale tunnel (process already dead).
-/// Attempts killpg on the old PID to reap orphaned SSH children.
+/// No signals sent — the process is confirmed dead (lockfile released).
+/// Orphaned SSH children self-terminate via ServerAliveInterval/ServerAliveCountMax.
 fn cleanup_stale_files(name: &str) {
-    let pid_file = connect_pid_path(name);
-    if let Ok(contents) = std::fs::read_to_string(&pid_file) {
-        if let Ok(pid) = contents.trim().parse::<i32>() {
-            // Safe: PGID won't be recycled to a different group while files exist
-            unsafe {
-                libc::killpg(pid, libc::SIGTERM);
-            }
-        }
-    }
     let _ = std::fs::remove_file(local_socket_path(name));
-    let _ = std::fs::remove_file(pid_file);
+    let _ = std::fs::remove_file(connect_pid_path(name));
     let _ = std::fs::remove_file(connect_lock_path(name));
     let _ = std::fs::remove_file(connect_dest_path(name));
 }
