@@ -628,3 +628,51 @@ async fn kill_server(ctl_path: PathBuf) -> anyhow::Result<()> {
         other => anyhow::bail!("unexpected response from server: {other:?}"),
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn resolve_ctl_path_both_args_errors() {
+        let result = resolve_ctl_path(Some(PathBuf::from("/tmp/x.sock")), Some("myhost"));
+        assert!(result.is_err());
+        let msg = result.unwrap_err().to_string();
+        assert!(msg.contains("cannot specify both"), "got: {msg}");
+    }
+
+    #[test]
+    fn resolve_ctl_path_ctl_socket_only() {
+        let p = PathBuf::from("/tmp/custom.sock");
+        let result = resolve_ctl_path(Some(p.clone()), None).unwrap();
+        assert_eq!(result, p);
+    }
+
+    #[test]
+    fn resolve_ctl_path_host_only() {
+        let result = resolve_ctl_path(None, Some("devbox")).unwrap();
+        let s = result.to_string_lossy();
+        assert!(s.contains("connect-devbox.sock"), "got: {s}");
+    }
+
+    #[test]
+    fn resolve_ctl_path_neither() {
+        let result = resolve_ctl_path(None, None).unwrap();
+        assert_eq!(result, gritty::daemon::control_socket_path());
+    }
+
+    #[test]
+    fn format_timestamp_epoch_zero() {
+        let s = format_timestamp(0);
+        assert_eq!(s.len(), 19, "got: {s}");
+        // Could be 1970 (UTC) or 1969 (negative UTC offset)
+        assert!(s.contains("1970") || s.contains("1969"), "got: {s}");
+    }
+
+    #[test]
+    fn format_timestamp_recent() {
+        let s = format_timestamp(1_700_000_000);
+        assert_eq!(s.len(), 19, "got: {s}");
+        assert!(s.starts_with("202"), "got: {s}");
+    }
+}

@@ -123,3 +123,39 @@ fn validate_dir(path: &Path) -> io::Result<()> {
 
     Ok(())
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn clamp_winsize_zeros_to_minimum() {
+        assert_eq!(clamp_winsize(0, 0), (1, 1));
+    }
+
+    #[test]
+    fn clamp_winsize_normal_passthrough() {
+        assert_eq!(clamp_winsize(80, 24), (80, 24));
+    }
+
+    #[test]
+    fn clamp_winsize_max_boundary() {
+        assert_eq!(clamp_winsize(10_000, 10_000), (10_000, 10_000));
+    }
+
+    #[test]
+    fn clamp_winsize_over_max_clamped() {
+        assert_eq!(clamp_winsize(10_001, 10_001), (10_000, 10_000));
+    }
+
+    #[test]
+    fn clamp_winsize_extreme_values() {
+        assert_eq!(clamp_winsize(u16::MAX, u16::MAX), (10_000, 10_000));
+    }
+
+    #[test]
+    fn clamp_winsize_asymmetric() {
+        assert_eq!(clamp_winsize(0, 80), (1, 80));
+        assert_eq!(clamp_winsize(20_000, 5), (10_000, 5));
+    }
+}

@@ -61,3 +61,117 @@ where
 
     writer_tx
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn collect_env_vars_only_known_keys() {
+        let vars = collect_env_vars();
+        for (k, _) in &vars {
+            assert!(
+                ["TERM", "LANG", "COLORTERM"].contains(&k.as_str()),
+                "unexpected key: {k}"
+            );
+        }
+    }
+
+    #[test]
+    fn collect_env_vars_no_duplicates() {
+        let vars = collect_env_vars();
+        let keys: Vec<&str> = vars.iter().map(|(k, _)| k.as_str()).collect();
+        let mut deduped = keys.clone();
+        deduped.sort();
+        deduped.dedup();
+        assert_eq!(keys.len(), deduped.len());
+    }
+
+    #[test]
+    fn collect_env_vars_includes_term_if_set() {
+        if std::env::var("TERM").is_ok() {
+            let vars = collect_env_vars();
+            assert!(vars.iter().any(|(k, _)| k == "TERM"));
+        }
+    }
+
+    #[tokio::test]
+    async fn spawn_channel_relay_on_data_and_close() {
+        use std::sync::{Arc, Mutex};
+        use tokio::io::AsyncWriteExt;
+        use tokio::net::UnixStream;
+
+        // Two pairs: one for read side, one for write side
+        let (read_stream, mut feed_stream) = UnixStream::pair().unwrap();
+        let (write_stream, _drain_stream) = UnixStream::pair().unwrap();
+        let (read_half, _) = read_stream.into_split();
+        let (_, write_half) = write_stream.into_split();
+
+        let received = Arc::new(Mutex::new(Vec::<(u32, bytes::Bytes)>::new()));
+        let received_clone = received.clone();
+        let closed = Arc::new(Mutex::new(false));
+        let closed_clone = closed.clone();
+
+        let _writer_tx = spawn_channel_relay(
+            42,
+            read_half,
+            write_half,
+            move |ch, data| {
+                received_clone.lock().unwrap().push((ch, data));
+                true
+            },
+            move |ch| {
+                assert_eq!(ch, 42);
+                *closed_clone.lock().unwrap() = true;
+            },
+        );
+
+        // Write data to the relay's read side
+        feed_stream.write_all(b"hello").await.unwrap();
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+
+        let data = received.lock().unwrap();
+        assert_eq!(data.len(), 1);
+        assert_eq!(data[0].0, 42);
+        assert_eq!(&data[0].1[..], b"hello");
+        drop(data);
+
+        // Close the feed stream -> triggers on_close
+        drop(feed_stream);
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        assert!(*closed.lock().unwrap());
+    }
+
+    #[tokio::test]
+    async fn spawn_channel_relay_writer_sends_data() {
+        use tokio::io::AsyncReadExt;
+        use tokio::net::UnixStream;
+
+        // Two pairs: one for read side, one for write side
+        let (read_stream, _feed_stream) = UnixStream::pair().unwrap();
+        let (write_stream, mut drain_stream) = UnixStream::pair().unwrap();
+        let (read_half, _) = read_stream.into_split();
+        let (_, write_half) = write_stream.into_split();
+
+        let writer_tx = spawn_channel_relay(
+            7,
+            read_half,
+            write_half,
+            |_, _| true,
+            |_| {},
+        );
+
+        writer_tx.send(bytes::Bytes::from_static(b"hello")).unwrap();
+
+        let mut buf = vec![0u8; 32];
+        let n = tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            drain_stream.read(&mut buf),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+
+        assert_eq!(&buf[..n], b"hello");
+    }
+}
