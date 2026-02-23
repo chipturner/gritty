@@ -400,6 +400,103 @@ async fn pty_buffer_saturation_and_resume() {
 }
 
 #[tokio::test]
+async fn pty_ring_buffer_drains_during_disconnect() {
+    let _permit = CONCURRENCY.acquire().await.unwrap();
+    let (client_tx, mut framed, server, _meta) = setup_session().await;
+    wait_for_shell(&mut framed).await;
+    read_available_data(&mut framed, Duration::from_secs(1)).await;
+
+    // Start a background job that outputs more than 4KB (kernel PTY buffer)
+    // but less than 1MB (ring buffer cap)
+    framed
+        .send(Frame::Data(Bytes::from(
+            "{ sleep 0.3; seq 1 5000; echo RING_BUF_OK; } &\n",
+        )))
+        .await
+        .unwrap();
+    read_available_data(&mut framed, Duration::from_millis(200)).await;
+
+    // Disconnect
+    drop(framed);
+
+    // Wait for output to complete (would stall without ring buffer)
+    tokio::time::sleep(Duration::from_secs(3)).await;
+
+    // Reconnect
+    let (server_stream, client_stream) = UnixStream::pair().unwrap();
+    client_tx
+        .send(Framed::new(server_stream, FrameCodec))
+        .unwrap();
+    let mut framed = Framed::new(client_stream, FrameCodec);
+    framed
+        .send(Frame::Resize { cols: 80, rows: 24 })
+        .await
+        .unwrap();
+
+    // Should get buffered output including the marker
+    let output = read_available_data(&mut framed, Duration::from_secs(3)).await;
+    let output_str = String::from_utf8_lossy(&output);
+    assert!(
+        output_str.contains("RING_BUF_OK"),
+        "ring buffer should have captured output during disconnect, got last 200 chars: {}",
+        &output_str[output_str.len().saturating_sub(200)..]
+    );
+
+    let _ = framed.send(Frame::Data(Bytes::from("exit\n"))).await;
+    let _ = timeout(Duration::from_secs(3), server).await;
+}
+
+#[tokio::test]
+async fn pty_ring_buffer_caps_at_limit() {
+    let _permit = CONCURRENCY.acquire().await.unwrap();
+    let (client_tx, mut framed, server, _meta) = setup_session().await;
+    wait_for_shell(&mut framed).await;
+    read_available_data(&mut framed, Duration::from_secs(1)).await;
+
+    // Generate ~2MB of output (exceeds 1MB ring buffer cap)
+    framed
+        .send(Frame::Data(Bytes::from(
+            "{ sleep 0.3; dd if=/dev/zero bs=1024 count=2048 2>/dev/null | base64; echo CAP_TEST_DONE; } &\n",
+        )))
+        .await
+        .unwrap();
+    read_available_data(&mut framed, Duration::from_millis(200)).await;
+
+    // Disconnect and wait for output to complete
+    drop(framed);
+    tokio::time::sleep(Duration::from_secs(5)).await;
+
+    // Reconnect
+    let (server_stream, client_stream) = UnixStream::pair().unwrap();
+    client_tx
+        .send(Framed::new(server_stream, FrameCodec))
+        .unwrap();
+    let mut framed = Framed::new(client_stream, FrameCodec);
+    framed
+        .send(Frame::Resize { cols: 80, rows: 24 })
+        .await
+        .unwrap();
+
+    // Should get the tail of the output (ring buffer dropped old data)
+    let output = read_available_data(&mut framed, Duration::from_secs(3)).await;
+    let output_str = String::from_utf8_lossy(&output);
+    assert!(
+        output_str.contains("CAP_TEST_DONE"),
+        "tail of output should be preserved even when buffer overflows cap, got last 200 chars: {}",
+        &output_str[output_str.len().saturating_sub(200)..]
+    );
+    // Verify we didn't get all 2MB+ (some was dropped)
+    assert!(
+        output.len() < 1_500_000,
+        "ring buffer should cap output, got {} bytes",
+        output.len()
+    );
+
+    let _ = framed.send(Frame::Data(Bytes::from("exit\n"))).await;
+    let _ = timeout(Duration::from_secs(3), server).await;
+}
+
+#[tokio::test]
 async fn resize_propagates_to_pty() {
     let _permit = CONCURRENCY.acquire().await.unwrap();
     let (_tx, mut framed, server, _meta) = setup_session().await;
