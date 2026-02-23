@@ -44,6 +44,10 @@ enum Command {
         /// Forward local SSH agent to the session
         #[arg(short = 'A', long)]
         forward_agent: bool,
+
+        /// Forward URL open requests back to the local machine
+        #[arg(short = 'O', long)]
+        forward_open: bool,
     },
     /// Attach to an existing session (detaches other clients)
     #[command(alias = "a")]
@@ -66,6 +70,10 @@ enum Command {
         /// Forward local SSH agent to the session
         #[arg(short = 'A', long)]
         forward_agent: bool,
+
+        /// Forward URL open requests back to the local machine
+        #[arg(short = 'O', long)]
+        forward_open: bool,
     },
     /// List active sessions
     #[command(alias = "ls", alias = "list")]
@@ -86,6 +94,11 @@ enum Command {
     KillServer {
         /// Remote host (connection name from `gritty connect`)
         host: Option<String>,
+    },
+    /// Open a URL on the local machine (for use inside gritty sessions)
+    Open {
+        /// URL to open
+        url: String,
     },
     /// Print the default socket path
     #[command(alias = "socket")]
@@ -328,13 +341,14 @@ fn resolve_ctl_path(ctl_socket: Option<PathBuf>, host: Option<&str>) -> anyhow::
 async fn run(cli: Cli) -> anyhow::Result<()> {
     match cli.command {
         Command::Server { .. } | Command::Connect { .. } => unreachable!(),
-        Command::NewSession { host, target, no_escape, forward_agent } => {
+        Command::NewSession { host, target, no_escape, forward_agent, forward_open } => {
             let ctl_path = resolve_ctl_path(cli.ctl_socket, host.as_deref())?;
-            new_session(target, no_escape, forward_agent, ctl_path).await
+            new_session(target, no_escape, forward_agent, forward_open, ctl_path).await
         }
-        Command::Attach { host, target, no_redraw, no_escape, forward_agent } => {
+        Command::Attach { host, target, no_redraw, no_escape, forward_agent, forward_open } => {
             let ctl_path = resolve_ctl_path(cli.ctl_socket, host.as_deref())?;
-            let code = attach(target, !no_redraw, no_escape, forward_agent, ctl_path).await?;
+            let code = attach(target, !no_redraw, no_escape, forward_agent, forward_open, ctl_path)
+                .await?;
             std::process::exit(code);
         }
         Command::ListSessions { host } => {
@@ -354,6 +368,10 @@ async fn run(cli: Cli) -> anyhow::Result<()> {
             println!("{}", ctl_path.display());
             Ok(())
         }
+        Command::Open { url } => {
+            open_url(&url);
+            Ok(())
+        }
         Command::Disconnect { name } => gritty::connect::disconnect(&name).await,
         Command::Tunnels => {
             gritty::connect::list_tunnels();
@@ -366,6 +384,7 @@ async fn new_session(
     name: Option<String>,
     no_escape: bool,
     forward_agent: bool,
+    forward_open: bool,
     ctl_path: PathBuf,
 ) -> anyhow::Result<()> {
     use futures_util::{SinkExt, StreamExt};
@@ -387,7 +406,10 @@ async fn new_session(
                 Some(n) => eprintln!("session created: {n} (id {id})"),
                 None => eprintln!("session created: id {id}"),
             }
-            let env_vars = gritty::collect_env_vars();
+            let mut env_vars = gritty::collect_env_vars();
+            if forward_open {
+                env_vars.push(("BROWSER".into(), "gritty open".into()));
+            }
             let code = gritty::client::run(
                 &id,
                 framed,
@@ -396,6 +418,7 @@ async fn new_session(
                 env_vars,
                 no_escape,
                 forward_agent,
+                forward_open,
             )
             .await?;
             std::process::exit(code);
@@ -410,6 +433,7 @@ async fn attach(
     redraw: bool,
     no_escape: bool,
     forward_agent: bool,
+    forward_open: bool,
     ctl_path: PathBuf,
 ) -> anyhow::Result<i32> {
     use futures_util::{SinkExt, StreamExt};
@@ -440,6 +464,7 @@ async fn attach(
                 vec![],
                 no_escape,
                 forward_agent,
+                forward_open,
             )
             .await?;
             Ok(code)
@@ -537,6 +562,29 @@ async fn list_sessions(ctl_path: PathBuf) -> anyhow::Result<()> {
         }
         other => {
             anyhow::bail!("unexpected response from server: {other:?}");
+        }
+    }
+}
+
+fn open_url(url: &str) {
+    let sock_path = match std::env::var("GRITTY_OPEN_SOCK") {
+        Ok(p) => p,
+        Err(_) => {
+            eprintln!(
+                "error: GRITTY_OPEN_SOCK not set (are you inside a gritty session with --forward-open?)"
+            );
+            std::process::exit(1);
+        }
+    };
+    match std::os::unix::net::UnixStream::connect(&sock_path) {
+        Ok(mut stream) => {
+            use std::io::Write;
+            let _ = stream.write_all(url.as_bytes());
+            let _ = stream.write_all(b"\n");
+        }
+        Err(e) => {
+            eprintln!("error: could not connect to open socket ({sock_path}): {e}");
+            std::process::exit(1);
         }
     }
 }

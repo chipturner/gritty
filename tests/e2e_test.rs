@@ -23,6 +23,12 @@ fn unique_agent_socket_path() -> PathBuf {
     std::env::temp_dir().join(format!("gritty-test-agent-{pid}-{id}.sock"))
 }
 
+fn unique_open_socket_path() -> PathBuf {
+    let id = TEST_ID.fetch_add(1, Ordering::Relaxed);
+    let pid = std::process::id();
+    std::env::temp_dir().join(format!("gritty-test-open-{pid}-{id}.sock"))
+}
+
 /// Spawn a server task connected via socketpair + channel.
 /// Returns (client_tx for takeover, client-side framed, server join handle).
 async fn setup_session() -> (
@@ -35,8 +41,10 @@ async fn setup_session() -> (
     let meta = Arc::new(OnceLock::new());
     let meta_clone = Arc::clone(&meta);
     let agent_path = unique_agent_socket_path();
-    let handle =
-        tokio::spawn(async move { gritty::server::run(client_rx, meta_clone, agent_path).await });
+    let open_path = unique_open_socket_path();
+    let handle = tokio::spawn(async move {
+        gritty::server::run(client_rx, meta_clone, agent_path, open_path).await
+    });
 
     let (server_stream, client_stream) = UnixStream::pair().unwrap();
     client_tx.send(Framed::new(server_stream, FrameCodec)).unwrap();
@@ -59,8 +67,10 @@ async fn setup_session_with_env(
     let meta = Arc::new(OnceLock::new());
     let meta_clone = Arc::clone(&meta);
     let agent_path = unique_agent_socket_path();
-    let handle =
-        tokio::spawn(async move { gritty::server::run(client_rx, meta_clone, agent_path).await });
+    let open_path = unique_open_socket_path();
+    let handle = tokio::spawn(async move {
+        gritty::server::run(client_rx, meta_clone, agent_path, open_path).await
+    });
 
     let (server_stream, client_stream) = UnixStream::pair().unwrap();
     client_tx.send(Framed::new(server_stream, FrameCodec)).unwrap();
@@ -608,10 +618,10 @@ async fn setup_session_with_agent_path() -> (
     let meta_clone = Arc::clone(&meta);
     let agent_path = unique_agent_socket_path();
     let agent_path_clone = agent_path.clone();
-    let handle =
-        tokio::spawn(
-            async move { gritty::server::run(client_rx, meta_clone, agent_path_clone).await },
-        );
+    let open_path = unique_open_socket_path();
+    let handle = tokio::spawn(async move {
+        gritty::server::run(client_rx, meta_clone, agent_path_clone, open_path).await
+    });
 
     let (server_stream, client_stream) = UnixStream::pair().unwrap();
     client_tx.send(Framed::new(server_stream, FrameCodec)).unwrap();
@@ -739,6 +749,83 @@ async fn agent_not_forwarded_without_flag() {
     assert!(
         UnixStream::connect(&agent_path).await.is_err(),
         "connect to agent socket should fail without AgentForward"
+    );
+
+    let _ = framed.send(Frame::Data(Bytes::from("exit\n"))).await;
+    let _ = timeout(Duration::from_secs(3), server).await;
+}
+
+/// Like setup_session but returns the open socket path for open forwarding tests.
+async fn setup_session_with_open_path() -> (
+    mpsc::UnboundedSender<Framed<UnixStream, FrameCodec>>,
+    Framed<UnixStream, FrameCodec>,
+    JoinHandle<anyhow::Result<()>>,
+    Arc<OnceLock<gritty::server::SessionMetadata>>,
+    PathBuf,
+) {
+    let (client_tx, client_rx) = mpsc::unbounded_channel();
+    let meta = Arc::new(OnceLock::new());
+    let meta_clone = Arc::clone(&meta);
+    let agent_path = unique_agent_socket_path();
+    let open_path = unique_open_socket_path();
+    let open_path_clone = open_path.clone();
+    let handle = tokio::spawn(async move {
+        gritty::server::run(client_rx, meta_clone, agent_path, open_path_clone).await
+    });
+
+    let (server_stream, client_stream) = UnixStream::pair().unwrap();
+    client_tx.send(Framed::new(server_stream, FrameCodec)).unwrap();
+
+    let framed = Framed::new(client_stream, FrameCodec);
+    (client_tx, framed, handle, meta, open_path)
+}
+
+#[tokio::test]
+async fn open_forwarding_url_roundtrip() {
+    let _permit = CONCURRENCY.acquire().await.unwrap();
+    let (_tx, mut framed, server, _meta, open_path) = setup_session_with_open_path().await;
+    wait_for_shell(&mut framed).await;
+    read_available_data(&mut framed, Duration::from_secs(1)).await;
+
+    // Client sends OpenForward to enable forwarding
+    framed.send(Frame::OpenForward).await.unwrap();
+    tokio::time::sleep(Duration::from_millis(100)).await;
+
+    // Connect to open socket (simulating `gritty open` inside the session)
+    let mut open_conn = UnixStream::connect(&open_path).await.unwrap();
+    open_conn.write_all(b"https://example.com\n").await.unwrap();
+    drop(open_conn);
+    tokio::time::sleep(Duration::from_millis(200)).await;
+
+    // Server should send OpenUrl to client
+    loop {
+        match timeout(Duration::from_secs(3), framed.next()).await {
+            Ok(Some(Ok(Frame::OpenUrl { url }))) => {
+                assert_eq!(url, "https://example.com");
+                break;
+            }
+            Ok(Some(Ok(Frame::Data(_)))) => continue,
+            other => panic!("expected OpenUrl, got: {other:?}"),
+        }
+    }
+
+    let _ = framed.send(Frame::Data(Bytes::from("exit\n"))).await;
+    let _ = timeout(Duration::from_secs(3), server).await;
+}
+
+#[tokio::test]
+async fn open_forwarding_not_enabled() {
+    let _permit = CONCURRENCY.acquire().await.unwrap();
+    let (_tx, mut framed, server, _meta, open_path) = setup_session_with_open_path().await;
+    wait_for_shell(&mut framed).await;
+    read_available_data(&mut framed, Duration::from_secs(1)).await;
+
+    // Do NOT send OpenForward — open socket file should not exist.
+    assert!(!open_path.exists(), "open socket should not exist without OpenForward");
+
+    assert!(
+        UnixStream::connect(&open_path).await.is_err(),
+        "connect to open socket should fail without OpenForward"
     );
 
     let _ = framed.send(Frame::Data(Bytes::from("exit\n"))).await;

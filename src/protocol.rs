@@ -13,6 +13,8 @@ const TYPE_AGENT_FORWARD: u8 = 0x08;
 const TYPE_AGENT_OPEN: u8 = 0x09;
 const TYPE_AGENT_DATA: u8 = 0x0A;
 const TYPE_AGENT_CLOSE: u8 = 0x0B;
+const TYPE_OPEN_FORWARD: u8 = 0x0C;
+const TYPE_OPEN_URL: u8 = 0x0D;
 const TYPE_NEW_SESSION: u8 = 0x10;
 const TYPE_ATTACH: u8 = 0x11;
 const TYPE_LIST_SESSIONS: u8 = 0x12;
@@ -72,6 +74,12 @@ pub enum Frame {
     /// Close an agent channel (bidirectional).
     AgentClose {
         channel_id: u32,
+    },
+    /// Client signals it can handle URL open forwarding (client → server).
+    OpenForward,
+    /// URL to open on the client machine (server → client).
+    OpenUrl {
+        url: String,
     },
     // Control requests
     NewSession {
@@ -230,6 +238,8 @@ impl Decoder for FrameCodec {
                     u32::from_be_bytes([payload[0], payload[1], payload[2], payload[3]]);
                 Ok(Some(Frame::AgentClose { channel_id }))
             }
+            TYPE_OPEN_FORWARD => Ok(Some(Frame::OpenForward)),
+            TYPE_OPEN_URL => Ok(Some(Frame::OpenUrl { url: decode_string(payload)? })),
             TYPE_NEW_SESSION => Ok(Some(Frame::NewSession { name: decode_string(payload)? })),
             TYPE_ATTACH => Ok(Some(Frame::Attach { session: decode_string(payload)? })),
             TYPE_LIST_SESSIONS => Ok(Some(Frame::ListSessions)),
@@ -321,6 +331,8 @@ impl Encoder<Frame> for FrameCodec {
                 dst.put_u32(4);
                 dst.put_u32(channel_id);
             }
+            Frame::OpenForward => encode_empty(dst, TYPE_OPEN_FORWARD),
+            Frame::OpenUrl { url } => encode_str(dst, TYPE_OPEN_URL, &url),
             Frame::NewSession { name } => encode_str(dst, TYPE_NEW_SESSION, &name),
             Frame::Attach { session } => encode_str(dst, TYPE_ATTACH, &session),
             Frame::ListSessions => encode_empty(dst, TYPE_LIST_SESSIONS),

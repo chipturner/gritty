@@ -584,3 +584,25 @@ fn agent_close_wrong_payload_size() {
     let err = codec.decode(&mut buf).unwrap_err();
     assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
 }
+
+#[test]
+fn roundtrip_open_forward() {
+    let mut codec = FrameCodec;
+    let mut buf = BytesMut::new();
+    codec.encode(Frame::OpenForward, &mut buf).unwrap();
+    assert_eq!(buf.len(), 5); // type(1) + len(4), zero payload
+    assert_eq!(buf[0], 0x0C);
+    let decoded = codec.decode(&mut buf).unwrap().unwrap();
+    assert_eq!(Frame::OpenForward, decoded);
+}
+
+#[test]
+fn roundtrip_open_url() {
+    let mut codec = FrameCodec;
+    let mut buf = BytesMut::new();
+    let original = Frame::OpenUrl { url: "https://example.com".to_string() };
+    codec.encode(original.clone(), &mut buf).unwrap();
+    assert_eq!(buf[0], 0x0D);
+    let decoded = codec.decode(&mut buf).unwrap().unwrap();
+    assert_eq!(original, decoded);
+}

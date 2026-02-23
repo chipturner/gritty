@@ -266,6 +266,7 @@ async fn relay(
     nb_guard: &NonBlockGuard,
     forward_agent: bool,
     agent_socket: Option<&str>,
+    forward_open: bool,
 ) -> anyhow::Result<Option<i32>> {
     // Send env vars before resize (server reads Env frame before spawning shell)
     if !env_vars.is_empty() && !timed_send(framed, Frame::Env { vars: env_vars.to_vec() }).await {
@@ -273,6 +274,10 @@ async fn relay(
     }
     // Signal agent forwarding capability
     if forward_agent && agent_socket.is_some() && !timed_send(framed, Frame::AgentForward).await {
+        return Ok(None);
+    }
+    // Signal open forwarding capability
+    if forward_open && !timed_send(framed, Frame::OpenForward).await {
         return Ok(None);
     }
     // Send initial window size
@@ -411,6 +416,16 @@ async fn relay(
                     Some(Ok(Frame::AgentClose { channel_id })) => {
                         agent_channels.remove(&channel_id);
                     }
+                    Some(Ok(Frame::OpenUrl { url })) => {
+                        debug!("opening URL locally: {url}");
+                        let cmd = if cfg!(target_os = "macos") { "open" } else { "xdg-open" };
+                        let _ = std::process::Command::new(cmd)
+                            .arg(&url)
+                            .stdin(std::process::Stdio::null())
+                            .stdout(std::process::Stdio::null())
+                            .stderr(std::process::Stdio::null())
+                            .spawn();
+                    }
                     Some(Ok(_)) => {} // ignore control/resize frames
                     Some(Err(e)) => {
                         debug!("server connection error: {e}");
@@ -465,6 +480,7 @@ async fn relay(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 pub async fn run(
     session: &str,
     mut framed: Framed<UnixStream, FrameCodec>,
@@ -473,6 +489,7 @@ pub async fn run(
     env_vars: Vec<(String, String)>,
     no_escape: bool,
     forward_agent: bool,
+    forward_open: bool,
 ) -> anyhow::Result<i32> {
     let stdin = io::stdin();
     let stdin_fd = stdin.as_fd();
@@ -505,6 +522,7 @@ pub async fn run(
             &nb_guard,
             forward_agent,
             agent_socket.as_deref(),
+            forward_open,
         )
         .await?
         {

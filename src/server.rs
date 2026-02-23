@@ -61,6 +61,11 @@ enum AgentEvent {
     Closed { channel_id: u32 },
 }
 
+/// Events from open socket acceptor to the main relay loop.
+enum OpenEvent {
+    Url(String),
+}
+
 /// Spawn the agent acceptor task that accepts connections on the agent socket
 /// and creates per-connection relay tasks.
 fn spawn_agent_acceptor(
@@ -123,10 +128,54 @@ fn spawn_agent_acceptor(
     })
 }
 
+/// Spawn the open acceptor task that accepts connections on the open socket,
+/// reads a URL (up to 8KB, newline-terminated or EOF), and sends it as an event.
+fn spawn_open_acceptor(
+    listener: UnixListener,
+    event_tx: mpsc::UnboundedSender<OpenEvent>,
+) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        loop {
+            let (mut stream, _) = match listener.accept().await {
+                Ok(conn) => conn,
+                Err(e) => {
+                    debug!("open listener accept error: {e}");
+                    break;
+                }
+            };
+
+            let etx = event_tx.clone();
+            tokio::spawn(async move {
+                let mut buf = vec![0u8; 8192];
+                let mut total = 0;
+                loop {
+                    match stream.read(&mut buf[total..]).await {
+                        Ok(0) => break,
+                        Ok(n) => {
+                            total += n;
+                            // Stop at newline or buffer full
+                            if buf[..total].contains(&b'\n') || total >= buf.len() {
+                                break;
+                            }
+                        }
+                        Err(_) => return,
+                    }
+                }
+                let s = String::from_utf8_lossy(&buf[..total]);
+                let url = s.trim();
+                if !url.is_empty() {
+                    let _ = etx.send(OpenEvent::Url(url.to_string()));
+                }
+            });
+        }
+    })
+}
+
 pub async fn run(
     mut client_rx: mpsc::UnboundedReceiver<Framed<UnixStream, FrameCodec>>,
     metadata_slot: Arc<OnceLock<SessionMetadata>>,
     agent_socket_path: PathBuf,
+    open_socket_path: PathBuf,
 ) -> anyhow::Result<()> {
     // Allocate PTY (once, before accept loop)
     let pty = openpty(None, None)?;
@@ -165,7 +214,7 @@ pub async fn run(
         }
         None => {
             info!("client channel closed before first client");
-            cleanup_agent_socket(&agent_socket_path);
+            cleanup_socket(&agent_socket_path);
             return Ok(());
         }
     };
@@ -193,6 +242,8 @@ pub async fn run(
     }
     // Set SSH_AUTH_SOCK to the agent socket path
     cmd.env("SSH_AUTH_SOCK", &agent_socket_path);
+    // Set GRITTY_OPEN_SOCK so `gritty open` can find the open socket
+    cmd.env("GRITTY_OPEN_SOCK", &open_socket_path);
     let mut managed = ManagedChild::new(unsafe {
         cmd.pre_exec(move || {
             nix::unistd::setsid().map_err(io::Error::other)?;
@@ -226,6 +277,11 @@ pub async fn run(
     let mut agent_forward_enabled = false;
     let mut agent_channels: HashMap<u32, mpsc::UnboundedSender<Bytes>> = HashMap::new();
     let mut agent_acceptor: Option<tokio::task::JoinHandle<()>> = None;
+
+    // Open forwarding state
+    let mut open_forward_enabled = false;
+    let mut open_acceptor: Option<tokio::task::JoinHandle<()>> = None;
+    let (open_event_tx, mut open_event_rx) = mpsc::unbounded_channel::<OpenEvent>();
 
     // Outer loop: accept clients via channel. PTY persists across reconnects.
     // First iteration skips client-wait (first client already connected above).
@@ -323,6 +379,15 @@ pub async fn run(
                             // Drop the sender, writer task sees closed channel and exits
                             agent_channels.remove(&channel_id);
                         }
+                        Some(Ok(Frame::OpenForward)) => {
+                            debug!("open forwarding enabled by client");
+                            open_forward_enabled = true;
+                            if open_acceptor.is_none() {
+                                if let Some(listener) = bind_agent_listener(&open_socket_path) {
+                                    open_acceptor = Some(spawn_open_acceptor(listener, open_event_tx.clone()));
+                                }
+                            }
+                        }
                         // Client disconnected or sent Exit
                         Some(Ok(Frame::Exit { .. })) | None => {
                             break RelayExit::ClientGone;
@@ -368,7 +433,13 @@ pub async fn run(
                         if let Some(handle) = agent_acceptor.take() {
                             handle.abort();
                         }
-                        cleanup_agent_socket(&agent_socket_path);
+                        cleanup_socket(&agent_socket_path);
+                        // Tear down open forwarding — new client must re-enable
+                        open_forward_enabled = false;
+                        if let Some(handle) = open_acceptor.take() {
+                            handle.abort();
+                        }
+                        cleanup_socket(&open_socket_path);
                         framed = new_framed;
                     }
                 }
@@ -400,6 +471,20 @@ pub async fn run(
                     }
                 }
 
+                // Open URL events from open acceptor
+                event = open_event_rx.recv() => {
+                    match event {
+                        Some(OpenEvent::Url(url)) => {
+                            if open_forward_enabled {
+                                let _ = framed.send(Frame::OpenUrl { url }).await;
+                            }
+                        }
+                        None => {
+                            debug!("open event channel closed");
+                        }
+                    }
+                }
+
                 status = managed.child.wait() => {
                     let code = status?.code().unwrap_or(1);
                     info!(code, "shell exited");
@@ -419,7 +504,13 @@ pub async fn run(
                 if let Some(handle) = agent_acceptor.take() {
                     handle.abort();
                 }
-                cleanup_agent_socket(&agent_socket_path);
+                cleanup_socket(&agent_socket_path);
+                // Tear down open forwarding — next client must re-enable
+                open_forward_enabled = false;
+                if let Some(handle) = open_acceptor.take() {
+                    handle.abort();
+                }
+                cleanup_socket(&open_socket_path);
                 info!("client disconnected, waiting for reconnect");
                 continue;
             }
@@ -436,7 +527,8 @@ pub async fn run(
         }
     }
 
-    cleanup_agent_socket(&agent_socket_path);
+    cleanup_socket(&agent_socket_path);
+    cleanup_socket(&open_socket_path);
     Ok(())
 }
 
@@ -453,6 +545,6 @@ fn bind_agent_listener(path: &Path) -> Option<UnixListener> {
     }
 }
 
-fn cleanup_agent_socket(path: &Path) {
+fn cleanup_socket(path: &Path) {
     let _ = std::fs::remove_file(path);
 }

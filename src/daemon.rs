@@ -200,8 +200,9 @@ pub async fn run(ctl_path: &Path, ready_fd: Option<OwnedFd>) -> anyhow::Result<(
                 let metadata = Arc::new(OnceLock::new());
                 let meta_clone = Arc::clone(&metadata);
                 let agent_socket_path = socket_dir().join(format!("agent-{id}.sock"));
+                let open_socket_path = socket_dir().join(format!("open-{id}.sock"));
                 let handle = tokio::spawn(async move {
-                    server::run(client_rx, meta_clone, agent_socket_path).await
+                    server::run(client_rx, meta_clone, agent_socket_path, open_socket_path).await
                 });
 
                 sessions.insert(

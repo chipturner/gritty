@@ -10,6 +10,7 @@ It works by forwarding Unix domain sockets over SSH — no custom protocol, no o
 
 - **Self-healing connections** — heartbeat detection, automatic tunnel respawn, transparent client reconnect
 - **SSH agent forwarding** — `--forward-agent` / `-A` tunnels your local SSH agent through gritty sessions, so `git push`, `ssh`, and other agent-dependent commands work on the remote host as if you were local
+- **URL open forwarding** — `--forward-open` / `-O` forwards URL open requests back to your local machine, so `cargo doc --open`, `python -m webbrowser`, and anything using `$BROWSER` opens locally
 - **Persistent sessions** — shells survive client disconnect, network failure, laptop sleep
 - **Single binary, zero config** — no server config, no port allocation, no root required; gritty auto-starts the remote server for you
 - **No network protocol** — Unix domain sockets locally, SSH handles encryption and auth
@@ -46,6 +47,9 @@ gritty attach devbox -t work
 
 # Forward your SSH agent for git/ssh on the remote host
 gritty new devbox -t deploy -A
+
+# Forward URL opens back to your local browser
+gritty new devbox -t docs -O
 
 # List sessions
 gritty ls devbox
@@ -86,12 +90,14 @@ gritty kill-server       # clean up
 | `gritty list-sessions [host]` | `ls`, `list` | List sessions |
 | `gritty kill-session [host] -t <id\|name>` | | Kill a session |
 | `gritty kill-server [host]` | | Kill the server and all sessions |
+| `gritty open <url>` | | Open a URL on the local machine (inside sessions) |
 | `gritty server` | `s` | Start a local server |
 
 The `[host]` argument is a connection name from `gritty connect` (e.g., `gritty ls devbox`). Omit it to use the local server.
 
 **Notable options:**
 - `-A` / `--forward-agent` on `new`/`attach`: forward your local SSH agent
+- `-O` / `--forward-open` on `new`/`attach`: forward URL opens to local machine
 - `-t <name>` on `new`/`attach`: target session by name or ID
 - `-n <name>` on `connect`: override connection name (defaults to hostname)
 - `-o <option>` on `connect`: extra SSH options (repeatable, e.g., `-o "ProxyJump=bastion"`)
@@ -138,6 +144,8 @@ The client sends a Ping every 5 seconds; the server replies with Pong. If no Pon
 For remote connections, `gritty connect` spawns an SSH process that forwards the remote server socket to a local one. A tunnel monitor watches the SSH child and respawns it on transient failure. The client's reconnect loop handles the brief gap transparently.
 
 SSH agent forwarding works by creating a per-session agent socket on the remote host. When a process in the session needs the agent, gritty relays the request back to your local `SSH_AUTH_SOCK` over the existing session connection — no extra SSH tunnel needed.
+
+URL open forwarding works similarly: a per-session socket is created and `GRITTY_OPEN_SOCK` + `BROWSER=gritty open` are set in the shell environment. When `gritty open <url>` is invoked (directly or via `$BROWSER`), the URL is relayed back to the client which opens it with the local browser.
 
 ## Prior Art
 
