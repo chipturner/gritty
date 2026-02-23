@@ -2,7 +2,9 @@
 
 A tool for persistent, automatically reconnecting terminal sessions.
 
-SSH sessions die when your connection drops. gritty keeps your shell running on the server and reconnects to it automatically — close your laptop, change networks, lose your VPN, and pick up where you left off.
+gritty creates and maintains persistent terminal sessions to remote hosts that survive network changes, network interruptions, and client reboots. It does this by using SSH to provide a secure, private, and robust communication channel to bridge your terminal to a remote shell. Close your laptop, change networks, reconnect your VPN, and pick up where you left off.
+
+gritty focuses on being a minimal tool that requires no special privileges or system-wide configuration on the client or server. It requires no open ports and performs no cryptography, instead relying solely on SSH. It can function on any system you can establish an SSH connection to.
 
 ## Features
 
