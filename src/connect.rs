@@ -410,9 +410,7 @@ fn probe_tunnel_status(name: &str) -> TunnelStatus {
 /// No signals sent — the process is confirmed dead (lockfile released).
 /// Orphaned SSH children self-terminate via ServerAliveInterval/ServerAliveCountMax.
 fn read_pid_hint(name: &str) -> Option<u32> {
-    std::fs::read_to_string(connect_pid_path(name))
-        .ok()
-        .and_then(|s| s.trim().parse().ok())
+    std::fs::read_to_string(connect_pid_path(name)).ok().and_then(|s| s.trim().parse().ok())
 }
 
 fn cleanup_stale_files(name: &str) {

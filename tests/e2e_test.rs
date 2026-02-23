@@ -409,9 +409,7 @@ async fn pty_ring_buffer_drains_during_disconnect() {
     // Start a background job that outputs more than 4KB (kernel PTY buffer)
     // but less than 1MB (ring buffer cap)
     framed
-        .send(Frame::Data(Bytes::from(
-            "{ sleep 0.3; seq 1 5000; echo RING_BUF_OK; } &\n",
-        )))
+        .send(Frame::Data(Bytes::from("{ sleep 0.3; seq 1 5000; echo RING_BUF_OK; } &\n")))
         .await
         .unwrap();
     read_available_data(&mut framed, Duration::from_millis(200)).await;
@@ -424,14 +422,9 @@ async fn pty_ring_buffer_drains_during_disconnect() {
 
     // Reconnect
     let (server_stream, client_stream) = UnixStream::pair().unwrap();
-    client_tx
-        .send(Framed::new(server_stream, FrameCodec))
-        .unwrap();
+    client_tx.send(Framed::new(server_stream, FrameCodec)).unwrap();
     let mut framed = Framed::new(client_stream, FrameCodec);
-    framed
-        .send(Frame::Resize { cols: 80, rows: 24 })
-        .await
-        .unwrap();
+    framed.send(Frame::Resize { cols: 80, rows: 24 }).await.unwrap();
 
     // Should get buffered output including the marker
     let output = read_available_data(&mut framed, Duration::from_secs(3)).await;
@@ -468,14 +461,9 @@ async fn pty_ring_buffer_caps_at_limit() {
 
     // Reconnect
     let (server_stream, client_stream) = UnixStream::pair().unwrap();
-    client_tx
-        .send(Framed::new(server_stream, FrameCodec))
-        .unwrap();
+    client_tx.send(Framed::new(server_stream, FrameCodec)).unwrap();
     let mut framed = Framed::new(client_stream, FrameCodec);
-    framed
-        .send(Frame::Resize { cols: 80, rows: 24 })
-        .await
-        .unwrap();
+    framed.send(Frame::Resize { cols: 80, rows: 24 }).await.unwrap();
 
     // Should get the tail of the output (ring buffer dropped old data)
     let output = read_available_data(&mut framed, Duration::from_secs(3)).await;
@@ -486,11 +474,7 @@ async fn pty_ring_buffer_caps_at_limit() {
         &output_str[output_str.len().saturating_sub(200)..]
     );
     // Verify we didn't get all 2MB+ (some was dropped)
-    assert!(
-        output.len() < 1_500_000,
-        "ring buffer should cap output, got {} bytes",
-        output.len()
-    );
+    assert!(output.len() < 1_500_000, "ring buffer should cap output, got {} bytes", output.len());
 
     let _ = framed.send(Frame::Data(Bytes::from("exit\n"))).await;
     let _ = timeout(Duration::from_secs(3), server).await;

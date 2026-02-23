@@ -9,8 +9,8 @@ use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, OnceLock};
-use tokio::io::unix::AsyncFd;
 use tokio::io::AsyncReadExt;
+use tokio::io::unix::AsyncFd;
 use tokio::net::{UnixListener, UnixStream};
 use tokio::process::Command;
 use tokio::sync::mpsc;
@@ -93,7 +93,9 @@ fn spawn_agent_acceptor(
                 read_half,
                 write_half,
                 move |id, data| data_tx.send(AgentEvent::Data { channel_id: id, data }).is_ok(),
-                move |id| { let _ = close_tx.send(AgentEvent::Closed { channel_id: id }); },
+                move |id| {
+                    let _ = close_tx.send(AgentEvent::Closed { channel_id: id });
+                },
             );
 
             // Notify the relay loop about the new connection
@@ -263,25 +265,24 @@ pub async fn run(
     let mut open_acceptor: Option<tokio::task::JoinHandle<()>> = None;
     let (open_event_tx, mut open_event_rx) = mpsc::unbounded_channel::<OpenEvent>();
 
-    let teardown_forwarding = |
-        agent_channels: &mut HashMap<u32, mpsc::UnboundedSender<Bytes>>,
-        agent_forward_enabled: &mut bool,
-        agent_acceptor: &mut Option<tokio::task::JoinHandle<()>>,
-        open_forward_enabled: &mut bool,
-        open_acceptor: &mut Option<tokio::task::JoinHandle<()>>,
-    | {
-        agent_channels.clear();
-        *agent_forward_enabled = false;
-        if let Some(handle) = agent_acceptor.take() {
-            handle.abort();
-        }
-        cleanup_socket(&agent_socket_path);
-        *open_forward_enabled = false;
-        if let Some(handle) = open_acceptor.take() {
-            handle.abort();
-        }
-        cleanup_socket(&open_socket_path);
-    };
+    let teardown_forwarding =
+        |agent_channels: &mut HashMap<u32, mpsc::UnboundedSender<Bytes>>,
+         agent_forward_enabled: &mut bool,
+         agent_acceptor: &mut Option<tokio::task::JoinHandle<()>>,
+         open_forward_enabled: &mut bool,
+         open_acceptor: &mut Option<tokio::task::JoinHandle<()>>| {
+            agent_channels.clear();
+            *agent_forward_enabled = false;
+            if let Some(handle) = agent_acceptor.take() {
+                handle.abort();
+            }
+            cleanup_socket(&agent_socket_path);
+            *open_forward_enabled = false;
+            if let Some(handle) = open_acceptor.take() {
+                handle.abort();
+            }
+            cleanup_socket(&open_socket_path);
+        };
 
     // Outer loop: accept clients via channel. PTY persists across reconnects.
     // First iteration skips client-wait (first client already connected above).
