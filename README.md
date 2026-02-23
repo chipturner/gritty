@@ -1,170 +1,100 @@
 # gritty
 
-A tool for persistent, automatically reconnecting terminal sessions.
+Persistent, self-healing terminal sessions over SSH.
 
-gritty creates and maintains persistent terminal sessions to remote hosts that survive network changes, network interruptions, and client reboots. It does this by using SSH to provide a secure, private, and robust communication channel to bridge your terminal to a remote shell. Close your laptop, change networks, reconnect your VPN, and pick up where you left off.
+gritty gives you remote shell sessions that survive network changes, laptop sleep, and SSH disconnects. Close your laptop, change networks, reconnect your VPN — gritty detects the dead connection, respawns the SSH tunnel, and picks up where you left off. Your session never dies.
 
-gritty focuses on being a minimal tool that requires no special privileges or system-wide configuration on the client or server. It requires no open ports and performs no cryptography, instead relying solely on SSH. It can function on any system you can establish an SSH connection to.
+It works by forwarding Unix domain sockets over SSH — no custom protocol, no open ports, no certificates, no configuration. If you can `ssh` to a host, you can use gritty.
 
 ## Features
 
+- **Self-healing connections** — heartbeat detection, automatic tunnel respawn, transparent client reconnect
+- **SSH agent forwarding** — `--forward-agent` / `-A` tunnels your local SSH agent through gritty sessions, so `git push`, `ssh`, and other agent-dependent commands work on the remote host as if you were local
 - **Persistent sessions** — shells survive client disconnect, network failure, laptop sleep
-- **Auto-reconnect** — heartbeat detection with transparent reconnection, no manual intervention
-- **SSH tunneling** — one command sets up the tunnel, starts the remote server, and forwards the socket
-- **Single binary, zero config** — no server config files, no port allocation, no root required
-- **No network protocol** — sessions live on Unix domain sockets; SSH handles encryption and auth
+- **Single binary, zero config** — no server config, no port allocation, no root required; gritty auto-starts the remote server for you
+- **No network protocol** — Unix domain sockets locally, SSH handles encryption and auth
 - **SSH-style escape sequences** — `~.` detach, `~^Z` suspend, `~?` help
-- **Client environment forwarding** — TERM, LANG, COLORTERM propagated to remote shell
-- **SSH agent forwarding** — `--forward-agent` tunnels your local SSH agent through the session
-- **Multiple named sessions** — create, list, attach, kill by name or auto-assigned ID
-
-## Table of Contents
-
-- [Quick Start](#quick-start)
-- [Remote Usage via SSH](#remote-usage-via-ssh)
-- [Commands](#commands)
-- [Escape Sequences](#escape-sequences)
-- [Design](#design)
-- [How It Works](#how-it-works)
-- [Tips](#tips)
-- [Prior Art](#prior-art)
-- [Status & Roadmap](#status--roadmap)
-- [License](#license)
+- **Environment forwarding** — TERM, LANG, COLORTERM propagated to remote shell
+- **Multiple named sessions** — create, list, attach, kill by name or ID
 
 ## Quick Start
 
 ```bash
-# Build
+# Build and install
 cargo build --release
 cp target/release/gritty ~/.local/bin/  # or somewhere in your PATH
+```
 
-# Start the server (self-backgrounds, prints PID)
-gritty server
+### Connect to a remote host
 
+One command sets up an SSH tunnel, starts the remote server, and returns:
+
+```bash
+gritty connect user@devbox
+```
+
+Create sessions, attach, detach, reattach — all through the tunnel:
+
+```bash
 # Create a named session (auto-attaches)
-gritty new -t work
+gritty new devbox -t work
 
-# Detach with ~. or just close the terminal
+# Detach with ~. or just close your terminal
 
-# Reattach later
-gritty attach -t work
+# Reattach from any terminal
+gritty attach devbox -t work
+
+# Forward your SSH agent for git/ssh on the remote host
+gritty new devbox -t deploy -A
 
 # List sessions
-gritty ls
+gritty ls devbox
 
-# Clean up
-gritty kill-session -t work
-gritty kill-server
+# Manage tunnels
+gritty tunnels           # list active tunnels
+gritty disconnect devbox # tear down
 ```
 
-`gritty ls` output:
+`gritty ls devbox` output:
 
 ```
-ID  Name  PTY         PID    Created              Status
-0   work  /dev/pts/4  48291  2026-02-21 14:32:07  attached (heartbeat 3s ago)
-1   logs  /dev/pts/5  48305  2026-02-21 14:33:41  detached
+ID  Name    PTY         PID    Created              Status
+0   work    /dev/pts/4  48291  2026-02-21 14:32:07  attached (heartbeat 3s ago)
+1   deploy  /dev/pts/5  48305  2026-02-21 14:33:41  detached
 ```
 
-## Remote Usage via SSH
+### Local usage
 
-The real value of gritty is remote sessions that survive network interruptions.
-
-`gritty connect` sets up an SSH tunnel to a remote host, auto-starts the remote server if needed, and returns immediately — the tunnel runs in the background. You then use the hostname to create and attach to sessions:
+gritty also works locally without SSH — useful for persistent sessions that survive terminal close:
 
 ```bash
-# Start the tunnel (backgrounds, prints socket path, returns)
-gritty connect user@remote-host
-# /run/user/1000/gritty/connect-remote-host.sock
-# tunnel started (name: remote-host). to use:
-#   gritty new remote-host
-#   gritty attach remote-host -t <name>
-
-# Create a session through the tunnel
-gritty new remote-host -t project
-
-# Attach from any terminal
-gritty attach remote-host -t project
-
-# List remote sessions
-gritty ls remote-host
-
-# List active tunnels
-gritty tunnels
-# Name         Destination      Status
-# remote-host  user@remote-host healthy
-
-# Tear down the tunnel
-gritty disconnect remote-host
-
-# Custom connection name
-gritty connect user@remote-host -n prod
-
-# Run tunnel in foreground (for debugging)
-gritty connect user@remote-host --foreground
-
-# Custom SSH port
-gritty connect user@remote-host:2222
-
-# Extra SSH options (repeatable)
-gritty connect user@remote-host -o "ProxyJump=bastion"
-
-# Don't auto-start the remote server
-gritty connect user@remote-host --no-server-start
-```
-
-Close your laptop, switch networks, lose your SSH tunnel — gritty detects the dead connection via heartbeat, the tunnel monitor respawns SSH, and your client auto-reconnects. Use `~.` to detach cleanly, or `gritty disconnect` to tear down the tunnel.
-
-The `--ctl-socket` flag still works as a manual override on any command (e.g., `gritty ls --ctl-socket /path/to/socket`).
-
-### Manual SSH tunnel
-
-If you prefer to manage the tunnel yourself:
-
-```bash
-# On the remote host
-gritty server
-
-# From your laptop: get the socket path and forward it
-REMOTE_SOCK=$(ssh user@remote-host gritty socket-path)
-ssh -N -T -L /tmp/gritty-remote.sock:$REMOTE_SOCK \
-  -o ServerAliveInterval=3 -o ServerAliveCountMax=2 \
-  -o StreamLocalBindUnlink=yes \
-  -o ExitOnForwardFailure=yes \
-  user@remote-host &
-
-# Create or attach through the tunnel
-gritty new -t project --ctl-socket /tmp/gritty-remote.sock
-gritty attach -t project --ctl-socket /tmp/gritty-remote.sock
+gritty server            # start local server (self-backgrounds)
+gritty new -t scratch    # create a session
+gritty attach -t scratch # reattach later
+gritty kill-server       # clean up
 ```
 
 ## Commands
 
 | Command | Aliases | Description |
 |---------|---------|-------------|
-| `gritty server` | `s` | Start the server (self-backgrounds by default) |
-| `gritty new-session [host]` | `new` | Create a session and auto-attach |
-| `gritty attach [host] -t <id\|name>` | `a` | Attach to a session (detaches other clients) |
-| `gritty connect user@host` | `c` | SSH tunnel to remote host (backgrounds, prints socket path) |
+| `gritty connect user@host` | `c` | Set up SSH tunnel to remote host |
 | `gritty disconnect <name>` | `dc` | Tear down an SSH tunnel |
 | `gritty tunnels` | `tun` | List active SSH tunnels |
-| `gritty list-sessions [host]` | `ls`, `list` | List active sessions |
+| `gritty new-session [host] [-t name]` | `new` | Create a session and auto-attach |
+| `gritty attach [host] -t <id\|name>` | `a` | Attach to a session |
+| `gritty list-sessions [host]` | `ls`, `list` | List sessions |
 | `gritty kill-session [host] -t <id\|name>` | | Kill a session |
 | `gritty kill-server [host]` | | Kill the server and all sessions |
-| `gritty socket-path` | `socket` | Print the default socket path |
+| `gritty server` | `s` | Start a local server |
 
-The optional `[host]` argument is a connection name from `gritty connect` — it resolves to the connect socket for that host (e.g., `gritty ls devbox` instead of `gritty ls --ctl-socket /run/.../connect-devbox.sock`). Omit it to use the local server.
+The `[host]` argument is a connection name from `gritty connect` (e.g., `gritty ls devbox`). Omit it to use the local server.
 
-**Options:**
-- `-t <name>` on `new-session`/`attach`: session name (or auto-assigned integer ID)
-- `--foreground` on `server`/`connect`: run in foreground instead of self-backgrounding
+**Notable options:**
+- `-A` / `--forward-agent` on `new`/`attach`: forward your local SSH agent
+- `-t <name>` on `new`/`attach`: target session by name or ID
 - `-n <name>` on `connect`: override connection name (defaults to hostname)
-- `--no-server-start` on `connect`: don't auto-start remote server
-- `-o <option>` on `connect`: extra SSH options (repeatable)
-- `--dry-run` on `connect`: print the SSH commands instead of running them
-- `--no-redraw` on `attach`: skip Ctrl-L redraw after attaching
-- `--forward-agent` / `-A` on `new-session`/`attach`: forward local SSH agent to the session
-- `--no-escape` on `new-session`/`attach`: disable `~` escape sequences
-- `--ctl-socket <path>` (global): override the server socket path (errors if combined with `[host]`)
+- `-o <option>` on `connect`: extra SSH options (repeatable, e.g., `-o "ProxyJump=bastion"`)
 
 ## Escape Sequences
 
@@ -177,15 +107,13 @@ After a newline (or at session start), `~` enters escape mode:
 | `~?` | Print help |
 | `~~` | Send a literal `~` |
 
-Disable with `--no-escape`.
-
 ## Design
 
 ### No Network Protocol
 
 gritty contains zero networking code. Sessions live on Unix domain sockets. For remote access, you forward the socket over SSH — the same SSH that already handles your keys, your `.ssh/config`, your bastion hosts, your MFA.
 
-This means no ports to open, no firewall rules to maintain, no TLS certificates to manage, and no authentication system to trust beyond the one you already use.
+No ports to open, no firewall rules, no TLS certificates, no authentication system to trust beyond the one you already use.
 
 ### Security by Composition
 
@@ -205,42 +133,13 @@ A background server listens on a single Unix domain socket. Each session owns a 
 
 When a client connects, it sends a control frame declaring intent (new session, attach, list, etc.). For session operations, the server transfers the socket connection to the session task via an in-process channel — the server is out of the loop after that.
 
-The client sends a Ping frame every 5 seconds; the server replies with Pong. If no Pong arrives within 15 seconds, the client treats the connection as dead and enters a reconnect loop — retrying every second until it succeeds or the user hits Ctrl-C.
+The client sends a Ping every 5 seconds; the server replies with Pong. If no Pong arrives within 15 seconds, the client treats the connection as dead and enters a reconnect loop — retrying every second until it succeeds or the user hits Ctrl-C.
 
-When a new client attaches to an already-occupied session, the existing client receives a Detached frame and exits cleanly. One session, one client.
+For remote connections, `gritty connect` spawns an SSH process that forwards the remote server socket to a local one. A tunnel monitor watches the SSH child and respawns it on transient failure. The client's reconnect loop handles the brief gap transparently.
 
-## Tips
-
-### Aliases
-
-```bash
-alias gn='gritty new -t'
-alias ga='gritty attach -t'
-alias gl='gritty ls'
-alias gk='gritty kill-session -t'
-
-# Remote aliases (after `gritty connect user@devbox`)
-alias gn-dev='gritty new devbox -t'
-alias ga-dev='gritty attach devbox -t'
-alias gl-dev='gritty ls devbox'
-```
-
-### Debugging
-
-```bash
-# Run server in foreground with debug logging
-RUST_LOG=debug gritty server --foreground
-```
-
-### Reconnect Behavior
-
-When auto-reconnecting, your terminal stays in raw mode. You'll see `[reconnecting...]` and `[reconnected]` messages. Press Ctrl-C to abort the reconnect and exit instead.
-
-If the session is gone (shell exited while you were disconnected), the reconnect will report the error and exit cleanly.
+SSH agent forwarding works by creating a per-session agent socket on the remote host. When a process in the session needs the agent, gritty relays the request back to your local `SSH_AUTH_SOCK` over the existing session connection — no extra SSH tunnel needed.
 
 ## Prior Art
-
-gritty is inspired by:
 
 - [mosh](https://mosh.org/) — persistent remote terminal using UDP and SSP
 - [Eternal Terminal](https://eternalterminal.dev/) — persistent SSH sessions over a custom protocol
@@ -250,13 +149,12 @@ gritty differs by having no network protocol of its own. Where mosh and ET imple
 
 ## Status & Roadmap
 
-Early stage. Works on Linux. Not yet packaged for distribution.
+Early stage. Works on Linux and macOS. Not yet packaged for distribution.
 
 **Planned:**
 - **Server auto-start** — start the server on demand (systemd socket activation, launchd, or on first `new-session`)
-- **Zero-downtime upgrades** — server re-execs itself with a new binary, preserving sessions and child processes across upgrades
+- **Zero-downtime upgrades** — server re-execs itself, preserving sessions across upgrades
 - **Read-only attach** — multiple clients viewing the same session for pair programming or demos
-- **Better remote PATH resolution** — `connect` currently prepends common paths (`~/bin`, `~/.local/bin`, `~/.cargo/bin`) to find gritty on the remote host; needs a more robust solution (login shell invocation or user-configurable remote binary path)
 
 ## License
 
