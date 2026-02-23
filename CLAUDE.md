@@ -31,10 +31,10 @@ Similar to Eternal Terminal but socket-based. Sessions are persistent (shell sur
 
 ```bash
 cargo build
-cargo test                           # all tests (140 total)
+cargo test                           # all tests (142 total)
 cargo test --test protocol_test      # codec unit tests only (51)
 cargo test --test daemon_test        # daemon integration tests (21)
-cargo test --test e2e_test           # e2e session tests (23)
+cargo test --test e2e_test           # e2e session tests (25)
                                      # + 28 connect unit tests + 17 escape processor tests in lib
 cargo run -- server                   # start server (self-backgrounds, prints PID)
 cargo run -- server --foreground      # start server in foreground
@@ -78,7 +78,7 @@ Six modules behind a lib crate (`src/lib.rs`) with a thin binary entry point (`s
 - **PTY lifecycle**: `openpty` then defer shell spawn until first client connects. Read optional `Env` frame, then fork with `pre_exec(setsid + TIOCSCTTY)` using `-l` (login shell) and `CWD=$HOME`. Drop slave in parent then relay on master. EIO means shell exited.
 - **Deferred shell spawn**: PTY is allocated early but shell spawn waits for first client so the server can read the `Env` frame and apply env vars. First client feeds directly into the relay loop (no re-wait in the outer loop).
 - **Client environment forwarding**: Client sends `Env` frame with TERM/LANG/COLORTERM before the first `Resize` on new sessions. Server applies these as env vars when spawning the shell. On reconnect/attach, no `Env` frame is sent (shell already running).
-- **Persistent sessions**: PTY spawns once after the first client connects. Client disconnect breaks the inner relay loop only; outer loop re-accepts via channel. While disconnected, shell blocks on full kernel PTY buffer (~4KB) and resumes on reconnect.
+- **Persistent sessions**: PTY spawns once after the first client connects. Client disconnect breaks the inner relay loop only; outer loop drains PTY output into a userspace ring buffer (VecDeque<Bytes>, 1MB cap) so the shell never blocks. Oldest chunks are evicted when the cap is exceeded. On reconnect, buffered output is flushed to the new client before entering the inner relay.
 - **Client takeover**: Inner relay loop also selects on `client_rx.recv()`. New client causes `Detached` to be sent to old client, then relay switches to new connection.
 - **Process group cleanup**: `ManagedChild` drop sends `SIGHUP` to shell's process group via `killpg`.
 - **Terminal state guards**: `RawModeGuard` restores terminal attrs, `NonBlockGuard` restores stdin flags. Drop order ensures `NonBlockGuard` outlives `AsyncFd`.
@@ -102,7 +102,7 @@ Six modules behind a lib crate (`src/lib.rs`) with a thin binary entry point (`s
 
 ## Current Status
 
-Full CLI with tmux-like ergonomics. Single-socket architecture. Self-daemonizing server with `--foreground` option. PID file and clean signal handling (SIGTERM/SIGINT). Ping/Pong heartbeat with auto-reconnect. Login shell with client environment forwarding. SSH agent forwarding (`--forward-agent` / `-A`). URL open forwarding (`--forward-open` / `-O`, `gritty open <url>`). SSH-style escape sequences (`~.` detach, `~^Z` suspend, `~?` help). Self-backgrounding SSH connect with lockfile-based liveness (`gritty connect` forks, prints socket path, returns; `gritty disconnect` tears down; `gritty tunnels` lists status). All modules implemented and tested (140 tests: 17 escape processor + 28 connect + 51 protocol codec + 23 e2e session + 21 daemon integration).
+Full CLI with tmux-like ergonomics. Single-socket architecture. Self-daemonizing server with `--foreground` option. PID file and clean signal handling (SIGTERM/SIGINT). Ping/Pong heartbeat with auto-reconnect. Login shell with client environment forwarding. SSH agent forwarding (`--forward-agent` / `-A`). URL open forwarding (`--forward-open` / `-O`, `gritty open <url>`). SSH-style escape sequences (`~.` detach, `~^Z` suspend, `~?` help). Self-backgrounding SSH connect with lockfile-based liveness (`gritty connect` forks, prints socket path, returns; `gritty disconnect` tears down; `gritty tunnels` lists status). All modules implemented and tested (142 tests: 17 escape processor + 28 connect + 51 protocol codec + 25 e2e session + 21 daemon integration).
 
 ## Development Notes
 
