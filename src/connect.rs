@@ -974,8 +974,7 @@ mod tests {
 
     #[test]
     fn cleanup_stale_files_removes_all() {
-        let dir = tempfile::tempdir().unwrap();
-        // Override socket_dir by creating files manually in a temp location
+        let _dir = tempfile::tempdir().unwrap();
         // We can't easily override socket_dir(), so test that cleanup_stale_files
         // at least doesn't panic on nonexistent files
         cleanup_stale_files("nonexistent-cleanup-test-xyz");
