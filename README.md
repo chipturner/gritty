@@ -135,17 +135,102 @@ The PTY and shell process keep running when the client disconnects. While discon
 
 ## How It Works
 
-A background server listens on a single Unix domain socket. Each session owns a PTY with a login shell. Communication uses a simple framed protocol: `[type: u8][length: u32 BE][payload]`.
+### Architecture
 
-When a client connects, it sends a control frame declaring intent (new session, attach, list, etc.). For session operations, the server transfers the socket connection to the session task via an in-process channel — the server is out of the loop after that.
+```mermaid
+flowchart LR
+    subgraph local["Local Machine"]
+        T1["Terminal"] <--> C1["gritty client"]
+        T2["Terminal"] <--> C2["gritty client"]
+    end
 
-The client sends a Ping every 5 seconds; the server replies with Pong. If no Pong arrives within 15 seconds, the client treats the connection as dead and enters a reconnect loop — retrying every second until it succeeds or the user hits Ctrl-C.
+    C1 <-->|"socket or<br/>SSH tunnel"| D
+    C2 <-->|"socket or<br/>SSH tunnel"| D
 
-For remote connections, `gritty connect` spawns an SSH process that forwards the remote server socket to a local one. A tunnel monitor watches the SSH child and respawns it on transient failure. The client's reconnect loop handles the brief gap transparently.
+    subgraph remote["Remote Host"]
+        D["gritty daemon<br/>ctl.sock"]
+        D -.->|handoff| S0 & S1 & S2
+        S0["Session 0 'work'<br/>● attached"] <--> P0["PTY + bash"]
+        S1["Session 1 'deploy'<br/>● attached"] <--> P1["PTY + bash"]
+        S2["Session 2 'docs'<br/>○ disconnected"] <--> P2["PTY + bash"]
+    end
+```
 
-SSH agent forwarding works by creating a per-session agent socket on the remote host. When a process in the session needs the agent, gritty relays the request back to your local `SSH_AUTH_SOCK` over the existing session connection — no extra SSH tunnel needed.
+A daemon listens on a single Unix socket (`ctl.sock`). Clients send a control frame declaring intent (new session, attach, list); the daemon hands off the raw socket connection to the target session and gets out of the loop. Each session owns a PTY with a login shell that persists across disconnects — while no client is attached, the shell blocks on its kernel PTY buffer (~4KB) and resumes instantly on reconnect.
 
-URL open forwarding works similarly: a per-session socket is created and `GRITTY_OPEN_SOCK` + `BROWSER=gritty open` are set in the shell environment. When `gritty open <url>` is invoked (directly or via `$BROWSER`), the URL is relayed back to the client which opens it with the local browser.
+For remote access, `gritty connect` forwards the remote socket over SSH. All commands work identically over the tunnel.
+
+### Self-Healing Reconnect
+
+```mermaid
+sequenceDiagram
+    participant C as gritty client
+    participant T as SSH tunnel
+    participant S as Session + PTY
+
+    C->>S: Ping (every 5s)
+    S->>C: Pong
+
+    Note over C,T: Network interruption
+    C--xS: Ping (no response)
+    Note over C: 15s with no Pong
+
+    rect rgb(255, 245, 245)
+    Note over C: [reconnecting...]
+    Note over S: Shell keeps running
+    C--xT: connect (tunnel down)
+    Note over T: Monitor detects exit,<br/>respawns SSH
+    C->>T: connect (tunnel back)
+    C->>S: Attach
+    S->>C: Ok
+    end
+
+    Note over C: [reconnected]
+    C->>S: Resize + Ctrl-L redraw
+    Note over S: Buffer drains,<br/>shell resumes
+```
+
+The client pings every 5 seconds; no pong within 15 seconds means dead connection. The client enters a reconnect loop (retry every 1s, Ctrl-C to abort). Meanwhile, the tunnel monitor detects the SSH process exit and respawns it. The client reconnects through the restored tunnel transparently.
+
+### Agent & URL Forwarding
+
+```mermaid
+sequenceDiagram
+    box Remote Host
+    participant P as Remote Process
+    participant S as gritty session
+    end
+    participant C as gritty client
+    box Local Machine
+    participant L as SSH Agent / Browser
+    end
+
+    rect rgb(240, 248, 255)
+    Note over P,L: SSH Agent Forwarding (-A)
+    P->>S: connect to agent socket<br/>(SSH_AUTH_SOCK)
+    S->>C: AgentOpen
+    C->>L: connect to local SSH agent
+    P-->>S: agent request
+    S-->>C: AgentData
+    C-->>L: forward
+    L-->>C: response
+    C-->>S: AgentData
+    S-->>P: response
+    end
+
+    rect rgb(255, 248, 240)
+    Note over P,L: URL Open Forwarding (-O)
+    P->>S: gritty open URL<br/>(via GRITTY_OPEN_SOCK)
+    S->>C: OpenUrl
+    C->>L: xdg-open / open
+    end
+```
+
+Both features multiplex over the existing session connection — no extra sockets or tunnels.
+
+**SSH agent forwarding** (`-A`): a per-session agent socket on the remote host (`SSH_AUTH_SOCK`) relays requests back to your local SSH agent via bidirectional channel IDs. Commands like `git push` and `ssh` work as if you were local.
+
+**URL open forwarding** (`-O`): `GRITTY_OPEN_SOCK` and `BROWSER=gritty open` are set in the shell. When `gritty open <url>` runs (directly or via `$BROWSER`), the URL is relayed to the client which opens it with the local browser.
 
 ## Prior Art
 
