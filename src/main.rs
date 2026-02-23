@@ -40,6 +40,10 @@ enum Command {
         /// Disable escape sequences (~. detach, ~? help, etc.)
         #[arg(long)]
         no_escape: bool,
+
+        /// Forward local SSH agent to the session
+        #[arg(short = 'A', long)]
+        forward_agent: bool,
     },
     /// Attach to an existing session (detaches other clients)
     #[command(alias = "a")]
@@ -58,6 +62,10 @@ enum Command {
         /// Disable escape sequences (~. detach, ~? help, etc.)
         #[arg(long)]
         no_escape: bool,
+
+        /// Forward local SSH agent to the session
+        #[arg(short = 'A', long)]
+        forward_agent: bool,
     },
     /// List active sessions
     #[command(alias = "ls", alias = "list")]
@@ -320,13 +328,13 @@ fn resolve_ctl_path(ctl_socket: Option<PathBuf>, host: Option<&str>) -> anyhow::
 async fn run(cli: Cli) -> anyhow::Result<()> {
     match cli.command {
         Command::Server { .. } | Command::Connect { .. } => unreachable!(),
-        Command::NewSession { host, target, no_escape } => {
+        Command::NewSession { host, target, no_escape, forward_agent } => {
             let ctl_path = resolve_ctl_path(cli.ctl_socket, host.as_deref())?;
-            new_session(target, no_escape, ctl_path).await
+            new_session(target, no_escape, forward_agent, ctl_path).await
         }
-        Command::Attach { host, target, no_redraw, no_escape } => {
+        Command::Attach { host, target, no_redraw, no_escape, forward_agent } => {
             let ctl_path = resolve_ctl_path(cli.ctl_socket, host.as_deref())?;
-            let code = attach(target, !no_redraw, no_escape, ctl_path).await?;
+            let code = attach(target, !no_redraw, no_escape, forward_agent, ctl_path).await?;
             std::process::exit(code);
         }
         Command::ListSessions { host } => {
@@ -357,6 +365,7 @@ async fn run(cli: Cli) -> anyhow::Result<()> {
 async fn new_session(
     name: Option<String>,
     no_escape: bool,
+    forward_agent: bool,
     ctl_path: PathBuf,
 ) -> anyhow::Result<()> {
     use futures_util::{SinkExt, StreamExt};
@@ -379,8 +388,16 @@ async fn new_session(
                 None => eprintln!("session created: id {id}"),
             }
             let env_vars = gritty::collect_env_vars();
-            let code =
-                gritty::client::run(&id, framed, false, &ctl_path, env_vars, no_escape).await?;
+            let code = gritty::client::run(
+                &id,
+                framed,
+                false,
+                &ctl_path,
+                env_vars,
+                no_escape,
+                forward_agent,
+            )
+            .await?;
             std::process::exit(code);
         }
         Frame::Error { message } => anyhow::bail!("{message}"),
@@ -392,6 +409,7 @@ async fn attach(
     target: String,
     redraw: bool,
     no_escape: bool,
+    forward_agent: bool,
     ctl_path: PathBuf,
 ) -> anyhow::Result<i32> {
     use futures_util::{SinkExt, StreamExt};
@@ -414,8 +432,16 @@ async fn attach(
     match Frame::expect_from(framed.next().await)? {
         Frame::Ok => {
             eprintln!("[attached]");
-            let code =
-                gritty::client::run(&target, framed, redraw, &ctl_path, vec![], no_escape).await?;
+            let code = gritty::client::run(
+                &target,
+                framed,
+                redraw,
+                &ctl_path,
+                vec![],
+                no_escape,
+                forward_agent,
+            )
+            .await?;
             Ok(code)
         }
         Frame::Error { message } => anyhow::bail!("{message}"),

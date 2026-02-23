@@ -15,6 +15,7 @@ gritty focuses on being a minimal tool that requires no special privileges or sy
 - **No network protocol** — sessions live on Unix domain sockets; SSH handles encryption and auth
 - **SSH-style escape sequences** — `~.` detach, `~^Z` suspend, `~?` help
 - **Client environment forwarding** — TERM, LANG, COLORTERM propagated to remote shell
+- **SSH agent forwarding** — `--forward-agent` tunnels your local SSH agent through the session
 - **Multiple named sessions** — create, list, attach, kill by name or auto-assigned ID
 
 ## Table of Contents
@@ -161,6 +162,7 @@ The optional `[host]` argument is a connection name from `gritty connect` — it
 - `-o <option>` on `connect`: extra SSH options (repeatable)
 - `--dry-run` on `connect`: print the SSH commands instead of running them
 - `--no-redraw` on `attach`: skip Ctrl-L redraw after attaching
+- `--forward-agent` / `-A` on `new-session`/`attach`: forward local SSH agent to the session
 - `--no-escape` on `new-session`/`attach`: disable `~` escape sequences
 - `--ctl-socket <path>` (global): override the server socket path (errors if combined with `[host]`)
 

@@ -2,13 +2,16 @@ use crate::protocol::{Frame, FrameCodec};
 use bytes::Bytes;
 use futures_util::{SinkExt, StreamExt};
 use nix::sys::termios::{self, SetArg, Termios};
+use std::collections::HashMap;
 use std::io::{self, Read, Write};
 use std::os::fd::{AsFd, AsRawFd, BorrowedFd};
 use std::path::Path;
 use std::time::Duration;
 use tokio::io::unix::AsyncFd;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::UnixStream;
 use tokio::signal::unix::{SignalKind, signal};
+use tokio::sync::mpsc;
 use tokio::time::Instant;
 use tokio_util::codec::Framed;
 use tracing::{debug, info};
@@ -242,6 +245,12 @@ async fn timed_send(framed: &mut Framed<UnixStream, FrameCodec>, frame: Frame) -
 const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(5);
 const HEARTBEAT_TIMEOUT: Duration = Duration::from_secs(15);
 
+/// Events from local agent connection tasks to the relay loop.
+enum AgentEvent {
+    Data { channel_id: u32, data: Bytes },
+    Closed { channel_id: u32 },
+}
+
 /// Relay between stdin/stdout and the framed socket.
 /// Returns `Some(code)` on clean shell exit or detach, `None` on server disconnect / heartbeat timeout.
 #[allow(clippy::too_many_arguments)]
@@ -255,9 +264,15 @@ async fn relay(
     mut escape: Option<&mut EscapeProcessor>,
     raw_guard: &RawModeGuard,
     nb_guard: &NonBlockGuard,
+    forward_agent: bool,
+    agent_socket: Option<&str>,
 ) -> anyhow::Result<Option<i32>> {
     // Send env vars before resize (server reads Env frame before spawning shell)
     if !env_vars.is_empty() && !timed_send(framed, Frame::Env { vars: env_vars.to_vec() }).await {
+        return Ok(None);
+    }
+    // Signal agent forwarding capability
+    if forward_agent && agent_socket.is_some() && !timed_send(framed, Frame::AgentForward).await {
         return Ok(None);
     }
     // Send initial window size
@@ -273,6 +288,10 @@ async fn relay(
     let mut heartbeat_interval = tokio::time::interval(HEARTBEAT_INTERVAL);
     heartbeat_interval.reset(); // first tick is immediate otherwise; delay it
     let mut last_pong = Instant::now();
+
+    // Agent channel management
+    let mut agent_channels: HashMap<u32, mpsc::UnboundedSender<Bytes>> = HashMap::new();
+    let (agent_event_tx, mut agent_event_rx) = mpsc::unbounded_channel::<AgentEvent>();
 
     loop {
         tokio::select! {
@@ -338,6 +357,60 @@ async fn relay(
                         write_stdout(b"[detached]\r\n")?;
                         return Ok(Some(0));
                     }
+                    Some(Ok(Frame::AgentOpen { channel_id })) => {
+                        if let Some(sock_path) = agent_socket {
+                            match tokio::net::UnixStream::connect(sock_path).await {
+                                Ok(stream) => {
+                                    let (writer_tx, mut writer_rx) = mpsc::unbounded_channel::<Bytes>();
+                                    agent_channels.insert(channel_id, writer_tx);
+                                    let (mut read_half, mut write_half) = stream.into_split();
+
+                                    // Reader: local agent → AgentEvent::Data
+                                    let etx = agent_event_tx.clone();
+                                    tokio::spawn(async move {
+                                        let mut buf = vec![0u8; 8192];
+                                        loop {
+                                            match read_half.read(&mut buf).await {
+                                                Ok(0) | Err(_) => {
+                                                    let _ = etx.send(AgentEvent::Closed { channel_id });
+                                                    break;
+                                                }
+                                                Ok(n) => {
+                                                    let data = Bytes::copy_from_slice(&buf[..n]);
+                                                    if etx.send(AgentEvent::Data { channel_id, data }).is_err() {
+                                                        break;
+                                                    }
+                                                }
+                                            }
+                                        }
+                                    });
+
+                                    // Writer: mpsc → local agent
+                                    tokio::spawn(async move {
+                                        while let Some(data) = writer_rx.recv().await {
+                                            if write_half.write_all(&data).await.is_err() {
+                                                break;
+                                            }
+                                        }
+                                    });
+                                }
+                                Err(e) => {
+                                    debug!("failed to connect to local agent: {e}");
+                                    let _ = timed_send(framed, Frame::AgentClose { channel_id }).await;
+                                }
+                            }
+                        } else {
+                            let _ = timed_send(framed, Frame::AgentClose { channel_id }).await;
+                        }
+                    }
+                    Some(Ok(Frame::AgentData { channel_id, data })) => {
+                        if let Some(tx) = agent_channels.get(&channel_id) {
+                            let _ = tx.send(data);
+                        }
+                    }
+                    Some(Ok(Frame::AgentClose { channel_id })) => {
+                        agent_channels.remove(&channel_id);
+                    }
                     Some(Ok(_)) => {} // ignore control/resize frames
                     Some(Err(e)) => {
                         debug!("server connection error: {e}");
@@ -347,6 +420,27 @@ async fn relay(
                         debug!("server disconnected");
                         return Ok(None);
                     }
+                }
+            }
+
+            // Agent events from local agent connections
+            event = agent_event_rx.recv() => {
+                match event {
+                    Some(AgentEvent::Data { channel_id, data }) => {
+                        if agent_channels.contains_key(&channel_id)
+                            && !timed_send(framed, Frame::AgentData { channel_id, data }).await
+                        {
+                            return Ok(None);
+                        }
+                    }
+                    Some(AgentEvent::Closed { channel_id }) => {
+                        if agent_channels.remove(&channel_id).is_some()
+                            && !timed_send(framed, Frame::AgentClose { channel_id }).await
+                        {
+                            return Ok(None);
+                        }
+                    }
+                    None => {} // no more agent tasks
                 }
             }
 
@@ -378,6 +472,7 @@ pub async fn run(
     ctl_path: &Path,
     env_vars: Vec<(String, String)>,
     no_escape: bool,
+    forward_agent: bool,
 ) -> anyhow::Result<i32> {
     let stdin = io::stdin();
     let stdin_fd = stdin.as_fd();
@@ -395,6 +490,7 @@ pub async fn run(
     let mut current_redraw = redraw;
     let mut current_env = env_vars;
     let mut escape = if no_escape { None } else { Some(EscapeProcessor::new()) };
+    let agent_socket = if forward_agent { std::env::var("SSH_AUTH_SOCK").ok() } else { None };
 
     loop {
         match relay(
@@ -407,6 +503,8 @@ pub async fn run(
             escape.as_mut(),
             &raw_guard,
             &nb_guard,
+            forward_agent,
+            agent_socket.as_deref(),
         )
         .await?
         {

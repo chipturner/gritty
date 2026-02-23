@@ -9,6 +9,10 @@ const TYPE_DETACHED: u8 = 0x04;
 const TYPE_PING: u8 = 0x05;
 const TYPE_PONG: u8 = 0x06;
 const TYPE_ENV: u8 = 0x07;
+const TYPE_AGENT_FORWARD: u8 = 0x08;
+const TYPE_AGENT_OPEN: u8 = 0x09;
+const TYPE_AGENT_DATA: u8 = 0x0A;
+const TYPE_AGENT_CLOSE: u8 = 0x0B;
 const TYPE_NEW_SESSION: u8 = 0x10;
 const TYPE_ATTACH: u8 = 0x11;
 const TYPE_LIST_SESSIONS: u8 = 0x12;
@@ -53,6 +57,21 @@ pub enum Frame {
     /// Environment variables (client → server, sent before first Resize on new session).
     Env {
         vars: Vec<(String, String)>,
+    },
+    /// Client signals it can handle agent forwarding (client → server).
+    AgentForward,
+    /// New agent connection on the remote side (server → client).
+    AgentOpen {
+        channel_id: u32,
+    },
+    /// Agent protocol data (bidirectional).
+    AgentData {
+        channel_id: u32,
+        data: Bytes,
+    },
+    /// Close an agent channel (bidirectional).
+    AgentClose {
+        channel_id: u32,
     },
     // Control requests
     NewSession {
@@ -176,6 +195,41 @@ impl Decoder for FrameCodec {
                 };
                 Ok(Some(Frame::Env { vars }))
             }
+            TYPE_AGENT_FORWARD => Ok(Some(Frame::AgentForward)),
+            TYPE_AGENT_OPEN => {
+                if payload.len() != 4 {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "agent open frame must be 4 bytes",
+                    ));
+                }
+                let channel_id =
+                    u32::from_be_bytes([payload[0], payload[1], payload[2], payload[3]]);
+                Ok(Some(Frame::AgentOpen { channel_id }))
+            }
+            TYPE_AGENT_DATA => {
+                if payload.len() < 4 {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "agent data frame must be at least 4 bytes",
+                    ));
+                }
+                let channel_id =
+                    u32::from_be_bytes([payload[0], payload[1], payload[2], payload[3]]);
+                let data = payload.freeze().slice(4..);
+                Ok(Some(Frame::AgentData { channel_id, data }))
+            }
+            TYPE_AGENT_CLOSE => {
+                if payload.len() != 4 {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "agent close frame must be 4 bytes",
+                    ));
+                }
+                let channel_id =
+                    u32::from_be_bytes([payload[0], payload[1], payload[2], payload[3]]);
+                Ok(Some(Frame::AgentClose { channel_id }))
+            }
             TYPE_NEW_SESSION => Ok(Some(Frame::NewSession { name: decode_string(payload)? })),
             TYPE_ATTACH => Ok(Some(Frame::Attach { session: decode_string(payload)? })),
             TYPE_LIST_SESSIONS => Ok(Some(Frame::ListSessions)),
@@ -249,6 +303,23 @@ impl Encoder<Frame> for FrameCodec {
                 dst.put_u8(TYPE_ENV);
                 dst.put_u32(text.len() as u32);
                 dst.extend_from_slice(text.as_bytes());
+            }
+            Frame::AgentForward => encode_empty(dst, TYPE_AGENT_FORWARD),
+            Frame::AgentOpen { channel_id } => {
+                dst.put_u8(TYPE_AGENT_OPEN);
+                dst.put_u32(4);
+                dst.put_u32(channel_id);
+            }
+            Frame::AgentData { channel_id, data } => {
+                dst.put_u8(TYPE_AGENT_DATA);
+                dst.put_u32(4 + data.len() as u32);
+                dst.put_u32(channel_id);
+                dst.extend_from_slice(&data);
+            }
+            Frame::AgentClose { channel_id } => {
+                dst.put_u8(TYPE_AGENT_CLOSE);
+                dst.put_u32(4);
+                dst.put_u32(channel_id);
             }
             Frame::NewSession { name } => encode_str(dst, TYPE_NEW_SESSION, &name),
             Frame::Attach { session } => encode_str(dst, TYPE_ATTACH, &session),

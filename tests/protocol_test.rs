@@ -492,3 +492,95 @@ fn roundtrip_env_empty() {
     let decoded = codec.decode(&mut buf).unwrap().unwrap();
     assert_eq!(original, decoded);
 }
+
+#[test]
+fn roundtrip_agent_forward() {
+    let mut codec = FrameCodec;
+    let mut buf = BytesMut::new();
+    codec.encode(Frame::AgentForward, &mut buf).unwrap();
+    assert_eq!(buf.len(), 5); // type(1) + len(4), zero payload
+    assert_eq!(buf[0], 0x08);
+    let decoded = codec.decode(&mut buf).unwrap().unwrap();
+    assert_eq!(Frame::AgentForward, decoded);
+}
+
+#[test]
+fn roundtrip_agent_open() {
+    let mut codec = FrameCodec;
+    let mut buf = BytesMut::new();
+    let original = Frame::AgentOpen { channel_id: 42 };
+    codec.encode(original.clone(), &mut buf).unwrap();
+    assert_eq!(buf.len(), 9); // type(1) + len(4) + channel_id(4)
+    assert_eq!(buf[0], 0x09);
+    let decoded = codec.decode(&mut buf).unwrap().unwrap();
+    assert_eq!(original, decoded);
+}
+
+#[test]
+fn roundtrip_agent_data() {
+    let mut codec = FrameCodec;
+    let mut buf = BytesMut::new();
+    let original = Frame::AgentData { channel_id: 7, data: Bytes::from("agent-payload") };
+    codec.encode(original.clone(), &mut buf).unwrap();
+    // type(1) + len(4) + channel_id(4) + data(13) = 22
+    assert_eq!(buf.len(), 22);
+    assert_eq!(buf[0], 0x0A);
+    let decoded = codec.decode(&mut buf).unwrap().unwrap();
+    assert_eq!(original, decoded);
+}
+
+#[test]
+fn roundtrip_agent_data_empty() {
+    let mut codec = FrameCodec;
+    let mut buf = BytesMut::new();
+    let original = Frame::AgentData { channel_id: 0, data: Bytes::new() };
+    codec.encode(original.clone(), &mut buf).unwrap();
+    assert_eq!(buf.len(), 9); // type(1) + len(4) + channel_id(4)
+    let decoded = codec.decode(&mut buf).unwrap().unwrap();
+    assert_eq!(original, decoded);
+}
+
+#[test]
+fn roundtrip_agent_close() {
+    let mut codec = FrameCodec;
+    let mut buf = BytesMut::new();
+    let original = Frame::AgentClose { channel_id: 99 };
+    codec.encode(original.clone(), &mut buf).unwrap();
+    assert_eq!(buf.len(), 9); // type(1) + len(4) + channel_id(4)
+    assert_eq!(buf[0], 0x0B);
+    let decoded = codec.decode(&mut buf).unwrap().unwrap();
+    assert_eq!(original, decoded);
+}
+
+#[test]
+fn agent_open_wrong_payload_size() {
+    let mut codec = FrameCodec;
+    let mut buf = BytesMut::new();
+    buf.put_u8(0x09); // TYPE_AGENT_OPEN
+    buf.put_u32(2); // wrong: should be 4
+    buf.put_slice(&[0x00, 0x00]);
+    let err = codec.decode(&mut buf).unwrap_err();
+    assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
+}
+
+#[test]
+fn agent_data_too_short() {
+    let mut codec = FrameCodec;
+    let mut buf = BytesMut::new();
+    buf.put_u8(0x0A); // TYPE_AGENT_DATA
+    buf.put_u32(2); // less than 4 bytes
+    buf.put_slice(&[0x00, 0x00]);
+    let err = codec.decode(&mut buf).unwrap_err();
+    assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
+}
+
+#[test]
+fn agent_close_wrong_payload_size() {
+    let mut codec = FrameCodec;
+    let mut buf = BytesMut::new();
+    buf.put_u8(0x0B); // TYPE_AGENT_CLOSE
+    buf.put_u32(8); // wrong: should be 4
+    buf.put_slice(&[0x00; 8]);
+    let err = codec.decode(&mut buf).unwrap_err();
+    assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
+}

@@ -1,8 +1,11 @@
 use bytes::Bytes;
 use futures_util::{SinkExt, StreamExt};
 use gritty::protocol::{Frame, FrameCodec};
+use std::path::PathBuf;
+use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Arc, LazyLock, OnceLock};
 use std::time::Duration;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::UnixStream;
 use tokio::sync::{Semaphore, mpsc};
 use tokio::task::JoinHandle;
@@ -11,6 +14,14 @@ use tokio_util::codec::Framed;
 
 /// Limit concurrent e2e tests to avoid PTY/CPU exhaustion under parallel load.
 static CONCURRENCY: LazyLock<Semaphore> = LazyLock::new(|| Semaphore::new(4));
+
+static TEST_ID: AtomicU32 = AtomicU32::new(0);
+
+fn unique_agent_socket_path() -> PathBuf {
+    let id = TEST_ID.fetch_add(1, Ordering::Relaxed);
+    let pid = std::process::id();
+    std::env::temp_dir().join(format!("gritty-test-agent-{pid}-{id}.sock"))
+}
 
 /// Spawn a server task connected via socketpair + channel.
 /// Returns (client_tx for takeover, client-side framed, server join handle).
@@ -23,7 +34,9 @@ async fn setup_session() -> (
     let (client_tx, client_rx) = mpsc::unbounded_channel();
     let meta = Arc::new(OnceLock::new());
     let meta_clone = Arc::clone(&meta);
-    let handle = tokio::spawn(async move { gritty::server::run(client_rx, meta_clone).await });
+    let agent_path = unique_agent_socket_path();
+    let handle =
+        tokio::spawn(async move { gritty::server::run(client_rx, meta_clone, agent_path).await });
 
     let (server_stream, client_stream) = UnixStream::pair().unwrap();
     client_tx.send(Framed::new(server_stream, FrameCodec)).unwrap();
@@ -45,7 +58,9 @@ async fn setup_session_with_env(
     let (client_tx, client_rx) = mpsc::unbounded_channel();
     let meta = Arc::new(OnceLock::new());
     let meta_clone = Arc::clone(&meta);
-    let handle = tokio::spawn(async move { gritty::server::run(client_rx, meta_clone).await });
+    let agent_path = unique_agent_socket_path();
+    let handle =
+        tokio::spawn(async move { gritty::server::run(client_rx, meta_clone, agent_path).await });
 
     let (server_stream, client_stream) = UnixStream::pair().unwrap();
     client_tx.send(Framed::new(server_stream, FrameCodec)).unwrap();
@@ -575,6 +590,156 @@ async fn login_shell_starts_in_home() {
     let output_str = String::from_utf8_lossy(&output);
     let home = std::env::var("HOME").unwrap();
     assert!(output_str.contains(&home), "expected CWD to be $HOME ({home}), got: {output_str}");
+
+    let _ = framed.send(Frame::Data(Bytes::from("exit\n"))).await;
+    let _ = timeout(Duration::from_secs(3), server).await;
+}
+
+/// Like setup_session but returns the agent socket path for agent forwarding tests.
+async fn setup_session_with_agent_path() -> (
+    mpsc::UnboundedSender<Framed<UnixStream, FrameCodec>>,
+    Framed<UnixStream, FrameCodec>,
+    JoinHandle<anyhow::Result<()>>,
+    Arc<OnceLock<gritty::server::SessionMetadata>>,
+    PathBuf,
+) {
+    let (client_tx, client_rx) = mpsc::unbounded_channel();
+    let meta = Arc::new(OnceLock::new());
+    let meta_clone = Arc::clone(&meta);
+    let agent_path = unique_agent_socket_path();
+    let agent_path_clone = agent_path.clone();
+    let handle =
+        tokio::spawn(
+            async move { gritty::server::run(client_rx, meta_clone, agent_path_clone).await },
+        );
+
+    let (server_stream, client_stream) = UnixStream::pair().unwrap();
+    client_tx.send(Framed::new(server_stream, FrameCodec)).unwrap();
+
+    let framed = Framed::new(client_stream, FrameCodec);
+    (client_tx, framed, handle, meta, agent_path)
+}
+
+#[tokio::test]
+async fn agent_forwarding_data_roundtrip() {
+    let _permit = CONCURRENCY.acquire().await.unwrap();
+    let (_tx, mut framed, server, _meta, agent_path) = setup_session_with_agent_path().await;
+    wait_for_shell(&mut framed).await;
+    read_available_data(&mut framed, Duration::from_secs(1)).await;
+
+    // Client sends AgentForward to enable forwarding
+    framed.send(Frame::AgentForward).await.unwrap();
+    tokio::time::sleep(Duration::from_millis(100)).await;
+
+    // Connect to agent socket (simulating a process inside the session using SSH_AUTH_SOCK)
+    let mut agent_conn = UnixStream::connect(&agent_path).await.unwrap();
+    tokio::time::sleep(Duration::from_millis(100)).await;
+
+    // Server should send AgentOpen
+    let cid = loop {
+        match timeout(Duration::from_secs(3), framed.next()).await {
+            Ok(Some(Ok(Frame::AgentOpen { channel_id }))) => break channel_id,
+            Ok(Some(Ok(Frame::Data(_)))) => continue,
+            other => panic!("expected AgentOpen, got: {other:?}"),
+        }
+    };
+
+    // Server should send AgentData with whatever the remote process wrote
+    agent_conn.write_all(b"hello-agent").await.unwrap();
+    tokio::time::sleep(Duration::from_millis(100)).await;
+
+    loop {
+        match timeout(Duration::from_secs(3), framed.next()).await {
+            Ok(Some(Ok(Frame::AgentData { channel_id, data }))) => {
+                assert_eq!(channel_id, cid);
+                assert_eq!(&data[..], b"hello-agent");
+                break;
+            }
+            Ok(Some(Ok(Frame::Data(_)))) => continue,
+            other => panic!("expected AgentData, got: {other:?}"),
+        }
+    }
+
+    // Client sends AgentData back (simulating a response from local agent)
+    framed
+        .send(Frame::AgentData { channel_id: cid, data: Bytes::from("agent-response") })
+        .await
+        .unwrap();
+    tokio::time::sleep(Duration::from_millis(100)).await;
+
+    // The remote agent connection should receive the data
+    let mut response_buf = vec![0u8; 64];
+    let n =
+        timeout(Duration::from_secs(3), agent_conn.read(&mut response_buf)).await.unwrap().unwrap();
+    assert_eq!(&response_buf[..n], b"agent-response");
+
+    // Clean up
+    drop(agent_conn);
+    let _ = framed.send(Frame::Data(Bytes::from("exit\n"))).await;
+    let _ = timeout(Duration::from_secs(3), server).await;
+}
+
+#[tokio::test]
+async fn agent_close_on_remote_disconnect() {
+    let _permit = CONCURRENCY.acquire().await.unwrap();
+    let (_tx, mut framed, server, _meta, agent_path) = setup_session_with_agent_path().await;
+    wait_for_shell(&mut framed).await;
+    read_available_data(&mut framed, Duration::from_secs(1)).await;
+
+    // Enable agent forwarding
+    framed.send(Frame::AgentForward).await.unwrap();
+    tokio::time::sleep(Duration::from_millis(100)).await;
+
+    // Connect to agent socket
+    let agent_conn = UnixStream::connect(&agent_path).await.unwrap();
+    tokio::time::sleep(Duration::from_millis(100)).await;
+
+    // Consume AgentOpen
+    let cid = loop {
+        match timeout(Duration::from_secs(3), framed.next()).await {
+            Ok(Some(Ok(Frame::AgentOpen { channel_id }))) => break channel_id,
+            Ok(Some(Ok(Frame::Data(_)))) => continue,
+            other => panic!("expected AgentOpen, got: {other:?}"),
+        }
+    };
+
+    // Drop the agent connection — server should send AgentClose
+    drop(agent_conn);
+    tokio::time::sleep(Duration::from_millis(200)).await;
+
+    let mut got_close = false;
+    loop {
+        match timeout(Duration::from_secs(3), framed.next()).await {
+            Ok(Some(Ok(Frame::AgentClose { channel_id }))) => {
+                assert_eq!(channel_id, cid);
+                got_close = true;
+                break;
+            }
+            Ok(Some(Ok(Frame::Data(_)))) => continue,
+            _ => break,
+        }
+    }
+    assert!(got_close, "should receive AgentClose when remote agent connection closes");
+
+    let _ = framed.send(Frame::Data(Bytes::from("exit\n"))).await;
+    let _ = timeout(Duration::from_secs(3), server).await;
+}
+
+#[tokio::test]
+async fn agent_not_forwarded_without_flag() {
+    let _permit = CONCURRENCY.acquire().await.unwrap();
+    let (_tx, mut framed, server, _meta, agent_path) = setup_session_with_agent_path().await;
+    wait_for_shell(&mut framed).await;
+    read_available_data(&mut framed, Duration::from_secs(1)).await;
+
+    // Do NOT send AgentForward — agent socket file should not exist.
+    assert!(!agent_path.exists(), "agent socket should not exist without AgentForward");
+
+    // Connecting should fail
+    assert!(
+        UnixStream::connect(&agent_path).await.is_err(),
+        "connect to agent socket should fail without AgentForward"
+    );
 
     let _ = framed.send(Frame::Data(Bytes::from("exit\n"))).await;
     let _ = timeout(Duration::from_secs(3), server).await;

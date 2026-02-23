@@ -2,17 +2,20 @@ use crate::protocol::{Frame, FrameCodec};
 use bytes::Bytes;
 use futures_util::{SinkExt, StreamExt};
 use nix::pty::openpty;
+use std::collections::HashMap;
 use std::io;
 use std::os::fd::{AsRawFd, OwnedFd};
+use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, OnceLock};
 use tokio::io::unix::AsyncFd;
-use tokio::net::UnixStream;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::net::{UnixListener, UnixStream};
 use tokio::process::Command;
 use tokio::sync::mpsc;
 use tokio_util::codec::Framed;
-use tracing::{debug, info};
+use tracing::{debug, info, warn};
 
 pub struct SessionMetadata {
     pub pty_path: String,
@@ -51,9 +54,79 @@ enum RelayExit {
     ShellExited(i32),
 }
 
+/// Events from agent connection tasks to the main relay loop.
+enum AgentEvent {
+    Accepted { channel_id: u32, writer_tx: mpsc::UnboundedSender<Bytes> },
+    Data { channel_id: u32, data: Bytes },
+    Closed { channel_id: u32 },
+}
+
+/// Spawn the agent acceptor task that accepts connections on the agent socket
+/// and creates per-connection relay tasks.
+fn spawn_agent_acceptor(
+    listener: UnixListener,
+    event_tx: mpsc::UnboundedSender<AgentEvent>,
+) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        let mut next_channel_id: u32 = 0;
+        loop {
+            let (stream, _) = match listener.accept().await {
+                Ok(conn) => conn,
+                Err(e) => {
+                    debug!("agent listener accept error: {e}");
+                    break;
+                }
+            };
+
+            let channel_id = next_channel_id;
+            next_channel_id = next_channel_id.wrapping_add(1);
+
+            let (writer_tx, mut writer_rx) = mpsc::unbounded_channel::<Bytes>();
+
+            // Notify the relay loop about the new connection
+            if event_tx.send(AgentEvent::Accepted { channel_id, writer_tx }).is_err() {
+                break; // relay loop is gone
+            }
+
+            let reader_event_tx = event_tx.clone();
+            let (mut read_half, mut write_half) = stream.into_split();
+
+            // Reader task: agent socket → AgentEvent::Data
+            tokio::spawn(async move {
+                let mut buf = vec![0u8; 8192];
+                loop {
+                    match read_half.read(&mut buf).await {
+                        Ok(0) | Err(_) => {
+                            let _ = reader_event_tx.send(AgentEvent::Closed { channel_id });
+                            break;
+                        }
+                        Ok(n) => {
+                            let data = Bytes::copy_from_slice(&buf[..n]);
+                            if reader_event_tx.send(AgentEvent::Data { channel_id, data }).is_err()
+                            {
+                                break;
+                            }
+                        }
+                    }
+                }
+            });
+
+            // Writer task: mpsc → agent socket
+            tokio::spawn(async move {
+                while let Some(data) = writer_rx.recv().await {
+                    if write_half.write_all(&data).await.is_err() {
+                        break;
+                    }
+                }
+            });
+        }
+    })
+}
+
 pub async fn run(
     mut client_rx: mpsc::UnboundedReceiver<Framed<UnixStream, FrameCodec>>,
     metadata_slot: Arc<OnceLock<SessionMetadata>>,
+    agent_socket_path: PathBuf,
 ) -> anyhow::Result<()> {
     // Allocate PTY (once, before accept loop)
     let pty = openpty(None, None)?;
@@ -81,6 +154,9 @@ pub async fn run(
     let async_master = AsyncFd::new(master)?;
     let mut buf = vec![0u8; 4096];
 
+    // Agent event channel persists across acceptor lifetimes
+    let (agent_event_tx, mut agent_event_rx) = mpsc::unbounded_channel::<AgentEvent>();
+
     // Wait for first client before spawning shell (so we can read Env frame)
     let mut framed = match client_rx.recv().await {
         Some(framed) => {
@@ -89,6 +165,7 @@ pub async fn run(
         }
         None => {
             info!("client channel closed before first client");
+            cleanup_agent_socket(&agent_socket_path);
             return Ok(());
         }
     };
@@ -114,6 +191,8 @@ pub async fn run(
     for (k, v) in &env_vars {
         cmd.env(k, v);
     }
+    // Set SSH_AUTH_SOCK to the agent socket path
+    cmd.env("SSH_AUTH_SOCK", &agent_socket_path);
     let mut managed = ManagedChild::new(unsafe {
         cmd.pre_exec(move || {
             nix::unistd::setsid().map_err(io::Error::other)?;
@@ -142,6 +221,11 @@ pub async fn run(
 
     // First client is already connected — enter relay directly
     metadata_slot.get().unwrap().attached.store(true, Ordering::Relaxed);
+
+    // Agent forwarding state
+    let mut agent_forward_enabled = false;
+    let mut agent_channels: HashMap<u32, mpsc::UnboundedSender<Bytes>> = HashMap::new();
+    let mut agent_acceptor: Option<tokio::task::JoinHandle<()>> = None;
 
     // Outer loop: accept clients via channel. PTY persists across reconnects.
     // First iteration skips client-wait (first client already connected above).
@@ -220,6 +304,25 @@ pub async fn run(
                             }
                             let _ = framed.send(Frame::Pong).await;
                         }
+                        Some(Ok(Frame::AgentForward)) => {
+                            debug!("agent forwarding enabled by client");
+                            agent_forward_enabled = true;
+                            // Bind agent socket so SSH_AUTH_SOCK points to a live file
+                            if agent_acceptor.is_none() {
+                                if let Some(listener) = bind_agent_listener(&agent_socket_path) {
+                                    agent_acceptor = Some(spawn_agent_acceptor(listener, agent_event_tx.clone()));
+                                }
+                            }
+                        }
+                        Some(Ok(Frame::AgentData { channel_id, data })) => {
+                            if let Some(tx) = agent_channels.get(&channel_id) {
+                                let _ = tx.send(data);
+                            }
+                        }
+                        Some(Ok(Frame::AgentClose { channel_id })) => {
+                            // Drop the sender, writer task sees closed channel and exits
+                            agent_channels.remove(&channel_id);
+                        }
                         // Client disconnected or sent Exit
                         Some(Ok(Frame::Exit { .. })) | None => {
                             break RelayExit::ClientGone;
@@ -259,7 +362,41 @@ pub async fn run(
                     if let Some(new_framed) = new_client {
                         info!("new client via channel, detaching old client");
                         let _ = framed.send(Frame::Detached).await;
+                        // Tear down agent forwarding — new client must re-enable
+                        agent_channels.clear();
+                        agent_forward_enabled = false;
+                        if let Some(handle) = agent_acceptor.take() {
+                            handle.abort();
+                        }
+                        cleanup_agent_socket(&agent_socket_path);
                         framed = new_framed;
+                    }
+                }
+
+                // Agent events from acceptor/connection tasks
+                event = agent_event_rx.recv() => {
+                    match event {
+                        Some(AgentEvent::Accepted { channel_id, writer_tx }) => {
+                            if agent_forward_enabled {
+                                agent_channels.insert(channel_id, writer_tx);
+                                let _ = framed.send(Frame::AgentOpen { channel_id }).await;
+                            }
+                            // If forwarding not enabled, drop writer_tx (closes the connection)
+                        }
+                        Some(AgentEvent::Data { channel_id, data }) => {
+                            if agent_forward_enabled && agent_channels.contains_key(&channel_id) {
+                                let _ = framed.send(Frame::AgentData { channel_id, data }).await;
+                            }
+                        }
+                        Some(AgentEvent::Closed { channel_id }) => {
+                            if agent_channels.remove(&channel_id).is_some() {
+                                let _ = framed.send(Frame::AgentClose { channel_id }).await;
+                            }
+                        }
+                        None => {
+                            // Agent acceptor exited — not fatal
+                            debug!("agent event channel closed");
+                        }
                     }
                 }
 
@@ -276,6 +413,13 @@ pub async fn run(
                 if let Some(meta) = metadata_slot.get() {
                     meta.attached.store(false, Ordering::Relaxed);
                 }
+                // Tear down agent forwarding — next client must re-enable
+                agent_channels.clear();
+                agent_forward_enabled = false;
+                if let Some(handle) = agent_acceptor.take() {
+                    handle.abort();
+                }
+                cleanup_agent_socket(&agent_socket_path);
                 info!("client disconnected, waiting for reconnect");
                 continue;
             }
@@ -292,5 +436,23 @@ pub async fn run(
         }
     }
 
+    cleanup_agent_socket(&agent_socket_path);
     Ok(())
+}
+
+fn bind_agent_listener(path: &Path) -> Option<UnixListener> {
+    match crate::security::bind_unix_listener(path) {
+        Ok(listener) => {
+            info!(path = %path.display(), "agent socket listening");
+            Some(listener)
+        }
+        Err(e) => {
+            warn!("failed to bind agent socket at {}: {e}", path.display());
+            None
+        }
+    }
+}
+
+fn cleanup_agent_socket(path: &Path) {
+    let _ = std::fs::remove_file(path);
 }
