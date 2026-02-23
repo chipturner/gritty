@@ -142,10 +142,11 @@ flowchart LR
     subgraph local["Local Machine"]
         T1["Terminal"] <--> C1["gritty client"]
         T2["Terminal"] <--> C2["gritty client"]
+        C1 <--> LS["connect-host.sock"]
+        C2 <--> LS
     end
 
-    C1 <-->|"SSH tunnel"| D
-    C2 <-->|"SSH tunnel"| D
+    LS <-->|"SSH tunnel<br/>(single TCP connection)"| D
 
     subgraph remote["Remote Host"]
         D["gritty daemon<br/>ctl.sock"]
@@ -155,10 +156,10 @@ flowchart LR
         S2["Session 2 'docs'<br/>○ disconnected"] <--> P2["PTY + bash"]
     end
 
-    linkStyle 0,1 stroke:#2080c0
-    linkStyle 2,3 stroke:#e07020,stroke-width:2px
-    linkStyle 4,5,6 stroke:#2080c0,stroke-dasharray:5 5
-    linkStyle 7,8,9 stroke:#2080c0
+    linkStyle 0,1,2,3 stroke:#2080c0
+    linkStyle 4 stroke:#e07020,stroke-width:2px
+    linkStyle 5,6,7 stroke:#2080c0,stroke-dasharray:5 5
+    linkStyle 8,9,10 stroke:#2080c0
 ```
 
 <sub>Orange = SSH tunnel (TCP) · Blue = Unix domain socket</sub>
