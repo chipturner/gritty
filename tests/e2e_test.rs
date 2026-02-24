@@ -17,16 +17,19 @@ static CONCURRENCY: LazyLock<Semaphore> = LazyLock::new(|| Semaphore::new(4));
 
 static TEST_ID: AtomicU32 = AtomicU32::new(0);
 
+/// Shared temp directory for all e2e test sockets (isolated from /tmp).
+static TEST_DIR: LazyLock<tempfile::TempDir> = LazyLock::new(|| tempfile::tempdir().unwrap());
+
 fn unique_agent_socket_path() -> PathBuf {
     let id = TEST_ID.fetch_add(1, Ordering::Relaxed);
     let pid = std::process::id();
-    std::env::temp_dir().join(format!("gritty-test-agent-{pid}-{id}.sock"))
+    TEST_DIR.path().join(format!("agent-{pid}-{id}.sock"))
 }
 
 fn unique_open_socket_path() -> PathBuf {
     let id = TEST_ID.fetch_add(1, Ordering::Relaxed);
     let pid = std::process::id();
-    std::env::temp_dir().join(format!("gritty-test-open-{pid}-{id}.sock"))
+    TEST_DIR.path().join(format!("open-{pid}-{id}.sock"))
 }
 
 /// Spawn a server task connected via socketpair + channel.

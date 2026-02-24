@@ -221,11 +221,10 @@ mod tests {
     async fn bind_unix_listener_stale_socket() {
         let tmp = tempfile::tempdir().unwrap();
         let sock = tmp.path().join("stale.sock");
-        // Create and immediately drop a listener (stale socket)
-        {
-            let _l = bind_unix_listener(&sock).unwrap();
-        }
-        // Socket file remains but nobody is listening
+        // Create a stale socket file using UnixDatagram (never calls listen()).
+        // This avoids a macOS kernel race where connect() briefly succeeds on a
+        // just-closed listening socket.
+        drop(std::os::unix::net::UnixDatagram::bind(&sock).unwrap());
         assert!(sock.exists());
         // Re-bind should clean up stale socket and succeed
         let _listener = bind_unix_listener(&sock).unwrap();

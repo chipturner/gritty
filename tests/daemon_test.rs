@@ -2,23 +2,21 @@ use bytes::Bytes;
 use futures_util::{SinkExt, StreamExt};
 use gritty::protocol::{Frame, FrameCodec};
 use std::sync::LazyLock;
-use std::sync::atomic::{AtomicU32, Ordering};
 use std::time::Duration;
 use tokio::net::UnixStream;
 use tokio::sync::Semaphore;
 use tokio::time::timeout;
 use tokio_util::codec::Framed;
 
-static TEST_COUNTER: AtomicU32 = AtomicU32::new(0);
-
 /// Limit concurrent daemon tests to avoid PTY/CPU exhaustion under parallel load.
 static CONCURRENCY: LazyLock<Semaphore> = LazyLock::new(|| Semaphore::new(3));
 
-/// Generate a unique control socket path per test.
-fn unique_ctl(label: &str) -> std::path::PathBuf {
-    let pid = std::process::id();
-    let seq = TEST_COUNTER.fetch_add(1, Ordering::Relaxed);
-    std::env::temp_dir().join(format!("gritty-d-{label}-{pid}-{seq}-ctl.sock"))
+/// Create an isolated temp directory with a control socket path inside it.
+/// The TempDir must be kept alive for the duration of the test.
+fn test_ctl() -> (tempfile::TempDir, std::path::PathBuf) {
+    let tmp = tempfile::tempdir().unwrap();
+    let ctl_path = tmp.path().join("ctl.sock");
+    (tmp, ctl_path)
 }
 
 /// Helper: send a control frame and get the response.
@@ -90,8 +88,7 @@ async fn kill_cleanup(ctl_path: &std::path::Path, session: &str) {
 #[tokio::test]
 async fn daemon_creates_and_lists_sessions() {
     let _permit = CONCURRENCY.acquire().await.unwrap();
-    let ctl_path = unique_ctl("create-list");
-    let _ = std::fs::remove_file(&ctl_path);
+    let (_tmp, ctl_path) = test_ctl();
 
     let ctl = ctl_path.clone();
     let _daemon = tokio::spawn(async move { gritty::daemon::run(&ctl, None).await });
@@ -111,14 +108,12 @@ async fn daemon_creates_and_lists_sessions() {
     }
 
     kill_cleanup(&ctl_path, &id).await;
-    let _ = std::fs::remove_file(&ctl_path);
 }
 
 #[tokio::test]
 async fn daemon_rejects_duplicate_name() {
     let _permit = CONCURRENCY.acquire().await.unwrap();
-    let ctl_path = unique_ctl("dup");
-    let _ = std::fs::remove_file(&ctl_path);
+    let (_tmp, ctl_path) = test_ctl();
 
     let ctl = ctl_path.clone();
     let _daemon = tokio::spawn(async move { gritty::daemon::run(&ctl, None).await });
@@ -131,14 +126,12 @@ async fn daemon_rejects_duplicate_name() {
     assert!(matches!(resp, Frame::Error { .. }), "expected Error for duplicate name, got {resp:?}");
 
     kill_cleanup(&ctl_path, &id).await;
-    let _ = std::fs::remove_file(&ctl_path);
 }
 
 #[tokio::test]
 async fn daemon_allows_multiple_unnamed_sessions() {
     let _permit = CONCURRENCY.acquire().await.unwrap();
-    let ctl_path = unique_ctl("unnamed");
-    let _ = std::fs::remove_file(&ctl_path);
+    let (_tmp, ctl_path) = test_ctl();
 
     let ctl = ctl_path.clone();
     let _daemon = tokio::spawn(async move { gritty::daemon::run(&ctl, None).await });
@@ -159,14 +152,12 @@ async fn daemon_allows_multiple_unnamed_sessions() {
 
     kill_cleanup(&ctl_path, &id1).await;
     kill_cleanup(&ctl_path, &id2).await;
-    let _ = std::fs::remove_file(&ctl_path);
 }
 
 #[tokio::test]
 async fn daemon_kills_session() {
     let _permit = CONCURRENCY.acquire().await.unwrap();
-    let ctl_path = unique_ctl("kill");
-    let _ = std::fs::remove_file(&ctl_path);
+    let (_tmp, ctl_path) = test_ctl();
 
     let ctl = ctl_path.clone();
     let _daemon = tokio::spawn(async move { gritty::daemon::run(&ctl, None).await });
@@ -186,15 +177,12 @@ async fn daemon_kills_session() {
         }
         other => panic!("expected SessionInfo, got {other:?}"),
     }
-
-    let _ = std::fs::remove_file(&ctl_path);
 }
 
 #[tokio::test]
 async fn daemon_kills_session_by_name() {
     let _permit = CONCURRENCY.acquire().await.unwrap();
-    let ctl_path = unique_ctl("kill-name");
-    let _ = std::fs::remove_file(&ctl_path);
+    let (_tmp, ctl_path) = test_ctl();
 
     let ctl = ctl_path.clone();
     let _daemon = tokio::spawn(async move { gritty::daemon::run(&ctl, None).await });
@@ -215,15 +203,12 @@ async fn daemon_kills_session_by_name() {
         }
         other => panic!("expected SessionInfo, got {other:?}"),
     }
-
-    let _ = std::fs::remove_file(&ctl_path);
 }
 
 #[tokio::test]
 async fn daemon_kills_server() {
     let _permit = CONCURRENCY.acquire().await.unwrap();
-    let ctl_path = unique_ctl("killsrv");
-    let _ = std::fs::remove_file(&ctl_path);
+    let (_tmp, ctl_path) = test_ctl();
 
     let ctl = ctl_path.clone();
     let daemon = tokio::spawn(async move { gritty::daemon::run(&ctl, None).await });
@@ -243,8 +228,7 @@ async fn daemon_kills_server() {
 #[tokio::test]
 async fn create_after_kill_same_name() {
     let _permit = CONCURRENCY.acquire().await.unwrap();
-    let ctl_path = unique_ctl("create-after-kill");
-    let _ = std::fs::remove_file(&ctl_path);
+    let (_tmp, ctl_path) = test_ctl();
 
     let ctl = ctl_path.clone();
     let _daemon = tokio::spawn(async move { gritty::daemon::run(&ctl, None).await });
@@ -278,14 +262,12 @@ async fn create_after_kill_same_name() {
     }
 
     kill_cleanup(&ctl_path, &id2).await;
-    let _ = std::fs::remove_file(&ctl_path);
 }
 
 #[tokio::test]
 async fn multiple_concurrent_sessions() {
     let _permit = CONCURRENCY.acquire().await.unwrap();
-    let ctl_path = unique_ctl("multi");
-    let _ = std::fs::remove_file(&ctl_path);
+    let (_tmp, ctl_path) = test_ctl();
 
     let ctl = ctl_path.clone();
     let _daemon = tokio::spawn(async move { gritty::daemon::run(&ctl, None).await });
@@ -323,14 +305,12 @@ async fn multiple_concurrent_sessions() {
 
     kill_cleanup(&ctl_path, &id1).await;
     kill_cleanup(&ctl_path, &id2).await;
-    let _ = std::fs::remove_file(&ctl_path);
 }
 
 #[tokio::test]
 async fn daemon_unexpected_frame() {
     let _permit = CONCURRENCY.acquire().await.unwrap();
-    let ctl_path = unique_ctl("unexpected");
-    let _ = std::fs::remove_file(&ctl_path);
+    let (_tmp, ctl_path) = test_ctl();
 
     let ctl = ctl_path.clone();
     let _daemon = tokio::spawn(async move { gritty::daemon::run(&ctl, None).await });
@@ -358,15 +338,12 @@ async fn daemon_unexpected_frame() {
         }
         other => panic!("expected SessionInfo, got {other:?}"),
     }
-
-    let _ = std::fs::remove_file(&ctl_path);
 }
 
 #[tokio::test]
 async fn kill_server_no_sessions() {
     let _permit = CONCURRENCY.acquire().await.unwrap();
-    let ctl_path = unique_ctl("killsrv-empty");
-    let _ = std::fs::remove_file(&ctl_path);
+    let (_tmp, ctl_path) = test_ctl();
 
     let ctl = ctl_path.clone();
     let daemon = tokio::spawn(async move { gritty::daemon::run(&ctl, None).await });
@@ -384,8 +361,7 @@ async fn kill_server_no_sessions() {
 #[tokio::test]
 async fn kill_nonexistent_session() {
     let _permit = CONCURRENCY.acquire().await.unwrap();
-    let ctl_path = unique_ctl("kill-nonexist");
-    let _ = std::fs::remove_file(&ctl_path);
+    let (_tmp, ctl_path) = test_ctl();
 
     let ctl = ctl_path.clone();
     let _daemon = tokio::spawn(async move { gritty::daemon::run(&ctl, None).await });
@@ -396,15 +372,12 @@ async fn kill_nonexistent_session() {
         matches!(resp, Frame::Error { .. }),
         "expected Error for nonexistent session, got {resp:?}"
     );
-
-    let _ = std::fs::remove_file(&ctl_path);
 }
 
 #[tokio::test]
 async fn session_natural_exit_reaps_from_list() {
     let _permit = CONCURRENCY.acquire().await.unwrap();
-    let ctl_path = unique_ctl("natural-reap");
-    let _ = std::fs::remove_file(&ctl_path);
+    let (_tmp, ctl_path) = test_ctl();
 
     let ctl = ctl_path.clone();
     let _daemon = tokio::spawn(async move { gritty::daemon::run(&ctl, None).await });
@@ -447,15 +420,12 @@ async fn session_natural_exit_reaps_from_list() {
             other => panic!("expected SessionInfo, got {other:?}"),
         }
     }
-
-    let _ = std::fs::remove_file(&ctl_path);
 }
 
 #[tokio::test]
 async fn list_before_session_ready() {
     let _permit = CONCURRENCY.acquire().await.unwrap();
-    let ctl_path = unique_ctl("list-early");
-    let _ = std::fs::remove_file(&ctl_path);
+    let (_tmp, ctl_path) = test_ctl();
 
     let ctl = ctl_path.clone();
     let _daemon = tokio::spawn(async move { gritty::daemon::run(&ctl, None).await });
@@ -480,14 +450,12 @@ async fn list_before_session_ready() {
 
     tokio::time::sleep(Duration::from_millis(300)).await;
     kill_cleanup(&ctl_path, &id).await;
-    let _ = std::fs::remove_file(&ctl_path);
 }
 
 #[tokio::test]
 async fn kill_session_while_client_connected() {
     let _permit = CONCURRENCY.acquire().await.unwrap();
-    let ctl_path = unique_ctl("kill-connected");
-    let _ = std::fs::remove_file(&ctl_path);
+    let (_tmp, ctl_path) = test_ctl();
 
     let ctl = ctl_path.clone();
     let _daemon = tokio::spawn(async move { gritty::daemon::run(&ctl, None).await });
@@ -518,15 +486,12 @@ async fn kill_session_while_client_connected() {
             panic!("unexpected frame after session kill: {other:?}");
         }
     }
-
-    let _ = std::fs::remove_file(&ctl_path);
 }
 
 #[tokio::test]
 async fn session_metadata_has_pty_and_pid() {
     let _permit = CONCURRENCY.acquire().await.unwrap();
-    let ctl_path = unique_ctl("meta-info");
-    let _ = std::fs::remove_file(&ctl_path);
+    let (_tmp, ctl_path) = test_ctl();
 
     let ctl = ctl_path.clone();
     let _daemon = tokio::spawn(async move { gritty::daemon::run(&ctl, None).await });
@@ -555,14 +520,12 @@ async fn session_metadata_has_pty_and_pid() {
     }
 
     kill_cleanup(&ctl_path, &id).await;
-    let _ = std::fs::remove_file(&ctl_path);
 }
 
 #[tokio::test]
 async fn attach_to_session() {
     let _permit = CONCURRENCY.acquire().await.unwrap();
-    let ctl_path = unique_ctl("attach");
-    let _ = std::fs::remove_file(&ctl_path);
+    let (_tmp, ctl_path) = test_ctl();
 
     let ctl = ctl_path.clone();
     let _daemon = tokio::spawn(async move { gritty::daemon::run(&ctl, None).await });
@@ -587,14 +550,12 @@ async fn attach_to_session() {
     );
 
     kill_cleanup(&ctl_path, &id).await;
-    let _ = std::fs::remove_file(&ctl_path);
 }
 
 #[tokio::test]
 async fn attach_by_name() {
     let _permit = CONCURRENCY.acquire().await.unwrap();
-    let ctl_path = unique_ctl("attach-name");
-    let _ = std::fs::remove_file(&ctl_path);
+    let (_tmp, ctl_path) = test_ctl();
 
     let ctl = ctl_path.clone();
     let _daemon = tokio::spawn(async move { gritty::daemon::run(&ctl, None).await });
@@ -619,14 +580,12 @@ async fn attach_by_name() {
     );
 
     kill_cleanup(&ctl_path, &id).await;
-    let _ = std::fs::remove_file(&ctl_path);
 }
 
 #[tokio::test]
 async fn attach_nonexistent_returns_error() {
     let _permit = CONCURRENCY.acquire().await.unwrap();
-    let ctl_path = unique_ctl("attach-noexist");
-    let _ = std::fs::remove_file(&ctl_path);
+    let (_tmp, ctl_path) = test_ctl();
 
     let ctl = ctl_path.clone();
     let _daemon = tokio::spawn(async move { gritty::daemon::run(&ctl, None).await });
@@ -638,8 +597,6 @@ async fn attach_nonexistent_returns_error() {
         matches!(resp, Frame::Error { .. }),
         "expected Error for nonexistent attach, got {resp:?}"
     );
-
-    let _ = std::fs::remove_file(&ctl_path);
 }
 
 /// Regression: attaching to a session whose shell has exited should return Error,
@@ -647,8 +604,7 @@ async fn attach_nonexistent_returns_error() {
 #[tokio::test]
 async fn attach_dead_session_returns_error() {
     let _permit = CONCURRENCY.acquire().await.unwrap();
-    let ctl_path = unique_ctl("attach-dead");
-    let _ = std::fs::remove_file(&ctl_path);
+    let (_tmp, ctl_path) = test_ctl();
 
     let ctl = ctl_path.clone();
     let _daemon = tokio::spawn(async move { gritty::daemon::run(&ctl, None).await });
@@ -686,8 +642,6 @@ async fn attach_dead_session_returns_error() {
         matches!(resp, Frame::Error { .. }),
         "expected Error for dead session attach, got {resp:?}"
     );
-
-    let _ = std::fs::remove_file(&ctl_path);
 }
 
 /// Regression: killing a session whose shell has already exited should return Error,
@@ -695,8 +649,7 @@ async fn attach_dead_session_returns_error() {
 #[tokio::test]
 async fn kill_dead_session_returns_error() {
     let _permit = CONCURRENCY.acquire().await.unwrap();
-    let ctl_path = unique_ctl("kill-dead");
-    let _ = std::fs::remove_file(&ctl_path);
+    let (_tmp, ctl_path) = test_ctl();
 
     let ctl = ctl_path.clone();
     let _daemon = tokio::spawn(async move { gritty::daemon::run(&ctl, None).await });
@@ -734,15 +687,12 @@ async fn kill_dead_session_returns_error() {
         matches!(resp, Frame::Error { .. }),
         "expected Error for dead session kill, got {resp:?}"
     );
-
-    let _ = std::fs::remove_file(&ctl_path);
 }
 
 #[tokio::test]
 async fn list_sessions_shows_heartbeat() {
     let _permit = CONCURRENCY.acquire().await.unwrap();
-    let ctl_path = unique_ctl("heartbeat");
-    let _ = std::fs::remove_file(&ctl_path);
+    let (_tmp, ctl_path) = test_ctl();
 
     let ctl = ctl_path.clone();
     let _daemon = tokio::spawn(async move { gritty::daemon::run(&ctl, None).await });
@@ -779,14 +729,12 @@ async fn list_sessions_shows_heartbeat() {
     }
 
     kill_cleanup(&ctl_path, &id).await;
-    let _ = std::fs::remove_file(&ctl_path);
 }
 
 #[tokio::test]
 async fn reconnect_via_daemon_after_disconnect() {
     let _permit = CONCURRENCY.acquire().await.unwrap();
-    let ctl_path = unique_ctl("reconnect");
-    let _ = std::fs::remove_file(&ctl_path);
+    let (_tmp, ctl_path) = test_ctl();
 
     let ctl = ctl_path.clone();
     let _daemon = tokio::spawn(async move { gritty::daemon::run(&ctl, None).await });
@@ -831,14 +779,12 @@ async fn reconnect_via_daemon_after_disconnect() {
     );
 
     kill_cleanup(&ctl_path, &id).await;
-    let _ = std::fs::remove_file(&ctl_path);
 }
 
 #[tokio::test]
 async fn reconnect_after_session_killed_returns_error() {
     let _permit = CONCURRENCY.acquire().await.unwrap();
-    let ctl_path = unique_ctl("reconn-killed");
-    let _ = std::fs::remove_file(&ctl_path);
+    let (_tmp, ctl_path) = test_ctl();
 
     let ctl = ctl_path.clone();
     let _daemon = tokio::spawn(async move { gritty::daemon::run(&ctl, None).await });
@@ -865,6 +811,4 @@ async fn reconnect_after_session_killed_returns_error() {
         matches!(resp, Frame::Error { .. }),
         "expected Error when attaching to killed session, got {resp:?}"
     );
-
-    let _ = std::fs::remove_file(&ctl_path);
 }
