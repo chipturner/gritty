@@ -11,8 +11,11 @@ env:
 
 jobs:
   check:
-    name: Check
-    runs-on: ubuntu-latest
+    name: Check (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      matrix:
+        os: [ubuntu-latest, macos-latest]
     steps:
       - uses: actions/checkout@v6
 
@@ -23,6 +26,7 @@ jobs:
       - uses: Swatinem/rust-cache@v2
 
       - name: Format
+        if: matrix.os == 'ubuntu-latest'
         run: cargo fmt --check
 
       - name: Clippy
@@ -30,3 +34,62 @@ jobs:
 
       - name: Test
         run: cargo test --locked
+
+  ssh-integration:
+    name: SSH Integration (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    steps:
+      - uses: actions/checkout@v6
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Install and start sshd
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y openssh-server
+          sudo systemctl enable --now ssh
+
+      - name: Enable sshd
+        if: runner.os == 'macOS'
+        run: |
+          sudo systemsetup -setremotelogin on
+
+      - name: Configure SSH key auth
+        run: |
+          ssh-keygen -t ed25519 -f ~/.ssh/id_ed25519 -N ""
+          cat ~/.ssh/id_ed25519.pub >> ~/.ssh/authorized_keys
+          chmod 600 ~/.ssh/authorized_keys
+          ssh-keyscan localhost >> ~/.ssh/known_hosts
+          ssh localhost whoami
+
+      - name: Build and install gritty
+        run: |
+          cargo build
+          mkdir -p ~/.local/bin
+          cp target/debug/gritty ~/.local/bin/
+          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+
+      - name: SSH integration tests
+        run: GRITTY_SSH_TEST=1 cargo test --test ssh_integration_test -- --test-threads=1
+
+  socat-tunnel:
+    name: Socat Tunnel Tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Build
+        run: cargo build
+
+      - name: Socat tunnel tests
+        run: cargo test --test socat_tunnel_test -- --test-threads=1

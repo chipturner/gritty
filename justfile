@@ -36,6 +36,14 @@ test-e2e:
 test-daemon:
     cargo test --test daemon_test
 
+# SSH integration tests (requires sshd + ssh localhost)
+test-ssh:
+    GRITTY_SSH_TEST=1 cargo test --test ssh_integration_test -- --test-threads=1
+
+# Socat tunnel disruption tests (requires socat; skips gracefully if missing)
+test-socat:
+    cargo test --test socat_tunnel_test -- --test-threads=1
+
 # Run full suite N times and report pass/fail tally
 stress count="10":
     #!/usr/bin/env zsh
