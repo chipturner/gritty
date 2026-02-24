@@ -404,7 +404,11 @@ async fn new_session(
             }
             let mut env_vars = gritty::collect_env_vars();
             if forward_open {
-                env_vars.push(("BROWSER".into(), "gritty open".into()));
+                let exe = std::env::current_exe()
+                    .ok()
+                    .and_then(|p| p.to_str().map(String::from))
+                    .unwrap_or_else(|| "gritty".into());
+                env_vars.push(("BROWSER".into(), format!("{exe} open")));
             }
             let code = gritty::client::run(
                 &id,
