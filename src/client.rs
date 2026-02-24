@@ -292,6 +292,9 @@ async fn relay(
     nb_guard: &NonBlockGuard,
     agent_socket: Option<&str>,
 ) -> anyhow::Result<Option<i32>> {
+    let mut sigterm = signal(SignalKind::terminate())?;
+    let mut sighup = signal(SignalKind::hangup())?;
+
     let mut heartbeat_interval = tokio::time::interval(HEARTBEAT_INTERVAL);
     heartbeat_interval.reset(); // first tick is immediate otherwise; delay it
     let mut last_pong = Instant::now();
@@ -456,6 +459,16 @@ async fn relay(
                 if !timed_send(framed, Frame::Ping).await {
                     return Ok(None);
                 }
+            }
+
+            _ = sigterm.recv() => {
+                debug!("SIGTERM received, exiting");
+                return Ok(Some(1));
+            }
+
+            _ = sighup.recv() => {
+                debug!("SIGHUP received, exiting");
+                return Ok(Some(1));
             }
         }
     }
