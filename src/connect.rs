@@ -193,9 +193,9 @@ async fn spawn_tunnel(
     Ok(child)
 }
 
-/// Poll until the local socket is connectable (200ms interval, 15s timeout).
-async fn wait_for_socket(path: &Path) -> anyhow::Result<()> {
-    let deadline = Instant::now() + Duration::from_secs(15);
+/// Poll until the local socket is connectable (200ms interval).
+async fn wait_for_socket(path: &Path, timeout: Duration) -> anyhow::Result<()> {
+    let deadline = Instant::now() + timeout;
     loop {
         if std::os::unix::net::UnixStream::connect(path).is_ok() {
             return Ok(());
@@ -576,7 +576,7 @@ pub async fn run(opts: ConnectOpts, ready_fd: Option<OwnedFd>) -> anyhow::Result
     };
 
     // 6. Wait for local socket to become connectable
-    wait_for_socket(&local_sock).await?;
+    wait_for_socket(&local_sock, Duration::from_secs(15)).await?;
     debug!("tunnel socket ready");
 
     // Write PID + dest files
@@ -1089,22 +1089,15 @@ mod tests {
             tokio::time::sleep(Duration::from_secs(30)).await;
         });
 
-        let result = tokio::time::timeout(
-            Duration::from_secs(5),
-            wait_for_socket(&sock_path),
-        )
-        .await;
-
-        assert!(result.is_ok(), "should complete within timeout");
-        assert!(result.unwrap().is_ok(), "should successfully connect");
+        let result = wait_for_socket(&sock_path, Duration::from_secs(5)).await;
+        assert!(result.is_ok(), "should successfully connect");
     }
 
-    #[ignore] // Takes 15s (full timeout)
     #[tokio::test]
     async fn wait_for_socket_timeout() {
         let dir = tempfile::tempdir().unwrap();
         let sock_path = dir.path().join("never.sock");
-        let result = wait_for_socket(&sock_path).await;
+        let result = wait_for_socket(&sock_path, Duration::from_secs(1)).await;
         assert!(result.is_err());
     }
 }
