@@ -140,9 +140,19 @@ fn spawn_open_acceptor(
                 }
             };
 
-            if let Err(e) = crate::security::verify_peer_uid(&stream) {
-                warn!("open socket: {e}");
-                continue;
+            // Open socket uses fire-and-forget connections (connect, write URL,
+            // close). On macOS, getpeereid() can fail if the peer has already
+            // disconnected by the time accept() returns. Reject known-bad UIDs
+            // but tolerate OS-level errors (filesystem perms still protect).
+            match crate::security::verify_peer_uid(&stream) {
+                Ok(()) => {}
+                Err(e) if e.kind() == std::io::ErrorKind::PermissionDenied => {
+                    warn!("open socket: {e}");
+                    continue;
+                }
+                Err(e) => {
+                    debug!("open socket peer_cred unavailable: {e}");
+                }
             }
 
             let etx = event_tx.clone();
