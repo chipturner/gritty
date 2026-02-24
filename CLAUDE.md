@@ -18,6 +18,7 @@ gritty provides persistent TTY sessions over Unix domain sockets. Single binary,
 - `gritty kill-session -t <id|name>` — kills a specific session
 - `gritty socket-path` — prints the default server socket path. Alias: `socket`
 - `gritty kill-server` — kills server and all sessions
+- `gritty info` — shows diagnostics: version, socket paths, server status/session count, log file paths, active tunnels with status/pid/log paths
 
 Sessions get auto-incrementing integer IDs (0, 1, 2...) with optional human-friendly names via `-t`.
 

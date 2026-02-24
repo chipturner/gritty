@@ -741,15 +741,18 @@ pub async fn disconnect(name: &str) -> anyhow::Result<()> {
 // List tunnels
 // ---------------------------------------------------------------------------
 
-pub fn list_tunnels() {
-    let names = enumerate_tunnels();
-    if names.is_empty() {
-        println!("no active tunnels");
-        return;
-    }
+pub struct TunnelInfo {
+    pub name: String,
+    pub destination: String,
+    pub status: String,
+    pub pid: Option<u32>,
+    pub log_path: PathBuf,
+}
 
-    // Probe each, clean stale ones, collect live entries
-    let mut rows: Vec<(String, String, String)> = Vec::new();
+/// Gather info for all live tunnels (cleans stale ones as a side effect).
+pub fn get_tunnel_info() -> Vec<TunnelInfo> {
+    let names = enumerate_tunnels();
+    let mut infos = Vec::new();
     for name in &names {
         let status = probe_tunnel_status(name);
         if status == TunnelStatus::Stale {
@@ -764,20 +767,30 @@ pub fn list_tunnels() {
             TunnelStatus::Reconnecting => "reconnecting".to_string(),
             TunnelStatus::Stale => unreachable!(),
         };
-        rows.push((name.clone(), dest.trim().to_string(), status_str));
+        infos.push(TunnelInfo {
+            name: name.clone(),
+            destination: dest.trim().to_string(),
+            status: status_str,
+            pid: read_pid_hint(name),
+            log_path: crate::daemon::socket_dir().join(format!("connect-{name}.log")),
+        });
     }
+    infos
+}
 
-    if rows.is_empty() {
+pub fn list_tunnels() {
+    let infos = get_tunnel_info();
+    if infos.is_empty() {
         println!("no active tunnels");
         return;
     }
 
-    let w_name = rows.iter().map(|r| r.0.len()).max().unwrap().max(4);
-    let w_dest = rows.iter().map(|r| r.1.len()).max().unwrap().max(11);
+    let w_name = infos.iter().map(|i| i.name.len()).max().unwrap().max(4);
+    let w_dest = infos.iter().map(|i| i.destination.len()).max().unwrap().max(11);
 
     println!("{:<w_name$}  {:<w_dest$}  Status", "Name", "Destination");
-    for (name, dest, status) in &rows {
-        println!("{:<w_name$}  {:<w_dest$}  {status}", name, dest);
+    for info in &infos {
+        println!("{:<w_name$}  {:<w_dest$}  {}", info.name, info.destination, info.status);
     }
 }
 

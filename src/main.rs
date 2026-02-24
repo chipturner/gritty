@@ -138,6 +138,8 @@ enum Command {
     /// List active SSH tunnels
     #[command(alias = "tun")]
     Tunnels,
+    /// Show diagnostics (paths, server status, tunnels)
+    Info,
 }
 
 fn init_tracing(verbose: bool, log_path: Option<&Path>) {
@@ -463,6 +465,7 @@ async fn run(cli: Cli) -> anyhow::Result<()> {
             gritty::connect::list_tunnels();
             Ok(())
         }
+        Command::Info => info().await,
     }
 }
 
@@ -721,6 +724,77 @@ async fn kill_server(ctl_path: PathBuf) -> anyhow::Result<()> {
         Frame::Error { message } => anyhow::bail!("{message}"),
         other => anyhow::bail!("unexpected response from server: {other:?}"),
     }
+}
+
+async fn info() -> anyhow::Result<()> {
+    use gritty::protocol::Frame;
+    use tokio::net::UnixStream;
+
+    println!("gritty {}", env!("CARGO_PKG_VERSION"));
+    println!();
+
+    let socket_dir = canonicalize_or_raw(gritty::daemon::socket_dir());
+    let ctl_path = socket_dir.join("ctl.sock");
+
+    println!("socket dir:     {}", socket_dir.display());
+    println!("server socket:  {}", ctl_path.display());
+
+    // Probe server status
+    let pid_path = gritty::daemon::pid_file_path(&ctl_path);
+    let pid = std::fs::read_to_string(&pid_path).ok().and_then(|s| s.trim().parse::<u32>().ok());
+
+    if UnixStream::connect(&ctl_path).await.is_ok() {
+        // Server is reachable — try to get session count
+        let session_count = match server_request(&ctl_path, Frame::ListSessions).await {
+            Ok(Frame::SessionInfo { sessions }) => Some(sessions.len()),
+            _ => None,
+        };
+        match (pid, session_count) {
+            (Some(p), Some(n)) => {
+                let s = if n == 1 { "" } else { "s" };
+                println!("server status:  running (pid {p}, {n} session{s})");
+            }
+            (Some(p), None) => println!("server status:  running (pid {p})"),
+            (None, _) => println!("server status:  running"),
+        }
+    } else {
+        println!("server status:  not running");
+    }
+
+    let log_path = socket_dir.join("daemon.log");
+    let out_path = socket_dir.join("daemon.out");
+    print_path("server log:    ", &log_path);
+    print_path("server output: ", &out_path);
+
+    // Tunnels
+    let tunnels = gritty::connect::get_tunnel_info();
+    if !tunnels.is_empty() {
+        println!();
+        println!("tunnels:");
+        for t in &tunnels {
+            let pid_str = match t.pid {
+                Some(p) => format!(" (pid {p})"),
+                None => String::new(),
+            };
+            println!("  {:<14}{}{pid_str}", t.name, t.status);
+            print_path("                log:", &canonicalize_or_raw(t.log_path.clone()));
+        }
+    }
+
+    Ok(())
+}
+
+fn print_path(label: &str, path: &Path) {
+    if path.exists() {
+        println!("{label} {}", path.display());
+    } else {
+        println!("{label} {} (not found)", path.display());
+    }
+}
+
+/// Resolve symlinks in the path (e.g. /tmp → /private/tmp on macOS).
+fn canonicalize_or_raw(path: PathBuf) -> PathBuf {
+    std::fs::canonicalize(&path).unwrap_or(path)
 }
 
 #[cfg(test)]

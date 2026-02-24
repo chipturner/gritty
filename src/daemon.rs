@@ -36,7 +36,7 @@ pub fn control_socket_path() -> PathBuf {
 }
 
 /// Returns the PID file path (sibling to ctl.sock).
-fn pid_file_path(ctl_path: &Path) -> PathBuf {
+pub fn pid_file_path(ctl_path: &Path) -> PathBuf {
     ctl_path.with_file_name("daemon.pid")
 }
 
