@@ -108,28 +108,45 @@ fn remote_exec_command(dest: &Destination, remote_cmd: &str, extra_ssh_opts: &[S
 }
 
 /// Run a command on the remote host via SSH, returning stdout.
+///
+/// In foreground mode, stdin and stderr inherit the terminal so interactive
+/// prompts (host key confirmation, password, MFA) work. In background mode,
+/// `BatchMode=yes` is set so SSH fails fast instead of hanging.
 async fn remote_exec(
     dest: &Destination,
     remote_cmd: &str,
     extra_ssh_opts: &[String],
+    foreground: bool,
 ) -> anyhow::Result<String> {
     debug!("ssh {}: {remote_cmd}", dest.ssh_dest());
 
     let mut cmd = remote_exec_command(dest, remote_cmd, extra_ssh_opts);
     cmd.stdout(Stdio::piped());
-    cmd.stderr(Stdio::piped());
-    cmd.stdin(Stdio::null());
+    if foreground {
+        cmd.stdin(Stdio::inherit());
+        cmd.stderr(Stdio::inherit());
+    } else {
+        cmd.arg("-o").arg("BatchMode=yes");
+        cmd.stdin(Stdio::null());
+        cmd.stderr(Stdio::piped());
+    }
 
     let output = cmd.output().await.context("failed to run ssh")?;
 
     if !output.status.success() {
+        if foreground {
+            bail!("ssh command failed (exit {})", output.status);
+        }
         let stderr = String::from_utf8_lossy(&output.stderr);
         let stderr = stderr.trim();
         debug!("ssh failed (status {}): {stderr}", output.status);
         if stderr.contains("command not found") || stderr.contains("No such file") {
             bail!("gritty not found on remote host (is it in PATH?)");
         }
-        bail!("ssh command failed: {stderr}");
+        let ssh_dest = dest.ssh_dest();
+        bail!(
+            "ssh command failed: {stderr}\n  to diagnose: ssh {ssh_dest}\n  or try: gritty connect --foreground {ssh_dest}"
+        );
     }
 
     let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
@@ -158,11 +175,15 @@ fn format_command(cmd: &Command) -> String {
 }
 
 /// Build the SSH tunnel command with hardened options.
+///
+/// In foreground mode, stdio is inherited so the user sees errors directly.
+/// In background mode, `BatchMode=yes` is added and stdio is null/piped.
 fn tunnel_command(
     dest: &Destination,
     local_sock: &Path,
     remote_sock: &str,
     extra_ssh_opts: &[String],
+    foreground: bool,
 ) -> Command {
     let mut cmd = Command::new("ssh");
     cmd.args(dest.port_args());
@@ -170,12 +191,19 @@ fn tunnel_command(
     for opt in extra_ssh_opts {
         cmd.arg("-o").arg(opt);
     }
+    if !foreground {
+        cmd.arg("-o").arg("BatchMode=yes");
+    }
     let forward = format!("{}:{}", local_sock.display(), remote_sock);
     cmd.arg("-L").arg(forward);
     cmd.arg(dest.ssh_dest());
-    cmd.stdout(Stdio::null());
-    cmd.stderr(Stdio::piped());
-    cmd.stdin(Stdio::null());
+    if foreground {
+        // Inherit stdio so the user sees any SSH errors/prompts
+    } else {
+        cmd.stdout(Stdio::null());
+        cmd.stderr(Stdio::piped());
+        cmd.stdin(Stdio::null());
+    }
     cmd
 }
 
@@ -185,9 +213,10 @@ async fn spawn_tunnel(
     local_sock: &Path,
     remote_sock: &str,
     extra_ssh_opts: &[String],
+    foreground: bool,
 ) -> anyhow::Result<Child> {
     debug!("tunnel: {} -> {}:{}", local_sock.display(), dest.ssh_dest(), remote_sock,);
-    let mut cmd = tunnel_command(dest, local_sock, remote_sock, extra_ssh_opts);
+    let mut cmd = tunnel_command(dest, local_sock, remote_sock, extra_ssh_opts, foreground);
     let child = cmd.spawn().context("failed to spawn ssh tunnel")?;
     debug!("ssh tunnel pid: {:?}", child.id());
     Ok(child)
@@ -265,7 +294,7 @@ async fn tunnel_monitor(
                     return;
                 }
 
-                match spawn_tunnel(&dest, &local_sock, &remote_sock, &extra_ssh_opts).await {
+                match spawn_tunnel(&dest, &local_sock, &remote_sock, &extra_ssh_opts, false).await {
                     Ok(new_child) => {
                         info!("ssh tunnel respawned");
                         child = new_child;
@@ -295,11 +324,12 @@ async fn ensure_remote_ready(
     dest: &Destination,
     no_server_start: bool,
     extra_ssh_opts: &[String],
+    foreground: bool,
 ) -> anyhow::Result<String> {
     let remote_cmd = if no_server_start { "gritty socket-path" } else { REMOTE_ENSURE_CMD };
     debug!("ensuring remote server (no_server_start={no_server_start})");
 
-    let sock_path = remote_exec(dest, remote_cmd, extra_ssh_opts).await?;
+    let sock_path = remote_exec(dest, remote_cmd, extra_ssh_opts, foreground).await?;
 
     if sock_path.is_empty() {
         bail!("remote host returned empty socket path");
@@ -483,6 +513,7 @@ pub struct ConnectOpts {
     pub ssh_options: Vec<String>,
     pub name: Option<String>,
     pub dry_run: bool,
+    pub foreground: bool,
 }
 
 pub async fn run(opts: ConnectOpts, ready_fd: Option<OwnedFd>) -> anyhow::Result<i32> {
@@ -494,7 +525,8 @@ pub async fn run(opts: ConnectOpts, ready_fd: Option<OwnedFd>) -> anyhow::Result
         let remote_cmd =
             if opts.no_server_start { "gritty socket-path" } else { REMOTE_ENSURE_CMD };
         let ensure_cmd = remote_exec_command(&dest, remote_cmd, &opts.ssh_options);
-        let tunnel_cmd = tunnel_command(&dest, &local_sock, "$REMOTE_SOCK", &opts.ssh_options);
+        let tunnel_cmd =
+            tunnel_command(&dest, &local_sock, "$REMOTE_SOCK", &opts.ssh_options, true);
 
         println!(
             "# Get remote socket path{}",
@@ -558,11 +590,14 @@ pub async fn run(opts: ConnectOpts, ready_fd: Option<OwnedFd>) -> anyhow::Result
     let lock_fd = acquire_lock(&lock_path)?;
 
     // 4. Ensure remote server is running and get socket path
-    let remote_sock = ensure_remote_ready(&dest, opts.no_server_start, &opts.ssh_options).await?;
+    let remote_sock =
+        ensure_remote_ready(&dest, opts.no_server_start, &opts.ssh_options, opts.foreground)
+            .await?;
     debug!(remote_sock, "remote socket path");
 
     // 5. Spawn SSH tunnel
-    let child = spawn_tunnel(&dest, &local_sock, &remote_sock, &opts.ssh_options).await?;
+    let child =
+        spawn_tunnel(&dest, &local_sock, &remote_sock, &opts.ssh_options, opts.foreground).await?;
     let stop = tokio_util::sync::CancellationToken::new();
 
     let mut guard = ConnectGuard {
@@ -774,6 +809,7 @@ mod tests {
             Path::new("/tmp/local.sock"),
             "/run/user/1000/gritty/ctl.sock",
             &[],
+            false,
         );
         let args: Vec<_> =
             cmd.as_std().get_args().map(|a| a.to_string_lossy().to_string()).collect();
@@ -781,6 +817,7 @@ mod tests {
         assert!(args.contains(&"StreamLocalBindUnlink=yes".to_string()));
         assert!(args.contains(&"ExitOnForwardFailure=yes".to_string()));
         assert!(args.contains(&"ConnectTimeout=5".to_string()));
+        assert!(args.contains(&"BatchMode=yes".to_string()));
         assert!(args.contains(&"-N".to_string()));
         assert!(args.contains(&"-T".to_string()));
         assert!(args.contains(&"/tmp/local.sock:/run/user/1000/gritty/ctl.sock".to_string()));
@@ -795,6 +832,7 @@ mod tests {
             Path::new("/tmp/local.sock"),
             "/tmp/remote.sock",
             &["ProxyJump=bastion".to_string()],
+            false,
         );
         let args: Vec<_> =
             cmd.as_std().get_args().map(|a| a.to_string_lossy().to_string()).collect();
@@ -883,7 +921,7 @@ mod tests {
     #[test]
     fn format_command_tunnel() {
         let dest = Destination::parse("user@host").unwrap();
-        let cmd = tunnel_command(&dest, Path::new("/tmp/local.sock"), "$REMOTE_SOCK", &[]);
+        let cmd = tunnel_command(&dest, Path::new("/tmp/local.sock"), "$REMOTE_SOCK", &[], true);
         let formatted = format_command(&cmd);
         // Uses the same SSH_TUNNEL_OPTS
         assert!(formatted.contains("ServerAliveInterval=3"));

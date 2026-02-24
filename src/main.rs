@@ -298,6 +298,7 @@ fn main() {
                 ssh_options,
                 name,
                 dry_run,
+                foreground,
             };
 
             match rt.block_on(gritty::connect::run(opts, ready_fd)) {
