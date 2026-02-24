@@ -96,6 +96,11 @@ fn spawn_agent_acceptor(
                 }
             };
 
+            if let Err(e) = crate::security::verify_peer_uid(&stream) {
+                warn!("agent socket: {e}");
+                continue;
+            }
+
             let channel_id = next_channel_id.fetch_add(1, Ordering::Relaxed);
 
             let (read_half, write_half) = stream.into_split();
@@ -134,6 +139,11 @@ fn spawn_open_acceptor(
                     break;
                 }
             };
+
+            if let Err(e) = crate::security::verify_peer_uid(&stream) {
+                warn!("open socket: {e}");
+                continue;
+            }
 
             let etx = event_tx.clone();
             tokio::spawn(async move {
