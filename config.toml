@@ -1,0 +1,33 @@
+# gritty configuration file
+# $XDG_CONFIG_HOME/gritty/config.toml (default: ~/.config/gritty/config.toml)
+#
+# All settings are optional. CLI flags always take priority.
+# Precedence: CLI flag > [host.<name>] > [defaults] > built-in default.
+
+# Global defaults for all sessions and connections.
+[defaults]
+# forward-agent = false
+# forward-open = false
+# no-escape = false
+# no-redraw = false
+
+# Connect-specific global defaults.
+[defaults.connect]
+# ssh-options = []
+# no-server-start = false
+
+# Per-host overrides, keyed by connection name.
+# Connection name = hostname from destination, or -n <name> override.
+#
+# [host.devbox]
+# forward-agent = true
+# forward-open = true
+#
+# [host.devbox.connect]
+# ssh-options = ["IdentityFile=~/.ssh/devbox_key"]
+#
+# [host.prod]
+# no-escape = true
+#
+# [host.prod.connect]
+# no-server-start = true

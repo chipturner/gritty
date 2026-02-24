@@ -144,6 +144,8 @@ enum Command {
     Tunnels,
     /// Show diagnostics (paths, server status, tunnels)
     Info,
+    /// Open config file in $EDITOR (creates from template if missing)
+    ConfigEdit,
 }
 
 fn init_tracing(verbose: bool, log_path: Option<&Path>) {
@@ -494,6 +496,7 @@ async fn run(cli: Cli, config: gritty::config::ConfigFile) -> anyhow::Result<()>
             Ok(())
         }
         Command::Info => info(&config).await,
+        Command::ConfigEdit => config_edit(),
     }
 }
 
@@ -753,6 +756,25 @@ async fn kill_server(ctl_path: PathBuf) -> anyhow::Result<()> {
         Frame::Error { message } => anyhow::bail!("{message}"),
         other => anyhow::bail!("unexpected response from server: {other:?}"),
     }
+}
+
+fn config_edit() -> anyhow::Result<()> {
+    let path = gritty::config::config_path();
+    if !path.exists() {
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        std::fs::write(&path, gritty::config::DEFAULT_CONFIG)?;
+        eprintln!("created {}", path.display());
+    }
+    let editor = std::env::var("VISUAL")
+        .or_else(|_| std::env::var("EDITOR"))
+        .unwrap_or_else(|_| "vi".into());
+    let status = std::process::Command::new(&editor).arg(&path).status()?;
+    if !status.success() {
+        anyhow::bail!("{editor} exited with {status}");
+    }
+    Ok(())
 }
 
 async fn info(config: &gritty::config::ConfigFile) -> anyhow::Result<()> {

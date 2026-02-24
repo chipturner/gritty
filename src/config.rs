@@ -3,6 +3,9 @@ use std::path::PathBuf;
 
 use serde::Deserialize;
 
+/// Embedded default config template (from repo root config.toml).
+pub const DEFAULT_CONFIG: &str = include_str!("../config.toml");
+
 /// Resolved session settings after merging all config layers.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct SessionSettings {

@@ -82,6 +82,7 @@ ID  Name    PTY         PID    Created              Status
 | `gritty kill-session [host] -t <id\|name>` | | Kill a session |
 | `gritty kill-server [host]` | | Kill the server and all sessions |
 | `gritty open <url>` | | Open a URL on the local machine (inside sessions) |
+| `gritty config-edit` | | Open config in `$EDITOR` (creates from template if missing) |
 
 The `[host]` argument is a connection name from `gritty connect` (e.g., `gritty ls devbox`). Omit it to use the local server.
 
@@ -96,7 +97,7 @@ The `[host]` argument is a connection name from `gritty connect` (e.g., `gritty 
 
 ## Configuration
 
-gritty works out of the box with no config file. Optionally, you can set persistent defaults in `$XDG_CONFIG_HOME/gritty/config.toml` (default: `~/.config/gritty/config.toml`).
+gritty works out of the box with no config file. Optionally, you can set persistent defaults in `$XDG_CONFIG_HOME/gritty/config.toml` (default: `~/.config/gritty/config.toml`). Run `gritty config-edit` to create and open the config file.
 
 ```toml
 # Global defaults for all sessions/connections.
