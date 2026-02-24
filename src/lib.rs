@@ -70,10 +70,7 @@ mod tests {
     fn collect_env_vars_only_known_keys() {
         let vars = collect_env_vars();
         for (k, _) in &vars {
-            assert!(
-                ["TERM", "LANG", "COLORTERM"].contains(&k.as_str()),
-                "unexpected key: {k}"
-            );
+            assert!(["TERM", "LANG", "COLORTERM"].contains(&k.as_str()), "unexpected key: {k}");
         }
     }
 
@@ -153,24 +150,16 @@ mod tests {
         let (read_half, _) = read_stream.into_split();
         let (_, write_half) = write_stream.into_split();
 
-        let writer_tx = spawn_channel_relay(
-            7,
-            read_half,
-            write_half,
-            |_, _| true,
-            |_| {},
-        );
+        let writer_tx = spawn_channel_relay(7, read_half, write_half, |_, _| true, |_| {});
 
         writer_tx.send(bytes::Bytes::from_static(b"hello")).unwrap();
 
         let mut buf = vec![0u8; 32];
-        let n = tokio::time::timeout(
-            std::time::Duration::from_secs(2),
-            drain_stream.read(&mut buf),
-        )
-        .await
-        .unwrap()
-        .unwrap();
+        let n =
+            tokio::time::timeout(std::time::Duration::from_secs(2), drain_stream.read(&mut buf))
+                .await
+                .unwrap()
+                .unwrap();
 
         assert_eq!(&buf[..n], b"hello");
     }

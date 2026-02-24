@@ -809,7 +809,10 @@ async fn reconnect_via_daemon_after_disconnect() {
     let mut framed = Framed::new(stream, FrameCodec);
     framed.send(Frame::Attach { session: id.clone() }).await.unwrap();
     let resp = timeout(Duration::from_secs(3), framed.next())
-        .await.expect("timed out").expect("stream ended").expect("decode error");
+        .await
+        .expect("timed out")
+        .expect("stream ended")
+        .expect("decode error");
     assert_eq!(resp, Frame::Ok, "expected Ok for re-attach, got {resp:?}");
     framed.send(Frame::Resize { cols: 80, rows: 24 }).await.unwrap();
     drain_data(&mut framed, Duration::from_millis(500)).await;
