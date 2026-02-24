@@ -73,35 +73,51 @@ impl Destination {
 // SSH helpers
 // ---------------------------------------------------------------------------
 
-/// Hardened SSH options embedded in every tunnel.
-const SSH_TUNNEL_OPTS: &[&str] = &[
-    "-o",
+/// Tunnel-specific SSH `-o` options (keepalive, cleanup, failure behavior).
+const TUNNEL_SSH_OPTS: &[&str] = &[
     "ServerAliveInterval=3",
-    "-o",
     "ServerAliveCountMax=2",
-    "-o",
     "StreamLocalBindUnlink=yes",
-    "-o",
     "ExitOnForwardFailure=yes",
-    "-o",
-    "ConnectTimeout=5",
-    "-N",
-    "-T",
+    // Prevent user config from leaking forwarding or connection sharing
+    // into the tunnel (gritty handles agent forwarding separately).
+    "ControlPath=none",
+    "ForwardAgent=no",
+    "ForwardX11=no",
 ];
 
 /// PATH prefix prepended to remote commands so gritty is discoverable
 /// in non-interactive SSH shells.
 const REMOTE_PATH_PREFIX: &str = "$HOME/bin:$HOME/.local/bin:$HOME/.cargo/bin:$PATH";
 
+/// Build the common SSH args that precede the destination in every invocation:
+/// port, user-supplied options, ConnectTimeout, and BatchMode (background only).
+fn base_ssh_args(dest: &Destination, extra_ssh_opts: &[String], foreground: bool) -> Vec<String> {
+    let mut args = Vec::new();
+    args.extend(dest.port_args());
+    for opt in extra_ssh_opts {
+        args.push("-o".into());
+        args.push(opt.clone());
+    }
+    args.push("-o".into());
+    args.push("ConnectTimeout=5".into());
+    if !foreground {
+        args.push("-o".into());
+        args.push("BatchMode=yes".into());
+    }
+    args
+}
+
 /// Build the SSH command for remote execution (without stdio config).
-fn remote_exec_command(dest: &Destination, remote_cmd: &str, extra_ssh_opts: &[String]) -> Command {
+fn remote_exec_command(
+    dest: &Destination,
+    remote_cmd: &str,
+    extra_ssh_opts: &[String],
+    foreground: bool,
+) -> Command {
     let wrapped_cmd = format!("PATH=\"{REMOTE_PATH_PREFIX}\"; {remote_cmd}");
     let mut cmd = Command::new("ssh");
-    cmd.args(dest.port_args());
-    for opt in extra_ssh_opts {
-        cmd.arg("-o").arg(opt);
-    }
-    cmd.arg("-o").arg("ConnectTimeout=5");
+    cmd.args(base_ssh_args(dest, extra_ssh_opts, foreground));
     cmd.arg(dest.ssh_dest());
     cmd.arg(&wrapped_cmd);
     cmd
@@ -109,9 +125,9 @@ fn remote_exec_command(dest: &Destination, remote_cmd: &str, extra_ssh_opts: &[S
 
 /// Run a command on the remote host via SSH, returning stdout.
 ///
-/// In foreground mode, stdin and stderr inherit the terminal so interactive
-/// prompts (host key confirmation, password, MFA) work. In background mode,
-/// `BatchMode=yes` is set so SSH fails fast instead of hanging.
+/// Stderr is always piped so we can include SSH errors in our error messages.
+/// SSH interactive prompts use `/dev/tty` directly, not stderr.
+/// In background mode, `BatchMode=yes` is set so SSH fails fast instead of hanging.
 async fn remote_exec(
     dest: &Destination,
     remote_cmd: &str,
@@ -120,38 +136,41 @@ async fn remote_exec(
 ) -> anyhow::Result<String> {
     debug!("ssh {}: {remote_cmd}", dest.ssh_dest());
 
-    let mut cmd = remote_exec_command(dest, remote_cmd, extra_ssh_opts);
+    let mut cmd = remote_exec_command(dest, remote_cmd, extra_ssh_opts, foreground);
     cmd.stdout(Stdio::piped());
-    if foreground {
-        cmd.stdin(Stdio::inherit());
-        cmd.stderr(Stdio::inherit());
-    } else {
-        cmd.arg("-o").arg("BatchMode=yes");
-        cmd.stdin(Stdio::null());
-        cmd.stderr(Stdio::piped());
-    }
+    cmd.stderr(Stdio::piped());
+    cmd.stdin(Stdio::null());
 
     let output = cmd.output().await.context("failed to run ssh")?;
 
     if !output.status.success() {
-        if foreground {
-            bail!("ssh command failed (exit {})", output.status);
-        }
         let stderr = String::from_utf8_lossy(&output.stderr);
         let stderr = stderr.trim();
         debug!("ssh failed (status {}): {stderr}", output.status);
         if stderr.contains("command not found") || stderr.contains("No such file") {
             bail!("gritty not found on remote host (is it in PATH?)");
         }
-        let ssh_dest = dest.ssh_dest();
-        bail!(
-            "ssh command failed: {stderr}\n  to diagnose: ssh {ssh_dest}\n  or try: gritty connect --foreground {ssh_dest}"
-        );
+        let diag = format_ssh_diag(dest, extra_ssh_opts, foreground);
+        if stderr.is_empty() {
+            bail!("ssh command failed (exit {})\n  to diagnose: {diag}", output.status);
+        }
+        bail!("ssh command failed: {stderr}\n  to diagnose: {diag}");
     }
 
     let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
     debug!("ssh output: {stdout}");
     Ok(stdout)
+}
+
+/// Format a diagnostic SSH command for display in error messages.
+/// Mirrors `base_ssh_args` so the suggestion matches what was actually run.
+fn format_ssh_diag(dest: &Destination, extra_ssh_opts: &[String], foreground: bool) -> String {
+    let mut parts = vec!["ssh".to_string()];
+    for arg in base_ssh_args(dest, extra_ssh_opts, foreground) {
+        parts.push(shell_quote(&arg));
+    }
+    parts.push(dest.ssh_dest());
+    parts.join(" ")
 }
 
 /// Shell-quote a string if it contains characters that need quoting.
@@ -176,8 +195,8 @@ fn format_command(cmd: &Command) -> String {
 
 /// Build the SSH tunnel command with hardened options.
 ///
-/// In foreground mode, stdio is inherited so the user sees errors directly.
-/// In background mode, `BatchMode=yes` is added and stdio is null/piped.
+/// Stderr is always piped so we can capture SSH errors on failure.
+/// (SSH interactive prompts use `/dev/tty` directly, not stderr.)
 fn tunnel_command(
     dest: &Destination,
     local_sock: &Path,
@@ -186,24 +205,17 @@ fn tunnel_command(
     foreground: bool,
 ) -> Command {
     let mut cmd = Command::new("ssh");
-    cmd.args(dest.port_args());
-    cmd.args(SSH_TUNNEL_OPTS);
-    for opt in extra_ssh_opts {
+    cmd.args(base_ssh_args(dest, extra_ssh_opts, foreground));
+    for opt in TUNNEL_SSH_OPTS {
         cmd.arg("-o").arg(opt);
     }
-    if !foreground {
-        cmd.arg("-o").arg("BatchMode=yes");
-    }
+    cmd.args(["-N", "-T"]);
     let forward = format!("{}:{}", local_sock.display(), remote_sock);
     cmd.arg("-L").arg(forward);
     cmd.arg(dest.ssh_dest());
-    if foreground {
-        // Inherit stdio so the user sees any SSH errors/prompts
-    } else {
-        cmd.stdout(Stdio::null());
-        cmd.stderr(Stdio::piped());
-        cmd.stdin(Stdio::null());
-    }
+    cmd.stdout(Stdio::null());
+    cmd.stderr(Stdio::piped());
+    cmd.stdin(Stdio::null());
     cmd
 }
 
@@ -524,7 +536,7 @@ pub async fn run(opts: ConnectOpts, ready_fd: Option<OwnedFd>) -> anyhow::Result
     if opts.dry_run {
         let remote_cmd =
             if opts.no_server_start { "gritty socket-path" } else { REMOTE_ENSURE_CMD };
-        let ensure_cmd = remote_exec_command(&dest, remote_cmd, &opts.ssh_options);
+        let ensure_cmd = remote_exec_command(&dest, remote_cmd, &opts.ssh_options, true);
         let tunnel_cmd =
             tunnel_command(&dest, &local_sock, "$REMOTE_SOCK", &opts.ssh_options, true);
 
@@ -610,8 +622,31 @@ pub async fn run(opts: ConnectOpts, ready_fd: Option<OwnedFd>) -> anyhow::Result
         stop: stop.clone(),
     };
 
-    // 6. Wait for local socket to become connectable
-    wait_for_socket(&local_sock, Duration::from_secs(15)).await?;
+    // 6. Wait for local socket to become connectable (race against child exit)
+    let mut child = guard.child.take().unwrap();
+    tokio::select! {
+        result = wait_for_socket(&local_sock, Duration::from_secs(15)) => {
+            result?;
+            guard.child = Some(child);
+        }
+        status = child.wait() => {
+            let status = status.context("failed to wait on ssh tunnel")?;
+            let diag = format_ssh_diag(&dest, &opts.ssh_options, opts.foreground);
+            let msg = if let Some(mut stderr) = child.stderr.take() {
+                use tokio::io::AsyncReadExt;
+                let mut buf = String::new();
+                let _ = stderr.read_to_string(&mut buf).await;
+                let buf = buf.trim().to_string();
+                if buf.is_empty() { None } else { Some(buf) }
+            } else {
+                None
+            };
+            match msg {
+                Some(err) => bail!("ssh tunnel failed: {err}\n  to diagnose: {diag}"),
+                None => bail!("ssh tunnel exited ({status})\n  to diagnose: {diag}"),
+            }
+        }
+    }
     debug!("tunnel socket ready");
 
     // Write PID + dest files
@@ -813,11 +848,17 @@ mod tests {
         );
         let args: Vec<_> =
             cmd.as_std().get_args().map(|a| a.to_string_lossy().to_string()).collect();
+        // From base_ssh_args
+        assert!(args.contains(&"ConnectTimeout=5".to_string()));
+        assert!(args.contains(&"BatchMode=yes".to_string()));
+        // From TUNNEL_SSH_OPTS
         assert!(args.contains(&"ServerAliveInterval=3".to_string()));
         assert!(args.contains(&"StreamLocalBindUnlink=yes".to_string()));
         assert!(args.contains(&"ExitOnForwardFailure=yes".to_string()));
-        assert!(args.contains(&"ConnectTimeout=5".to_string()));
-        assert!(args.contains(&"BatchMode=yes".to_string()));
+        assert!(args.contains(&"ControlPath=none".to_string()));
+        assert!(args.contains(&"ForwardAgent=no".to_string()));
+        assert!(args.contains(&"ForwardX11=no".to_string()));
+        // Tunnel flags and forward
         assert!(args.contains(&"-N".to_string()));
         assert!(args.contains(&"-T".to_string()));
         assert!(args.contains(&"/tmp/local.sock:/run/user/1000/gritty/ctl.sock".to_string()));
@@ -923,8 +964,9 @@ mod tests {
         let dest = Destination::parse("user@host").unwrap();
         let cmd = tunnel_command(&dest, Path::new("/tmp/local.sock"), "$REMOTE_SOCK", &[], true);
         let formatted = format_command(&cmd);
-        // Uses the same SSH_TUNNEL_OPTS
         assert!(formatted.contains("ServerAliveInterval=3"));
+        assert!(formatted.contains("ControlPath=none"));
+        assert!(formatted.contains("ForwardAgent=no"));
         assert!(formatted.contains("-N"));
         assert!(formatted.contains("-T"));
         // Forward arg references $REMOTE_SOCK unquoted (no spaces, $ is safe)
@@ -935,7 +977,7 @@ mod tests {
     #[test]
     fn format_command_remote_exec() {
         let dest = Destination::parse("user@host:2222").unwrap();
-        let cmd = remote_exec_command(&dest, "gritty socket-path", &[]);
+        let cmd = remote_exec_command(&dest, "gritty socket-path", &[], true);
         let formatted = format_command(&cmd);
         assert!(formatted.starts_with("ssh "));
         assert!(formatted.contains("-p 2222"));
@@ -948,11 +990,32 @@ mod tests {
     #[test]
     fn format_command_remote_exec_with_extra_opts() {
         let dest = Destination::parse("user@host").unwrap();
-        let cmd = remote_exec_command(&dest, REMOTE_ENSURE_CMD, &["ProxyJump=bastion".to_string()]);
+        let cmd =
+            remote_exec_command(&dest, REMOTE_ENSURE_CMD, &["ProxyJump=bastion".to_string()], true);
         let formatted = format_command(&cmd);
         assert!(formatted.contains("ProxyJump=bastion"));
         assert!(formatted.contains("gritty socket-path"));
         assert!(formatted.contains("gritty server"));
+    }
+
+    #[test]
+    fn base_ssh_args_foreground() {
+        let dest = Destination::parse("user@host:2222").unwrap();
+        let args = base_ssh_args(&dest, &["ProxyJump=bastion".into()], true);
+        assert!(args.contains(&"-p".to_string()));
+        assert!(args.contains(&"2222".to_string()));
+        assert!(args.contains(&"ProxyJump=bastion".to_string()));
+        assert!(args.contains(&"ConnectTimeout=5".to_string()));
+        assert!(!args.contains(&"BatchMode=yes".to_string()));
+    }
+
+    #[test]
+    fn base_ssh_args_background() {
+        let dest = Destination::parse("host").unwrap();
+        let args = base_ssh_args(&dest, &[], false);
+        assert!(args.contains(&"ConnectTimeout=5".to_string()));
+        assert!(args.contains(&"BatchMode=yes".to_string()));
+        assert!(!args.contains(&"-p".to_string()));
     }
 
     // -----------------------------------------------------------------------

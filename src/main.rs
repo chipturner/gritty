@@ -192,14 +192,21 @@ fn daemonize(
             // Close write end
             drop(write_fd);
 
-            // Read from pipe: one byte = child ready, EOF = child died
+            // Read from pipe: 0x01 = child ready, other data = error message, EOF = crashed
             let mut buf = [0u8; 1];
             let mut read_file = std::fs::File::from(read_fd);
             use std::io::Read;
             match read_file.read(&mut buf) {
-                Ok(1) => {
+                Ok(1) if buf[0] == 0x01 => {
                     on_ready(child);
                     std::process::exit(0);
+                }
+                Ok(1) => {
+                    // Error message from child — read the rest
+                    let mut msg = vec![buf[0]];
+                    let _ = read_file.read_to_end(&mut msg);
+                    eprintln!("{}", String::from_utf8_lossy(&msg).trim());
+                    std::process::exit(1);
                 }
                 _ => {
                     eprintln!("error: failed to start");
@@ -250,6 +257,21 @@ fn daemonize(
     }
 }
 
+/// Dup the ready_fd so we can send errors back to the parent after `run()` consumes it.
+fn dup_ready_fd(ready_fd: &Option<OwnedFd>) -> Option<OwnedFd> {
+    ready_fd.as_ref().and_then(|fd| gritty::security::checked_dup(fd.as_raw_fd()).ok())
+}
+
+/// Write error to the readiness pipe (so the parent displays it), print to stderr, and exit.
+fn report_error(error_pipe: &Option<OwnedFd>, e: &anyhow::Error) -> ! {
+    let msg = format!("error: {e}");
+    if let Some(fd) = error_pipe {
+        let _ = nix::unistd::write(fd, msg.as_bytes());
+    }
+    eprintln!("{msg}");
+    std::process::exit(1);
+}
+
 fn main() {
     let cli = Cli::parse();
     let verbose = cli.verbose;
@@ -288,9 +310,9 @@ fn main() {
                     std::process::exit(1);
                 }
             };
+            let error_pipe = dup_ready_fd(&ready_fd);
             if let Err(e) = rt.block_on(gritty::daemon::run(&ctl_path, ready_fd)) {
-                eprintln!("error: {e}");
-                std::process::exit(1);
+                report_error(&error_pipe, &e);
             }
         }
         Command::Connect {
@@ -366,12 +388,10 @@ fn main() {
                 foreground,
             };
 
+            let error_pipe = dup_ready_fd(&ready_fd);
             match rt.block_on(gritty::connect::run(opts, ready_fd)) {
                 Ok(code) => std::process::exit(code),
-                Err(e) => {
-                    eprintln!("error: {e}");
-                    std::process::exit(1);
-                }
+                Err(e) => report_error(&error_pipe, &e),
             }
         }
         _ => {
