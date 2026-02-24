@@ -693,10 +693,7 @@ async fn disallowed_env_vars_rejected() {
     );
 
     // LD_PRELOAD should NOT be forwarded (disallowed)
-    framed
-        .send(Frame::Data(Bytes::from("echo LD_PRELOAD=${LD_PRELOAD:-unset}\n")))
-        .await
-        .unwrap();
+    framed.send(Frame::Data(Bytes::from("echo LD_PRELOAD=${LD_PRELOAD:-unset}\n"))).await.unwrap();
     let output = read_available_data(&mut framed, Duration::from_secs(2)).await;
     let output_str = String::from_utf8_lossy(&output);
     assert!(

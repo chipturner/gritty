@@ -139,10 +139,7 @@ async fn daemon_rejects_name_with_tab() {
 
     let resp =
         control_request(&ctl_path, Frame::NewSession { name: "bad\tname".to_string() }).await;
-    assert!(
-        matches!(resp, Frame::Error { .. }),
-        "expected Error for name with tab, got {resp:?}"
-    );
+    assert!(matches!(resp, Frame::Error { .. }), "expected Error for name with tab, got {resp:?}");
 
     control_request(&ctl_path, Frame::KillServer).await;
 }

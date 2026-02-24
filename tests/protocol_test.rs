@@ -482,9 +482,7 @@ fn env_newlines_stripped_in_encoder() {
 fn env_newlines_in_key_stripped() {
     let mut codec = FrameCodec;
     let mut buf = BytesMut::new();
-    let original = Frame::Env {
-        vars: vec![("TE\nRM".to_string(), "xterm".to_string())],
-    };
+    let original = Frame::Env { vars: vec![("TE\nRM".to_string(), "xterm".to_string())] };
     codec.encode(original, &mut buf).unwrap();
     let decoded = codec.decode(&mut buf).unwrap().unwrap();
     match decoded {
