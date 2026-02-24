@@ -2,25 +2,25 @@
 
 Persistent, self-healing terminal sessions over SSH for smooth remote development.
 
-gritty gives you seamless, robust remote shell sessions that survive network changes, laptop sleep, and SSH disconnects. Close your laptop, change networks, reconnect your VPN — gritty detects the dead connection, respawns the SSH tunnel, and picks up where you left off.  gritty also optionally forwards your `ssh-agent` and will handle remote requests to open URLs via `$BROWSER`.
+gritty gives you seamless, robust remote shell sessions that survive network changes, laptop sleep, and SSH disconnects. Close your laptop, change networks, reconnect your VPN -- gritty detects the dead connection, respawns the SSH tunnel, and picks up where you left off.  gritty also optionally forwards your `ssh-agent` and will handle remote requests to open URLs via `$BROWSER`.
 
-It works by forwarding Unix domain sockets over SSH — no custom protocol, no open ports, no certificates, no configuration. If you can `ssh` to a host, you can use gritty for reliable remote development.
+It works by forwarding Unix domain sockets over SSH -- no custom protocol, no open ports, no certificates, no configuration. If you can `ssh` to a host, you can use gritty for reliable remote development.
 
 ## Features
 
 - **Reliable**
-    - **Self-healing connections** — heartbeat detection, automatic tunnel respawn, transparent client reconnect
-    - **Persistent sessions** — shells survive client disconnect, network failure, laptop sleep
+    - **Self-healing connections** -- heartbeat detection, automatic tunnel respawn, transparent client reconnect
+    - **Persistent sessions** -- shells survive client disconnect, network failure, laptop sleep
 - **Remote development**
-    - **SSH agent forwarding** (`-A`) — tunnels your local SSH agent so `git push`, `ssh`, and other agent-dependent commands work remotely
-    - **URL open forwarding** (`-O`) — forwards `$BROWSER` / URL open requests back to your local machine
-    - **Environment forwarding** — TERM, LANG, COLORTERM propagated to remote shell
+    - **SSH agent forwarding** (`-A`) -- tunnels your local SSH agent so `git push`, `ssh`, and other agent-dependent commands work remotely
+    - **URL open forwarding** (`-O`) -- forwards `$BROWSER` / URL open requests back to your local machine
+    - **Environment forwarding** -- TERM, LANG, COLORTERM propagated to remote shell
 - **Simple**
-    - **Single binary, zero config** — no server config, no port allocation, no root required; auto-starts the remote server
-    - **No network protocol** — Unix domain sockets locally, SSH handles encryption and auth
+    - **Single binary, zero config** -- no server config, no port allocation, no root required; auto-starts the remote server
+    - **No network protocol** -- Unix domain sockets locally, SSH handles encryption and auth
 - **Session management**
-    - **Multiple named sessions** — create, list, attach, kill by name or ID
-    - **SSH-style escape sequences** — `~.` detach, `~^Z` suspend, `~?` help
+    - **Multiple named sessions** -- create, list, attach, kill by name or ID
+    - **SSH-style escape sequences** -- `~.` detach, `~^Z` suspend, `~?` help
 
 ## Quick Start
 
@@ -36,7 +36,7 @@ One command sets up an SSH tunnel, starts the remote server, and returns:
 gritty connect user@devbox
 ```
 
-Create sessions, attach, detach, reattach — all through the tunnel:
+Create sessions, attach, detach, reattach -- all through the tunnel:
 
 ```bash
 # Create a named session (auto-attaches)
@@ -107,7 +107,7 @@ After a newline (or at session start), `~` enters escape mode:
 
 ### No Network Protocol
 
-gritty contains zero networking code. Sessions live on Unix domain sockets. For remote access, you forward the socket over SSH — the same SSH that already handles your keys, your `.ssh/config`, your bastion hosts, your MFA.
+gritty contains zero networking code. Sessions live on Unix domain sockets. For remote access, you forward the socket over SSH -- the same SSH that already handles your keys, your `.ssh/config`, your bastion hosts, your MFA.
 
 No ports to open, no firewall rules, no TLS certificates, no authentication system to trust beyond the one you already use.
 
@@ -117,11 +117,11 @@ gritty delegates encryption and authentication to SSH rather than reimplementing
 
 ### Single-Socket Architecture
 
-All communication — control messages and session relay — flows through one server socket. When a client connects to a session, the server hands off the raw connection and gets out of the loop. No per-session sockets, no port allocation, no cleanup races.
+All communication -- control messages and session relay -- flows through one server socket. When a client connects to a session, the server hands off the raw connection and gets out of the loop. No per-session sockets, no port allocation, no cleanup races.
 
 ### Persistence Model
 
-The PTY and shell process keep running when the client disconnects. While disconnected, the server drains PTY output into a userspace ring buffer (1MB cap) so the shell never blocks — long builds complete in the background. On reconnect, buffered output is flushed to the new client. There's no scroll-back replay or screen reconstruction — just a live PTY that never dies.
+The PTY and shell process keep running when the client disconnects. While disconnected, the server drains PTY output into a userspace ring buffer (1MB cap) so the shell never blocks -- long builds complete in the background. On reconnect, buffered output is flushed to the new client. There's no scroll-back replay or screen reconstruction -- just a live PTY that never dies.
 
 ## How It Works
 
@@ -154,7 +154,7 @@ flowchart LR
 
 <sub>Orange = SSH tunnel (TCP) · Blue = Unix domain socket</sub>
 
-A daemon listens on a single Unix socket (`ctl.sock`). Clients send a control frame declaring intent (new session, attach, list); the daemon hands off the raw socket connection to the target session and gets out of the loop. Each session owns a PTY with a login shell that persists across disconnects — while no client is attached, the shell blocks on its kernel PTY buffer (~4KB) and resumes instantly on reconnect.
+A daemon listens on a single Unix socket (`ctl.sock`). Clients send a control frame declaring intent (new session, attach, list); the daemon hands off the raw socket connection to the target session and gets out of the loop. Each session owns a PTY with a login shell that persists across disconnects -- while no client is attached, the shell blocks on its kernel PTY buffer (~4KB) and resumes instantly on reconnect.
 
 For remote access, `gritty connect` forwards the remote socket over SSH. All commands work identically over the tunnel.
 
@@ -214,7 +214,7 @@ flowchart LR
     end
 ```
 
-Forwarding multiplexes over the existing session connection — no extra tunnels.
+Forwarding multiplexes over the existing session connection -- no extra tunnels.
 
 **SSH agent** (`-A`): the session creates `agent-N.sock` and sets `SSH_AUTH_SOCK`. When a remote process (e.g. `git push`) connects, the request is relayed to the client's local SSH agent and back.
 
@@ -222,9 +222,9 @@ Forwarding multiplexes over the existing session connection — no extra tunnels
 
 ## Prior Art
 
-- [mosh](https://mosh.org/) — persistent remote terminal using UDP and SSP
-- [Eternal Terminal](https://eternalterminal.dev/) — persistent SSH sessions over a custom protocol
-- [tmux](https://github.com/tmux/tmux) / [screen](https://www.gnu.org/software/screen/) — terminal multiplexers with session persistence
+- [mosh](https://mosh.org/) -- persistent remote terminal using UDP and SSP
+- [Eternal Terminal](https://eternalterminal.dev/) -- persistent SSH sessions over a custom protocol
+- [tmux](https://github.com/tmux/tmux) / [screen](https://www.gnu.org/software/screen/) -- terminal multiplexers with session persistence
 
 gritty differs by having no network protocol of its own. Where mosh and ET implement custom transport and encryption, gritty uses Unix domain sockets and delegates networking entirely to SSH. Where tmux and screen are full multiplexers with windows, panes, and key bindings, gritty does one thing: persistent sessions with auto-reconnect.
 
@@ -233,9 +233,10 @@ gritty differs by having no network protocol of its own. Where mosh and ET imple
 Early stage. Works on Linux and macOS. Available on [crates.io](https://crates.io/crates/gritty-cli).
 
 **Planned:**
-- **Server auto-start** — start the server on demand (systemd socket activation, launchd, or on first `new-session`)
-- **Zero-downtime upgrades** — server re-execs itself, preserving sessions across upgrades
-- **Read-only attach** — multiple clients viewing the same session for pair programming or demos
+- **Config file** -- support common config settings (e.g. forwarding, aliases) in a config
+- **Server auto-start** -- start the server on demand (systemd socket activation, launchd, or on first `new-session`)
+- **Zero-downtime upgrades** -- server re-execs itself, preserving sessions across upgrades
+- **Read-only attach** -- multiple clients viewing the same session for pair programming or demos
 
 ## License
 
