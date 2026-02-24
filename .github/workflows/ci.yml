@@ -59,14 +59,25 @@ jobs:
         if: runner.os == 'macOS'
         run: |
           sudo systemsetup -setremotelogin on
+          # Ensure sshd accepts pubkey auth and knows where to find authorized_keys
+          sudo sed -i '' 's/^#PubkeyAuthentication.*/PubkeyAuthentication yes/' /etc/ssh/sshd_config
+          sudo sed -i '' 's/^#AuthorizedKeysFile.*/AuthorizedKeysFile .ssh\/authorized_keys/' /etc/ssh/sshd_config
+          # Disable PAM keyboard-interactive to avoid "Too many auth failures"
+          sudo sed -i '' 's/^UsePAM.*/UsePAM no/' /etc/ssh/sshd_config
+          sudo sed -i '' 's/^#UsePAM.*/UsePAM no/' /etc/ssh/sshd_config
+          sudo launchctl stop com.openssh.sshd || true
+          sudo launchctl start com.openssh.sshd
 
       - name: Configure SSH key auth
         run: |
+          mkdir -p ~/.ssh
+          chmod 700 ~/.ssh
           ssh-keygen -t ed25519 -f ~/.ssh/id_ed25519 -N ""
           cat ~/.ssh/id_ed25519.pub >> ~/.ssh/authorized_keys
           chmod 600 ~/.ssh/authorized_keys
           ssh-keyscan localhost >> ~/.ssh/known_hosts
-          ssh localhost whoami
+          # Verify SSH works
+          ssh -o BatchMode=yes -o StrictHostKeyChecking=no localhost whoami
 
       - name: Build and install gritty
         run: |
