@@ -129,6 +129,44 @@ async fn daemon_rejects_duplicate_name() {
 }
 
 #[tokio::test]
+async fn daemon_rejects_name_with_tab() {
+    let _permit = CONCURRENCY.acquire().await.unwrap();
+    let (_tmp, ctl_path) = test_ctl();
+
+    let ctl = ctl_path.clone();
+    let _daemon = tokio::spawn(async move { gritty::daemon::run(&ctl, None).await });
+    tokio::time::sleep(Duration::from_millis(200)).await;
+
+    let resp =
+        control_request(&ctl_path, Frame::NewSession { name: "bad\tname".to_string() }).await;
+    assert!(
+        matches!(resp, Frame::Error { .. }),
+        "expected Error for name with tab, got {resp:?}"
+    );
+
+    control_request(&ctl_path, Frame::KillServer).await;
+}
+
+#[tokio::test]
+async fn daemon_rejects_name_with_newline() {
+    let _permit = CONCURRENCY.acquire().await.unwrap();
+    let (_tmp, ctl_path) = test_ctl();
+
+    let ctl = ctl_path.clone();
+    let _daemon = tokio::spawn(async move { gritty::daemon::run(&ctl, None).await });
+    tokio::time::sleep(Duration::from_millis(200)).await;
+
+    let resp =
+        control_request(&ctl_path, Frame::NewSession { name: "bad\nname".to_string() }).await;
+    assert!(
+        matches!(resp, Frame::Error { .. }),
+        "expected Error for name with newline, got {resp:?}"
+    );
+
+    control_request(&ctl_path, Frame::KillServer).await;
+}
+
+#[tokio::test]
 async fn daemon_allows_multiple_unnamed_sessions() {
     let _permit = CONCURRENCY.acquire().await.unwrap();
     let (_tmp, ctl_path) = test_ctl();

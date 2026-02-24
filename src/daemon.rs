@@ -178,9 +178,19 @@ pub async fn run(ctl_path: &Path, ready_fd: Option<OwnedFd>) -> anyhow::Result<(
 
         match frame {
             Frame::NewSession { name } => {
-                // Check for duplicate name
+                // Reject names containing control characters (prevents wire
+                // format corruption in tab/newline-delimited SessionInfo)
                 let name_opt = if name.is_empty() { None } else { Some(name) };
                 if let Some(ref n) = name_opt {
+                    if n.bytes().any(|b| b.is_ascii_control()) {
+                        let _ = framed
+                            .send(Frame::Error {
+                                message: "session name must not contain control characters"
+                                    .to_string(),
+                            })
+                            .await;
+                        continue;
+                    }
                     let dup = sessions.values().any(|s| s.name.as_deref() == Some(n));
                     if dup {
                         let _ = framed
