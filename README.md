@@ -234,6 +234,7 @@ Early stage. Works on Linux and macOS. Available on [crates.io](https://crates.i
 
 **Planned:**
 - **Config file** -- support common config settings (e.g. forwarding, aliases) in a config
+- **Logging** -- need a system to store logs for remote and local daemons
 - **Server auto-start** -- start the server on demand (systemd socket activation, launchd, or on first `new-session`)
 - **Zero-downtime upgrades** -- server re-execs itself, preserving sessions across upgrades
 - **Read-only attach** -- multiple clients viewing the same session for pair programming or demos
