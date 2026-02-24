@@ -314,8 +314,17 @@ impl Encoder<Frame> for FrameCodec {
             Frame::Ping => encode_empty(dst, TYPE_PING),
             Frame::Pong => encode_empty(dst, TYPE_PONG),
             Frame::Env { vars } => {
-                let text: String =
-                    vars.iter().map(|(k, v)| format!("{k}={v}")).collect::<Vec<_>>().join("\n");
+                // Strip newlines from keys/values to prevent injection of extra
+                // key=value pairs via the newline-delimited wire format.
+                let text: String = vars
+                    .iter()
+                    .map(|(k, v)| {
+                        let k = k.replace('\n', "");
+                        let v = v.replace('\n', "");
+                        format!("{k}={v}")
+                    })
+                    .collect::<Vec<_>>()
+                    .join("\n");
                 dst.put_u8(TYPE_ENV);
                 dst.put_u32(text.len() as u32);
                 dst.extend_from_slice(text.as_bytes());

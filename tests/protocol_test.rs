@@ -458,6 +458,46 @@ fn roundtrip_env() {
 }
 
 #[test]
+fn env_newlines_stripped_in_encoder() {
+    let mut codec = FrameCodec;
+    let mut buf = BytesMut::new();
+    // Value contains a newline that could inject LD_PRELOAD
+    let original = Frame::Env {
+        vars: vec![("TERM".to_string(), "xterm\nLD_PRELOAD=/tmp/evil.so".to_string())],
+    };
+    codec.encode(original, &mut buf).unwrap();
+    let decoded = codec.decode(&mut buf).unwrap().unwrap();
+    match decoded {
+        Frame::Env { vars } => {
+            // Should decode as a single var with newline stripped
+            assert_eq!(vars.len(), 1);
+            assert_eq!(vars[0].0, "TERM");
+            assert_eq!(vars[0].1, "xtermLD_PRELOAD=/tmp/evil.so");
+        }
+        _ => panic!("expected Env frame"),
+    }
+}
+
+#[test]
+fn env_newlines_in_key_stripped() {
+    let mut codec = FrameCodec;
+    let mut buf = BytesMut::new();
+    let original = Frame::Env {
+        vars: vec![("TE\nRM".to_string(), "xterm".to_string())],
+    };
+    codec.encode(original, &mut buf).unwrap();
+    let decoded = codec.decode(&mut buf).unwrap().unwrap();
+    match decoded {
+        Frame::Env { vars } => {
+            assert_eq!(vars.len(), 1);
+            assert_eq!(vars[0].0, "TERM");
+            assert_eq!(vars[0].1, "xterm");
+        }
+        _ => panic!("expected Env frame"),
+    }
+}
+
+#[test]
 fn decode_oversized_frame_rejected() {
     let mut codec = FrameCodec;
     let mut buf = BytesMut::new();

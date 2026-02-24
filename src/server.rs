@@ -297,8 +297,13 @@ pub async fn run(
     if let Some(ref dir) = home {
         cmd.current_dir(dir);
     }
+    const ALLOWED_ENV_KEYS: &[&str] = &["TERM", "LANG", "COLORTERM", "BROWSER"];
     for (k, v) in &env_vars {
-        cmd.env(k, v);
+        if ALLOWED_ENV_KEYS.contains(&k.as_str()) {
+            cmd.env(k, v);
+        } else {
+            warn!(key = k, "ignoring disallowed env var from client");
+        }
     }
     // Set SSH_AUTH_SOCK to the agent socket path
     cmd.env("SSH_AUTH_SOCK", &agent_socket_path);

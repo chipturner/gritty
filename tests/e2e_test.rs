@@ -673,6 +673,42 @@ async fn env_vars_forwarded() {
 }
 
 #[tokio::test]
+async fn disallowed_env_vars_rejected() {
+    let _permit = CONCURRENCY.acquire().await.unwrap();
+    let (_tx, mut framed, server, _meta) = setup_session_with_env(vec![
+        ("TERM".to_string(), "xterm-test-env".to_string()),
+        ("LD_PRELOAD".to_string(), "/tmp/evil.so".to_string()),
+    ])
+    .await;
+    wait_for_shell(&mut framed).await;
+    read_available_data(&mut framed, Duration::from_secs(1)).await;
+
+    // TERM should be forwarded (allowed)
+    framed.send(Frame::Data(Bytes::from("echo TERM=$TERM\n"))).await.unwrap();
+    let output = read_available_data(&mut framed, Duration::from_secs(2)).await;
+    let output_str = String::from_utf8_lossy(&output);
+    assert!(
+        output_str.contains("TERM=xterm-test-env"),
+        "expected TERM to be forwarded, got: {output_str}"
+    );
+
+    // LD_PRELOAD should NOT be forwarded (disallowed)
+    framed
+        .send(Frame::Data(Bytes::from("echo LD_PRELOAD=${LD_PRELOAD:-unset}\n")))
+        .await
+        .unwrap();
+    let output = read_available_data(&mut framed, Duration::from_secs(2)).await;
+    let output_str = String::from_utf8_lossy(&output);
+    assert!(
+        output_str.contains("LD_PRELOAD=unset"),
+        "expected LD_PRELOAD to be unset, got: {output_str}"
+    );
+
+    let _ = framed.send(Frame::Data(Bytes::from("exit\n"))).await;
+    let _ = timeout(Duration::from_secs(3), server).await;
+}
+
+#[tokio::test]
 async fn login_shell_starts_in_home() {
     let _permit = CONCURRENCY.acquire().await.unwrap();
     let (_tx, mut framed, server, _meta) = setup_session().await;
