@@ -1,6 +1,6 @@
 use clap::{Parser, Subcommand};
 use std::os::fd::{AsRawFd, OwnedFd};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use tracing_subscriber::EnvFilter;
 
 #[derive(Parser)]
@@ -140,13 +140,35 @@ enum Command {
     Tunnels,
 }
 
-fn init_tracing(verbose: bool) {
-    let filter = if verbose && std::env::var("RUST_LOG").is_err() {
+fn init_tracing(verbose: bool, log_path: Option<&Path>) {
+    let filter = if std::env::var("RUST_LOG").is_ok() {
+        EnvFilter::from_default_env()
+    } else if verbose {
         EnvFilter::new("gritty=debug")
     } else {
-        EnvFilter::from_default_env()
+        EnvFilter::new("gritty=info")
     };
-    tracing_subscriber::fmt().with_env_filter(filter).with_writer(std::io::stderr).init();
+
+    match log_path.and_then(open_log_file) {
+        Some(file) => {
+            tracing_subscriber::fmt()
+                .with_env_filter(filter)
+                .with_writer(std::sync::Mutex::new(file))
+                .with_ansi(false)
+                .with_line_number(true)
+                .with_file(true)
+                .with_target(true)
+                .init();
+        }
+        None => {
+            tracing_subscriber::fmt().with_env_filter(filter).with_writer(std::io::stderr).init();
+        }
+    }
+}
+
+fn open_log_file(path: &Path) -> Option<std::fs::File> {
+    use std::os::unix::fs::OpenOptionsExt;
+    std::fs::OpenOptions::new().create(true).append(true).mode(0o600).open(path).ok()
 }
 
 /// Fork into background, returning the write end of the readiness pipe.
@@ -154,7 +176,13 @@ fn init_tracing(verbose: bool) {
 /// Parent: blocks reading the pipe. Gets a byte → child is ready, runs `on_ready`, exits 0.
 /// Gets EOF → child died (exits 1).
 /// Child: returns Ok(OwnedFd) for the write end of the pipe.
-fn daemonize(on_ready: impl FnOnce(nix::unistd::Pid)) -> anyhow::Result<OwnedFd> {
+///
+/// If `output_path` is `Some`, stdout/stderr are redirected to that file (O_APPEND).
+/// Otherwise they go to `/dev/null`. stdin always goes to `/dev/null`.
+fn daemonize(
+    on_ready: impl FnOnce(nix::unistd::Pid),
+    output_path: Option<&Path>,
+) -> anyhow::Result<OwnedFd> {
     use nix::unistd::{ForkResult, fork, pipe, setsid};
     let (read_fd, write_fd) = pipe()?;
 
@@ -186,7 +214,7 @@ fn daemonize(on_ready: impl FnOnce(nix::unistd::Pid)) -> anyhow::Result<OwnedFd>
             // New session, detach from terminal
             setsid()?;
 
-            // Redirect stdin/stdout/stderr to /dev/null
+            // stdin always to /dev/null
             let devnull = nix::fcntl::open(
                 "/dev/null",
                 nix::fcntl::OFlag::O_RDWR,
@@ -194,10 +222,28 @@ fn daemonize(on_ready: impl FnOnce(nix::unistd::Pid)) -> anyhow::Result<OwnedFd>
             )?;
             unsafe {
                 libc::dup2(devnull.as_raw_fd(), 0);
-                libc::dup2(devnull.as_raw_fd(), 1);
-                libc::dup2(devnull.as_raw_fd(), 2);
             }
-            // devnull drops here, closing the original fd (always >2 post-fork)
+
+            // stdout/stderr: to output file if provided, else /dev/null
+            let out_fd = match output_path {
+                Some(path) => nix::fcntl::open(
+                    path,
+                    nix::fcntl::OFlag::O_WRONLY
+                        | nix::fcntl::OFlag::O_CREAT
+                        | nix::fcntl::OFlag::O_APPEND,
+                    nix::sys::stat::Mode::from_bits_truncate(0o600),
+                )?,
+                None => nix::fcntl::open(
+                    "/dev/null",
+                    nix::fcntl::OFlag::O_RDWR,
+                    nix::sys::stat::Mode::empty(),
+                )?,
+            };
+            unsafe {
+                libc::dup2(out_fd.as_raw_fd(), 1);
+                libc::dup2(out_fd.as_raw_fd(), 2);
+            }
+            // devnull and out_fd drop here, closing the original fds (always >2 post-fork)
 
             Ok(write_fd)
         }
@@ -211,11 +257,19 @@ fn main() {
     match cli.command {
         Command::Server { foreground } => {
             let ctl_path = cli.ctl_socket.unwrap_or_else(gritty::daemon::control_socket_path);
+            let socket_dir = ctl_path.parent().unwrap_or(Path::new("."));
+            if let Err(e) = gritty::security::secure_create_dir_all(socket_dir) {
+                eprintln!("error: {e}");
+                std::process::exit(1);
+            }
+            let out_path = socket_dir.join("daemon.out");
+            let log_path = socket_dir.join("daemon.log");
 
             let ready_fd = if foreground {
                 None
             } else {
-                match daemonize(|child| eprintln!("server started (pid {child})")) {
+                match daemonize(|child| eprintln!("server started (pid {child})"), Some(&out_path))
+                {
                     Ok(fd) => Some(fd),
                     Err(e) => {
                         eprintln!("error: failed to daemonize: {e}");
@@ -224,8 +278,8 @@ fn main() {
                 }
             };
 
-            // Init tracing AFTER fork (stderr may be /dev/null in server mode)
-            init_tracing(verbose);
+            // Init tracing AFTER fork: file in daemon mode, stderr in foreground
+            init_tracing(verbose, if ready_fd.is_some() { Some(&log_path) } else { None });
 
             let rt = match tokio::runtime::Runtime::new() {
                 Ok(rt) => rt,
@@ -260,17 +314,28 @@ fn main() {
             };
             let local_sock = gritty::connect::connection_socket_path(&connection_name);
 
+            let socket_dir = gritty::daemon::socket_dir();
+            if let Err(e) = gritty::security::secure_create_dir_all(&socket_dir) {
+                eprintln!("error: {e}");
+                std::process::exit(1);
+            }
+            let out_path = socket_dir.join(format!("connect-{connection_name}.out"));
+            let log_path = socket_dir.join(format!("connect-{connection_name}.log"));
+
             let ready_fd = if foreground || dry_run {
                 None
             } else {
                 let sock_display = local_sock.display().to_string();
                 let conn_name = connection_name.clone();
-                match daemonize(move |_child| {
-                    println!("{sock_display}");
-                    eprintln!("tunnel started (name: {conn_name}). to use:");
-                    eprintln!("  gritty new {conn_name}");
-                    eprintln!("  gritty attach {conn_name} -t <name>");
-                }) {
+                match daemonize(
+                    move |_child| {
+                        println!("{sock_display}");
+                        eprintln!("tunnel started (name: {conn_name}). to use:");
+                        eprintln!("  gritty new {conn_name}");
+                        eprintln!("  gritty attach {conn_name} -t <name>");
+                    },
+                    Some(&out_path),
+                ) {
                     Ok(fd) => Some(fd),
                     Err(e) => {
                         eprintln!("error: failed to daemonize: {e}");
@@ -282,7 +347,7 @@ fn main() {
             // In the parent process, daemonize() exits via std::process::exit.
             // If we're here, we're either the child or running in foreground.
 
-            init_tracing(verbose);
+            init_tracing(verbose, if ready_fd.is_some() { Some(&log_path) } else { None });
 
             let rt = match tokio::runtime::Runtime::new() {
                 Ok(rt) => rt,
@@ -310,7 +375,7 @@ fn main() {
             }
         }
         _ => {
-            init_tracing(verbose);
+            init_tracing(verbose, None);
             let rt = match tokio::runtime::Runtime::new() {
                 Ok(rt) => rt,
                 Err(e) => {
