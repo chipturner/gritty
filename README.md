@@ -1,29 +1,31 @@
 # gritty
 
-Persistent, self-healing terminal sessions over SSH.
+Persistent, self-healing terminal sessions over SSH for smooth remote development.
 
-gritty gives you remote shell sessions that survive network changes, laptop sleep, and SSH disconnects. Close your laptop, change networks, reconnect your VPN — gritty detects the dead connection, respawns the SSH tunnel, and picks up where you left off. Your session never dies.
+gritty gives you seamless, robust remote shell sessions that survive network changes, laptop sleep, and SSH disconnects. Close your laptop, change networks, reconnect your VPN — gritty detects the dead connection, respawns the SSH tunnel, and picks up where you left off.  gritty also optionally forwards your `ssh-agent` and will handle remote requests to open URLs via `$BROWSER`.
 
-It works by forwarding Unix domain sockets over SSH — no custom protocol, no open ports, no certificates, no configuration. If you can `ssh` to a host, you can use gritty.
+It works by forwarding Unix domain sockets over SSH — no custom protocol, no open ports, no certificates, no configuration. If you can `ssh` to a host, you can use gritty for reliable remote development.
 
 ## Features
 
-- **Self-healing connections** — heartbeat detection, automatic tunnel respawn, transparent client reconnect
-- **SSH agent forwarding** — `--forward-agent` / `-A` tunnels your local SSH agent through gritty sessions, so `git push`, `ssh`, and other agent-dependent commands work on the remote host as if you were local
-- **URL open forwarding** — `--forward-open` / `-O` forwards URL open requests back to your local machine, so `cargo doc --open`, `python -m webbrowser`, and anything using `$BROWSER` opens locally
-- **Persistent sessions** — shells survive client disconnect, network failure, laptop sleep
-- **Single binary, zero config** — no server config, no port allocation, no root required; gritty auto-starts the remote server for you
-- **No network protocol** — Unix domain sockets locally, SSH handles encryption and auth
-- **SSH-style escape sequences** — `~.` detach, `~^Z` suspend, `~?` help
-- **Environment forwarding** — TERM, LANG, COLORTERM propagated to remote shell
-- **Multiple named sessions** — create, list, attach, kill by name or ID
+- **Reliable**
+    - **Self-healing connections** — heartbeat detection, automatic tunnel respawn, transparent client reconnect
+    - **Persistent sessions** — shells survive client disconnect, network failure, laptop sleep
+- **Remote development**
+    - **SSH agent forwarding** (`-A`) — tunnels your local SSH agent so `git push`, `ssh`, and other agent-dependent commands work remotely
+    - **URL open forwarding** (`-O`) — forwards `$BROWSER` / URL open requests back to your local machine
+    - **Environment forwarding** — TERM, LANG, COLORTERM propagated to remote shell
+- **Simple**
+    - **Single binary, zero config** — no server config, no port allocation, no root required; auto-starts the remote server
+    - **No network protocol** — Unix domain sockets locally, SSH handles encryption and auth
+- **Session management**
+    - **Multiple named sessions** — create, list, attach, kill by name or ID
+    - **SSH-style escape sequences** — `~.` detach, `~^Z` suspend, `~?` help
 
 ## Quick Start
 
 ```bash
-# Build and install
-cargo build --release
-cp target/release/gritty ~/.local/bin/  # or somewhere in your PATH
+cargo install gritty-cli
 ```
 
 ### Connect to a remote host
@@ -67,17 +69,6 @@ ID  Name    PTY         PID    Created              Status
 1   deploy  /dev/pts/5  48305  2026-02-21 14:33:41  detached
 ```
 
-### Local usage
-
-gritty also works locally without SSH — useful for persistent sessions that survive terminal close:
-
-```bash
-gritty server            # start local server (self-backgrounds)
-gritty new -t scratch    # create a session
-gritty attach -t scratch # reattach later
-gritty kill-server       # clean up
-```
-
 ## Commands
 
 | Command | Aliases | Description |
@@ -91,7 +82,6 @@ gritty kill-server       # clean up
 | `gritty kill-session [host] -t <id\|name>` | | Kill a session |
 | `gritty kill-server [host]` | | Kill the server and all sessions |
 | `gritty open <url>` | | Open a URL on the local machine (inside sessions) |
-| `gritty server` | `s` | Start a local server |
 
 The `[host]` argument is a connection name from `gritty connect` (e.g., `gritty ls devbox`). Omit it to use the local server.
 
@@ -240,7 +230,7 @@ gritty differs by having no network protocol of its own. Where mosh and ET imple
 
 ## Status & Roadmap
 
-Early stage. Works on Linux and macOS. Not yet packaged for distribution.
+Early stage. Works on Linux and macOS. Available on [crates.io](https://crates.io/crates/gritty-cli).
 
 **Planned:**
 - **Server auto-start** — start the server on demand (systemd socket activation, launchd, or on first `new-session`)
