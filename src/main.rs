@@ -423,7 +423,11 @@ async fn run(cli: Cli) -> anyhow::Result<()> {
         }
         Command::KillServer { host } => {
             let ctl_path = resolve_ctl_path(cli.ctl_socket, host.as_deref())?;
-            kill_server(ctl_path).await
+            kill_server(ctl_path).await?;
+            if let Some(host) = &host {
+                gritty::connect::disconnect(host).await?;
+            }
+            Ok(())
         }
         Command::SocketPath => {
             let ctl_path = cli.ctl_socket.unwrap_or_else(gritty::daemon::control_socket_path);
