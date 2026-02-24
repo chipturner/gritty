@@ -250,6 +250,35 @@ enum AgentEvent {
     Closed { channel_id: u32 },
 }
 
+/// Send session setup frames (env, agent/open forwarding, resize, redraw).
+/// Returns false if the connection dropped during setup.
+async fn send_init_frames(
+    framed: &mut Framed<UnixStream, FrameCodec>,
+    env_vars: &[(String, String)],
+    forward_agent: bool,
+    agent_socket: Option<&str>,
+    forward_open: bool,
+    redraw: bool,
+) -> bool {
+    if !env_vars.is_empty() && !timed_send(framed, Frame::Env { vars: env_vars.to_vec() }).await {
+        return false;
+    }
+    if forward_agent && agent_socket.is_some() && !timed_send(framed, Frame::AgentForward).await {
+        return false;
+    }
+    if forward_open && !timed_send(framed, Frame::OpenForward).await {
+        return false;
+    }
+    let (cols, rows) = get_terminal_size();
+    if !timed_send(framed, Frame::Resize { cols, rows }).await {
+        return false;
+    }
+    if redraw && !timed_send(framed, Frame::Data(Bytes::from_static(b"\x0c"))).await {
+        return false;
+    }
+    true
+}
+
 /// Relay between stdin/stdout and the framed socket.
 /// Returns `Some(code)` on clean shell exit or detach, `None` on server disconnect / heartbeat timeout.
 #[allow(clippy::too_many_arguments)]
@@ -258,37 +287,11 @@ async fn relay(
     async_stdin: &AsyncFd<io::Stdin>,
     sigwinch: &mut tokio::signal::unix::Signal,
     buf: &mut [u8],
-    redraw: bool,
-    env_vars: &[(String, String)],
     mut escape: Option<&mut EscapeProcessor>,
     raw_guard: &RawModeGuard,
     nb_guard: &NonBlockGuard,
-    forward_agent: bool,
     agent_socket: Option<&str>,
-    forward_open: bool,
 ) -> anyhow::Result<Option<i32>> {
-    // Send env vars before resize (server reads Env frame before spawning shell)
-    if !env_vars.is_empty() && !timed_send(framed, Frame::Env { vars: env_vars.to_vec() }).await {
-        return Ok(None);
-    }
-    // Signal agent forwarding capability
-    if forward_agent && agent_socket.is_some() && !timed_send(framed, Frame::AgentForward).await {
-        return Ok(None);
-    }
-    // Signal open forwarding capability
-    if forward_open && !timed_send(framed, Frame::OpenForward).await {
-        return Ok(None);
-    }
-    // Send initial window size
-    let (cols, rows) = get_terminal_size();
-    if !timed_send(framed, Frame::Resize { cols, rows }).await {
-        return Ok(None);
-    }
-    // Inject Ctrl-L to force the shell/app to redraw
-    if redraw && !timed_send(framed, Frame::Data(Bytes::from_static(b"\x0c"))).await {
-        return Ok(None);
-    }
-
     let mut heartbeat_interval = tokio::time::interval(HEARTBEAT_INTERVAL);
     heartbeat_interval.reset(); // first tick is immediate otherwise; delay it
     let mut last_pong = Instant::now();
@@ -488,22 +491,31 @@ pub async fn run(
     let agent_socket = if forward_agent { std::env::var("SSH_AUTH_SOCK").ok() } else { None };
 
     loop {
-        match relay(
+        let result = if send_init_frames(
             &mut framed,
-            &async_stdin,
-            &mut sigwinch,
-            &mut buf,
-            current_redraw,
             &current_env,
-            escape.as_mut(),
-            &raw_guard,
-            &nb_guard,
             forward_agent,
             agent_socket.as_deref(),
             forward_open,
+            current_redraw,
         )
-        .await?
+        .await
         {
+            relay(
+                &mut framed,
+                &async_stdin,
+                &mut sigwinch,
+                &mut buf,
+                escape.as_mut(),
+                &raw_guard,
+                &nb_guard,
+                agent_socket.as_deref(),
+            )
+            .await?
+        } else {
+            None
+        };
+        match result {
             Some(code) => return Ok(code),
             None => {
                 // Env vars only sent on first connection; clear for reconnect
