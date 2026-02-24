@@ -781,3 +781,87 @@ async fn list_sessions_shows_heartbeat() {
     kill_cleanup(&ctl_path, &id).await;
     let _ = std::fs::remove_file(&ctl_path);
 }
+
+#[tokio::test]
+async fn reconnect_via_daemon_after_disconnect() {
+    let _permit = CONCURRENCY.acquire().await.unwrap();
+    let ctl_path = unique_ctl("reconnect");
+    let _ = std::fs::remove_file(&ctl_path);
+
+    let ctl = ctl_path.clone();
+    let _daemon = tokio::spawn(async move { gritty::daemon::run(&ctl, None).await });
+    tokio::time::sleep(Duration::from_millis(200)).await;
+
+    let id = create_session(&ctl_path, "reconn").await;
+
+    // First attach — set an env marker
+    let mut framed = attach_session(&ctl_path, &id).await;
+    drain_data(&mut framed, Duration::from_millis(500)).await;
+    framed.send(Frame::Data(Bytes::from("export RECONN_MARKER=persisted\n"))).await.unwrap();
+    drain_data(&mut framed, Duration::from_millis(500)).await;
+
+    // Disconnect
+    drop(framed);
+    tokio::time::sleep(Duration::from_millis(500)).await;
+
+    // Re-attach via new daemon connection (raw — shell already running, no guaranteed output)
+    let stream = UnixStream::connect(&ctl_path).await.unwrap();
+    let mut framed = Framed::new(stream, FrameCodec);
+    framed.send(Frame::Attach { session: id.clone() }).await.unwrap();
+    let resp = timeout(Duration::from_secs(3), framed.next())
+        .await.expect("timed out").expect("stream ended").expect("decode error");
+    assert_eq!(resp, Frame::Ok, "expected Ok for re-attach, got {resp:?}");
+    framed.send(Frame::Resize { cols: 80, rows: 24 }).await.unwrap();
+    drain_data(&mut framed, Duration::from_millis(500)).await;
+
+    // Verify marker persists
+    framed.send(Frame::Data(Bytes::from("echo $RECONN_MARKER\n"))).await.unwrap();
+    let mut output = Vec::new();
+    while let Ok(Some(Ok(Frame::Data(data)))) = timeout(Duration::from_secs(2), framed.next()).await
+    {
+        output.extend_from_slice(&data);
+    }
+    let output_str = String::from_utf8_lossy(&output);
+    assert!(
+        output_str.contains("persisted"),
+        "env marker should persist across reconnect, got: {output_str}"
+    );
+
+    kill_cleanup(&ctl_path, &id).await;
+    let _ = std::fs::remove_file(&ctl_path);
+}
+
+#[tokio::test]
+async fn reconnect_after_session_killed_returns_error() {
+    let _permit = CONCURRENCY.acquire().await.unwrap();
+    let ctl_path = unique_ctl("reconn-killed");
+    let _ = std::fs::remove_file(&ctl_path);
+
+    let ctl = ctl_path.clone();
+    let _daemon = tokio::spawn(async move { gritty::daemon::run(&ctl, None).await });
+    tokio::time::sleep(Duration::from_millis(200)).await;
+
+    let id = create_session(&ctl_path, "doomed-reconn").await;
+
+    // Attach
+    let mut framed = attach_session(&ctl_path, &id).await;
+    drain_data(&mut framed, Duration::from_millis(500)).await;
+
+    // Disconnect
+    drop(framed);
+    tokio::time::sleep(Duration::from_millis(300)).await;
+
+    // Kill the session
+    let resp = control_request(&ctl_path, Frame::KillSession { session: id.clone() }).await;
+    assert_eq!(resp, Frame::Ok);
+    tokio::time::sleep(Duration::from_millis(300)).await;
+
+    // Try to re-attach — should get Error
+    let resp = control_request(&ctl_path, Frame::Attach { session: id.clone() }).await;
+    assert!(
+        matches!(resp, Frame::Error { .. }),
+        "expected Error when attaching to killed session, got {resp:?}"
+    );
+
+    let _ = std::fs::remove_file(&ctl_path);
+}

@@ -912,3 +912,60 @@ async fn open_forwarding_not_enabled() {
     let _ = framed.send(Frame::Data(Bytes::from("exit\n"))).await;
     let _ = timeout(Duration::from_secs(3), server).await;
 }
+
+#[tokio::test]
+async fn ping_pong_response_is_fast() {
+    let _permit = CONCURRENCY.acquire().await.unwrap();
+    let (_tx, mut framed, server, _meta) = setup_session().await;
+    wait_for_shell(&mut framed).await;
+    read_available_data(&mut framed, Duration::from_secs(1)).await;
+
+    let start = std::time::Instant::now();
+    framed.send(Frame::Ping).await.unwrap();
+
+    loop {
+        match timeout(Duration::from_secs(3), framed.next()).await {
+            Ok(Some(Ok(Frame::Pong))) => break,
+            Ok(Some(Ok(Frame::Data(_)))) => continue,
+            other => panic!("expected Pong, got: {other:?}"),
+        }
+    }
+
+    let elapsed = start.elapsed();
+    assert!(elapsed < Duration::from_secs(1), "Pong should arrive in <1s, took {elapsed:?}");
+
+    let _ = framed.send(Frame::Data(Bytes::from("exit\n"))).await;
+    let _ = timeout(Duration::from_secs(3), server).await;
+}
+
+#[tokio::test]
+async fn multiple_pings_get_multiple_pongs() {
+    let _permit = CONCURRENCY.acquire().await.unwrap();
+    let (_tx, mut framed, server, _meta) = setup_session().await;
+    wait_for_shell(&mut framed).await;
+    read_available_data(&mut framed, Duration::from_secs(1)).await;
+
+    // Send 3 Pings rapidly
+    for _ in 0..3 {
+        framed.send(Frame::Ping).await.unwrap();
+    }
+
+    // Collect exactly 3 Pongs
+    let mut pong_count = 0;
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    while pong_count < 3 {
+        match timeout(Duration::from_secs(3), framed.next()).await {
+            Ok(Some(Ok(Frame::Pong))) => pong_count += 1,
+            Ok(Some(Ok(Frame::Data(_)))) => continue,
+            other => panic!("expected Pong #{}, got: {other:?}", pong_count + 1),
+        }
+        if tokio::time::Instant::now() >= deadline {
+            break;
+        }
+    }
+
+    assert_eq!(pong_count, 3, "expected 3 Pongs for 3 Pings");
+
+    let _ = framed.send(Frame::Data(Bytes::from("exit\n"))).await;
+    let _ = timeout(Duration::from_secs(3), server).await;
+}
