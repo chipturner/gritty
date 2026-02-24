@@ -31,11 +31,11 @@ Similar to Eternal Terminal but socket-based. Sessions are persistent (shell sur
 
 ```bash
 cargo build
-cargo test                           # all tests (142 total)
+cargo test                           # all tests (179 total, 1 ignored)
 cargo test --test protocol_test      # codec unit tests only (51)
-cargo test --test daemon_test        # daemon integration tests (21)
-cargo test --test e2e_test           # e2e session tests (25)
-                                     # + 28 connect unit tests + 17 escape processor tests in lib
+cargo test --test daemon_test        # daemon integration tests (23)
+cargo test --test e2e_test           # e2e session tests (27)
+                                     # + 32 connect + 18 security + 17 escape + 5 lib + 6 main in lib/bin
 cargo run -- server                   # start server (self-backgrounds, prints PID)
 cargo run -- server --foreground      # start server in foreground
 cargo run -- new -t myproject        # create named session (requires server)
@@ -102,7 +102,7 @@ Six modules behind a lib crate (`src/lib.rs`) with a thin binary entry point (`s
 
 ## Current Status
 
-Full CLI with tmux-like ergonomics. Single-socket architecture. Self-daemonizing server with `--foreground` option. PID file and clean signal handling (SIGTERM/SIGINT). Ping/Pong heartbeat with auto-reconnect. Login shell with client environment forwarding. SSH agent forwarding (`--forward-agent` / `-A`). URL open forwarding (`--forward-open` / `-O`, `gritty open <url>`). SSH-style escape sequences (`~.` detach, `~^Z` suspend, `~?` help). Self-backgrounding SSH connect with lockfile-based liveness (`gritty connect` forks, prints socket path, returns; `gritty disconnect` tears down; `gritty tunnels` lists status). All modules implemented and tested (142 tests: 17 escape processor + 28 connect + 51 protocol codec + 25 e2e session + 21 daemon integration).
+Full CLI with tmux-like ergonomics. Single-socket architecture. Self-daemonizing server with `--foreground` option. PID file and clean signal handling (SIGTERM/SIGINT). Ping/Pong heartbeat with auto-reconnect. Login shell with client environment forwarding. SSH agent forwarding (`--forward-agent` / `-A`). URL open forwarding (`--forward-open` / `-O`, `gritty open <url>`). SSH-style escape sequences (`~.` detach, `~^Z` suspend, `~?` help). Self-backgrounding SSH connect with lockfile-based liveness (`gritty connect` forks, prints socket path, returns; `gritty disconnect` tears down; `gritty tunnels` lists status). All modules implemented and tested (179 tests, 1 ignored: 17 escape processor + 32 connect + 18 security + 5 lib + 6 main + 51 protocol codec + 27 e2e session + 23 daemon integration).
 
 ## Development Notes
 
