@@ -13,9 +13,22 @@ use tokio::io::AsyncReadExt;
 use tokio::io::unix::AsyncFd;
 use tokio::net::{UnixListener, UnixStream};
 use tokio::process::Command;
-use tokio::sync::mpsc;
+use tokio::sync::{broadcast, mpsc};
 use tokio_util::codec::Framed;
 use tracing::{debug, info, warn};
+
+/// Wrapper to distinguish active vs tail connections arriving via channel.
+pub enum ClientConn {
+    Active(Framed<UnixStream, FrameCodec>),
+    Tail(Framed<UnixStream, FrameCodec>),
+}
+
+/// Events broadcast to tail clients.
+#[derive(Clone)]
+enum TailEvent {
+    Data(Bytes),
+    Exit { code: i32 },
+}
 
 pub struct SessionMetadata {
     pub pty_path: String,
@@ -149,8 +162,52 @@ fn spawn_open_acceptor(
     })
 }
 
+/// Relay broadcast events to a tail client. Handles Ping/Pong for keepalive.
+async fn tail_relay(
+    mut framed: Framed<UnixStream, FrameCodec>,
+    mut rx: broadcast::Receiver<TailEvent>,
+) {
+    loop {
+        tokio::select! {
+            event = rx.recv() => match event {
+                Ok(TailEvent::Data(chunk)) => {
+                    if framed.send(Frame::Data(chunk)).await.is_err() { break; }
+                }
+                Ok(TailEvent::Exit { code }) => {
+                    let _ = framed.send(Frame::Exit { code }).await;
+                    break;
+                }
+                Err(broadcast::error::RecvError::Lagged(_)) => continue,
+                Err(broadcast::error::RecvError::Closed) => break,
+            },
+            frame = framed.next() => match frame {
+                Some(Ok(Frame::Ping)) => { let _ = framed.send(Frame::Pong).await; }
+                _ => break,
+            },
+        }
+    }
+}
+
+/// Drain ring buffer contents to a tail client, then subscribe to broadcast and spawn relay.
+fn spawn_tail(
+    mut framed: Framed<UnixStream, FrameCodec>,
+    ring_buf: &VecDeque<Bytes>,
+    tail_tx: &broadcast::Sender<TailEvent>,
+) {
+    let rx = tail_tx.subscribe();
+    let chunks: Vec<Bytes> = ring_buf.iter().cloned().collect();
+    tokio::spawn(async move {
+        for chunk in chunks {
+            if framed.send(Frame::Data(chunk)).await.is_err() {
+                return;
+            }
+        }
+        tail_relay(framed, rx).await;
+    });
+}
+
 pub async fn run(
-    mut client_rx: mpsc::UnboundedReceiver<Framed<UnixStream, FrameCodec>>,
+    mut client_rx: mpsc::UnboundedReceiver<ClientConn>,
     metadata_slot: Arc<OnceLock<SessionMetadata>>,
     agent_socket_path: PathBuf,
     open_socket_path: PathBuf,
@@ -187,16 +244,28 @@ pub async fn run(
     // Agent event channel persists across acceptor lifetimes
     let (agent_event_tx, mut agent_event_rx) = mpsc::unbounded_channel::<AgentEvent>();
 
-    // Wait for first client before spawning shell (so we can read Env frame)
-    let mut framed = match client_rx.recv().await {
-        Some(framed) => {
-            info!("first client connected via channel");
-            framed
-        }
-        None => {
-            info!("client channel closed before first client");
-            cleanup_socket(&agent_socket_path);
-            return Ok(());
+    // Broadcast channel for tail clients
+    let (tail_tx, _) = broadcast::channel::<TailEvent>(256);
+
+    // Wait for first active client before spawning shell (so we can read Env frame).
+    // Tail clients that arrive before the first active client get subscribed to the
+    // broadcast and will receive output once the shell starts.
+    let mut framed = loop {
+        match client_rx.recv().await {
+            Some(ClientConn::Active(f)) => {
+                info!("first client connected via channel");
+                break f;
+            }
+            Some(ClientConn::Tail(f)) => {
+                info!("tail client connected before shell spawn");
+                spawn_tail(f, &ring_buf, &tail_tx);
+                continue;
+            }
+            None => {
+                info!("client channel closed before first client");
+                cleanup_socket(&agent_socket_path);
+                return Ok(());
+            }
         }
     };
 
@@ -293,10 +362,15 @@ pub async fn run(
                 tokio::select! {
                     client = client_rx.recv() => {
                         match client {
-                            Some(f) => {
+                            Some(ClientConn::Active(f)) => {
                                 info!("client connected via channel");
                                 framed = f;
                                 break 'drain true;
+                            }
+                            Some(ClientConn::Tail(f)) => {
+                                info!("tail client connected while disconnected");
+                                spawn_tail(f, &ring_buf, &tail_tx);
+                                continue;
                             }
                             None => {
                                 info!("client channel closed");
@@ -320,6 +394,7 @@ pub async fn run(
                             }
                             Ok(Ok(n)) => {
                                 let chunk = Bytes::copy_from_slice(&buf[..n]);
+                                let _ = tail_tx.send(TailEvent::Data(chunk.clone()));
                                 ring_buf_size += chunk.len();
                                 ring_buf.push_back(chunk);
                                 while ring_buf_size > RING_BUF_CAP {
@@ -454,7 +529,9 @@ pub async fn run(
                         }
                         Ok(Ok(n)) => {
                             debug!(len = n, "pty -> socket");
-                            framed.send(Frame::Data(Bytes::copy_from_slice(&buf[..n]))).await?;
+                            let chunk = Bytes::copy_from_slice(&buf[..n]);
+                            let _ = tail_tx.send(TailEvent::Data(chunk.clone()));
+                            framed.send(Frame::Data(chunk)).await?;
                         }
                         Ok(Err(e)) => {
                             if e.raw_os_error() == Some(libc::EIO) {
@@ -467,19 +544,26 @@ pub async fn run(
                     }
                 }
 
-                // Client takeover via channel
+                // Client takeover or tail via channel
                 new_client = client_rx.recv() => {
-                    if let Some(new_framed) = new_client {
-                        info!("new client via channel, detaching old client");
-                        let _ = framed.send(Frame::Detached).await;
-                        teardown_forwarding(
-                            &mut agent_channels,
-                            &mut agent_forward_enabled,
-                            &mut agent_acceptor,
-                            &mut open_forward_enabled,
-                            &mut open_acceptor,
-                        );
-                        framed = new_framed;
+                    match new_client {
+                        Some(ClientConn::Active(new_framed)) => {
+                            info!("new client via channel, detaching old client");
+                            let _ = framed.send(Frame::Detached).await;
+                            teardown_forwarding(
+                                &mut agent_channels,
+                                &mut agent_forward_enabled,
+                                &mut agent_acceptor,
+                                &mut open_forward_enabled,
+                                &mut open_acceptor,
+                            );
+                            framed = new_framed;
+                        }
+                        Some(ClientConn::Tail(f)) => {
+                            info!("tail client connected while active");
+                            spawn_tail(f, &ring_buf, &tail_tx);
+                        }
+                        None => {}
                     }
                 }
 
@@ -553,6 +637,7 @@ pub async fn run(
                 if let Ok(Some(status)) = managed.child.try_wait() {
                     code = status.code().unwrap_or(code);
                 }
+                let _ = tail_tx.send(TailEvent::Exit { code });
                 let _ = framed.send(Frame::Exit { code }).await;
                 info!(code, "session ended");
                 break;

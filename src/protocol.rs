@@ -20,6 +20,7 @@ const TYPE_ATTACH: u8 = 0x11;
 const TYPE_LIST_SESSIONS: u8 = 0x12;
 const TYPE_KILL_SESSION: u8 = 0x13;
 const TYPE_KILL_SERVER: u8 = 0x14;
+const TYPE_TAIL: u8 = 0x15;
 const TYPE_SESSION_CREATED: u8 = 0x20;
 const TYPE_SESSION_INFO: u8 = 0x21;
 const TYPE_OK: u8 = 0x22;
@@ -86,6 +87,10 @@ pub enum Frame {
         name: String,
     },
     Attach {
+        session: String,
+    },
+    /// Read-only tail of a session's PTY output (client → server).
+    Tail {
         session: String,
     },
     ListSessions,
@@ -242,6 +247,7 @@ impl Decoder for FrameCodec {
             TYPE_OPEN_URL => Ok(Some(Frame::OpenUrl { url: decode_string(payload)? })),
             TYPE_NEW_SESSION => Ok(Some(Frame::NewSession { name: decode_string(payload)? })),
             TYPE_ATTACH => Ok(Some(Frame::Attach { session: decode_string(payload)? })),
+            TYPE_TAIL => Ok(Some(Frame::Tail { session: decode_string(payload)? })),
             TYPE_LIST_SESSIONS => Ok(Some(Frame::ListSessions)),
             TYPE_KILL_SESSION => Ok(Some(Frame::KillSession { session: decode_string(payload)? })),
             TYPE_KILL_SERVER => Ok(Some(Frame::KillServer)),
@@ -335,6 +341,7 @@ impl Encoder<Frame> for FrameCodec {
             Frame::OpenUrl { url } => encode_str(dst, TYPE_OPEN_URL, &url),
             Frame::NewSession { name } => encode_str(dst, TYPE_NEW_SESSION, &name),
             Frame::Attach { session } => encode_str(dst, TYPE_ATTACH, &session),
+            Frame::Tail { session } => encode_str(dst, TYPE_TAIL, &session),
             Frame::ListSessions => encode_empty(dst, TYPE_LIST_SESSIONS),
             Frame::KillSession { session } => encode_str(dst, TYPE_KILL_SESSION, &session),
             Frame::KillServer => encode_empty(dst, TYPE_KILL_SERVER),

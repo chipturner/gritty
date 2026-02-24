@@ -1,6 +1,7 @@
 use bytes::Bytes;
 use futures_util::{SinkExt, StreamExt};
 use gritty::protocol::{Frame, FrameCodec};
+use gritty::server::ClientConn;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Arc, LazyLock, OnceLock};
@@ -35,7 +36,7 @@ fn unique_open_socket_path() -> PathBuf {
 /// Spawn a server task connected via socketpair + channel.
 /// Returns (client_tx for takeover, client-side framed, server join handle).
 async fn setup_session() -> (
-    mpsc::UnboundedSender<Framed<UnixStream, FrameCodec>>,
+    mpsc::UnboundedSender<ClientConn>,
     Framed<UnixStream, FrameCodec>,
     JoinHandle<anyhow::Result<()>>,
     Arc<OnceLock<gritty::server::SessionMetadata>>,
@@ -50,7 +51,7 @@ async fn setup_session() -> (
     });
 
     let (server_stream, client_stream) = UnixStream::pair().unwrap();
-    client_tx.send(Framed::new(server_stream, FrameCodec)).unwrap();
+    client_tx.send(ClientConn::Active(Framed::new(server_stream, FrameCodec))).unwrap();
 
     let framed = Framed::new(client_stream, FrameCodec);
     (client_tx, framed, handle, meta)
@@ -61,7 +62,7 @@ async fn setup_session() -> (
 async fn setup_session_with_env(
     env_vars: Vec<(String, String)>,
 ) -> (
-    mpsc::UnboundedSender<Framed<UnixStream, FrameCodec>>,
+    mpsc::UnboundedSender<ClientConn>,
     Framed<UnixStream, FrameCodec>,
     JoinHandle<anyhow::Result<()>>,
     Arc<OnceLock<gritty::server::SessionMetadata>>,
@@ -76,7 +77,7 @@ async fn setup_session_with_env(
     });
 
     let (server_stream, client_stream) = UnixStream::pair().unwrap();
-    client_tx.send(Framed::new(server_stream, FrameCodec)).unwrap();
+    client_tx.send(ClientConn::Active(Framed::new(server_stream, FrameCodec))).unwrap();
 
     let mut framed = Framed::new(client_stream, FrameCodec);
     // Send Env frame so server reads it before spawning shell
@@ -190,7 +191,7 @@ async fn reconnect_preserves_shell_session() {
 
     // Second connection via socketpair through channel
     let (server_stream, client_stream) = UnixStream::pair().unwrap();
-    client_tx.send(Framed::new(server_stream, FrameCodec)).unwrap();
+    client_tx.send(ClientConn::Active(Framed::new(server_stream, FrameCodec))).unwrap();
     let mut framed = Framed::new(client_stream, FrameCodec);
     framed.send(Frame::Resize { cols: 80, rows: 24 }).await.unwrap();
 
@@ -237,7 +238,7 @@ async fn second_client_detaches_first() {
 
     // Second client connects via channel — should take over the session
     let (server_stream2, client_stream2) = UnixStream::pair().unwrap();
-    client_tx.send(Framed::new(server_stream2, FrameCodec)).unwrap();
+    client_tx.send(ClientConn::Active(Framed::new(server_stream2, FrameCodec))).unwrap();
     let mut client2 = Framed::new(client_stream2, FrameCodec);
     client2.send(Frame::Resize { cols: 80, rows: 24 }).await.unwrap();
 
@@ -320,7 +321,7 @@ async fn rapid_reconnect_cycles() {
         tokio::time::sleep(Duration::from_millis(200)).await;
 
         let (server_stream, client_stream) = UnixStream::pair().unwrap();
-        client_tx.send(Framed::new(server_stream, FrameCodec)).unwrap();
+        client_tx.send(ClientConn::Active(Framed::new(server_stream, FrameCodec))).unwrap();
         framed = Framed::new(client_stream, FrameCodec);
         framed.send(Frame::Resize { cols: 80, rows: 24 }).await.unwrap();
         read_available_data(&mut framed, Duration::from_millis(500)).await;
@@ -386,7 +387,7 @@ async fn pty_buffer_saturation_and_resume() {
 
     // Reconnect via socketpair
     let (server_stream, client_stream) = UnixStream::pair().unwrap();
-    client_tx.send(Framed::new(server_stream, FrameCodec)).unwrap();
+    client_tx.send(ClientConn::Active(Framed::new(server_stream, FrameCodec))).unwrap();
     let mut framed = Framed::new(client_stream, FrameCodec);
     framed.send(Frame::Resize { cols: 80, rows: 24 }).await.unwrap();
 
@@ -425,7 +426,7 @@ async fn pty_ring_buffer_drains_during_disconnect() {
 
     // Reconnect
     let (server_stream, client_stream) = UnixStream::pair().unwrap();
-    client_tx.send(Framed::new(server_stream, FrameCodec)).unwrap();
+    client_tx.send(ClientConn::Active(Framed::new(server_stream, FrameCodec))).unwrap();
     let mut framed = Framed::new(client_stream, FrameCodec);
     framed.send(Frame::Resize { cols: 80, rows: 24 }).await.unwrap();
 
@@ -464,7 +465,7 @@ async fn pty_ring_buffer_caps_at_limit() {
 
     // Reconnect
     let (server_stream, client_stream) = UnixStream::pair().unwrap();
-    client_tx.send(Framed::new(server_stream, FrameCodec)).unwrap();
+    client_tx.send(ClientConn::Active(Framed::new(server_stream, FrameCodec))).unwrap();
     let mut framed = Framed::new(client_stream, FrameCodec);
     framed.send(Frame::Resize { cols: 80, rows: 24 }).await.unwrap();
 
@@ -532,7 +533,7 @@ async fn metadata_reflects_attached_state() {
 
     // Reconnect and clean up
     let (server_stream, client_stream) = UnixStream::pair().unwrap();
-    client_tx.send(Framed::new(server_stream, FrameCodec)).unwrap();
+    client_tx.send(ClientConn::Active(Framed::new(server_stream, FrameCodec))).unwrap();
     let mut framed = Framed::new(client_stream, FrameCodec);
     framed.send(Frame::Resize { cols: 80, rows: 24 }).await.unwrap();
     let _ = framed.send(Frame::Data(Bytes::from("exit\n"))).await;
@@ -555,7 +556,7 @@ async fn client_explicit_exit_frame() {
     // Server should still be running (it treats Exit as client disconnect).
     // Reconnect to verify shell is alive.
     let (server_stream, client_stream) = UnixStream::pair().unwrap();
-    client_tx.send(Framed::new(server_stream, FrameCodec)).unwrap();
+    client_tx.send(ClientConn::Active(Framed::new(server_stream, FrameCodec))).unwrap();
     let mut framed = Framed::new(client_stream, FrameCodec);
     framed.send(Frame::Resize { cols: 80, rows: 24 }).await.unwrap();
     read_available_data(&mut framed, Duration::from_secs(1)).await;
@@ -691,7 +692,7 @@ async fn login_shell_starts_in_home() {
 
 /// Like setup_session but returns the agent socket path for agent forwarding tests.
 async fn setup_session_with_agent_path() -> (
-    mpsc::UnboundedSender<Framed<UnixStream, FrameCodec>>,
+    mpsc::UnboundedSender<ClientConn>,
     Framed<UnixStream, FrameCodec>,
     JoinHandle<anyhow::Result<()>>,
     Arc<OnceLock<gritty::server::SessionMetadata>>,
@@ -708,7 +709,7 @@ async fn setup_session_with_agent_path() -> (
     });
 
     let (server_stream, client_stream) = UnixStream::pair().unwrap();
-    client_tx.send(Framed::new(server_stream, FrameCodec)).unwrap();
+    client_tx.send(ClientConn::Active(Framed::new(server_stream, FrameCodec))).unwrap();
 
     let framed = Framed::new(client_stream, FrameCodec);
     (client_tx, framed, handle, meta, agent_path)
@@ -841,7 +842,7 @@ async fn agent_not_forwarded_without_flag() {
 
 /// Like setup_session but returns the open socket path for open forwarding tests.
 async fn setup_session_with_open_path() -> (
-    mpsc::UnboundedSender<Framed<UnixStream, FrameCodec>>,
+    mpsc::UnboundedSender<ClientConn>,
     Framed<UnixStream, FrameCodec>,
     JoinHandle<anyhow::Result<()>>,
     Arc<OnceLock<gritty::server::SessionMetadata>>,
@@ -858,7 +859,7 @@ async fn setup_session_with_open_path() -> (
     });
 
     let (server_stream, client_stream) = UnixStream::pair().unwrap();
-    client_tx.send(Framed::new(server_stream, FrameCodec)).unwrap();
+    client_tx.send(ClientConn::Active(Framed::new(server_stream, FrameCodec))).unwrap();
 
     let framed = Framed::new(client_stream, FrameCodec);
     (client_tx, framed, handle, meta, open_path)
@@ -971,4 +972,88 @@ async fn multiple_pings_get_multiple_pongs() {
 
     let _ = framed.send(Frame::Data(Bytes::from("exit\n"))).await;
     let _ = timeout(Duration::from_secs(3), server).await;
+}
+
+#[tokio::test]
+async fn tail_receives_output() {
+    let _permit = CONCURRENCY.acquire().await.unwrap();
+    let (client_tx, mut framed, server, _meta) = setup_session().await;
+    wait_for_shell(&mut framed).await;
+    read_available_data(&mut framed, Duration::from_secs(1)).await;
+
+    // Connect a tail client via channel
+    let (server_stream, client_stream) = UnixStream::pair().unwrap();
+    client_tx.send(ClientConn::Tail(Framed::new(server_stream, FrameCodec))).unwrap();
+    let mut tail = Framed::new(client_stream, FrameCodec);
+
+    tokio::time::sleep(Duration::from_millis(200)).await;
+
+    // Send command via active client
+    framed.send(Frame::Data(Bytes::from("echo TAIL_TEST_OK\n"))).await.unwrap();
+
+    // Tail client should see the output
+    let mut output = Vec::new();
+    while let Ok(Some(Ok(Frame::Data(data)))) = timeout(Duration::from_secs(3), tail.next()).await {
+        output.extend_from_slice(&data);
+        if String::from_utf8_lossy(&output).contains("TAIL_TEST_OK") {
+            break;
+        }
+    }
+    let output_str = String::from_utf8_lossy(&output);
+    assert!(
+        output_str.contains("TAIL_TEST_OK"),
+        "tail client should receive PTY output, got: {output_str}"
+    );
+
+    let _ = framed.send(Frame::Data(Bytes::from("exit\n"))).await;
+    let _ = timeout(Duration::from_secs(3), server).await;
+}
+
+#[tokio::test]
+async fn tail_does_not_detach_active_client() {
+    let _permit = CONCURRENCY.acquire().await.unwrap();
+    let (client_tx, mut framed, server, _meta) = setup_session().await;
+    wait_for_shell(&mut framed).await;
+    read_available_data(&mut framed, Duration::from_secs(1)).await;
+
+    // Connect a tail client
+    let (server_stream, client_stream) = UnixStream::pair().unwrap();
+    client_tx.send(ClientConn::Tail(Framed::new(server_stream, FrameCodec))).unwrap();
+    let mut _tail = Framed::new(client_stream, FrameCodec);
+
+    tokio::time::sleep(Duration::from_millis(200)).await;
+
+    // Active client should still be connected (no Detached frame)
+    framed.send(Frame::Data(Bytes::from("echo STILL_ACTIVE\n"))).await.unwrap();
+    let output = read_available_data(&mut framed, Duration::from_secs(2)).await;
+    let output_str = String::from_utf8_lossy(&output);
+    assert!(
+        output_str.contains("STILL_ACTIVE"),
+        "active client should not be detached by tail, got: {output_str}"
+    );
+
+    let _ = framed.send(Frame::Data(Bytes::from("exit\n"))).await;
+    let _ = timeout(Duration::from_secs(3), server).await;
+}
+
+#[tokio::test]
+async fn tail_receives_exit_on_shell_exit() {
+    let _permit = CONCURRENCY.acquire().await.unwrap();
+    let (client_tx, mut framed, _server, _meta) = setup_session().await;
+    wait_for_shell(&mut framed).await;
+    read_available_data(&mut framed, Duration::from_secs(1)).await;
+
+    // Connect a tail client
+    let (server_stream, client_stream) = UnixStream::pair().unwrap();
+    client_tx.send(ClientConn::Tail(Framed::new(server_stream, FrameCodec))).unwrap();
+    let mut tail = Framed::new(client_stream, FrameCodec);
+
+    tokio::time::sleep(Duration::from_millis(200)).await;
+
+    // Exit the shell
+    framed.send(Frame::Data(Bytes::from("exit 42\n"))).await.unwrap();
+
+    // Tail client should receive Exit frame
+    let code = expect_exit_frame(&mut tail, Duration::from_secs(5)).await;
+    assert_eq!(code, Some(42), "tail should receive exit code");
 }

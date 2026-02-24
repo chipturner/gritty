@@ -78,6 +78,7 @@ ID  Name    PTY         PID    Created              Status
 | `gritty tunnels` | `tun` | List active SSH tunnels |
 | `gritty new-session [host] [-t name]` | `new` | Create a session and auto-attach |
 | `gritty attach [host] -t <id\|name>` | `a` | Attach to a session |
+| `gritty tail [host] -t <id\|name>` | `t` | Read-only stream of session output |
 | `gritty list-sessions [host]` | `ls`, `list` | List sessions |
 | `gritty kill-session [host] -t <id\|name>` | | Kill a session |
 | `gritty kill-server [host]` | | Kill the server and all sessions |
@@ -91,7 +92,7 @@ The `[host]` argument is a connection name from `gritty connect` (e.g., `gritty 
 **Notable options:**
 - `-A` / `--forward-agent` on `new`/`attach`: forward your local SSH agent
 - `-O` / `--forward-open` on `new`/`attach`: forward URL opens to local machine
-- `-t <name>` on `new`/`attach`: target session by name or ID
+- `-t <name>` on `new`/`attach`/`tail`: target session by name or ID
 - `-n <name>` on `connect`: override connection name (defaults to hostname)
 - `-o <option>` on `connect`: extra SSH options (repeatable, e.g., `-o "ProxyJump=bastion"`)
 - `--no-redraw` on `new`/`attach`: don't send Ctrl-L after connecting
@@ -281,7 +282,6 @@ Early stage. Works on Linux and macOS. Available on [crates.io](https://crates.i
 **Planned:**
 - **Server auto-start** -- start the server on demand (systemd socket activation, launchd, or on first `new-session`)
 - **Zero-downtime upgrades** -- server re-execs itself, preserving sessions across upgrades
-- **Read-only attach** -- multiple clients viewing the same session for pair programming or demos
 
 ## License
 

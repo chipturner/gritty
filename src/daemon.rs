@@ -1,12 +1,11 @@
 use crate::protocol::{Frame, FrameCodec, SessionEntry};
-use crate::server::{self, SessionMetadata};
+use crate::server::{self, ClientConn, SessionMetadata};
 use futures_util::{SinkExt, StreamExt};
 use std::collections::HashMap;
 use std::os::fd::OwnedFd;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::Ordering;
 use std::sync::{Arc, OnceLock};
-use tokio::net::UnixStream;
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 use tokio_util::codec::Framed;
@@ -15,7 +14,7 @@ use tracing::{error, info, warn};
 struct SessionState {
     handle: JoinHandle<anyhow::Result<()>>,
     metadata: Arc<OnceLock<SessionMetadata>>,
-    client_tx: mpsc::UnboundedSender<Framed<UnixStream, FrameCodec>>,
+    client_tx: mpsc::UnboundedSender<ClientConn>,
     name: Option<String>,
 }
 
@@ -221,7 +220,7 @@ pub async fn run(ctl_path: &Path, ready_fd: Option<OwnedFd>) -> anyhow::Result<(
                 let _ = framed.send(Frame::SessionCreated { id: id.to_string() }).await;
 
                 // Hand off connection to session for auto-attach
-                let _ = client_tx.send(framed);
+                let _ = client_tx.send(ClientConn::Active(framed));
             }
             Frame::Attach { session } => {
                 reap_sessions(&mut sessions);
@@ -234,7 +233,26 @@ pub async fn run(ctl_path: &Path, ready_fd: Option<OwnedFd>) -> anyhow::Result<(
                             .await;
                     } else {
                         let _ = framed.send(Frame::Ok).await;
-                        let _ = state.client_tx.send(framed);
+                        let _ = state.client_tx.send(ClientConn::Active(framed));
+                    }
+                } else {
+                    let _ = framed
+                        .send(Frame::Error { message: format!("no such session: {session}") })
+                        .await;
+                }
+            }
+            Frame::Tail { session } => {
+                reap_sessions(&mut sessions);
+                if let Some(id) = resolve_session(&sessions, &session) {
+                    let state = &sessions[&id];
+                    if state.client_tx.is_closed() {
+                        sessions.remove(&id);
+                        let _ = framed
+                            .send(Frame::Error { message: format!("no such session: {session}") })
+                            .await;
+                    } else {
+                        let _ = framed.send(Frame::Ok).await;
+                        let _ = state.client_tx.send(ClientConn::Tail(framed));
                     }
                 } else {
                     let _ = framed

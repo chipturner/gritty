@@ -606,3 +606,24 @@ fn roundtrip_open_url() {
     let decoded = codec.decode(&mut buf).unwrap().unwrap();
     assert_eq!(original, decoded);
 }
+
+#[test]
+fn roundtrip_tail() {
+    let mut codec = FrameCodec;
+    let mut buf = BytesMut::new();
+    let original = Frame::Tail { session: "myproject".to_string() };
+    codec.encode(original.clone(), &mut buf).unwrap();
+    assert_eq!(buf[0], 0x15);
+    let decoded = codec.decode(&mut buf).unwrap().unwrap();
+    assert_eq!(original, decoded);
+}
+
+#[test]
+fn roundtrip_tail_by_id() {
+    let mut codec = FrameCodec;
+    let mut buf = BytesMut::new();
+    let original = Frame::Tail { session: "0".to_string() };
+    codec.encode(original.clone(), &mut buf).unwrap();
+    let decoded = codec.decode(&mut buf).unwrap().unwrap();
+    assert_eq!(original, decoded);
+}

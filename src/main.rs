@@ -79,6 +79,16 @@ enum Command {
         #[arg(short = 'O', long)]
         forward_open: bool,
     },
+    /// Tail a session's output (read-only, like tail -f)
+    #[command(alias = "t")]
+    Tail {
+        /// Remote host (connection name from `gritty connect`)
+        host: Option<String>,
+
+        /// Session id or name
+        #[arg(short = 't', long = "target")]
+        target: String,
+    },
     /// List active sessions
     #[command(alias = "ls", alias = "list")]
     ListSessions {
@@ -451,6 +461,11 @@ async fn run(cli: Cli, config: gritty::config::ConfigFile) -> anyhow::Result<()>
             )
             .await
         }
+        Command::Tail { host, target } => {
+            let ctl_path = resolve_ctl_path(cli.ctl_socket, host.as_deref())?;
+            let code = tail_session(target, ctl_path).await?;
+            std::process::exit(code);
+        }
         Command::Attach { host, target, no_redraw, no_escape, forward_agent, forward_open } => {
             let ctl_path = resolve_ctl_path(cli.ctl_socket, host.as_deref())?;
             let resolved = config.resolve_session(host.as_deref());
@@ -730,6 +745,28 @@ fn format_timestamp(epoch_secs: u64) -> String {
         tm.tm_min,
         tm.tm_sec,
     )
+}
+
+async fn tail_session(target: String, ctl_path: PathBuf) -> anyhow::Result<i32> {
+    use futures_util::{SinkExt, StreamExt};
+    use gritty::protocol::{Frame, FrameCodec};
+    use tokio::net::UnixStream;
+    use tokio_util::codec::Framed;
+
+    let stream = UnixStream::connect(&ctl_path).await.map_err(|_| {
+        anyhow::anyhow!("no server running (could not connect to {})", ctl_path.display())
+    })?;
+    let mut framed = Framed::new(stream, FrameCodec);
+    framed.send(Frame::Tail { session: target.clone() }).await?;
+
+    match Frame::expect_from(framed.next().await)? {
+        Frame::Ok => {
+            eprintln!("[tailing session {target}]");
+            gritty::client::tail(&target, framed, &ctl_path).await
+        }
+        Frame::Error { message } => anyhow::bail!("{message}"),
+        other => anyhow::bail!("unexpected response from server: {other:?}"),
+    }
 }
 
 async fn kill_session(target: String, ctl_path: PathBuf) -> anyhow::Result<()> {

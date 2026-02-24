@@ -585,6 +585,101 @@ pub async fn run(
     }
 }
 
+/// Read-only tail of a session's PTY output.
+/// No raw mode, no stdin, no escape processing, no forwarding.
+/// Ctrl-C exits normally (default SIGINT handler).
+pub async fn tail(
+    session: &str,
+    mut framed: Framed<UnixStream, FrameCodec>,
+    ctl_path: &Path,
+) -> anyhow::Result<i32> {
+    let mut heartbeat_interval = tokio::time::interval(HEARTBEAT_INTERVAL);
+    heartbeat_interval.reset();
+    let mut last_pong = Instant::now();
+    let mut sigterm = signal(SignalKind::terminate())?;
+    let mut sighup = signal(SignalKind::hangup())?;
+
+    loop {
+        let result = 'relay: loop {
+            tokio::select! {
+                frame = framed.next() => {
+                    match frame {
+                        Some(Ok(Frame::Data(data))) => {
+                            write_stdout(&data)?;
+                        }
+                        Some(Ok(Frame::Pong)) => {
+                            last_pong = Instant::now();
+                        }
+                        Some(Ok(Frame::Exit { code })) => {
+                            break 'relay Some(code);
+                        }
+                        Some(Ok(_)) => {}
+                        Some(Err(e)) => {
+                            debug!("tail connection error: {e}");
+                            break 'relay None;
+                        }
+                        None => {
+                            debug!("tail server disconnected");
+                            break 'relay None;
+                        }
+                    }
+                }
+                _ = heartbeat_interval.tick() => {
+                    if last_pong.elapsed() > HEARTBEAT_TIMEOUT {
+                        debug!("tail heartbeat timeout");
+                        break 'relay None;
+                    }
+                    if framed.send(Frame::Ping).await.is_err() {
+                        break 'relay None;
+                    }
+                }
+                _ = sigterm.recv() => {
+                    break 'relay Some(1);
+                }
+                _ = sighup.recv() => {
+                    break 'relay Some(1);
+                }
+            }
+        };
+
+        match result {
+            Some(code) => return Ok(code),
+            None => {
+                eprintln!("[reconnecting...]");
+                loop {
+                    tokio::time::sleep(Duration::from_secs(1)).await;
+
+                    let stream = match UnixStream::connect(ctl_path).await {
+                        Ok(s) => s,
+                        Err(_) => continue,
+                    };
+
+                    let mut new_framed = Framed::new(stream, FrameCodec);
+                    if new_framed.send(Frame::Tail { session: session.to_string() }).await.is_err()
+                    {
+                        continue;
+                    }
+
+                    match new_framed.next().await {
+                        Some(Ok(Frame::Ok)) => {
+                            eprintln!("[reconnected]");
+                            framed = new_framed;
+                            heartbeat_interval.reset();
+                            last_pong = Instant::now();
+                            break;
+                        }
+                        Some(Ok(Frame::Error { message })) => {
+                            eprintln!("[session gone: {message}]");
+                            return Ok(1);
+                        }
+                        _ => continue,
+                    }
+                }
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

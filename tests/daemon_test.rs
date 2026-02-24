@@ -812,3 +812,37 @@ async fn reconnect_after_session_killed_returns_error() {
         "expected Error when attaching to killed session, got {resp:?}"
     );
 }
+
+#[tokio::test]
+async fn tail_request() {
+    let _permit = CONCURRENCY.acquire().await.unwrap();
+    let (_tmp, ctl_path) = test_ctl();
+
+    let ctl = ctl_path.clone();
+    let _daemon = tokio::spawn(async move { gritty::daemon::run(&ctl, None).await });
+    tokio::time::sleep(Duration::from_millis(200)).await;
+
+    let id = create_session(&ctl_path, "tailtarget").await;
+
+    // Tail via the daemon — should get Ok
+    let resp = control_request(&ctl_path, Frame::Tail { session: id.clone() }).await;
+    assert_eq!(resp, Frame::Ok, "expected Ok for tail, got {resp:?}");
+
+    kill_cleanup(&ctl_path, &id).await;
+}
+
+#[tokio::test]
+async fn tail_nonexistent_returns_error() {
+    let _permit = CONCURRENCY.acquire().await.unwrap();
+    let (_tmp, ctl_path) = test_ctl();
+
+    let ctl = ctl_path.clone();
+    let _daemon = tokio::spawn(async move { gritty::daemon::run(&ctl, None).await });
+    tokio::time::sleep(Duration::from_millis(200)).await;
+
+    let resp = control_request(&ctl_path, Frame::Tail { session: "nonexistent".to_string() }).await;
+    assert!(
+        matches!(resp, Frame::Error { .. }),
+        "expected Error for nonexistent tail, got {resp:?}"
+    );
+}
