@@ -37,6 +37,10 @@ enum Command {
         #[arg(short = 't', long = "target")]
         target: Option<String>,
 
+        /// Don't send Ctrl-L to redraw after the shell starts
+        #[arg(long)]
+        no_redraw: bool,
+
         /// Disable escape sequences (~. detach, ~? help, etc.)
         #[arg(long)]
         no_escape: bool,
@@ -277,6 +281,7 @@ fn report_error(error_pipe: &Option<OwnedFd>, e: &anyhow::Error) -> ! {
 fn main() {
     let cli = Cli::parse();
     let verbose = cli.verbose;
+    let config = gritty::config::ConfigFile::load();
 
     match cli.command {
         Command::Server { foreground } => {
@@ -381,10 +386,16 @@ fn main() {
                 }
             };
 
+            let resolved = config.resolve_connect(&connection_name);
+
             let opts = gritty::connect::ConnectOpts {
                 destination,
-                no_server_start,
-                ssh_options,
+                no_server_start: no_server_start || resolved.no_server_start,
+                ssh_options: {
+                    let mut opts = ssh_options;
+                    opts.extend(resolved.ssh_options);
+                    opts
+                },
                 name,
                 dry_run,
                 foreground,
@@ -405,7 +416,7 @@ fn main() {
                     std::process::exit(1);
                 }
             };
-            if let Err(e) = rt.block_on(run(cli)) {
+            if let Err(e) = rt.block_on(run(cli, config)) {
                 eprintln!("error: {e}");
                 std::process::exit(1);
             }
@@ -422,17 +433,34 @@ fn resolve_ctl_path(ctl_socket: Option<PathBuf>, host: Option<&str>) -> anyhow::
     }
 }
 
-async fn run(cli: Cli) -> anyhow::Result<()> {
+async fn run(cli: Cli, config: gritty::config::ConfigFile) -> anyhow::Result<()> {
     match cli.command {
         Command::Server { .. } | Command::Connect { .. } => unreachable!(),
-        Command::NewSession { host, target, no_escape, forward_agent, forward_open } => {
+        Command::NewSession { host, target, no_redraw, no_escape, forward_agent, forward_open } => {
             let ctl_path = resolve_ctl_path(cli.ctl_socket, host.as_deref())?;
-            new_session(target, no_escape, forward_agent, forward_open, ctl_path).await
+            let resolved = config.resolve_session(host.as_deref());
+            new_session(
+                target,
+                !(no_redraw || resolved.no_redraw),
+                no_escape || resolved.no_escape,
+                forward_agent || resolved.forward_agent,
+                forward_open || resolved.forward_open,
+                ctl_path,
+            )
+            .await
         }
         Command::Attach { host, target, no_redraw, no_escape, forward_agent, forward_open } => {
             let ctl_path = resolve_ctl_path(cli.ctl_socket, host.as_deref())?;
-            let code = attach(target, !no_redraw, no_escape, forward_agent, forward_open, ctl_path)
-                .await?;
+            let resolved = config.resolve_session(host.as_deref());
+            let code = attach(
+                target,
+                !(no_redraw || resolved.no_redraw),
+                no_escape || resolved.no_escape,
+                forward_agent || resolved.forward_agent,
+                forward_open || resolved.forward_open,
+                ctl_path,
+            )
+            .await?;
             std::process::exit(code);
         }
         Command::ListSessions { host } => {
@@ -465,12 +493,13 @@ async fn run(cli: Cli) -> anyhow::Result<()> {
             gritty::connect::list_tunnels();
             Ok(())
         }
-        Command::Info => info().await,
+        Command::Info => info(&config).await,
     }
 }
 
 async fn new_session(
     name: Option<String>,
+    redraw: bool,
     no_escape: bool,
     forward_agent: bool,
     forward_open: bool,
@@ -506,7 +535,7 @@ async fn new_session(
             let code = gritty::client::run(
                 &id,
                 framed,
-                false,
+                redraw,
                 &ctl_path,
                 env_vars,
                 no_escape,
@@ -726,12 +755,26 @@ async fn kill_server(ctl_path: PathBuf) -> anyhow::Result<()> {
     }
 }
 
-async fn info() -> anyhow::Result<()> {
+async fn info(config: &gritty::config::ConfigFile) -> anyhow::Result<()> {
     use gritty::protocol::Frame;
     use tokio::net::UnixStream;
 
     println!("gritty {}", env!("CARGO_PKG_VERSION"));
     println!();
+
+    let cfg_path = gritty::config::config_path();
+    let cfg_status = if cfg_path.exists() {
+        if config.host.is_empty() {
+            "loaded".to_string()
+        } else {
+            let n = config.host.len();
+            let s = if n == 1 { "" } else { "s" };
+            format!("loaded, {n} host{s}")
+        }
+    } else {
+        "not found".to_string()
+    };
+    println!("config:         {} ({cfg_status})", cfg_path.display());
 
     let socket_dir = canonicalize_or_raw(gritty::daemon::socket_dir());
     let ctl_path = socket_dir.join("ctl.sock");

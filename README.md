@@ -16,7 +16,7 @@ It works by forwarding Unix domain sockets over SSH -- no custom protocol, no op
     - **URL open forwarding** (`-O`) -- forwards `$BROWSER` / URL open requests back to your local machine
     - **Environment forwarding** -- TERM, LANG, COLORTERM propagated to remote shell
 - **Simple**
-    - **Single binary, zero config** -- no server config, no port allocation, no root required; auto-starts the remote server
+    - **Single binary, zero config** -- optional TOML config for defaults; no server config, no port allocation, no root required; auto-starts the remote server
     - **No network protocol** -- Unix domain sockets locally, SSH handles encryption and auth
 - **Session management**
     - **Multiple named sessions** -- create, list, attach, kill by name or ID
@@ -91,6 +91,49 @@ The `[host]` argument is a connection name from `gritty connect` (e.g., `gritty 
 - `-t <name>` on `new`/`attach`: target session by name or ID
 - `-n <name>` on `connect`: override connection name (defaults to hostname)
 - `-o <option>` on `connect`: extra SSH options (repeatable, e.g., `-o "ProxyJump=bastion"`)
+- `--no-redraw` on `new`/`attach`: don't send Ctrl-L after connecting
+- `--no-escape` on `new`/`attach`: disable escape sequence processing
+
+## Configuration
+
+gritty works out of the box with no config file. Optionally, you can set persistent defaults in `$XDG_CONFIG_HOME/gritty/config.toml` (default: `~/.config/gritty/config.toml`).
+
+```toml
+# Global defaults for all sessions/connections.
+[defaults]
+forward-agent = false
+forward-open = true
+no-escape = false
+
+# Connect-specific global defaults.
+[defaults.connect]
+ssh-options = []
+no-server-start = false
+
+# Per-host overrides, keyed by connection name.
+# Connection name = hostname from destination, or -n override.
+[host.devbox]
+forward-agent = true
+forward-open = true
+
+[host.devbox.connect]
+ssh-options = ["IdentityFile=~/.ssh/devbox_tunnel_key"]
+
+[host.prod]
+forward-open = true
+no-escape = true
+
+[host.prod.connect]
+no-server-start = true
+```
+
+**Configurable settings:** `forward-agent`, `forward-open`, `no-escape`, `no-redraw` (session), `ssh-options`, `no-server-start` (connect).
+
+**Precedence:** CLI flag > `[host.<name>]` > `[defaults]` > built-in default. CLI flags always win. For `ssh-options`, values are appended: CLI first, then host, then defaults (SSH uses first-match, so earlier options take priority).
+
+**Host resolution:** The `[host.<name>]` key matches the gritty connection name -- what appears in `gritty tunnels` and `gritty disconnect <name>`. For local sessions (`gritty new` without a host), only `[defaults]` applies.
+
+A missing or malformed config file is silently ignored -- gritty remains zero-config if you want it to be. Use `gritty info` to check config status.
 
 ## Escape Sequences
 
@@ -233,7 +276,6 @@ gritty differs by having no network protocol of its own. Where mosh and ET imple
 Early stage. Works on Linux and macOS. Available on [crates.io](https://crates.io/crates/gritty-cli).
 
 **Planned:**
-- **Config file** -- support common config settings (e.g. forwarding, aliases) in a config
 - **Logging** -- need a system to store logs for remote and local daemons
 - **Server auto-start** -- start the server on demand (systemd socket activation, launchd, or on first `new-session`)
 - **Zero-downtime upgrades** -- server re-execs itself, preserving sessions across upgrades

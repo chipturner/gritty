@@ -7,7 +7,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 gritty provides persistent TTY sessions over Unix domain sockets. Single binary, tmux-like CLI:
 - `gritty server` — starts the server (self-daemonizes by default, returns after socket is bound). Alias: `s`
 - `gritty server --foreground` — runs server in the foreground (for debugging or process managers)
-- `gritty new-session` — creates a persistent session and auto-attaches (requires running server). Alias: `new`. `-A`/`--forward-agent` forwards local SSH agent. `-O`/`--forward-open` forwards URL opens to local machine.
+- `gritty new-session` — creates a persistent session and auto-attaches (requires running server). Alias: `new`. `-A`/`--forward-agent` forwards local SSH agent. `-O`/`--forward-open` forwards URL opens to local machine. `--no-redraw` suppresses Ctrl-L redraw. `--no-escape` disables escape sequences.
 - `gritty new-session -t <name>` — creates a named session and auto-attaches
 - `gritty attach -t <id|name>` — attaches to a session, detaches other clients. Alias: `a`. `-A`/`--forward-agent` forwards local SSH agent. `-O`/`--forward-open` forwards URL opens to local machine.
 - `gritty open <url>` — opens a URL on the local machine (for use inside gritty sessions with `--forward-open`). Reads `GRITTY_OPEN_SOCK` from env.
@@ -18,7 +18,7 @@ gritty provides persistent TTY sessions over Unix domain sockets. Single binary,
 - `gritty kill-session -t <id|name>` — kills a specific session
 - `gritty socket-path` — prints the default server socket path. Alias: `socket`
 - `gritty kill-server` — kills server and all sessions
-- `gritty info` — shows diagnostics: version, socket paths, server status/session count, log file paths, active tunnels with status/pid/log paths
+- `gritty info` — shows diagnostics: version, config file path/status, socket paths, server status/session count, log file paths, active tunnels with status/pid/log paths
 
 Sessions get auto-incrementing integer IDs (0, 1, 2...) with optional human-friendly names via `-t`.
 
@@ -32,11 +32,11 @@ Similar to Eternal Terminal but socket-based. Sessions are persistent (shell sur
 
 ```bash
 cargo build
-cargo test                           # all tests (180 total)
+cargo test                           # all tests (195 total)
 cargo test --test protocol_test      # codec unit tests only (51)
 cargo test --test daemon_test        # daemon integration tests (23)
 cargo test --test e2e_test           # e2e session tests (27)
-                                     # + 33 connect + 18 security + 17 escape + 5 lib + 6 main in lib/bin
+                                     # + 33 connect + 18 security + 17 escape + 14 config + 5 lib + 6 main in lib/bin
 cargo run -- server                   # start server (self-backgrounds, prints PID)
 cargo run -- server --foreground      # start server in foreground
 cargo run -- new -t myproject        # create named session (requires server)
@@ -57,9 +57,11 @@ tmux start-server\; source-file quicktest.tmux  # manual 2-pane test (server + c
 
 Single-socket architecture: all communication (control AND session relay) goes through one server socket. Clients connect, send a control frame declaring intent, server routes accordingly.
 
-Six modules behind a lib crate (`src/lib.rs`) with a thin binary entry point (`src/main.rs`):
+Seven modules behind a lib crate (`src/lib.rs`) with a thin binary entry point (`src/main.rs`):
 
 - **`security`** — Shared security utilities. `secure_create_dir_all` (0700 dirs, ownership validation, symlink rejection). `bind_unix_listener` (TOCTOU-safe stale socket handling, 0600 permissions). `verify_peer_uid` (SO_PEERCRED check). `checked_dup` (returns `OwnedFd`). `clamp_winsize`. All socket/directory creation MUST go through this module.
+
+- **`config`** — TOML config file support (`$XDG_CONFIG_HOME/gritty/config.toml`). `ConfigFile` struct with `[defaults]` and `[host.<name>]` sections. `config_path()` returns the config file path. `ConfigFile::load()` reads and parses, defaulting on missing/malformed. `resolve_session(host)` merges defaults + host overrides into `SessionSettings` (forward_agent, forward_open, no_escape, no_redraw). `resolve_connect(host)` merges into `ConnectSettings` (session settings + ssh_options + no_server_start). Precedence: CLI > host > defaults > built-in. SSH options use append semantics (host-specific first, then defaults; SSH first-match gives host priority). Unknown keys ignored for forward-compatibility.
 
 - **`protocol`** — `Frame` enum with session relay types (Data/Resize/Exit/Detached/Ping/Pong/Env/AgentForward/AgentOpen/AgentData/AgentClose/OpenForward/OpenUrl), control request types (NewSession/Attach/ListSessions/KillSession/KillServer), and control response types (SessionCreated/SessionInfo/Ok/Error). `SessionEntry` struct carries per-session metadata (id, name, pty_path, shell_pid, created_at, attached, last_heartbeat). Custom tokio-util `Encoder`/`Decoder`. Wire format: `[type: u8][length: u32 BE][payload]`. Session relay: `0x01` Data, `0x02` Resize, `0x03` Exit, `0x04` Detached, `0x05` Ping, `0x06` Pong, `0x07` Env, `0x08` AgentForward, `0x09` AgentOpen, `0x0A` AgentData, `0x0B` AgentClose, `0x0C` OpenForward, `0x0D` OpenUrl. Control requests: `0x10` NewSession, `0x11` Attach, `0x12` ListSessions, `0x13` KillSession, `0x14` KillServer. Control responses: `0x20` SessionCreated, `0x21` SessionInfo, `0x22` Ok, `0x23` Error.
 
@@ -104,7 +106,7 @@ Six modules behind a lib crate (`src/lib.rs`) with a thin binary entry point (`s
 
 ## Current Status
 
-Full CLI with tmux-like ergonomics. Single-socket architecture. Self-daemonizing server with `--foreground` option. PID file and clean signal handling (SIGTERM/SIGINT). Ping/Pong heartbeat with auto-reconnect. Login shell with client environment forwarding. SSH agent forwarding (`--forward-agent` / `-A`). URL open forwarding (`--forward-open` / `-O`, `gritty open <url>`). SSH-style escape sequences (`~.` detach, `~^Z` suspend, `~?` help). Self-backgrounding SSH connect with lockfile-based liveness (`gritty connect` forks, prints socket path, returns; `gritty disconnect` tears down; `gritty tunnels` lists status). All modules implemented and tested (180 tests: 17 escape processor + 33 connect + 18 security + 5 lib + 6 main + 51 protocol codec + 27 e2e session + 23 daemon integration).
+Full CLI with tmux-like ergonomics. Single-socket architecture. Self-daemonizing server with `--foreground` option. PID file and clean signal handling (SIGTERM/SIGINT). Ping/Pong heartbeat with auto-reconnect. Login shell with client environment forwarding. SSH agent forwarding (`--forward-agent` / `-A`). URL open forwarding (`--forward-open` / `-O`, `gritty open <url>`). SSH-style escape sequences (`~.` detach, `~^Z` suspend, `~?` help). Self-backgrounding SSH connect with lockfile-based liveness (`gritty connect` forks, prints socket path, returns; `gritty disconnect` tears down; `gritty tunnels` lists status). TOML config file with global defaults and per-host overrides. All modules implemented and tested (195 tests: 17 escape processor + 33 connect + 18 security + 14 config + 5 lib + 6 main + 51 protocol codec + 27 e2e session + 23 daemon integration + 1 doc).
 
 ## Development Notes
 
@@ -132,4 +134,6 @@ Full CLI with tmux-like ergonomics. Single-socket architecture. Self-daemonizing
 - **Channel closed check** — Before sending `Frame::Ok` for Attach, check `client_tx.is_closed()`. If true, the session died between reap and lookup; send `Frame::Error` instead.
 - **Error handling in main.rs** — `main()` returns `()`. Errors print as `error: <message>` via `eprintln!`, no backtraces. Never use `-> anyhow::Result` on `main()` in a CLI tool.
 - **Connect integration tests need SSH** — unit tests cover parsing and command building. Full integration requires a remote host, so deferred to manual testing.
+- **`config` module** — `ConfigFile` loaded once in `main()`, passed to `run()` and `info()`. Each command arm merges config with CLI flags. Session booleans use `cli_flag || config_value`. SSH options use append: CLI first, then host, then defaults. `config_path()` uses `XDG_CONFIG_HOME` with `HOME/.config` fallback. Missing/malformed config silently defaults (preserves zero-config). Unknown TOML keys ignored (forward-compatible via `#[serde(default)]`).
+- **`--no-redraw` on `new-session`** — added for consistency with `attach`. The `redraw` param flows through to `client::run()`.
 - **Test-first for bug fixes** — When fixing bugs, write a failing test first that reproduces the bug, then implement the fix, then confirm the test passes. Regression tests go in daemon_test.rs (for daemon races) or e2e_test.rs (for session/relay bugs).
