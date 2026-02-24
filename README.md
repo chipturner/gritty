@@ -82,7 +82,9 @@ ID  Name    PTY         PID    Created              Status
 | `gritty kill-session [host] -t <id\|name>` | | Kill a session |
 | `gritty kill-server [host]` | | Kill the server and all sessions |
 | `gritty open <url>` | | Open a URL on the local machine (inside sessions) |
-| `gritty config-edit` | | Open config in `$EDITOR` (creates from template if missing) |
+| `gritty socket-path` | `socket` | Print the default server socket path |
+| `gritty info` | | Show diagnostics (version, config, server status, tunnels) |
+| `gritty config-edit` | | Open config in `$VISUAL`/`$EDITOR` (creates from template if missing) |
 
 The `[host]` argument is a connection name from `gritty connect` (e.g., `gritty ls devbox`). Omit it to use the local server.
 
@@ -198,7 +200,7 @@ flowchart LR
 
 <sub>Orange = SSH tunnel (TCP) · Blue = Unix domain socket</sub>
 
-A daemon listens on a single Unix socket (`ctl.sock`). Clients send a control frame declaring intent (new session, attach, list); the daemon hands off the raw socket connection to the target session and gets out of the loop. Each session owns a PTY with a login shell that persists across disconnects -- while no client is attached, the shell blocks on its kernel PTY buffer (~4KB) and resumes instantly on reconnect.
+A daemon listens on a single Unix socket (`ctl.sock`). Clients send a control frame declaring intent (new session, attach, list); the daemon hands off the raw socket connection to the target session and gets out of the loop. Each session owns a PTY with a login shell that persists across disconnects -- while no client is attached, the server drains PTY output into a userspace ring buffer (1MB cap) so the shell never blocks. On reconnect, buffered output is flushed to the new client.
 
 For remote access, `gritty connect` forwards the remote socket over SSH. All commands work identically over the tunnel.
 
@@ -277,7 +279,6 @@ gritty differs by having no network protocol of its own. Where mosh and ET imple
 Early stage. Works on Linux and macOS. Available on [crates.io](https://crates.io/crates/gritty-cli).
 
 **Planned:**
-- **Logging** -- need a system to store logs for remote and local daemons
 - **Server auto-start** -- start the server on demand (systemd socket activation, launchd, or on first `new-session`)
 - **Zero-downtime upgrades** -- server re-execs itself, preserving sessions across upgrades
 - **Read-only attach** -- multiple clients viewing the same session for pair programming or demos
