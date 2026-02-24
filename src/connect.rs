@@ -986,4 +986,125 @@ mod tests {
         let internal_path = local_socket_path("myhost");
         assert_eq!(public_path, internal_path);
     }
+
+    // -----------------------------------------------------------------------
+    // tunnel_monitor tests
+    // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn tunnel_monitor_non_transient_exit() {
+        let child = Command::new("sh").arg("-c").arg("exit 1").spawn().unwrap();
+        let dest = Destination::parse("fake-host-test").unwrap();
+        let stop = tokio_util::sync::CancellationToken::new();
+
+        let result = tokio::time::timeout(
+            Duration::from_secs(5),
+            tunnel_monitor(
+                child,
+                dest,
+                PathBuf::from("/tmp/nonexistent.sock"),
+                "/tmp/remote.sock".into(),
+                vec![],
+                stop,
+            ),
+        )
+        .await;
+
+        assert!(result.is_ok(), "monitor should return quickly on non-transient exit");
+    }
+
+    #[tokio::test]
+    async fn tunnel_monitor_cancellation() {
+        let child = Command::new("sleep").arg("60").spawn().unwrap();
+        let dest = Destination::parse("fake-host-test").unwrap();
+        let stop = tokio_util::sync::CancellationToken::new();
+        let stop_clone = stop.clone();
+
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            stop_clone.cancel();
+        });
+
+        let result = tokio::time::timeout(
+            Duration::from_secs(5),
+            tunnel_monitor(
+                child,
+                dest,
+                PathBuf::from("/tmp/nonexistent.sock"),
+                "/tmp/remote.sock".into(),
+                vec![],
+                stop,
+            ),
+        )
+        .await;
+
+        assert!(result.is_ok(), "monitor should return after cancellation");
+    }
+
+    #[tokio::test]
+    async fn tunnel_monitor_transient_exit_checks_cancellation() {
+        // Child exits with 255 (transient). Monitor sleeps 1s then checks cancellation.
+        let child = Command::new("sh").arg("-c").arg("exit 255").spawn().unwrap();
+        let dest = Destination::parse("fake-host-test").unwrap();
+        let stop = tokio_util::sync::CancellationToken::new();
+        let stop_clone = stop.clone();
+
+        // Cancel during the 1s sleep between exit and respawn attempt
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(500)).await;
+            stop_clone.cancel();
+        });
+
+        let result = tokio::time::timeout(
+            Duration::from_secs(5),
+            tunnel_monitor(
+                child,
+                dest,
+                PathBuf::from("/tmp/nonexistent.sock"),
+                "/tmp/remote.sock".into(),
+                vec![],
+                stop,
+            ),
+        )
+        .await;
+
+        assert!(result.is_ok(), "monitor should return after cancellation during sleep");
+    }
+
+    // -----------------------------------------------------------------------
+    // wait_for_socket tests
+    // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn wait_for_socket_succeeds_after_delay() {
+        let dir = tempfile::tempdir().unwrap();
+        let sock_path = dir.path().join("delayed.sock");
+        let sock_path_clone = sock_path.clone();
+
+        // Bind the socket after 500ms
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(500)).await;
+            let _listener = tokio::net::UnixListener::bind(&sock_path_clone).unwrap();
+            // Keep listener alive
+            tokio::time::sleep(Duration::from_secs(30)).await;
+        });
+
+        let result = tokio::time::timeout(
+            Duration::from_secs(5),
+            wait_for_socket(&sock_path),
+        )
+        .await;
+
+        assert!(result.is_ok(), "should complete within timeout");
+        assert!(result.unwrap().is_ok(), "should successfully connect");
+    }
+
+    #[ignore] // Takes 15s (full timeout)
+    #[tokio::test]
+    async fn wait_for_socket_timeout() {
+        let dir = tempfile::tempdir().unwrap();
+        let sock_path = dir.path().join("never.sock");
+        let result = wait_for_socket(&sock_path).await;
+        assert!(result.is_err());
+    }
 }
