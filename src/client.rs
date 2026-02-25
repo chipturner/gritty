@@ -203,9 +203,7 @@ impl SuppressInputGuard {
     fn enter(fd: BorrowedFd<'static>) -> nix::Result<Self> {
         let original = termios::tcgetattr(fd)?;
         let mut modified = original.clone();
-        modified
-            .local_flags
-            .remove(LocalFlags::ECHO | LocalFlags::ICANON);
+        modified.local_flags.remove(LocalFlags::ECHO | LocalFlags::ICANON);
         modified.control_chars[SpecialCharacterIndices::VMIN as usize] = 1;
         modified.control_chars[SpecialCharacterIndices::VTIME as usize] = 0;
         termios::tcsetattr(fd, SetArg::TCSAFLUSH, &modified)?;
