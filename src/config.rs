@@ -82,7 +82,11 @@ impl ConfigFile {
     pub fn load_from(path: &std::path::Path) -> Self {
         let content = match std::fs::read_to_string(path) {
             Ok(c) => c,
-            Err(_) => return Self::default(),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Self::default(),
+            Err(e) => {
+                eprintln!("warning: cannot read config {}: {e}", path.display());
+                return Self::default();
+            }
         };
         match toml::from_str(&content) {
             Ok(c) => c,

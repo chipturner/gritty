@@ -171,10 +171,20 @@ pub async fn run(ctl_path: &Path, ready_fd: Option<OwnedFd>) -> anyhow::Result<(
         }
         let mut framed = Framed::new(stream, FrameCodec);
 
-        // Handle one control request per connection
-        let Some(Ok(frame)) = framed.next().await else {
-            continue;
-        };
+        // Handle one control request per connection (timeout prevents slowloris)
+        let frame =
+            match tokio::time::timeout(std::time::Duration::from_secs(5), framed.next()).await {
+                Ok(Some(Ok(f))) => f,
+                Ok(Some(Err(e))) => {
+                    warn!("frame decode error: {e}");
+                    continue;
+                }
+                Ok(None) => continue,
+                Err(_) => {
+                    warn!("control connection timed out");
+                    continue;
+                }
+            };
 
         match frame {
             Frame::NewSession { name } => {

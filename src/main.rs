@@ -799,7 +799,7 @@ fn config_edit() -> anyhow::Result<()> {
     let path = gritty::config::config_path();
     if !path.exists() {
         if let Some(parent) = path.parent() {
-            std::fs::create_dir_all(parent)?;
+            gritty::security::secure_create_dir_all(parent)?;
         }
         std::fs::write(&path, gritty::config::DEFAULT_CONFIG)?;
         eprintln!("created {}", path.display());

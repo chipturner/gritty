@@ -228,7 +228,7 @@ fn write_stdout(data: &[u8]) -> io::Result<()> {
         match stdout.write(&data[written..]) {
             Ok(n) => written += n,
             Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
-                std::thread::yield_now();
+                std::thread::sleep(Duration::from_millis(1));
             }
             Err(e) if e.kind() == io::ErrorKind::Interrupted => {}
             Err(e) => return Err(e),
@@ -238,7 +238,7 @@ fn write_stdout(data: &[u8]) -> io::Result<()> {
         match stdout.flush() {
             Ok(()) => return Ok(()),
             Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
-                std::thread::yield_now();
+                std::thread::sleep(Duration::from_millis(1));
             }
             Err(e) if e.kind() == io::ErrorKind::Interrupted => {}
             Err(e) => return Err(e),
@@ -248,7 +248,12 @@ fn write_stdout(data: &[u8]) -> io::Result<()> {
 
 fn get_terminal_size() -> (u16, u16) {
     let mut ws: libc::winsize = unsafe { std::mem::zeroed() };
-    unsafe { libc::ioctl(libc::STDIN_FILENO, libc::TIOCGWINSZ, &mut ws) };
+    if unsafe { libc::ioctl(libc::STDIN_FILENO, libc::TIOCGWINSZ, &mut ws) } != 0
+        || ws.ws_col == 0
+        || ws.ws_row == 0
+    {
+        return (80, 24);
+    }
     (ws.ws_col, ws.ws_row)
 }
 
@@ -427,14 +432,19 @@ async fn relay(
                         agent_channels.remove(&channel_id);
                     }
                     Some(Ok(Frame::OpenUrl { url })) => {
-                        debug!("opening URL locally: {url}");
-                        let cmd = if cfg!(target_os = "macos") { "open" } else { "xdg-open" };
-                        let _ = std::process::Command::new(cmd)
-                            .arg(&url)
-                            .stdin(std::process::Stdio::null())
-                            .stdout(std::process::Stdio::null())
-                            .stderr(std::process::Stdio::null())
-                            .spawn();
+                        if url.starts_with("http://") || url.starts_with("https://") {
+                            debug!("opening URL locally: {url}");
+                            let cmd = if cfg!(target_os = "macos") { "open" } else { "xdg-open" };
+                            let _ = std::process::Command::new(cmd)
+                                .arg("--")
+                                .arg(&url)
+                                .stdin(std::process::Stdio::null())
+                                .stdout(std::process::Stdio::null())
+                                .stderr(std::process::Stdio::null())
+                                .spawn();
+                        } else {
+                            debug!("rejected non-http(s) URL: {url}");
+                        }
                     }
                     Some(Ok(_)) => {} // ignore control/resize frames
                     Some(Err(e)) => {

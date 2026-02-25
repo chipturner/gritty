@@ -152,6 +152,7 @@ fn spawn_open_acceptor(
                 }
                 Err(e) => {
                     debug!("open socket peer_cred unavailable: {e}");
+                    continue;
                 }
             }
 

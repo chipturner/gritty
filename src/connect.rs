@@ -69,6 +69,17 @@ impl Destination {
     }
 }
 
+/// Reject connection names that could cause path traversal or corruption.
+fn validate_connection_name(name: &str) -> anyhow::Result<()> {
+    if name.is_empty() {
+        bail!("connection name must not be empty");
+    }
+    if name.contains('/') || name.contains('\0') || name.contains("..") {
+        bail!("invalid connection name: {name:?}");
+    }
+    Ok(())
+}
+
 // ---------------------------------------------------------------------------
 // SSH helpers
 // ---------------------------------------------------------------------------
@@ -529,8 +540,13 @@ pub struct ConnectOpts {
 }
 
 pub async fn run(opts: ConnectOpts, ready_fd: Option<OwnedFd>) -> anyhow::Result<i32> {
+    unsafe {
+        libc::umask(0o077);
+    }
+
     let dest = Destination::parse(&opts.destination)?;
     let connection_name = opts.name.unwrap_or_else(|| dest.host.clone());
+    validate_connection_name(&connection_name)?;
     let local_sock = local_socket_path(&connection_name);
 
     if opts.dry_run {
@@ -692,6 +708,7 @@ fn signal_ready(ready_fd: &Option<OwnedFd>) {
 // ---------------------------------------------------------------------------
 
 pub async fn disconnect(name: &str) -> anyhow::Result<()> {
+    validate_connection_name(name)?;
     match probe_tunnel_status(name) {
         TunnelStatus::Stale => {
             cleanup_stale_files(name);
@@ -703,11 +720,18 @@ pub async fn disconnect(name: &str) -> anyhow::Result<()> {
 
     // Read PID and send SIGTERM (let the process handle graceful shutdown)
     let pid_file = connect_pid_path(name);
-    let pid = std::fs::read_to_string(&pid_file)
+    let pid: i32 = std::fs::read_to_string(&pid_file)
         .ok()
-        .and_then(|s| s.trim().parse::<i32>().ok())
+        .and_then(|s| s.trim().parse::<u32>().ok())
+        .map(|p| p as i32)
         .ok_or_else(|| anyhow::anyhow!("cannot read PID for tunnel {name}"))?;
 
+    let lock_path = connect_lock_path(name);
+    if !is_lock_held(&lock_path) {
+        cleanup_stale_files(name);
+        eprintln!("tunnel already stopped: {name}");
+        return Ok(());
+    }
     unsafe {
         libc::kill(pid, libc::SIGTERM);
     }
@@ -716,7 +740,7 @@ pub async fn disconnect(name: &str) -> anyhow::Result<()> {
     let deadline = Instant::now() + Duration::from_secs(2);
     loop {
         tokio::time::sleep(Duration::from_millis(100)).await;
-        if !is_lock_held(&connect_lock_path(name)) {
+        if !is_lock_held(&lock_path) {
             cleanup_stale_files(name);
             eprintln!("tunnel stopped: {name}");
             return Ok(());
@@ -727,9 +751,11 @@ pub async fn disconnect(name: &str) -> anyhow::Result<()> {
     }
 
     // Still alive after timeout — escalate to SIGKILL + killpg
-    unsafe {
-        libc::kill(pid, libc::SIGKILL);
-        libc::killpg(pid, libc::SIGTERM);
+    if is_lock_held(&lock_path) {
+        unsafe {
+            libc::kill(pid, libc::SIGKILL);
+            libc::killpg(pid, libc::SIGTERM);
+        }
     }
     tokio::time::sleep(Duration::from_millis(100)).await;
     cleanup_stale_files(name);

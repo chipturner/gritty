@@ -359,11 +359,12 @@ impl Encoder<Frame> for FrameCodec {
                 let text: String = sessions
                     .iter()
                     .map(|e| {
+                        let safe_pty = e.pty_path.replace(['\t', '\n'], " ");
                         format!(
                             "{}\t{}\t{}\t{}\t{}\t{}\t{}",
                             e.id,
                             e.name,
-                            e.pty_path,
+                            safe_pty,
                             e.shell_pid,
                             e.created_at,
                             if e.attached { "1" } else { "0" },
