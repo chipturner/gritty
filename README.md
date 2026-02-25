@@ -280,6 +280,7 @@ gritty differs by having no network protocol of its own. Where mosh and ET imple
 Early stage. Works on Linux and macOS. Available on [crates.io](https://crates.io/crates/gritty-cli).
 
 **Planned:**
+- **Shell Tab Completion** -- add support for bash, zsh, and other shell tab completion
 - **Server auto-start** -- start the server on demand (systemd socket activation, launchd, or on first `new-session`)
 - **Zero-downtime upgrades** -- server re-execs itself, preserving sessions across upgrades
 
