@@ -151,8 +151,12 @@ fn spawn_open_acceptor(
                     continue;
                 }
                 Err(e) => {
+                    // Intentional fallthrough: do NOT reject here. Unlike
+                    // PermissionDenied (wrong UID), this means the OS couldn't
+                    // retrieve credentials at all -- normal on macOS when the
+                    // peer has already disconnected. Socket is 0600 so only
+                    // the owning user can connect in the first place.
                     debug!("open socket peer_cred unavailable: {e}");
-                    continue;
                 }
             }
 
