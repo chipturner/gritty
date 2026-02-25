@@ -1,7 +1,7 @@
 use crate::protocol::{Frame, FrameCodec};
 use bytes::Bytes;
 use futures_util::{SinkExt, StreamExt};
-use nix::sys::termios::{self, SetArg, Termios};
+use nix::sys::termios::{self, FlushArg, LocalFlags, SetArg, SpecialCharacterIndices, Termios};
 use std::collections::HashMap;
 use std::io::{self, Read, Write};
 use std::os::fd::{AsFd, AsRawFd, BorrowedFd};
@@ -188,6 +188,34 @@ impl RawModeGuard {
 
 impl Drop for RawModeGuard {
     fn drop(&mut self) {
+        let _ = termios::tcsetattr(self.fd, SetArg::TCSAFLUSH, &self.original);
+    }
+}
+
+/// Suppresses stdin echo for tail mode: disables ECHO and ICANON but keeps
+/// ISIG so Ctrl-C still generates SIGINT. Flushes pending input on drop.
+struct SuppressInputGuard {
+    fd: BorrowedFd<'static>,
+    original: Termios,
+}
+
+impl SuppressInputGuard {
+    fn enter(fd: BorrowedFd<'static>) -> nix::Result<Self> {
+        let original = termios::tcgetattr(fd)?;
+        let mut modified = original.clone();
+        modified
+            .local_flags
+            .remove(LocalFlags::ECHO | LocalFlags::ICANON);
+        modified.control_chars[SpecialCharacterIndices::VMIN as usize] = 1;
+        modified.control_chars[SpecialCharacterIndices::VTIME as usize] = 0;
+        termios::tcsetattr(fd, SetArg::TCSAFLUSH, &modified)?;
+        Ok(Self { fd, original })
+    }
+}
+
+impl Drop for SuppressInputGuard {
+    fn drop(&mut self) {
+        let _ = termios::tcflush(self.fd, FlushArg::TCIFLUSH);
         let _ = termios::tcsetattr(self.fd, SetArg::TCSAFLUSH, &self.original);
     }
 }
@@ -587,19 +615,41 @@ pub async fn run(
 
 /// Read-only tail of a session's PTY output.
 /// No raw mode, no stdin, no escape processing, no forwarding.
-/// Ctrl-C exits normally (default SIGINT handler).
+/// Ctrl-C triggers clean exit with terminal reset.
 pub async fn tail(
     session: &str,
     mut framed: Framed<UnixStream, FrameCodec>,
     ctl_path: &Path,
 ) -> anyhow::Result<i32> {
+    // Suppress stdin echo — tail is read-only. Guard restores on drop.
+    let stdin_fd = unsafe { BorrowedFd::borrow_raw(libc::STDIN_FILENO) };
+    let _input_guard = SuppressInputGuard::enter(stdin_fd).ok();
+
+    // Drain stdin in background, ring bell on first keystroke
+    tokio::task::spawn_blocking(|| {
+        let mut buf = [0u8; 64];
+        let mut belled = false;
+        loop {
+            match io::stdin().read(&mut buf) {
+                Ok(0) | Err(_) => break,
+                Ok(_) if !belled => {
+                    let _ = io::stderr().write_all(b"\x07");
+                    let _ = io::stderr().flush();
+                    belled = true;
+                }
+                _ => {}
+            }
+        }
+    });
+
     let mut heartbeat_interval = tokio::time::interval(HEARTBEAT_INTERVAL);
     heartbeat_interval.reset();
     let mut last_pong = Instant::now();
+    let mut sigint = signal(SignalKind::interrupt())?;
     let mut sigterm = signal(SignalKind::terminate())?;
     let mut sighup = signal(SignalKind::hangup())?;
 
-    loop {
+    let code = 'outer: loop {
         let result = 'relay: loop {
             tokio::select! {
                 frame = framed.next() => {
@@ -633,17 +683,20 @@ pub async fn tail(
                         break 'relay None;
                     }
                 }
+                _ = sigint.recv() => {
+                    break 'outer 0;
+                }
                 _ = sigterm.recv() => {
-                    break 'relay Some(1);
+                    break 'outer 1;
                 }
                 _ = sighup.recv() => {
-                    break 'relay Some(1);
+                    break 'outer 1;
                 }
             }
         };
 
         match result {
-            Some(code) => return Ok(code),
+            Some(code) => break code,
             None => {
                 eprintln!("[reconnecting...]");
                 loop {
@@ -670,14 +723,19 @@ pub async fn tail(
                         }
                         Some(Ok(Frame::Error { message })) => {
                             eprintln!("[session gone: {message}]");
-                            return Ok(1);
+                            break 'outer 1;
                         }
                         _ => continue,
                     }
                 }
             }
         }
-    }
+    };
+
+    // Reset terminal state: clear attributes and show cursor.
+    // PTY output may have left colors/bold set or cursor hidden.
+    let _ = write_stdout(b"\x1b[0m\x1b[?25h");
+    Ok(code)
 }
 
 #[cfg(test)]
