@@ -295,9 +295,9 @@ pub async fn run(
         }
     };
 
-    // Read optional Env frame from first client (100ms timeout)
+    // Read optional Env frame from first client (2s timeout -- generous for slow SSH tunnels)
     let env_vars =
-        match tokio::time::timeout(std::time::Duration::from_millis(100), framed.next()).await {
+        match tokio::time::timeout(std::time::Duration::from_secs(2), framed.next()).await {
             Ok(Some(Ok(Frame::Env { vars }))) => {
                 debug!(count = vars.len(), "received env vars from client");
                 vars

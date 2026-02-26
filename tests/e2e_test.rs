@@ -53,7 +53,10 @@ async fn setup_session() -> (
     let (server_stream, client_stream) = UnixStream::pair().unwrap();
     client_tx.send(ClientConn::Active(Framed::new(server_stream, FrameCodec))).unwrap();
 
-    let framed = Framed::new(client_stream, FrameCodec);
+    let mut framed = Framed::new(client_stream, FrameCodec);
+    // Send empty Env frame so server doesn't wait for the Env timeout before spawning shell
+    framed.send(Frame::Env { vars: vec![] }).await.unwrap();
+
     (client_tx, framed, handle, meta)
 }
 
@@ -744,7 +747,9 @@ async fn setup_session_with_agent_path() -> (
     let (server_stream, client_stream) = UnixStream::pair().unwrap();
     client_tx.send(ClientConn::Active(Framed::new(server_stream, FrameCodec))).unwrap();
 
-    let framed = Framed::new(client_stream, FrameCodec);
+    let mut framed = Framed::new(client_stream, FrameCodec);
+    framed.send(Frame::Env { vars: vec![] }).await.unwrap();
+
     (client_tx, framed, handle, meta, agent_path)
 }
 
@@ -894,7 +899,9 @@ async fn setup_session_with_open_path() -> (
     let (server_stream, client_stream) = UnixStream::pair().unwrap();
     client_tx.send(ClientConn::Active(Framed::new(server_stream, FrameCodec))).unwrap();
 
-    let framed = Framed::new(client_stream, FrameCodec);
+    let mut framed = Framed::new(client_stream, FrameCodec);
+    framed.send(Frame::Env { vars: vec![] }).await.unwrap();
+
     (client_tx, framed, handle, meta, open_path)
 }
 
