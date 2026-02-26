@@ -52,6 +52,10 @@ enum Command {
         /// Forward URL open requests back to the local machine
         #[arg(short = 'O', long)]
         forward_open: bool,
+
+        /// Wait indefinitely for the server instead of giving up after retries
+        #[arg(short = 'w', long)]
+        wait: bool,
     },
     /// Attach to an existing session (detaches other clients)
     #[command(alias = "a")]
@@ -78,6 +82,10 @@ enum Command {
         /// Forward URL open requests back to the local machine
         #[arg(short = 'O', long)]
         forward_open: bool,
+
+        /// Wait indefinitely for the server instead of giving up after retries
+        #[arg(short = 'w', long)]
+        wait: bool,
     },
     /// Tail a session's output (read-only, like tail -f)
     #[command(alias = "t")]
@@ -450,7 +458,16 @@ fn resolve_ctl_path(ctl_socket: Option<PathBuf>, host: Option<&str>) -> anyhow::
 async fn run(cli: Cli, config: gritty::config::ConfigFile) -> anyhow::Result<()> {
     match cli.command {
         Command::Server { .. } | Command::Connect { .. } => unreachable!(),
-        Command::NewSession { host, target, no_redraw, no_escape, forward_agent, forward_open } => {
+        Command::NewSession {
+            host,
+            target,
+            no_redraw,
+            no_escape,
+            forward_agent,
+            forward_open,
+            wait,
+        } => {
+            let is_default_path = cli.ctl_socket.is_none() && host.is_none();
             let ctl_path = resolve_ctl_path(cli.ctl_socket, host.as_deref())?;
             let resolved = config.resolve_session(host.as_deref());
             new_session(
@@ -460,6 +477,8 @@ async fn run(cli: Cli, config: gritty::config::ConfigFile) -> anyhow::Result<()>
                 forward_agent || resolved.forward_agent,
                 forward_open || resolved.forward_open,
                 ctl_path,
+                is_default_path,
+                wait,
             )
             .await
         }
@@ -468,7 +487,16 @@ async fn run(cli: Cli, config: gritty::config::ConfigFile) -> anyhow::Result<()>
             let code = tail_session(target, ctl_path).await?;
             std::process::exit(code);
         }
-        Command::Attach { host, target, no_redraw, no_escape, forward_agent, forward_open } => {
+        Command::Attach {
+            host,
+            target,
+            no_redraw,
+            no_escape,
+            forward_agent,
+            forward_open,
+            wait,
+        } => {
+            let is_default_path = cli.ctl_socket.is_none() && host.is_none();
             let ctl_path = resolve_ctl_path(cli.ctl_socket, host.as_deref())?;
             let resolved = config.resolve_session(host.as_deref());
             let code = attach(
@@ -478,6 +506,8 @@ async fn run(cli: Cli, config: gritty::config::ConfigFile) -> anyhow::Result<()>
                 forward_agent || resolved.forward_agent,
                 forward_open || resolved.forward_open,
                 ctl_path,
+                is_default_path,
+                wait,
             )
             .await?;
             std::process::exit(code);
@@ -521,6 +551,56 @@ async fn run(cli: Cli, config: gritty::config::ConfigFile) -> anyhow::Result<()>
     }
 }
 
+/// Start the server by running the current binary with `["server"]` args.
+/// The server self-daemonizes and returns after the socket is ready.
+fn auto_start_server() -> anyhow::Result<()> {
+    let exe = std::env::current_exe().unwrap_or_else(|_| PathBuf::from("gritty"));
+    let status = std::process::Command::new(&exe).arg("server").status()?;
+    if !status.success() {
+        anyhow::bail!("failed to auto-start server (exit {})", status);
+    }
+    Ok(())
+}
+
+/// Try to connect to the control socket. On failure, optionally auto-start the
+/// server (if `can_auto_start`) and retry with a bounded loop. With `--wait`,
+/// retries indefinitely instead.
+async fn connect_to_server(
+    ctl_path: &Path,
+    can_auto_start: bool,
+    wait: bool,
+) -> anyhow::Result<tokio::net::UnixStream> {
+    use tokio::net::UnixStream;
+
+    match UnixStream::connect(ctl_path).await {
+        Ok(s) => return Ok(s),
+        Err(_) if can_auto_start => {
+            eprintln!("no server running, starting one...");
+            auto_start_server()?;
+        }
+        Err(_) if wait => {}
+        Err(_) => {
+            anyhow::bail!("no server running (could not connect to {})", ctl_path.display());
+        }
+    }
+
+    // Retry loop: bounded (10 retries, 500ms apart) or indefinite (--wait)
+    let max_retries = if wait { u32::MAX } else { 10 };
+    for _ in 0..max_retries {
+        match UnixStream::connect(ctl_path).await {
+            Ok(s) => return Ok(s),
+            Err(_) => {
+                if wait {
+                    eprintln!("waiting for server ({})... ctrl-c to abort", ctl_path.display());
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+            }
+        }
+    }
+    anyhow::bail!("server did not become ready ({})", ctl_path.display())
+}
+
+#[allow(clippy::too_many_arguments)]
 async fn new_session(
     name: Option<String>,
     redraw: bool,
@@ -528,17 +608,16 @@ async fn new_session(
     forward_agent: bool,
     forward_open: bool,
     ctl_path: PathBuf,
+    is_default_path: bool,
+    wait: bool,
 ) -> anyhow::Result<()> {
     use futures_util::{SinkExt, StreamExt};
     use gritty::protocol::{Frame, FrameCodec};
-    use tokio::net::UnixStream;
     use tokio_util::codec::Framed;
 
     let session_name = name.clone().unwrap_or_default();
 
-    let stream = UnixStream::connect(&ctl_path).await.map_err(|_| {
-        anyhow::anyhow!("no server running (could not connect to {})", ctl_path.display())
-    })?;
+    let stream = connect_to_server(&ctl_path, is_default_path, wait).await?;
     let mut framed = Framed::new(stream, FrameCodec);
     gritty::handshake(&mut framed).await?;
     framed.send(Frame::NewSession { name: session_name }).await?;
@@ -575,6 +654,7 @@ async fn new_session(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn attach(
     target: String,
     redraw: bool,
@@ -582,21 +662,14 @@ async fn attach(
     forward_agent: bool,
     forward_open: bool,
     ctl_path: PathBuf,
+    is_default_path: bool,
+    wait: bool,
 ) -> anyhow::Result<i32> {
     use futures_util::{SinkExt, StreamExt};
     use gritty::protocol::{Frame, FrameCodec};
-    use tokio::net::UnixStream;
     use tokio_util::codec::Framed;
 
-    let stream = loop {
-        match UnixStream::connect(&ctl_path).await {
-            Ok(s) => break s,
-            Err(_) => {
-                eprintln!("waiting for server ({})... ctrl-c to abort", ctl_path.display());
-                tokio::time::sleep(std::time::Duration::from_secs(1)).await;
-            }
-        }
-    };
+    let stream = connect_to_server(&ctl_path, is_default_path, wait).await?;
     let mut framed = Framed::new(stream, FrameCodec);
     gritty::handshake(&mut framed).await?;
     framed.send(Frame::Attach { session: target.clone() }).await?;

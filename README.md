@@ -16,7 +16,7 @@ It works by forwarding Unix domain sockets over SSH -- no custom protocol, no op
     - **URL open forwarding** (`-O`) -- forwards `$BROWSER` / URL open requests back to your local machine
     - **Environment forwarding** -- TERM, LANG, COLORTERM propagated to remote shell
 - **Simple**
-    - **Single binary, zero config** -- optional TOML config for defaults; no server config, no port allocation, no root required; auto-starts the remote server
+    - **Single binary, zero config** -- optional TOML config for defaults; no server config, no port allocation, no root required; auto-starts the server on demand
     - **No network protocol** -- Unix domain sockets locally, SSH handles encryption and auth
 - **Session management**
     - **Multiple named sessions** -- create, list, attach, kill by name or ID
@@ -97,6 +97,7 @@ The `[host]` argument is a connection name from `gritty connect` (e.g., `gritty 
 - `-o <option>` on `connect`: extra SSH options (repeatable, e.g., `-o "ProxyJump=bastion"`)
 - `--no-redraw` on `new`/`attach`: don't send Ctrl-L after connecting
 - `--no-escape` on `new`/`attach`: disable escape sequence processing
+- `-w` / `--wait` on `new`/`attach`: wait indefinitely for the server (default: give up after retries)
 
 ## Configuration
 
@@ -283,7 +284,6 @@ Early stage. Works on Linux and macOS. No Windows support yet -- patches welcome
 
 **Planned:**
 - **Shell Tab Completion** -- add support for bash, zsh, and other shell tab completion
-- **Server auto-start** -- start the server on demand (systemd socket activation, launchd, or on first `new-session`)
 - **Zero-downtime upgrades** -- server re-execs itself, preserving sessions across upgrades
 
 ## License
