@@ -1,4 +1,4 @@
-use clap::{Parser, Subcommand};
+use clap::{CommandFactory, Parser, Subcommand};
 use std::os::fd::{AsRawFd, OwnedFd};
 use std::path::{Path, PathBuf};
 use tracing_subscriber::EnvFilter;
@@ -166,6 +166,11 @@ enum Command {
     ConfigEdit,
     /// Print the protocol version number
     ProtocolVersion,
+    /// Generate shell completions
+    Completions {
+        /// Shell to generate completions for
+        shell: clap_complete::Shell,
+    },
 }
 
 fn init_tracing(verbose: bool, log_path: Option<&Path>) {
@@ -546,6 +551,10 @@ async fn run(cli: Cli, config: gritty::config::ConfigFile) -> anyhow::Result<()>
         Command::ConfigEdit => config_edit(),
         Command::ProtocolVersion => {
             println!("{}", gritty::protocol::PROTOCOL_VERSION);
+            Ok(())
+        }
+        Command::Completions { shell } => {
+            clap_complete::generate(shell, &mut Cli::command(), "gritty", &mut std::io::stdout());
             Ok(())
         }
     }

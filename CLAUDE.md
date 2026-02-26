@@ -22,6 +22,7 @@ gritty provides persistent TTY sessions over Unix domain sockets. Single binary,
 - `gritty kill-server` — kills server and all sessions
 - `gritty info` — shows diagnostics: version, config file path/status, socket paths, server status/session count, log file paths, active tunnels with status/pid/log paths
 - `gritty config-edit` — opens config file in `$VISUAL`/`$EDITOR`/`vi` (creates from embedded template if missing)
+- `gritty completions <shell>` — generates shell completions (bash, zsh, fish, elvish, powershell). E.g. `gritty completions bash > /etc/bash_completion.d/gritty`
 
 Sessions get auto-incrementing integer IDs (0, 1, 2...) with optional human-friendly names via `-t`.
 

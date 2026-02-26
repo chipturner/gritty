@@ -86,6 +86,7 @@ ID  Name    PTY         PID    Created              Status
 | `gritty socket-path` | `socket` | Print the default server socket path |
 | `gritty info` | | Show diagnostics (version, config, server status, tunnels) |
 | `gritty config-edit` | | Open config in `$VISUAL`/`$EDITOR` (creates from template if missing) |
+| `gritty completions <shell>` | | Generate shell completions (bash, zsh, fish, elvish, powershell) |
 
 The `[host]` argument is a connection name from `gritty connect` (e.g., `gritty ls devbox`). Omit it to use the local server.
 
@@ -150,6 +151,19 @@ After a newline (or at session start), `~` enters escape mode:
 | `~^Z` | Suspend the client (SIGTSTP) |
 | `~?` | Print help |
 | `~~` | Send a literal `~` |
+
+## Shell Completions
+
+```bash
+# Bash
+gritty completions bash > /etc/bash_completion.d/gritty
+
+# Zsh (add to fpath)
+gritty completions zsh > ~/.zfunc/_gritty
+
+# Fish
+gritty completions fish > ~/.config/fish/completions/gritty.fish
+```
 
 ## Design
 
@@ -283,7 +297,6 @@ gritty differs by having no network protocol of its own. Where mosh and ET imple
 Early stage. Works on Linux and macOS. No Windows support yet -- patches welcome. Available on [crates.io](https://crates.io/crates/gritty-cli).
 
 **Planned:**
-- **Shell Tab Completion** -- add support for bash, zsh, and other shell tab completion
 - **Zero-downtime upgrades** -- server re-execs itself, preserving sessions across upgrades
 
 ## License
