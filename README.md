@@ -265,7 +265,7 @@ Forwarding multiplexes over the existing session connection -- no extra tunnels.
 
 **SSH agent** (`-A`): the session creates `agent-N.sock` and sets `SSH_AUTH_SOCK`. When a remote process (e.g. `git push`) connects, the request is relayed to the client's local SSH agent and back.
 
-**URL open** (`-O`): the session creates `open-N.sock` and sets `GRITTY_OPEN_SOCK` + `BROWSER=gritty open`. When `gritty open <url>` runs, the URL is relayed to the client which opens it locally.
+**URL open** (`-O`): the session creates `open-N.sock` and sets `GRITTY_OPEN_SOCK` + `BROWSER=gritty open`. When `gritty open <url>` runs, the URL is relayed to the client which opens it locally. Note that `-O` is a trust grant -- it gives processes inside the remote session the ability to open URLs on your local machine. Only use it with sessions you control.
 
 ## Prior Art
 
@@ -275,9 +275,11 @@ Forwarding multiplexes over the existing session connection -- no extra tunnels.
 
 gritty differs by having no network protocol of its own. Where mosh and ET implement custom transport and encryption, gritty uses Unix domain sockets and delegates networking entirely to SSH. Where tmux and screen are full multiplexers with windows, panes, and key bindings, gritty does one thing: persistent sessions with auto-reconnect.
 
+**gritty + tmux** is the ideal pairing. gritty handles the connection -- self-healing tunnels, agent forwarding, auto-reconnect -- while tmux handles the workspace -- splits, windows, copy-mode, scroll-back. Run tmux inside a gritty session and close your laptop, change wifi, open it back up: your tmux splits are exactly where you left them, no re-SSH and `tmux attach` required. gritty replaces the fragile SSH pipe underneath tmux, not tmux itself.
+
 ## Status & Roadmap
 
-Early stage. Works on Linux and macOS. Available on [crates.io](https://crates.io/crates/gritty-cli).
+Early stage. Works on Linux and macOS. No Windows support yet -- patches welcome. Available on [crates.io](https://crates.io/crates/gritty-cli).
 
 **Planned:**
 - **Shell Tab Completion** -- add support for bash, zsh, and other shell tab completion
