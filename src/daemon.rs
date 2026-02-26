@@ -1,4 +1,4 @@
-use crate::protocol::{Frame, FrameCodec, SessionEntry};
+use crate::protocol::{Frame, FrameCodec, PROTOCOL_VERSION, SessionEntry};
 use crate::server::{self, ClientConn, SessionMetadata};
 use futures_util::{SinkExt, StreamExt};
 use std::collections::HashMap;
@@ -6,10 +6,29 @@ use std::os::fd::OwnedFd;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::Ordering;
 use std::sync::{Arc, OnceLock};
+use std::time::Duration;
+use tokio::net::UnixStream;
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 use tokio_util::codec::Framed;
 use tracing::{error, info, warn};
+
+const SEND_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// Send a frame with a timeout. Returns true on success.
+async fn timed_send(framed: &mut Framed<UnixStream, FrameCodec>, frame: Frame) -> bool {
+    match tokio::time::timeout(SEND_TIMEOUT, framed.send(frame)).await {
+        Ok(Ok(())) => true,
+        Ok(Err(e)) => {
+            warn!("control send error: {e}");
+            false
+        }
+        Err(_) => {
+            warn!("control send timed out");
+            false
+        }
+    }
+}
 
 struct SessionState {
     handle: JoinHandle<anyhow::Result<()>>,
@@ -171,20 +190,47 @@ pub async fn run(ctl_path: &Path, ready_fd: Option<OwnedFd>) -> anyhow::Result<(
         }
         let mut framed = Framed::new(stream, FrameCodec);
 
-        // Handle one control request per connection (timeout prevents slowloris)
-        let frame =
-            match tokio::time::timeout(std::time::Duration::from_secs(5), framed.next()).await {
-                Ok(Some(Ok(f))) => f,
-                Ok(Some(Err(e))) => {
-                    warn!("frame decode error: {e}");
-                    continue;
-                }
-                Ok(None) => continue,
-                Err(_) => {
-                    warn!("control connection timed out");
-                    continue;
-                }
-            };
+        // Read Hello handshake (5s timeout)
+        let hello = match tokio::time::timeout(Duration::from_secs(5), framed.next()).await {
+            Ok(Some(Ok(Frame::Hello { version }))) => version,
+            Ok(Some(Ok(_))) => {
+                timed_send(
+                    &mut framed,
+                    Frame::Error { message: "expected Hello handshake".to_string() },
+                )
+                .await;
+                continue;
+            }
+            Ok(Some(Err(e))) => {
+                warn!("frame decode error: {e}");
+                continue;
+            }
+            Ok(None) => continue,
+            Err(_) => {
+                warn!("control connection timed out (hello)");
+                continue;
+            }
+        };
+
+        // Send HelloAck with negotiated version
+        let negotiated = hello.min(PROTOCOL_VERSION);
+        if !timed_send(&mut framed, Frame::HelloAck { version: negotiated }).await {
+            continue;
+        }
+
+        // Read control frame (5s timeout)
+        let frame = match tokio::time::timeout(Duration::from_secs(5), framed.next()).await {
+            Ok(Some(Ok(f))) => f,
+            Ok(Some(Err(e))) => {
+                warn!("frame decode error: {e}");
+                continue;
+            }
+            Ok(None) => continue,
+            Err(_) => {
+                warn!("control connection timed out");
+                continue;
+            }
+        };
 
         match frame {
             Frame::NewSession { name } => {
@@ -193,21 +239,23 @@ pub async fn run(ctl_path: &Path, ready_fd: Option<OwnedFd>) -> anyhow::Result<(
                 let name_opt = if name.is_empty() { None } else { Some(name) };
                 if let Some(ref n) = name_opt {
                     if n.bytes().any(|b| b.is_ascii_control()) {
-                        let _ = framed
-                            .send(Frame::Error {
+                        timed_send(
+                            &mut framed,
+                            Frame::Error {
                                 message: "session name must not contain control characters"
                                     .to_string(),
-                            })
-                            .await;
+                            },
+                        )
+                        .await;
                         continue;
                     }
                     let dup = sessions.values().any(|s| s.name.as_deref() == Some(n));
                     if dup {
-                        let _ = framed
-                            .send(Frame::Error {
-                                message: format!("session name already exists: {n}"),
-                            })
-                            .await;
+                        timed_send(
+                            &mut framed,
+                            Frame::Error { message: format!("session name already exists: {n}") },
+                        )
+                        .await;
                         continue;
                     }
                 }
@@ -237,7 +285,9 @@ pub async fn run(ctl_path: &Path, ready_fd: Option<OwnedFd>) -> anyhow::Result<(
 
                 info!(id, name = ?name_opt, "session created");
 
-                let _ = framed.send(Frame::SessionCreated { id: id.to_string() }).await;
+                if !timed_send(&mut framed, Frame::SessionCreated { id: id.to_string() }).await {
+                    continue;
+                }
 
                 // Hand off connection to session for auto-attach
                 let _ = client_tx.send(ClientConn::Active(framed));
@@ -248,17 +298,20 @@ pub async fn run(ctl_path: &Path, ready_fd: Option<OwnedFd>) -> anyhow::Result<(
                     let state = &sessions[&id];
                     if state.client_tx.is_closed() {
                         sessions.remove(&id);
-                        let _ = framed
-                            .send(Frame::Error { message: format!("no such session: {session}") })
-                            .await;
-                    } else {
-                        let _ = framed.send(Frame::Ok).await;
+                        timed_send(
+                            &mut framed,
+                            Frame::Error { message: format!("no such session: {session}") },
+                        )
+                        .await;
+                    } else if timed_send(&mut framed, Frame::Ok).await {
                         let _ = state.client_tx.send(ClientConn::Active(framed));
                     }
                 } else {
-                    let _ = framed
-                        .send(Frame::Error { message: format!("no such session: {session}") })
-                        .await;
+                    timed_send(
+                        &mut framed,
+                        Frame::Error { message: format!("no such session: {session}") },
+                    )
+                    .await;
                 }
             }
             Frame::Tail { session } => {
@@ -267,23 +320,26 @@ pub async fn run(ctl_path: &Path, ready_fd: Option<OwnedFd>) -> anyhow::Result<(
                     let state = &sessions[&id];
                     if state.client_tx.is_closed() {
                         sessions.remove(&id);
-                        let _ = framed
-                            .send(Frame::Error { message: format!("no such session: {session}") })
-                            .await;
-                    } else {
-                        let _ = framed.send(Frame::Ok).await;
+                        timed_send(
+                            &mut framed,
+                            Frame::Error { message: format!("no such session: {session}") },
+                        )
+                        .await;
+                    } else if timed_send(&mut framed, Frame::Ok).await {
                         let _ = state.client_tx.send(ClientConn::Tail(framed));
                     }
                 } else {
-                    let _ = framed
-                        .send(Frame::Error { message: format!("no such session: {session}") })
-                        .await;
+                    timed_send(
+                        &mut framed,
+                        Frame::Error { message: format!("no such session: {session}") },
+                    )
+                    .await;
                 }
             }
             Frame::ListSessions => {
                 reap_sessions(&mut sessions);
                 let entries = build_session_entries(&sessions);
-                let _ = framed.send(Frame::SessionInfo { sessions: entries }).await;
+                timed_send(&mut framed, Frame::SessionInfo { sessions: entries }).await;
             }
             Frame::KillSession { session } => {
                 reap_sessions(&mut sessions);
@@ -291,24 +347,28 @@ pub async fn run(ctl_path: &Path, ready_fd: Option<OwnedFd>) -> anyhow::Result<(
                     let state = sessions.remove(&id).unwrap();
                     state.handle.abort();
                     info!(id, "session killed");
-                    let _ = framed.send(Frame::Ok).await;
+                    timed_send(&mut framed, Frame::Ok).await;
                 } else {
-                    let _ = framed
-                        .send(Frame::Error { message: format!("no such session: {session}") })
-                        .await;
+                    timed_send(
+                        &mut framed,
+                        Frame::Error { message: format!("no such session: {session}") },
+                    )
+                    .await;
                 }
             }
             Frame::KillServer => {
                 info!("kill-server received, shutting down");
                 shutdown(&mut sessions, ctl_path);
-                let _ = framed.send(Frame::Ok).await;
+                timed_send(&mut framed, Frame::Ok).await;
                 break;
             }
             other => {
                 error!(?other, "unexpected frame on control socket");
-                let _ = framed
-                    .send(Frame::Error { message: "unexpected frame type".to_string() })
-                    .await;
+                timed_send(
+                    &mut framed,
+                    Frame::Error { message: "unexpected frame type".to_string() },
+                )
+                .await;
             }
         }
     }

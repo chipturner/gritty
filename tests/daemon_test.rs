@@ -1,6 +1,6 @@
 use bytes::Bytes;
 use futures_util::{SinkExt, StreamExt};
-use gritty::protocol::{Frame, FrameCodec};
+use gritty::protocol::{Frame, FrameCodec, PROTOCOL_VERSION};
 use std::sync::LazyLock;
 use std::time::Duration;
 use tokio::net::UnixStream;
@@ -19,10 +19,22 @@ fn test_ctl() -> (tempfile::TempDir, std::path::PathBuf) {
     (tmp, ctl_path)
 }
 
+/// Perform Hello handshake on a framed connection.
+async fn do_handshake(framed: &mut Framed<UnixStream, FrameCodec>) {
+    framed.send(Frame::Hello { version: PROTOCOL_VERSION }).await.unwrap();
+    let resp = timeout(Duration::from_secs(3), framed.next())
+        .await
+        .expect("timed out")
+        .expect("stream ended")
+        .expect("decode error");
+    assert!(matches!(resp, Frame::HelloAck { .. }), "expected HelloAck, got {resp:?}");
+}
+
 /// Helper: send a control frame and get the response.
 async fn control_request(ctl_path: &std::path::Path, frame: Frame) -> Frame {
     let stream = UnixStream::connect(ctl_path).await.unwrap();
     let mut framed = Framed::new(stream, FrameCodec);
+    do_handshake(&mut framed).await;
     framed.send(frame).await.unwrap();
     timeout(Duration::from_secs(3), framed.next())
         .await
@@ -55,6 +67,7 @@ async fn attach_session(
 ) -> Framed<UnixStream, FrameCodec> {
     let stream = UnixStream::connect(ctl_path).await.unwrap();
     let mut framed = Framed::new(stream, FrameCodec);
+    do_handshake(&mut framed).await;
     framed.send(Frame::Attach { session: session.to_string() }).await.unwrap();
     let resp = timeout(Duration::from_secs(3), framed.next())
         .await
@@ -790,6 +803,7 @@ async fn reconnect_via_daemon_after_disconnect() {
     // Re-attach via new daemon connection (raw — shell already running, no guaranteed output)
     let stream = UnixStream::connect(&ctl_path).await.unwrap();
     let mut framed = Framed::new(stream, FrameCodec);
+    do_handshake(&mut framed).await;
     framed.send(Frame::Attach { session: id.clone() }).await.unwrap();
     let resp = timeout(Duration::from_secs(3), framed.next())
         .await
@@ -879,5 +893,38 @@ async fn tail_nonexistent_returns_error() {
     assert!(
         matches!(resp, Frame::Error { .. }),
         "expected Error for nonexistent tail, got {resp:?}"
+    );
+}
+
+#[tokio::test]
+async fn daemon_rejects_non_hello_first_frame() {
+    let _permit = CONCURRENCY.acquire().await.unwrap();
+    let (_tmp, ctl_path) = test_ctl();
+
+    let ctl = ctl_path.clone();
+    let _daemon = tokio::spawn(async move { gritty::daemon::run(&ctl, None).await });
+    tokio::time::sleep(Duration::from_millis(200)).await;
+
+    // Send a ListSessions frame without Hello first
+    let stream = UnixStream::connect(&ctl_path).await.unwrap();
+    let mut framed = Framed::new(stream, FrameCodec);
+    framed.send(Frame::ListSessions).await.unwrap();
+    let resp = timeout(Duration::from_secs(3), framed.next())
+        .await
+        .expect("timed out")
+        .expect("stream ended")
+        .expect("decode error");
+    match resp {
+        Frame::Error { message } => {
+            assert!(message.contains("Hello"), "error should mention Hello, got: {message}");
+        }
+        other => panic!("expected Error for non-Hello first frame, got {other:?}"),
+    }
+
+    // Daemon should still be alive for subsequent valid requests
+    let resp = control_request(&ctl_path, Frame::ListSessions).await;
+    assert!(
+        matches!(resp, Frame::SessionInfo { .. }),
+        "daemon should still work after rejecting bad client, got {resp:?}"
     );
 }

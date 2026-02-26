@@ -156,6 +156,8 @@ enum Command {
     Info,
     /// Open config file in $EDITOR (creates from template if missing)
     ConfigEdit,
+    /// Print the protocol version number
+    ProtocolVersion,
 }
 
 fn init_tracing(verbose: bool, log_path: Option<&Path>) {
@@ -512,6 +514,10 @@ async fn run(cli: Cli, config: gritty::config::ConfigFile) -> anyhow::Result<()>
         }
         Command::Info => info(&config).await,
         Command::ConfigEdit => config_edit(),
+        Command::ProtocolVersion => {
+            println!("{}", gritty::protocol::PROTOCOL_VERSION);
+            Ok(())
+        }
     }
 }
 
@@ -534,6 +540,7 @@ async fn new_session(
         anyhow::anyhow!("no server running (could not connect to {})", ctl_path.display())
     })?;
     let mut framed = Framed::new(stream, FrameCodec);
+    gritty::handshake(&mut framed).await?;
     framed.send(Frame::NewSession { name: session_name }).await?;
 
     match Frame::expect_from(framed.next().await)? {
@@ -591,6 +598,7 @@ async fn attach(
         }
     };
     let mut framed = Framed::new(stream, FrameCodec);
+    gritty::handshake(&mut framed).await?;
     framed.send(Frame::Attach { session: target.clone() }).await?;
 
     match Frame::expect_from(framed.next().await)? {
@@ -628,6 +636,7 @@ async fn server_request(
         anyhow::anyhow!("no server running (could not connect to {})", ctl_path.display())
     })?;
     let mut framed = Framed::new(stream, FrameCodec);
+    gritty::handshake(&mut framed).await?;
     framed.send(frame).await?;
     Frame::expect_from(framed.next().await)
 }
@@ -757,6 +766,7 @@ async fn tail_session(target: String, ctl_path: PathBuf) -> anyhow::Result<i32> 
         anyhow::anyhow!("no server running (could not connect to {})", ctl_path.display())
     })?;
     let mut framed = Framed::new(stream, FrameCodec);
+    gritty::handshake(&mut framed).await?;
     framed.send(Frame::Tail { session: target.clone() }).await?;
 
     match Frame::expect_from(framed.next().await)? {
@@ -816,7 +826,6 @@ fn config_edit() -> anyhow::Result<()> {
 
 async fn info(config: &gritty::config::ConfigFile) -> anyhow::Result<()> {
     use gritty::protocol::Frame;
-    use tokio::net::UnixStream;
 
     println!("gritty {}", env!("CARGO_PKG_VERSION"));
     println!();
@@ -841,26 +850,24 @@ async fn info(config: &gritty::config::ConfigFile) -> anyhow::Result<()> {
     println!("socket dir:     {}", socket_dir.display());
     println!("server socket:  {}", ctl_path.display());
 
-    // Probe server status
+    // Probe server status via server_request (which includes handshake)
     let pid_path = gritty::daemon::pid_file_path(&ctl_path);
     let pid = std::fs::read_to_string(&pid_path).ok().and_then(|s| s.trim().parse::<u32>().ok());
 
-    if UnixStream::connect(&ctl_path).await.is_ok() {
-        // Server is reachable — try to get session count
-        let session_count = match server_request(&ctl_path, Frame::ListSessions).await {
-            Ok(Frame::SessionInfo { sessions }) => Some(sessions.len()),
-            _ => None,
-        };
-        match (pid, session_count) {
-            (Some(p), Some(n)) => {
-                let s = if n == 1 { "" } else { "s" };
-                println!("server status:  running (pid {p}, {n} session{s})");
+    match server_request(&ctl_path, Frame::ListSessions).await {
+        Ok(Frame::SessionInfo { sessions }) => {
+            let n = sessions.len();
+            match pid {
+                Some(p) => {
+                    let s = if n == 1 { "" } else { "s" };
+                    println!("server status:  running (pid {p}, {n} session{s})");
+                }
+                None => println!("server status:  running"),
             }
-            (Some(p), None) => println!("server status:  running (pid {p})"),
-            (None, _) => println!("server status:  running"),
         }
-    } else {
-        println!("server status:  not running");
+        _ => {
+            println!("server status:  not running");
+        }
     }
 
     let log_path = socket_dir.join("daemon.log");

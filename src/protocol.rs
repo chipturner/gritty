@@ -21,13 +21,18 @@ const TYPE_LIST_SESSIONS: u8 = 0x12;
 const TYPE_KILL_SESSION: u8 = 0x13;
 const TYPE_KILL_SERVER: u8 = 0x14;
 const TYPE_TAIL: u8 = 0x15;
+const TYPE_HELLO: u8 = 0x16;
 const TYPE_SESSION_CREATED: u8 = 0x20;
 const TYPE_SESSION_INFO: u8 = 0x21;
 const TYPE_OK: u8 = 0x22;
 const TYPE_ERROR: u8 = 0x23;
+const TYPE_HELLO_ACK: u8 = 0x24;
 
 const HEADER_LEN: usize = 5; // type(1) + length(4)
 const MAX_FRAME_SIZE: usize = 1 << 20; // 1 MB
+
+/// Protocol version for handshake negotiation.
+pub const PROTOCOL_VERSION: u16 = 1;
 
 /// Metadata for one session, returned in SessionInfo.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -81,6 +86,14 @@ pub enum Frame {
     /// URL to open on the client machine (server → client).
     OpenUrl {
         url: String,
+    },
+    /// Protocol version handshake (client → server, first frame on connection).
+    Hello {
+        version: u16,
+    },
+    /// Protocol version acknowledgement (server → client).
+    HelloAck {
+        version: u16,
     },
     // Control requests
     NewSession {
@@ -245,6 +258,26 @@ impl Decoder for FrameCodec {
             }
             TYPE_OPEN_FORWARD => Ok(Some(Frame::OpenForward)),
             TYPE_OPEN_URL => Ok(Some(Frame::OpenUrl { url: decode_string(payload)? })),
+            TYPE_HELLO => {
+                if payload.len() != 2 {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "hello frame must be 2 bytes",
+                    ));
+                }
+                let version = u16::from_be_bytes([payload[0], payload[1]]);
+                Ok(Some(Frame::Hello { version }))
+            }
+            TYPE_HELLO_ACK => {
+                if payload.len() != 2 {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "hello ack frame must be 2 bytes",
+                    ));
+                }
+                let version = u16::from_be_bytes([payload[0], payload[1]]);
+                Ok(Some(Frame::HelloAck { version }))
+            }
             TYPE_NEW_SESSION => Ok(Some(Frame::NewSession { name: decode_string(payload)? })),
             TYPE_ATTACH => Ok(Some(Frame::Attach { session: decode_string(payload)? })),
             TYPE_TAIL => Ok(Some(Frame::Tail { session: decode_string(payload)? })),
@@ -348,6 +381,16 @@ impl Encoder<Frame> for FrameCodec {
             }
             Frame::OpenForward => encode_empty(dst, TYPE_OPEN_FORWARD),
             Frame::OpenUrl { url } => encode_str(dst, TYPE_OPEN_URL, &url),
+            Frame::Hello { version } => {
+                dst.put_u8(TYPE_HELLO);
+                dst.put_u32(2);
+                dst.put_u16(version);
+            }
+            Frame::HelloAck { version } => {
+                dst.put_u8(TYPE_HELLO_ACK);
+                dst.put_u32(2);
+                dst.put_u16(version);
+            }
             Frame::NewSession { name } => encode_str(dst, TYPE_NEW_SESSION, &name),
             Frame::Attach { session } => encode_str(dst, TYPE_ATTACH, &session),
             Frame::Tail { session } => encode_str(dst, TYPE_TAIL, &session),

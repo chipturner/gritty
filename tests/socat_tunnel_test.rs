@@ -1,5 +1,5 @@
 use futures_util::{SinkExt, StreamExt};
-use gritty::protocol::{Frame, FrameCodec};
+use gritty::protocol::{Frame, FrameCodec, PROTOCOL_VERSION};
 use std::path::PathBuf;
 use std::process::{Child, Command};
 use std::time::Duration;
@@ -158,6 +158,13 @@ async fn tunnel_death_session_persists() {
     // Create a session via protocol through the proxy
     let stream = UnixStream::connect(&proxy_sock).await.unwrap();
     let mut framed = Framed::new(stream, FrameCodec);
+    framed.send(Frame::Hello { version: PROTOCOL_VERSION }).await.unwrap();
+    let ack = timeout(Duration::from_secs(5), framed.next())
+        .await
+        .expect("timed out")
+        .expect("stream ended")
+        .expect("decode error");
+    assert!(matches!(ack, Frame::HelloAck { .. }));
     framed.send(Frame::NewSession { name: "persist-test".to_string() }).await.unwrap();
     let resp = timeout(Duration::from_secs(5), framed.next())
         .await
@@ -189,6 +196,13 @@ async fn tunnel_death_session_persists() {
     // List sessions -- our session should still be there
     let stream = UnixStream::connect(&proxy_sock).await.unwrap();
     let mut framed = Framed::new(stream, FrameCodec);
+    framed.send(Frame::Hello { version: PROTOCOL_VERSION }).await.unwrap();
+    let ack = timeout(Duration::from_secs(5), framed.next())
+        .await
+        .expect("timed out")
+        .expect("stream ended")
+        .expect("decode error");
+    assert!(matches!(ack, Frame::HelloAck { .. }));
     framed.send(Frame::ListSessions).await.unwrap();
     let resp = timeout(Duration::from_secs(5), framed.next())
         .await

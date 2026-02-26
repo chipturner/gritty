@@ -1008,6 +1008,46 @@ async fn multiple_pings_get_multiple_pongs() {
 }
 
 #[tokio::test]
+async fn ring_buffer_overflow_shows_truncation_marker() {
+    let _permit = CONCURRENCY.acquire().await.unwrap();
+    let (client_tx, mut framed, server, _meta) = setup_session().await;
+    wait_for_shell(&mut framed).await;
+    read_available_data(&mut framed, Duration::from_secs(1)).await;
+
+    // Generate ~2MB of output (exceeds 1MB ring buffer cap)
+    framed
+        .send(Frame::Data(Bytes::from(
+            "{ sleep 0.3; dd if=/dev/zero bs=1024 count=2048 2>/dev/null | base64; echo TRUNC_DONE; } &\n",
+        )))
+        .await
+        .unwrap();
+    read_available_data(&mut framed, Duration::from_millis(200)).await;
+
+    // Disconnect and wait for output to complete
+    drop(framed);
+    tokio::time::sleep(Duration::from_secs(5)).await;
+
+    // Reconnect
+    let (server_stream, client_stream) = UnixStream::pair().unwrap();
+    client_tx.send(ClientConn::Active(Framed::new(server_stream, FrameCodec))).unwrap();
+    let mut framed = Framed::new(client_stream, FrameCodec);
+    framed.send(Frame::Resize { cols: 80, rows: 24 }).await.unwrap();
+
+    // First Data frame should contain the truncation marker
+    let output = read_available_data(&mut framed, Duration::from_secs(3)).await;
+    let output_str = String::from_utf8_lossy(&output);
+    assert!(
+        output_str.contains("bytes of output dropped"),
+        "reconnect should show truncation marker when ring buffer overflows, got first 200 chars: {}",
+        &output_str[..output_str.len().min(200)]
+    );
+    assert!(output_str.contains("TRUNC_DONE"), "tail of output should still be preserved");
+
+    let _ = framed.send(Frame::Data(Bytes::from("exit\n"))).await;
+    let _ = timeout(Duration::from_secs(3), server).await;
+}
+
+#[tokio::test]
 async fn tail_receives_output() {
     let _permit = CONCURRENCY.acquire().await.unwrap();
     let (client_tx, mut framed, server, _meta) = setup_session().await;

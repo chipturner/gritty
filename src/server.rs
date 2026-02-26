@@ -264,6 +264,7 @@ pub async fn run(
     let mut buf = vec![0u8; 4096];
     let mut ring_buf: VecDeque<Bytes> = VecDeque::new();
     let mut ring_buf_size: usize = 0;
+    let mut ring_buf_dropped: usize = 0;
     const RING_BUF_CAP: usize = 1 << 20; // 1 MB
 
     // Agent event channel persists across acceptor lifetimes
@@ -430,6 +431,7 @@ pub async fn run(
                                 while ring_buf_size > RING_BUF_CAP {
                                     if let Some(old) = ring_buf.pop_front() {
                                         ring_buf_size -= old.len();
+                                        ring_buf_dropped += old.len();
                                     }
                                 }
                             }
@@ -457,7 +459,17 @@ pub async fn run(
 
         // Flush any buffered PTY output to the new client
         if !ring_buf.is_empty() {
-            debug!(chunks = ring_buf.len(), bytes = ring_buf_size, "flushing ring buffer");
+            debug!(
+                chunks = ring_buf.len(),
+                bytes = ring_buf_size,
+                dropped = ring_buf_dropped,
+                "flushing ring buffer"
+            );
+            if ring_buf_dropped > 0 {
+                let msg = format!("\r\n[gritty: {} bytes of output dropped]\r\n", ring_buf_dropped);
+                framed.send(Frame::Data(Bytes::from(msg))).await?;
+                ring_buf_dropped = 0;
+            }
             while let Some(chunk) = ring_buf.pop_front() {
                 framed.send(Frame::Data(chunk)).await?;
             }

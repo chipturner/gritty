@@ -593,6 +593,9 @@ pub async fn run(
                     };
 
                     let mut new_framed = Framed::new(stream, FrameCodec);
+                    if crate::handshake(&mut new_framed).await.is_err() {
+                        continue;
+                    }
                     if new_framed
                         .send(Frame::Attach { session: session.to_string() })
                         .await
@@ -716,6 +719,9 @@ pub async fn tail(
                     };
 
                     let mut new_framed = Framed::new(stream, FrameCodec);
+                    if crate::handshake(&mut new_framed).await.is_err() {
+                        continue;
+                    }
                     if new_framed.send(Frame::Tail { session: session.to_string() }).await.is_err()
                     {
                         continue;

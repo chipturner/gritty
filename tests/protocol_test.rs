@@ -1,5 +1,5 @@
 use bytes::{BufMut, Bytes, BytesMut};
-use gritty::protocol::{Frame, FrameCodec, SessionEntry};
+use gritty::protocol::{Frame, FrameCodec, PROTOCOL_VERSION, SessionEntry};
 use tokio_util::codec::{Decoder, Encoder};
 
 #[test]
@@ -664,4 +664,52 @@ fn roundtrip_tail_by_id() {
     codec.encode(original.clone(), &mut buf).unwrap();
     let decoded = codec.decode(&mut buf).unwrap().unwrap();
     assert_eq!(original, decoded);
+}
+
+#[test]
+fn roundtrip_hello() {
+    let mut codec = FrameCodec;
+    let mut buf = BytesMut::new();
+    let original = Frame::Hello { version: PROTOCOL_VERSION };
+    codec.encode(original.clone(), &mut buf).unwrap();
+    // type(1) + len(4) + version(2) = 7
+    assert_eq!(buf.len(), 7);
+    assert_eq!(buf[0], 0x16);
+    let decoded = codec.decode(&mut buf).unwrap().unwrap();
+    assert_eq!(original, decoded);
+}
+
+#[test]
+fn roundtrip_hello_ack() {
+    let mut codec = FrameCodec;
+    let mut buf = BytesMut::new();
+    let original = Frame::HelloAck { version: PROTOCOL_VERSION };
+    codec.encode(original.clone(), &mut buf).unwrap();
+    // type(1) + len(4) + version(2) = 7
+    assert_eq!(buf.len(), 7);
+    assert_eq!(buf[0], 0x24);
+    let decoded = codec.decode(&mut buf).unwrap().unwrap();
+    assert_eq!(original, decoded);
+}
+
+#[test]
+fn hello_wrong_payload_size() {
+    let mut codec = FrameCodec;
+    let mut buf = BytesMut::new();
+    buf.put_u8(0x16); // TYPE_HELLO
+    buf.put_u32(4); // wrong: should be 2
+    buf.put_slice(&[0x00, 0x01, 0x00, 0x00]);
+    let err = codec.decode(&mut buf).unwrap_err();
+    assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
+}
+
+#[test]
+fn hello_ack_wrong_payload_size() {
+    let mut codec = FrameCodec;
+    let mut buf = BytesMut::new();
+    buf.put_u8(0x24); // TYPE_HELLO_ACK
+    buf.put_u32(1); // wrong: should be 2
+    buf.put_slice(&[0x01]);
+    let err = codec.decode(&mut buf).unwrap_err();
+    assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
 }

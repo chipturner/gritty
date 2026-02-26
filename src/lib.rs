@@ -6,6 +6,22 @@ pub mod protocol;
 pub mod security;
 pub mod server;
 
+/// Perform a protocol version handshake with the server.
+///
+/// Sends Hello with our PROTOCOL_VERSION, expects HelloAck with the
+/// negotiated version (min of client and server).
+pub async fn handshake(
+    framed: &mut tokio_util::codec::Framed<tokio::net::UnixStream, protocol::FrameCodec>,
+) -> anyhow::Result<u16> {
+    use futures_util::{SinkExt, StreamExt};
+    framed.send(protocol::Frame::Hello { version: protocol::PROTOCOL_VERSION }).await?;
+    match protocol::Frame::expect_from(framed.next().await)? {
+        protocol::Frame::HelloAck { version } => Ok(version),
+        protocol::Frame::Error { message } => anyhow::bail!("handshake rejected: {message}"),
+        other => anyhow::bail!("expected HelloAck, got {other:?}"),
+    }
+}
+
 /// Collect TERM/LANG/COLORTERM from the environment for forwarding to remote sessions.
 pub fn collect_env_vars() -> Vec<(String, String)> {
     ["TERM", "LANG", "COLORTERM"]

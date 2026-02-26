@@ -99,7 +99,8 @@ const TUNNEL_SSH_OPTS: &[&str] = &[
 
 /// PATH prefix prepended to remote commands so gritty is discoverable
 /// in non-interactive SSH shells.
-const REMOTE_PATH_PREFIX: &str = "$HOME/bin:$HOME/.local/bin:$HOME/.cargo/bin:$PATH";
+const REMOTE_PATH_PREFIX: &str =
+    "$HOME/bin:$HOME/.local/bin:$HOME/.cargo/bin:/usr/local/bin:/opt/homebrew/bin:$PATH";
 
 /// Build the common SSH args that precede the destination in every invocation:
 /// port, user-supplied options, ConnectTimeout, and BatchMode (background only).
@@ -340,25 +341,32 @@ const REMOTE_ENSURE_CMD: &str = "\
     SOCK=$(gritty socket-path) && \
     (gritty ls >/dev/null 2>&1 || \
      { gritty server && sleep 0.3; }) && \
-    echo \"$SOCK\"";
+    echo \"$SOCK\" && \
+    gritty protocol-version 2>/dev/null || true";
 
 /// Get the remote socket path and optionally auto-start the server.
+/// Returns (socket_path, remote_protocol_version).
 async fn ensure_remote_ready(
     dest: &Destination,
     no_server_start: bool,
     extra_ssh_opts: &[String],
     foreground: bool,
-) -> anyhow::Result<String> {
+) -> anyhow::Result<(String, Option<u16>)> {
     let remote_cmd = if no_server_start { "gritty socket-path" } else { REMOTE_ENSURE_CMD };
     debug!("ensuring remote server (no_server_start={no_server_start})");
 
-    let sock_path = remote_exec(dest, remote_cmd, extra_ssh_opts, foreground).await?;
+    let output = remote_exec(dest, remote_cmd, extra_ssh_opts, foreground).await?;
+
+    // Output is "socket_path\nversion" (version line may be absent for old remotes)
+    let mut lines = output.lines();
+    let sock_path = lines.next().unwrap_or("").to_string();
+    let remote_version = lines.next().and_then(|s| s.trim().parse::<u16>().ok());
 
     if sock_path.is_empty() {
         bail!("remote host returned empty socket path");
     }
 
-    Ok(sock_path)
+    Ok((sock_path, remote_version))
 }
 
 // ---------------------------------------------------------------------------
@@ -618,10 +626,20 @@ pub async fn run(opts: ConnectOpts, ready_fd: Option<OwnedFd>) -> anyhow::Result
     let lock_fd = acquire_lock(&lock_path)?;
 
     // 4. Ensure remote server is running and get socket path
-    let remote_sock =
+    let (remote_sock, remote_version) =
         ensure_remote_ready(&dest, opts.no_server_start, &opts.ssh_options, opts.foreground)
             .await?;
-    debug!(remote_sock, "remote socket path");
+    debug!(remote_sock, ?remote_version, "remote socket path");
+
+    // Check protocol version compatibility
+    if let Some(rv) = remote_version {
+        if rv != crate::protocol::PROTOCOL_VERSION {
+            warn!(
+                "remote protocol version ({rv}) differs from local ({})",
+                crate::protocol::PROTOCOL_VERSION
+            );
+        }
+    }
 
     // 5. Spawn SSH tunnel
     let child =
