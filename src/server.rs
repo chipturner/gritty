@@ -124,8 +124,11 @@ fn spawn_agent_acceptor(
     })
 }
 
+/// Maximum URL length accepted on the open socket.
+const URL_MAX_LEN: usize = 4096;
+
 /// Spawn the open acceptor task that accepts connections on the open socket,
-/// reads a URL (up to 8KB, newline-terminated or EOF), and sends it as an event.
+/// reads a URL (newline-terminated or EOF), and sends it as an event.
 fn spawn_open_acceptor(
     listener: UnixListener,
     event_tx: mpsc::UnboundedSender<OpenEvent>,
@@ -162,7 +165,7 @@ fn spawn_open_acceptor(
 
             let etx = event_tx.clone();
             tokio::spawn(async move {
-                let mut buf = vec![0u8; 8192];
+                let mut buf = vec![0u8; URL_MAX_LEN];
                 let mut total = 0;
                 loop {
                     match stream.read(&mut buf[total..]).await {
