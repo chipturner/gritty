@@ -483,13 +483,16 @@ pub async fn run(
                     match frame {
                         Some(Ok(Frame::Data(data))) => {
                             debug!(len = data.len(), "socket -> pty");
-                            let mut guard = async_master.writable().await?;
-                            match guard.try_io(|inner| {
-                                nix::unistd::write(inner, &data).map_err(io::Error::from)
-                            }) {
-                                Ok(Ok(_)) => {}
-                                Ok(Err(e)) => return Err(e.into()),
-                                Err(_would_block) => continue,
+                            let mut written = 0;
+                            while written < data.len() {
+                                let mut guard = async_master.writable().await?;
+                                match guard.try_io(|inner| {
+                                    nix::unistd::write(inner, &data[written..]).map_err(io::Error::from)
+                                }) {
+                                    Ok(Ok(n)) => written += n,
+                                    Ok(Err(e)) => return Err(e.into()),
+                                    Err(_would_block) => continue,
+                                }
                             }
                         }
                         Some(Ok(Frame::Resize { cols, rows })) => {
