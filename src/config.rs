@@ -275,7 +275,7 @@ mod tests {
     }
 
     #[test]
-    fn config_path_uses_xdg() {
+    fn config_path_ends_with_expected_suffix() {
         // Can't safely set env vars in tests (Rust 2024), but we can verify the
         // function returns a path ending in gritty/config.toml
         let p = config_path();
