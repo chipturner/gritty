@@ -82,10 +82,6 @@ enum Command {
         /// Forward URL open requests back to the local machine
         #[arg(short = 'O', long)]
         forward_open: bool,
-
-        /// Wait indefinitely for the server instead of giving up after retries
-        #[arg(short = 'w', long)]
-        wait: bool,
     },
     /// Tail a session's output (read-only, like tail -f)
     #[command(alias = "t")]
@@ -472,49 +468,36 @@ async fn run(cli: Cli, config: gritty::config::ConfigFile) -> anyhow::Result<()>
             forward_open,
             wait,
         } => {
-            let is_default_path = cli.ctl_socket.is_none() && host.is_none();
+            let auto_start_mode = match (&cli.ctl_socket, &host) {
+                (Some(_), _) => AutoStart::None,
+                (None, Some(h)) => AutoStart::Tunnel(h.clone()),
+                (None, None) => AutoStart::Server,
+            };
             let ctl_path = resolve_ctl_path(cli.ctl_socket, host.as_deref())?;
             let resolved = config.resolve_session(host.as_deref());
-            new_session(
-                target,
-                !(no_redraw || resolved.no_redraw),
-                no_escape || resolved.no_escape,
-                forward_agent || resolved.forward_agent,
-                forward_open || resolved.forward_open,
-                ctl_path,
-                is_default_path,
-                wait,
-            )
-            .await
+            let settings = gritty::config::SessionSettings {
+                no_redraw: no_redraw || resolved.no_redraw,
+                no_escape: no_escape || resolved.no_escape,
+                forward_agent: forward_agent || resolved.forward_agent,
+                forward_open: forward_open || resolved.forward_open,
+            };
+            new_session(target, settings, ctl_path, auto_start_mode, wait).await
         }
         Command::Tail { host, target } => {
             let ctl_path = resolve_ctl_path(cli.ctl_socket, host.as_deref())?;
             let code = tail_session(target, ctl_path).await?;
             std::process::exit(code);
         }
-        Command::Attach {
-            host,
-            target,
-            no_redraw,
-            no_escape,
-            forward_agent,
-            forward_open,
-            wait,
-        } => {
-            let is_default_path = cli.ctl_socket.is_none() && host.is_none();
+        Command::Attach { host, target, no_redraw, no_escape, forward_agent, forward_open } => {
             let ctl_path = resolve_ctl_path(cli.ctl_socket, host.as_deref())?;
             let resolved = config.resolve_session(host.as_deref());
-            let code = attach(
-                target,
-                !(no_redraw || resolved.no_redraw),
-                no_escape || resolved.no_escape,
-                forward_agent || resolved.forward_agent,
-                forward_open || resolved.forward_open,
-                ctl_path,
-                is_default_path,
-                wait,
-            )
-            .await?;
+            let settings = gritty::config::SessionSettings {
+                no_redraw: no_redraw || resolved.no_redraw,
+                no_escape: no_escape || resolved.no_escape,
+                forward_agent: forward_agent || resolved.forward_agent,
+                forward_open: forward_open || resolved.forward_open,
+            };
+            let code = attach(target, settings, ctl_path).await?;
             std::process::exit(code);
         }
         Command::ListSessions { host } => {
@@ -560,37 +543,53 @@ async fn run(cli: Cli, config: gritty::config::ConfigFile) -> anyhow::Result<()>
     }
 }
 
-/// Start the server by running the current binary with `["server"]` args.
-/// The server self-daemonizes and returns after the socket is ready.
-fn auto_start_server() -> anyhow::Result<()> {
+/// What to auto-start when new-session can't connect.
+enum AutoStart {
+    /// Explicit --ctl-socket: no auto-start
+    None,
+    /// Default path, no host: start local server
+    Server,
+    /// Host-routed: start SSH tunnel via `gritty connect <host>`
+    Tunnel(String),
+}
+
+/// Run the current binary with the given args. Both `gritty server` and
+/// `gritty connect <host>` self-daemonize and return after the socket is ready.
+fn auto_start(args: &[&str]) -> anyhow::Result<()> {
     let exe = std::env::current_exe().unwrap_or_else(|_| PathBuf::from("gritty"));
-    let status = std::process::Command::new(&exe).arg("server").status()?;
+    let status = std::process::Command::new(&exe).args(args).status()?;
     if !status.success() {
-        anyhow::bail!("failed to auto-start server (exit {})", status);
+        anyhow::bail!("failed to start `gritty {}` (exit {})", args.join(" "), status);
     }
     Ok(())
 }
 
-/// Try to connect to the control socket. On failure, optionally auto-start the
-/// server (if `can_auto_start`) and retry with a bounded loop. With `--wait`,
-/// retries indefinitely instead.
-async fn connect_to_server(
+/// Try to connect to the control socket. On failure, auto-start the
+/// appropriate process and retry with a bounded loop (or indefinitely
+/// with `--wait`).
+async fn connect_or_start(
     ctl_path: &Path,
-    can_auto_start: bool,
+    auto_start_mode: &AutoStart,
     wait: bool,
 ) -> anyhow::Result<tokio::net::UnixStream> {
     use tokio::net::UnixStream;
 
     match UnixStream::connect(ctl_path).await {
         Ok(s) => return Ok(s),
-        Err(_) if can_auto_start => {
-            eprintln!("no server running, starting one...");
-            auto_start_server()?;
-        }
-        Err(_) if wait => {}
-        Err(_) => {
-            anyhow::bail!("no server running (could not connect to {})", ctl_path.display());
-        }
+        Err(_) => match auto_start_mode {
+            AutoStart::Server => {
+                eprintln!("no server running, starting one...");
+                auto_start(&["server"])?;
+            }
+            AutoStart::Tunnel(host) => {
+                eprintln!("no tunnel running for {host}, starting one...");
+                auto_start(&["connect", host])?;
+            }
+            AutoStart::None if wait => {}
+            AutoStart::None => {
+                anyhow::bail!("no server running (could not connect to {})", ctl_path.display());
+            }
+        },
     }
 
     // Retry loop: bounded (10 retries, 500ms apart) or indefinite (--wait)
@@ -609,15 +608,11 @@ async fn connect_to_server(
     anyhow::bail!("server did not become ready ({})", ctl_path.display())
 }
 
-#[allow(clippy::too_many_arguments)]
 async fn new_session(
     name: Option<String>,
-    redraw: bool,
-    no_escape: bool,
-    forward_agent: bool,
-    forward_open: bool,
+    settings: gritty::config::SessionSettings,
     ctl_path: PathBuf,
-    is_default_path: bool,
+    auto_start_mode: AutoStart,
     wait: bool,
 ) -> anyhow::Result<()> {
     use futures_util::{SinkExt, StreamExt};
@@ -626,7 +621,7 @@ async fn new_session(
 
     let session_name = name.clone().unwrap_or_default();
 
-    let stream = connect_to_server(&ctl_path, is_default_path, wait).await?;
+    let stream = connect_or_start(&ctl_path, &auto_start_mode, wait).await?;
     let mut framed = Framed::new(stream, FrameCodec);
     gritty::handshake(&mut framed).await?;
     framed.send(Frame::NewSession { name: session_name }).await?;
@@ -638,7 +633,7 @@ async fn new_session(
                 None => eprintln!("session created: id {id}"),
             }
             let mut env_vars = gritty::collect_env_vars();
-            if forward_open {
+            if settings.forward_open {
                 let exe = std::env::current_exe()
                     .ok()
                     .and_then(|p| p.to_str().map(String::from))
@@ -648,12 +643,12 @@ async fn new_session(
             let code = gritty::client::run(
                 &id,
                 framed,
-                redraw,
+                !settings.no_redraw,
                 &ctl_path,
                 env_vars,
-                no_escape,
-                forward_agent,
-                forward_open,
+                settings.no_escape,
+                settings.forward_agent,
+                settings.forward_open,
             )
             .await?;
             std::process::exit(code);
@@ -663,22 +658,25 @@ async fn new_session(
     }
 }
 
-#[allow(clippy::too_many_arguments)]
 async fn attach(
     target: String,
-    redraw: bool,
-    no_escape: bool,
-    forward_agent: bool,
-    forward_open: bool,
+    settings: gritty::config::SessionSettings,
     ctl_path: PathBuf,
-    is_default_path: bool,
-    wait: bool,
 ) -> anyhow::Result<i32> {
     use futures_util::{SinkExt, StreamExt};
     use gritty::protocol::{Frame, FrameCodec};
+    use tokio::net::UnixStream;
     use tokio_util::codec::Framed;
 
-    let stream = connect_to_server(&ctl_path, is_default_path, wait).await?;
+    let stream = loop {
+        match UnixStream::connect(&ctl_path).await {
+            Ok(s) => break s,
+            Err(_) => {
+                eprintln!("waiting for server ({})... ctrl-c to abort", ctl_path.display());
+                tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+            }
+        }
+    };
     let mut framed = Framed::new(stream, FrameCodec);
     gritty::handshake(&mut framed).await?;
     framed.send(Frame::Attach { session: target.clone() }).await?;
@@ -689,12 +687,12 @@ async fn attach(
             let code = gritty::client::run(
                 &target,
                 framed,
-                redraw,
+                !settings.no_redraw,
                 &ctl_path,
                 vec![],
-                no_escape,
-                forward_agent,
-                forward_open,
+                settings.no_escape,
+                settings.forward_agent,
+                settings.forward_open,
             )
             .await?;
             Ok(code)

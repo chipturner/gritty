@@ -98,7 +98,7 @@ The `[host]` argument is a connection name from `gritty connect` (e.g., `gritty 
 - `-o <option>` on `connect`: extra SSH options (repeatable, e.g., `-o "ProxyJump=bastion"`)
 - `--no-redraw` on `new`/`attach`: don't send Ctrl-L after connecting
 - `--no-escape` on `new`/`attach`: disable escape sequence processing
-- `-w` / `--wait` on `new`/`attach`: wait indefinitely for the server (default: give up after retries)
+- `-w` / `--wait` on `new`: wait indefinitely for the server (default: give up after retries)
 
 ## Configuration
 
