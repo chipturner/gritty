@@ -158,8 +158,11 @@ After a newline (or at session start), `~` enters escape mode:
 # Bash
 gritty completions bash > /etc/bash_completion.d/gritty
 
-# Zsh (add to fpath)
+# Zsh -- put in fpath and ensure compinit runs after:
+mkdir -p ~/.zfunc
 gritty completions zsh > ~/.zfunc/_gritty
+# Add to .zshrc (before compinit):  fpath=(~/.zfunc $fpath)
+# Then: rm -f ~/.zcompdump && exec zsh
 
 # Fish
 gritty completions fish > ~/.config/fish/completions/gritty.fish

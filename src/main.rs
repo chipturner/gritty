@@ -21,14 +21,14 @@ struct Cli {
 #[derive(Subcommand)]
 enum Command {
     /// Start the server (backgrounds by default, use --foreground to stay in foreground)
-    #[command(alias = "s")]
+    #[command(visible_alias = "s")]
     Server {
         /// Run in the foreground instead of daemonizing
         #[arg(long, short = 'f')]
         foreground: bool,
     },
     /// Create a new persistent session (auto-attaches)
-    #[command(alias = "new")]
+    #[command(visible_alias = "new")]
     NewSession {
         /// Remote host (connection name from `gritty connect`)
         host: Option<String>,
@@ -58,7 +58,7 @@ enum Command {
         wait: bool,
     },
     /// Attach to an existing session (detaches other clients)
-    #[command(alias = "a")]
+    #[command(visible_alias = "a")]
     Attach {
         /// Remote host (connection name from `gritty connect`)
         host: Option<String>,
@@ -84,7 +84,7 @@ enum Command {
         forward_open: bool,
     },
     /// Tail a session's output (read-only, like tail -f)
-    #[command(alias = "t")]
+    #[command(visible_alias = "t")]
     Tail {
         /// Remote host (connection name from `gritty connect`)
         host: Option<String>,
@@ -94,7 +94,7 @@ enum Command {
         target: String,
     },
     /// List active sessions
-    #[command(alias = "ls", alias = "list")]
+    #[command(visible_alias = "ls", visible_alias = "list")]
     ListSessions {
         /// Remote host (connection name from `gritty connect`)
         host: Option<String>,
@@ -119,10 +119,10 @@ enum Command {
         url: String,
     },
     /// Print the default socket path
-    #[command(alias = "socket")]
+    #[command(visible_alias = "socket")]
     SocketPath,
     /// SSH tunnel to a remote host (backgrounds by default, prints socket path)
-    #[command(alias = "c")]
+    #[command(visible_alias = "c")]
     Connect {
         /// Remote destination ([user@]host[:port])
         destination: String,
@@ -148,13 +148,13 @@ enum Command {
         foreground: bool,
     },
     /// Disconnect an SSH tunnel by connection name
-    #[command(alias = "dc")]
+    #[command(visible_alias = "dc")]
     Disconnect {
         /// Connection name (as shown in `gritty tunnels`)
         name: String,
     },
     /// List active SSH tunnels
-    #[command(alias = "tun")]
+    #[command(visible_alias = "tun")]
     Tunnels,
     /// Show diagnostics (paths, server status, tunnels)
     Info,
@@ -643,7 +643,7 @@ async fn new_session(
             let code = gritty::client::run(
                 &id,
                 framed,
-                !settings.no_redraw,
+                false, // no redraw on new session -- nothing to redraw
                 &ctl_path,
                 env_vars,
                 settings.no_escape,
