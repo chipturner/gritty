@@ -390,7 +390,7 @@ async fn relay(
                         last_pong = Instant::now();
                     }
                     Some(Ok(Frame::Exit { code })) => {
-                        info!(code, "server sent exit");
+                        debug!(code, "server sent exit");
                         return Ok(Some(code));
                     }
                     Some(Ok(Frame::Detached)) => {
