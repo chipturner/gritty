@@ -680,9 +680,15 @@ pub async fn run(
                 continue;
             }
             RelayExit::ShellExited(mut code) => {
-                // PTY EOF/EIO may fire before child.wait(), giving code=0.
-                // Try to get the real exit code from the child.
-                if let Ok(Some(status)) = managed.child.try_wait() {
+                // PTY EOF/EIO may fire before child.wait() -- especially on
+                // macOS where the race window is wider. Give the child a
+                // moment to actually exit so we can capture the real code.
+                if let Ok(Ok(status)) = tokio::time::timeout(
+                    std::time::Duration::from_millis(500),
+                    managed.child.wait(),
+                )
+                .await
+                {
                     code = status.code().unwrap_or(code);
                 }
                 let _ = tail_tx.send(TailEvent::Exit { code });
