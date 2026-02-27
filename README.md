@@ -16,7 +16,7 @@ It works by forwarding Unix domain sockets over SSH -- no custom protocol, no op
     - **URL open forwarding** (`-O`) -- forwards `$BROWSER` / URL open requests back to your local machine
     - **Environment forwarding** -- TERM, LANG, COLORTERM propagated to remote shell
 - **Simple**
-    - **Single binary, zero config** -- optional TOML config for defaults; no server config, no port allocation, no root required; auto-starts the server on demand
+    - **Single binary, zero config** -- optional TOML config for defaults; no server config, no port allocation, no root required; auto-starts both the server and SSH tunnels on demand
     - **No network protocol** -- Unix domain sockets locally, SSH handles encryption and auth
 - **Session management**
     - **Multiple named sessions** -- create, list, attach, kill by name or ID
@@ -30,18 +30,22 @@ cargo install gritty-cli
 
 ### Connect to a remote host
 
-One command sets up an SSH tunnel, starts the remote server, and returns:
+One command creates a session and connects -- auto-starting the SSH tunnel and remote server if needed:
 
 ```bash
-gritty connect user@devbox
+gritty new devbox -t work
 ```
 
-Create sessions, attach, detach, reattach -- all through the tunnel:
+This works when the host is resolvable by SSH (e.g., via `~/.ssh/config`). For `user@host` destinations, start the tunnel explicitly first:
 
 ```bash
-# Create a named session (auto-attaches)
-gritty new devbox -t work
+gritty connect user@devbox    # sets up tunnel named "devbox"
+gritty new devbox -t work     # creates session through tunnel
+```
 
+Create, detach, reattach:
+
+```bash
 # Detach with ~. or just close your terminal
 
 # Reattach from any terminal
@@ -76,7 +80,7 @@ ID  Name    PTY         PID    Created              Status
 | `gritty connect user@host` | `c` | Set up SSH tunnel to remote host |
 | `gritty disconnect <name>` | `dc` | Tear down an SSH tunnel |
 | `gritty tunnels` | `tun` | List active SSH tunnels |
-| `gritty new-session [host] [-t name]` | `new` | Create a session and auto-attach |
+| `gritty new-session [host] [-t name]` | `new` | Create a session and auto-attach (auto-starts server/tunnel if needed) |
 | `gritty attach [host] -t <id\|name>` | `a` | Attach to a session |
 | `gritty tail [host] -t <id\|name>` | `t` | Read-only stream of session output |
 | `gritty list-sessions [host]` | `ls`, `list` | List sessions |
