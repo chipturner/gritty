@@ -8,12 +8,50 @@ permissions:
   contents: write
 
 jobs:
+  build:
+    name: Build (${{ matrix.target }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      matrix:
+        include:
+          - target: x86_64-unknown-linux-gnu
+            os: ubuntu-latest
+          - target: x86_64-apple-darwin
+            os: macos-latest
+          - target: aarch64-apple-darwin
+            os: macos-latest
+    steps:
+      - uses: actions/checkout@v6
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Build
+        run: cargo build --release --locked --target ${{ matrix.target }}
+
+      - name: Package
+        run: |
+          cd target/${{ matrix.target }}/release
+          tar czf ../../../gritty-${{ matrix.target }}.tar.gz gritty
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: gritty-${{ matrix.target }}
+          path: gritty-${{ matrix.target }}.tar.gz
+
   release:
     name: GitHub Release
+    needs: build
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v6
 
+      - uses: actions/download-artifact@v4
+        with:
+          merge-multiple: true
+
       - uses: softprops/action-gh-release@v2
         with:
           generate_release_notes: true
+          files: gritty-*.tar.gz
