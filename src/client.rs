@@ -281,6 +281,13 @@ enum AgentEvent {
     Closed { channel_id: u32 },
 }
 
+/// Events from the tunnel TCP listener/connection to the relay loop.
+enum ClientTunnelEvent {
+    Accepted(mpsc::UnboundedSender<Bytes>),
+    Data(Bytes),
+    Closed,
+}
+
 /// Send session setup frames (env, agent/open forwarding, resize, redraw).
 /// Returns false if the connection dropped during setup.
 async fn send_init_frames(
@@ -333,6 +340,11 @@ async fn relay(
     // Agent channel management
     let mut agent_channels: HashMap<u32, mpsc::UnboundedSender<Bytes>> = HashMap::new();
     let (agent_event_tx, mut agent_event_rx) = mpsc::unbounded_channel::<AgentEvent>();
+
+    // Tunnel state (reverse TCP tunnel for OAuth callbacks)
+    let mut tunnel_listener: Option<tokio::task::JoinHandle<()>> = None;
+    let (tunnel_event_tx, mut tunnel_event_rx) = mpsc::unbounded_channel::<ClientTunnelEvent>();
+    let mut tunnel_writer: Option<mpsc::UnboundedSender<Bytes>> = None;
 
     loop {
         tokio::select! {
@@ -446,6 +458,79 @@ async fn relay(
                             debug!("rejected non-http(s) URL: {url}");
                         }
                     }
+                    Some(Ok(Frame::TunnelListen { port })) => {
+                        // Bind synchronously to guarantee port is ready before OpenUrl
+                        match std::net::TcpListener::bind(("127.0.0.1", port)) {
+                            Ok(std_listener) => {
+                                debug!(port, "tunnel: bound local port");
+                                std_listener.set_nonblocking(true).ok();
+                                let listener = tokio::net::TcpListener::from_std(std_listener).unwrap();
+                                let tx = tunnel_event_tx.clone();
+                                tunnel_listener = Some(tokio::spawn(async move {
+                                    let accept = tokio::time::timeout(
+                                        Duration::from_secs(180),
+                                        listener.accept(),
+                                    ).await;
+                                    match accept {
+                                        Ok(Ok((stream, _))) => {
+                                            let (mut read_half, write_half) = stream.into_split();
+                                            let (writer_tx, mut writer_rx) = mpsc::unbounded_channel::<Bytes>();
+
+                                            // Writer task: channel -> TCP
+                                            tokio::spawn(async move {
+                                                use tokio::io::AsyncWriteExt;
+                                                let mut writer = write_half;
+                                                while let Some(data) = writer_rx.recv().await {
+                                                    if writer.write_all(&data).await.is_err() {
+                                                        break;
+                                                    }
+                                                }
+                                            });
+
+                                            let _ = tx.send(ClientTunnelEvent::Accepted(writer_tx));
+
+                                            // Reader task: TCP -> events
+                                            let mut buf = vec![0u8; 4096];
+                                            loop {
+                                                use tokio::io::AsyncReadExt;
+                                                match read_half.read(&mut buf).await {
+                                                    Ok(0) | Err(_) => {
+                                                        let _ = tx.send(ClientTunnelEvent::Closed);
+                                                        break;
+                                                    }
+                                                    Ok(n) => {
+                                                        let data = Bytes::copy_from_slice(&buf[..n]);
+                                                        if tx.send(ClientTunnelEvent::Data(data)).is_err() {
+                                                            break;
+                                                        }
+                                                    }
+                                                }
+                                            }
+                                        }
+                                        _ => {
+                                            debug!(port, "tunnel: accept timed out or failed");
+                                            let _ = tx.send(ClientTunnelEvent::Closed);
+                                        }
+                                    }
+                                }));
+                            }
+                            Err(e) => {
+                                debug!(port, "tunnel: bind failed: {e}");
+                                let _ = timed_send(framed, Frame::TunnelClose).await;
+                            }
+                        }
+                    }
+                    Some(Ok(Frame::TunnelData(data))) => {
+                        if let Some(ref tx) = tunnel_writer {
+                            let _ = tx.send(data);
+                        }
+                    }
+                    Some(Ok(Frame::TunnelClose)) => {
+                        tunnel_writer = None;
+                        if let Some(handle) = tunnel_listener.take() {
+                            handle.abort();
+                        }
+                    }
                     Some(Ok(_)) => {} // ignore control/resize frames
                     Some(Err(e)) => {
                         debug!("server connection error: {e}");
@@ -476,6 +561,33 @@ async fn relay(
                         }
                     }
                     None => {} // no more agent tasks
+                }
+            }
+
+            // Tunnel events from local TCP listener/connection
+            event = tunnel_event_rx.recv() => {
+                match event {
+                    Some(ClientTunnelEvent::Accepted(writer_tx)) => {
+                        tunnel_writer = Some(writer_tx);
+                        if !timed_send(framed, Frame::TunnelOpen).await {
+                            return Ok(None);
+                        }
+                    }
+                    Some(ClientTunnelEvent::Data(data)) => {
+                        if !timed_send(framed, Frame::TunnelData(data)).await {
+                            return Ok(None);
+                        }
+                    }
+                    Some(ClientTunnelEvent::Closed) => {
+                        tunnel_writer = None;
+                        if let Some(handle) = tunnel_listener.take() {
+                            handle.abort();
+                        }
+                        if !timed_send(framed, Frame::TunnelClose).await {
+                            return Ok(None);
+                        }
+                    }
+                    None => {}
                 }
             }
 

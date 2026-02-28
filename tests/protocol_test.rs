@@ -713,3 +713,70 @@ fn hello_ack_wrong_payload_size() {
     let err = codec.decode(&mut buf).unwrap_err();
     assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
 }
+
+#[test]
+fn roundtrip_tunnel_listen() {
+    let mut codec = FrameCodec;
+    let mut buf = BytesMut::new();
+    let original = Frame::TunnelListen { port: 8080 };
+    codec.encode(original.clone(), &mut buf).unwrap();
+    assert_eq!(buf.len(), 7); // type(1) + len(4) + port(2)
+    assert_eq!(buf[0], 0x0E);
+    let decoded = codec.decode(&mut buf).unwrap().unwrap();
+    assert_eq!(original, decoded);
+}
+
+#[test]
+fn roundtrip_tunnel_open() {
+    let mut codec = FrameCodec;
+    let mut buf = BytesMut::new();
+    codec.encode(Frame::TunnelOpen, &mut buf).unwrap();
+    assert_eq!(buf.len(), 5); // type(1) + len(4), zero payload
+    assert_eq!(buf[0], 0x0F);
+    let decoded = codec.decode(&mut buf).unwrap().unwrap();
+    assert_eq!(Frame::TunnelOpen, decoded);
+}
+
+#[test]
+fn roundtrip_tunnel_data() {
+    let mut codec = FrameCodec;
+    let mut buf = BytesMut::new();
+    let original = Frame::TunnelData(Bytes::from("tunnel-payload"));
+    codec.encode(original.clone(), &mut buf).unwrap();
+    assert_eq!(buf[0], 0x17);
+    let decoded = codec.decode(&mut buf).unwrap().unwrap();
+    assert_eq!(original, decoded);
+}
+
+#[test]
+fn roundtrip_tunnel_data_empty() {
+    let mut codec = FrameCodec;
+    let mut buf = BytesMut::new();
+    let original = Frame::TunnelData(Bytes::new());
+    codec.encode(original.clone(), &mut buf).unwrap();
+    assert_eq!(buf.len(), 5); // type(1) + len(4), zero payload
+    let decoded = codec.decode(&mut buf).unwrap().unwrap();
+    assert_eq!(original, decoded);
+}
+
+#[test]
+fn roundtrip_tunnel_close() {
+    let mut codec = FrameCodec;
+    let mut buf = BytesMut::new();
+    codec.encode(Frame::TunnelClose, &mut buf).unwrap();
+    assert_eq!(buf.len(), 5); // type(1) + len(4), zero payload
+    assert_eq!(buf[0], 0x18);
+    let decoded = codec.decode(&mut buf).unwrap().unwrap();
+    assert_eq!(Frame::TunnelClose, decoded);
+}
+
+#[test]
+fn tunnel_listen_wrong_payload_size() {
+    let mut codec = FrameCodec;
+    let mut buf = BytesMut::new();
+    buf.put_u8(0x0E); // TYPE_TUNNEL_LISTEN
+    buf.put_u32(4); // wrong: should be 2
+    buf.put_slice(&[0x00, 0x01, 0x00, 0x00]);
+    let err = codec.decode(&mut buf).unwrap_err();
+    assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
+}

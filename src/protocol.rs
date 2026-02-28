@@ -15,6 +15,8 @@ const TYPE_AGENT_DATA: u8 = 0x0A;
 const TYPE_AGENT_CLOSE: u8 = 0x0B;
 const TYPE_OPEN_FORWARD: u8 = 0x0C;
 const TYPE_OPEN_URL: u8 = 0x0D;
+const TYPE_TUNNEL_LISTEN: u8 = 0x0E;
+const TYPE_TUNNEL_OPEN: u8 = 0x0F;
 const TYPE_NEW_SESSION: u8 = 0x10;
 const TYPE_ATTACH: u8 = 0x11;
 const TYPE_LIST_SESSIONS: u8 = 0x12;
@@ -22,6 +24,8 @@ const TYPE_KILL_SESSION: u8 = 0x13;
 const TYPE_KILL_SERVER: u8 = 0x14;
 const TYPE_TAIL: u8 = 0x15;
 const TYPE_HELLO: u8 = 0x16;
+const TYPE_TUNNEL_DATA: u8 = 0x17;
+const TYPE_TUNNEL_CLOSE: u8 = 0x18;
 const TYPE_SESSION_CREATED: u8 = 0x20;
 const TYPE_SESSION_INFO: u8 = 0x21;
 const TYPE_OK: u8 = 0x22;
@@ -87,6 +91,16 @@ pub enum Frame {
     OpenUrl {
         url: String,
     },
+    /// Server asks client to bind a local TCP port for reverse tunneling (server → client).
+    TunnelListen {
+        port: u16,
+    },
+    /// Client signals the tunnel connection has been accepted (client → server).
+    TunnelOpen,
+    /// Tunnel data relay (bidirectional).
+    TunnelData(Bytes),
+    /// Tunnel connection closed (bidirectional).
+    TunnelClose,
     /// Protocol version handshake (client → server, first frame on connection).
     Hello {
         version: u16,
@@ -258,6 +272,19 @@ impl Decoder for FrameCodec {
             }
             TYPE_OPEN_FORWARD => Ok(Some(Frame::OpenForward)),
             TYPE_OPEN_URL => Ok(Some(Frame::OpenUrl { url: decode_string(payload)? })),
+            TYPE_TUNNEL_LISTEN => {
+                if payload.len() != 2 {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "tunnel listen frame must be 2 bytes",
+                    ));
+                }
+                let port = u16::from_be_bytes([payload[0], payload[1]]);
+                Ok(Some(Frame::TunnelListen { port }))
+            }
+            TYPE_TUNNEL_OPEN => Ok(Some(Frame::TunnelOpen)),
+            TYPE_TUNNEL_DATA => Ok(Some(Frame::TunnelData(payload.freeze()))),
+            TYPE_TUNNEL_CLOSE => Ok(Some(Frame::TunnelClose)),
             TYPE_HELLO => {
                 if payload.len() != 2 {
                     return Err(io::Error::new(
@@ -381,6 +408,18 @@ impl Encoder<Frame> for FrameCodec {
             }
             Frame::OpenForward => encode_empty(dst, TYPE_OPEN_FORWARD),
             Frame::OpenUrl { url } => encode_str(dst, TYPE_OPEN_URL, &url),
+            Frame::TunnelListen { port } => {
+                dst.put_u8(TYPE_TUNNEL_LISTEN);
+                dst.put_u32(2);
+                dst.put_u16(port);
+            }
+            Frame::TunnelOpen => encode_empty(dst, TYPE_TUNNEL_OPEN),
+            Frame::TunnelData(data) => {
+                dst.put_u8(TYPE_TUNNEL_DATA);
+                dst.put_u32(data.len() as u32);
+                dst.extend_from_slice(&data);
+            }
+            Frame::TunnelClose => encode_empty(dst, TYPE_TUNNEL_CLOSE),
             Frame::Hello { version } => {
                 dst.put_u8(TYPE_HELLO);
                 dst.put_u32(2);

@@ -79,6 +79,34 @@ enum OpenEvent {
     Url(String),
 }
 
+/// Events from tunnel TCP connection tasks to the main relay loop.
+enum TunnelEvent {
+    Data(Bytes),
+    Closed,
+}
+
+/// Extract redirect port from a URL's redirect_uri/redirect_url query parameter.
+/// Returns Some(port) if the redirect target is localhost or 127.0.0.1 with a port.
+fn extract_redirect_port(url_str: &str) -> Option<u16> {
+    let parsed = url::Url::parse(url_str).ok()?;
+    for (key, value) in parsed.query_pairs() {
+        if key != "redirect_uri" && key != "redirect_url" {
+            continue;
+        }
+        let redirect = url::Url::parse(&value).ok()?;
+        match redirect.host_str()? {
+            "localhost" | "127.0.0.1" => return redirect.port(),
+            _ => {}
+        }
+    }
+    None
+}
+
+/// Check if a TCP port is in use by attempting to bind it.
+fn port_in_use(port: u16) -> bool {
+    std::net::TcpListener::bind(("127.0.0.1", port)).is_err()
+}
+
 /// Spawn the agent acceptor task that accepts connections on the agent socket
 /// and creates per-connection relay tasks.
 fn spawn_agent_acceptor(
@@ -368,24 +396,32 @@ pub async fn run(
     let mut open_acceptor: Option<tokio::task::JoinHandle<()>> = None;
     let (open_event_tx, mut open_event_rx) = mpsc::unbounded_channel::<OpenEvent>();
 
-    let teardown_forwarding =
-        |agent_channels: &mut HashMap<u32, mpsc::UnboundedSender<Bytes>>,
-         agent_forward_enabled: &mut bool,
-         agent_acceptor: &mut Option<tokio::task::JoinHandle<()>>,
-         open_forward_enabled: &mut bool,
-         open_acceptor: &mut Option<tokio::task::JoinHandle<()>>| {
-            agent_channels.clear();
-            *agent_forward_enabled = false;
-            if let Some(handle) = agent_acceptor.take() {
-                handle.abort();
-            }
-            cleanup_socket(&agent_socket_path);
-            *open_forward_enabled = false;
-            if let Some(handle) = open_acceptor.take() {
-                handle.abort();
-            }
-            cleanup_socket(&open_socket_path);
-        };
+    // Tunnel state (reverse TCP tunnel for OAuth callbacks)
+    let mut tunnel_port: Option<u16> = None;
+    let (tunnel_event_tx, mut tunnel_event_rx) = mpsc::unbounded_channel::<TunnelEvent>();
+    let mut tunnel_writer: Option<mpsc::UnboundedSender<Bytes>> = None;
+
+    let teardown_forwarding = |agent_channels: &mut HashMap<u32, mpsc::UnboundedSender<Bytes>>,
+                               agent_forward_enabled: &mut bool,
+                               agent_acceptor: &mut Option<tokio::task::JoinHandle<()>>,
+                               open_forward_enabled: &mut bool,
+                               open_acceptor: &mut Option<tokio::task::JoinHandle<()>>,
+                               tunnel_writer: &mut Option<mpsc::UnboundedSender<Bytes>>,
+                               tunnel_port: &mut Option<u16>| {
+        agent_channels.clear();
+        *agent_forward_enabled = false;
+        if let Some(handle) = agent_acceptor.take() {
+            handle.abort();
+        }
+        cleanup_socket(&agent_socket_path);
+        *open_forward_enabled = false;
+        if let Some(handle) = open_acceptor.take() {
+            handle.abort();
+        }
+        cleanup_socket(&open_socket_path);
+        *tunnel_writer = None;
+        *tunnel_port = None;
+    };
 
     // Outer loop: accept clients via channel. PTY persists across reconnects.
     // First iteration skips client-wait (first client already connected above).
@@ -556,6 +592,63 @@ pub async fn run(
                                 }
                             }
                         }
+                        Some(Ok(Frame::TunnelOpen)) => {
+                            if let Some(port) = tunnel_port {
+                                match tokio::net::TcpStream::connect(("127.0.0.1", port)).await {
+                                    Ok(stream) => {
+                                        debug!(port, "tunnel connected to local port");
+                                        let (mut read_half, write_half) = stream.into_split();
+                                        let (writer_tx, mut writer_rx) = mpsc::unbounded_channel::<Bytes>();
+                                        tunnel_writer = Some(writer_tx);
+
+                                        // Writer task: channel -> TCP
+                                        tokio::spawn(async move {
+                                            use tokio::io::AsyncWriteExt;
+                                            let mut writer = write_half;
+                                            while let Some(data) = writer_rx.recv().await {
+                                                if writer.write_all(&data).await.is_err() {
+                                                    break;
+                                                }
+                                            }
+                                        });
+
+                                        // Reader task: TCP -> TunnelEvent
+                                        let tx = tunnel_event_tx.clone();
+                                        tokio::spawn(async move {
+                                            let mut buf = vec![0u8; 4096];
+                                            loop {
+                                                match read_half.read(&mut buf).await {
+                                                    Ok(0) | Err(_) => {
+                                                        let _ = tx.send(TunnelEvent::Closed);
+                                                        break;
+                                                    }
+                                                    Ok(n) => {
+                                                        let data = Bytes::copy_from_slice(&buf[..n]);
+                                                        if tx.send(TunnelEvent::Data(data)).is_err() {
+                                                            break;
+                                                        }
+                                                    }
+                                                }
+                                            }
+                                        });
+                                    }
+                                    Err(e) => {
+                                        debug!(port, "tunnel connect failed: {e}");
+                                        let _ = framed.send(Frame::TunnelClose).await;
+                                        tunnel_port = None;
+                                    }
+                                }
+                            }
+                        }
+                        Some(Ok(Frame::TunnelData(data))) => {
+                            if let Some(ref tx) = tunnel_writer {
+                                let _ = tx.send(data);
+                            }
+                        }
+                        Some(Ok(Frame::TunnelClose)) => {
+                            tunnel_writer = None;
+                            tunnel_port = None;
+                        }
                         // Client disconnected or sent Exit
                         Some(Ok(Frame::Exit { .. })) | None => {
                             break RelayExit::ClientGone;
@@ -604,6 +697,8 @@ pub async fn run(
                                 &mut agent_acceptor,
                                 &mut open_forward_enabled,
                                 &mut open_acceptor,
+                                &mut tunnel_writer,
+                                &mut tunnel_port,
                             );
                             framed = new_framed;
                         }
@@ -647,12 +742,34 @@ pub async fn run(
                     match event {
                         Some(OpenEvent::Url(url)) => {
                             if open_forward_enabled {
+                                if let Some(port) = extract_redirect_port(&url) {
+                                    if port_in_use(port) {
+                                        debug!(port, "setting up reverse tunnel for OAuth callback");
+                                        tunnel_port = Some(port);
+                                        let _ = framed.send(Frame::TunnelListen { port }).await;
+                                    }
+                                }
                                 let _ = framed.send(Frame::OpenUrl { url }).await;
                             }
                         }
                         None => {
                             debug!("open event channel closed");
                         }
+                    }
+                }
+
+                // Tunnel events from TCP relay tasks
+                event = tunnel_event_rx.recv() => {
+                    match event {
+                        Some(TunnelEvent::Data(data)) => {
+                            let _ = framed.send(Frame::TunnelData(data)).await;
+                        }
+                        Some(TunnelEvent::Closed) => {
+                            let _ = framed.send(Frame::TunnelClose).await;
+                            tunnel_writer = None;
+                            tunnel_port = None;
+                        }
+                        None => {}
                     }
                 }
 
@@ -675,6 +792,8 @@ pub async fn run(
                     &mut agent_acceptor,
                     &mut open_forward_enabled,
                     &mut open_acceptor,
+                    &mut tunnel_writer,
+                    &mut tunnel_port,
                 );
                 info!("client disconnected, waiting for reconnect");
                 continue;
@@ -719,4 +838,58 @@ fn bind_agent_listener(path: &Path) -> Option<UnixListener> {
 
 fn cleanup_socket(path: &Path) {
     let _ = std::fs::remove_file(path);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn extract_redirect_port_basic() {
+        let url = "https://accounts.google.com/o/oauth2/auth?redirect_uri=http://localhost:8080/callback&client_id=xyz";
+        assert_eq!(extract_redirect_port(url), Some(8080));
+    }
+
+    #[test]
+    fn extract_redirect_port_127() {
+        let url = "https://auth.example.com/authorize?redirect_uri=http://127.0.0.1:9090/cb";
+        assert_eq!(extract_redirect_port(url), Some(9090));
+    }
+
+    #[test]
+    fn extract_redirect_port_url_encoded() {
+        let url = "https://auth.example.com/authorize?redirect_uri=http%3A%2F%2Flocalhost%3A3000%2Fcallback";
+        assert_eq!(extract_redirect_port(url), Some(3000));
+    }
+
+    #[test]
+    fn extract_redirect_port_no_port() {
+        let url = "https://auth.example.com/authorize?redirect_uri=http://localhost/callback";
+        assert_eq!(extract_redirect_port(url), None);
+    }
+
+    #[test]
+    fn extract_redirect_port_no_redirect_uri() {
+        let url = "https://example.com/page?foo=bar";
+        assert_eq!(extract_redirect_port(url), None);
+    }
+
+    #[test]
+    fn extract_redirect_port_non_localhost() {
+        let url =
+            "https://auth.example.com/authorize?redirect_uri=https://example.com:8080/callback";
+        assert_eq!(extract_redirect_port(url), None);
+    }
+
+    #[test]
+    fn extract_redirect_port_https_redirect() {
+        let url = "https://auth.example.com/authorize?redirect_uri=https://localhost:4443/callback";
+        assert_eq!(extract_redirect_port(url), Some(4443));
+    }
+
+    #[test]
+    fn extract_redirect_url_variant() {
+        let url = "https://auth.example.com/authorize?redirect_url=http://localhost:5000/cb";
+        assert_eq!(extract_redirect_port(url), Some(5000));
+    }
 }

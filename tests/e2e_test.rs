@@ -1137,3 +1137,170 @@ async fn tail_receives_exit_on_shell_exit() {
     let code = expect_exit_frame(&mut tail, Duration::from_secs(5)).await;
     assert_eq!(code, Some(42), "tail should receive exit code");
 }
+
+#[tokio::test]
+async fn tunnel_forwarding_roundtrip() {
+    let _permit = CONCURRENCY.acquire().await.unwrap();
+    let (_tx, mut framed, server, _meta, open_path) = setup_session_with_open_path().await;
+    wait_for_shell(&mut framed).await;
+    read_available_data(&mut framed, Duration::from_secs(1)).await;
+
+    // Bind a TCP listener simulating the remote program waiting for OAuth callback
+    let callback_listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = callback_listener.local_addr().unwrap().port();
+    callback_listener.set_nonblocking(true).ok();
+    let callback_listener = tokio::net::TcpListener::from_std(callback_listener).unwrap();
+
+    // Enable open forwarding
+    framed.send(Frame::OpenForward).await.unwrap();
+    tokio::time::sleep(Duration::from_millis(100)).await;
+
+    // Send URL with redirect_uri pointing to the callback port
+    let url = format!(
+        "https://accounts.example.com/auth?redirect_uri=http://localhost:{port}/callback&client_id=test"
+    );
+    let mut open_conn = UnixStream::connect(&open_path).await.unwrap();
+    open_conn.write_all(format!("{url}\n").as_bytes()).await.unwrap();
+    drop(open_conn);
+
+    // Should receive TunnelListen then OpenUrl
+    let mut got_tunnel_listen = false;
+    loop {
+        match timeout(Duration::from_secs(5), framed.next()).await {
+            Ok(Some(Ok(Frame::TunnelListen { port: p }))) => {
+                assert_eq!(p, port);
+                got_tunnel_listen = true;
+            }
+            Ok(Some(Ok(Frame::OpenUrl { url: u }))) => {
+                assert!(u.contains("accounts.example.com"));
+                break;
+            }
+            Ok(Some(Ok(Frame::Data(_)))) => continue,
+            other => panic!("expected TunnelListen/OpenUrl, got: {other:?}"),
+        }
+    }
+    assert!(got_tunnel_listen, "should have received TunnelListen before OpenUrl");
+
+    // Send TunnelOpen (simulating client accepted a connection)
+    framed.send(Frame::TunnelOpen).await.unwrap();
+    tokio::time::sleep(Duration::from_millis(100)).await;
+
+    // Accept connection on the callback listener (simulating the remote program)
+    let (mut callback_conn, _) = callback_listener.accept().await.unwrap();
+
+    // Send data from client -> server -> callback program
+    let request = b"GET /callback?code=abc123 HTTP/1.1\r\n\r\n";
+    framed.send(Frame::TunnelData(Bytes::from_static(request))).await.unwrap();
+
+    // Read it from the callback connection
+    let mut buf = vec![0u8; 4096];
+    let n = timeout(Duration::from_secs(3), callback_conn.read(&mut buf)).await.unwrap().unwrap();
+    assert_eq!(&buf[..n], request);
+
+    // Send response back: callback program -> server -> client
+    let response = b"HTTP/1.1 200 OK\r\n\r\nSuccess";
+    callback_conn.write_all(response).await.unwrap();
+
+    // Read TunnelData back from the server
+    loop {
+        match timeout(Duration::from_secs(3), framed.next()).await {
+            Ok(Some(Ok(Frame::TunnelData(data)))) => {
+                assert_eq!(&data[..], response);
+                break;
+            }
+            Ok(Some(Ok(Frame::Data(_)))) => continue,
+            other => panic!("expected TunnelData, got: {other:?}"),
+        }
+    }
+
+    // Drop the callback connection, should get TunnelClose
+    drop(callback_conn);
+    loop {
+        match timeout(Duration::from_secs(3), framed.next()).await {
+            Ok(Some(Ok(Frame::TunnelClose))) => break,
+            Ok(Some(Ok(Frame::Data(_) | Frame::TunnelData(_)))) => continue,
+            other => panic!("expected TunnelClose, got: {other:?}"),
+        }
+    }
+
+    let _ = framed.send(Frame::Data(Bytes::from("exit\n"))).await;
+    let _ = timeout(Duration::from_secs(3), server).await;
+}
+
+#[tokio::test]
+async fn tunnel_not_created_without_redirect_uri() {
+    let _permit = CONCURRENCY.acquire().await.unwrap();
+    let (_tx, mut framed, server, _meta, open_path) = setup_session_with_open_path().await;
+    wait_for_shell(&mut framed).await;
+    read_available_data(&mut framed, Duration::from_secs(1)).await;
+
+    // Enable open forwarding
+    framed.send(Frame::OpenForward).await.unwrap();
+    tokio::time::sleep(Duration::from_millis(100)).await;
+
+    // Send URL without redirect_uri
+    let mut open_conn = UnixStream::connect(&open_path).await.unwrap();
+    open_conn.write_all(b"https://example.com/page\n").await.unwrap();
+    drop(open_conn);
+
+    // Should receive only OpenUrl, no TunnelListen
+    loop {
+        match timeout(Duration::from_secs(3), framed.next()).await {
+            Ok(Some(Ok(Frame::OpenUrl { url }))) => {
+                assert_eq!(url, "https://example.com/page");
+                break;
+            }
+            Ok(Some(Ok(Frame::TunnelListen { .. }))) => {
+                panic!("should not receive TunnelListen without redirect_uri");
+            }
+            Ok(Some(Ok(Frame::Data(_)))) => continue,
+            other => panic!("expected OpenUrl, got: {other:?}"),
+        }
+    }
+
+    let _ = framed.send(Frame::Data(Bytes::from("exit\n"))).await;
+    let _ = timeout(Duration::from_secs(3), server).await;
+}
+
+#[tokio::test]
+async fn tunnel_not_created_when_port_not_listening() {
+    let _permit = CONCURRENCY.acquire().await.unwrap();
+    let (_tx, mut framed, server, _meta, open_path) = setup_session_with_open_path().await;
+    wait_for_shell(&mut framed).await;
+    read_available_data(&mut framed, Duration::from_secs(1)).await;
+
+    // Enable open forwarding
+    framed.send(Frame::OpenForward).await.unwrap();
+    tokio::time::sleep(Duration::from_millis(100)).await;
+
+    // Find a port that's NOT in use by binding and immediately dropping
+    let temp_listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let unused_port = temp_listener.local_addr().unwrap().port();
+    drop(temp_listener);
+
+    // Send URL with redirect_uri pointing to the unused port
+    let url = format!(
+        "https://auth.example.com/authorize?redirect_uri=http://localhost:{unused_port}/callback"
+    );
+    let mut open_conn = UnixStream::connect(&open_path).await.unwrap();
+    open_conn.write_all(format!("{url}\n").as_bytes()).await.unwrap();
+    drop(open_conn);
+
+    // Should receive only OpenUrl, no TunnelListen (nothing listening on the port)
+    loop {
+        match timeout(Duration::from_secs(3), framed.next()).await {
+            Ok(Some(Ok(Frame::OpenUrl { url: u }))) => {
+                assert!(u.contains("auth.example.com"));
+                break;
+            }
+            Ok(Some(Ok(Frame::TunnelListen { .. }))) => {
+                panic!("should not receive TunnelListen when port is not in use");
+            }
+            Ok(Some(Ok(Frame::Data(_)))) => continue,
+            other => panic!("expected OpenUrl, got: {other:?}"),
+        }
+    }
+
+    let _ = framed.send(Frame::Data(Bytes::from("exit\n"))).await;
+    let _ = timeout(Duration::from_secs(3), server).await;
+}
