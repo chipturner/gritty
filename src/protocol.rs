@@ -26,11 +26,15 @@ const TYPE_TAIL: u8 = 0x15;
 const TYPE_HELLO: u8 = 0x16;
 const TYPE_TUNNEL_DATA: u8 = 0x17;
 const TYPE_TUNNEL_CLOSE: u8 = 0x18;
+const TYPE_SEND_OFFER: u8 = 0x19;
+const TYPE_SEND_DONE: u8 = 0x1A;
+const TYPE_SEND_CANCEL: u8 = 0x1B;
 const TYPE_SESSION_CREATED: u8 = 0x20;
 const TYPE_SESSION_INFO: u8 = 0x21;
 const TYPE_OK: u8 = 0x22;
 const TYPE_ERROR: u8 = 0x23;
 const TYPE_HELLO_ACK: u8 = 0x24;
+const TYPE_SEND_FILE: u8 = 0x25;
 
 const HEADER_LEN: usize = 5; // type(1) + length(4)
 const MAX_FRAME_SIZE: usize = 1 << 20; // 1 MB
@@ -101,6 +105,17 @@ pub enum Frame {
     TunnelData(Bytes),
     /// Tunnel connection closed (bidirectional).
     TunnelClose,
+    /// Server notifies attached client that a file transfer started (server → client).
+    SendOffer {
+        file_count: u32,
+        total_bytes: u64,
+    },
+    /// Server notifies attached client that a file transfer completed (server → client).
+    SendDone,
+    /// File transfer cancelled (server → client).
+    SendCancel {
+        reason: String,
+    },
     /// Protocol version handshake (client → server, first frame on connection).
     Hello {
         version: u16,
@@ -110,6 +125,11 @@ pub enum Frame {
         version: u16,
     },
     // Control requests
+    /// Local-side file transfer routing (client → daemon).
+    SendFile {
+        session: String,
+        role: u8,
+    },
     NewSession {
         name: String,
     },
@@ -285,6 +305,41 @@ impl Decoder for FrameCodec {
             TYPE_TUNNEL_OPEN => Ok(Some(Frame::TunnelOpen)),
             TYPE_TUNNEL_DATA => Ok(Some(Frame::TunnelData(payload.freeze()))),
             TYPE_TUNNEL_CLOSE => Ok(Some(Frame::TunnelClose)),
+            TYPE_SEND_OFFER => {
+                if payload.len() != 12 {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "send offer frame must be 12 bytes",
+                    ));
+                }
+                let file_count =
+                    u32::from_be_bytes([payload[0], payload[1], payload[2], payload[3]]);
+                let total_bytes = u64::from_be_bytes([
+                    payload[4],
+                    payload[5],
+                    payload[6],
+                    payload[7],
+                    payload[8],
+                    payload[9],
+                    payload[10],
+                    payload[11],
+                ]);
+                Ok(Some(Frame::SendOffer { file_count, total_bytes }))
+            }
+            TYPE_SEND_DONE => Ok(Some(Frame::SendDone)),
+            TYPE_SEND_CANCEL => Ok(Some(Frame::SendCancel { reason: decode_string(payload)? })),
+            TYPE_SEND_FILE => {
+                if payload.is_empty() {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "send file frame must have at least 1 byte",
+                    ));
+                }
+                let role = payload[payload.len() - 1];
+                let session = String::from_utf8(payload[..payload.len() - 1].to_vec())
+                    .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+                Ok(Some(Frame::SendFile { session, role }))
+            }
             TYPE_HELLO => {
                 if payload.len() != 2 {
                     return Err(io::Error::new(
@@ -420,6 +475,21 @@ impl Encoder<Frame> for FrameCodec {
                 dst.extend_from_slice(&data);
             }
             Frame::TunnelClose => encode_empty(dst, TYPE_TUNNEL_CLOSE),
+            Frame::SendOffer { file_count, total_bytes } => {
+                dst.put_u8(TYPE_SEND_OFFER);
+                dst.put_u32(12); // u32 + u64
+                dst.put_u32(file_count);
+                dst.put_u64(total_bytes);
+            }
+            Frame::SendDone => encode_empty(dst, TYPE_SEND_DONE),
+            Frame::SendCancel { reason } => encode_str(dst, TYPE_SEND_CANCEL, &reason),
+            Frame::SendFile { session, role } => {
+                let slen = session.len();
+                dst.put_u8(TYPE_SEND_FILE);
+                dst.put_u32((slen + 1) as u32); // session bytes + 1 byte role
+                dst.extend_from_slice(session.as_bytes());
+                dst.put_u8(role);
+            }
             Frame::Hello { version } => {
                 dst.put_u8(TYPE_HELLO);
                 dst.put_u32(2);

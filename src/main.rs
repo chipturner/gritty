@@ -129,6 +129,31 @@ enum Command {
         /// Remote host (connection name from `gritty connect`)
         host: Option<String>,
     },
+    /// Send files to a paired receiver
+    Send {
+        /// Remote host (connection name from `gritty connect`); omit when inside a session
+        host: Option<String>,
+
+        /// Session id or name (required from local side; auto-detected if only one session)
+        #[arg(short = 't', long = "target")]
+        target: Option<String>,
+
+        /// Files to send
+        #[arg(required = true)]
+        files: Vec<PathBuf>,
+    },
+    /// Receive files from a paired sender
+    Receive {
+        /// Remote host (connection name from `gritty connect`); omit when inside a session
+        host: Option<String>,
+
+        /// Session id or name (required from local side; auto-detected if only one session)
+        #[arg(short = 't', long = "target")]
+        target: Option<String>,
+
+        /// Destination directory (default: current directory)
+        dir: Option<PathBuf>,
+    },
     /// Open a URL on the local machine (for use inside gritty sessions)
     Open {
         /// URL to open
@@ -551,6 +576,12 @@ async fn run(cli: Cli, config: gritty::config::ConfigFile) -> anyhow::Result<()>
             let ctl_path = cli.ctl_socket.unwrap_or_else(gritty::daemon::control_socket_path);
             println!("{}", ctl_path.display());
             Ok(())
+        }
+        Command::Send { host, target, files } => {
+            send_command(cli.ctl_socket, host, target, files).await
+        }
+        Command::Receive { host, target, dir } => {
+            receive_command(cli.ctl_socket, host, target, dir).await
         }
         Command::Open { url } => {
             open_url(&url);
@@ -1019,6 +1050,247 @@ fn print_path(label: &str, path: &Path) {
 /// Resolve symlinks in the path (e.g. /tmp → /private/tmp on macOS).
 fn canonicalize_or_raw(path: PathBuf) -> PathBuf {
     std::fs::canonicalize(&path).unwrap_or(path)
+}
+
+/// Sanitize a filename to its basename, rejecting ".." and empty names.
+fn sanitize_basename(name: &str) -> anyhow::Result<String> {
+    let basename = Path::new(name).file_name().and_then(|n| n.to_str()).unwrap_or(name);
+    if basename.is_empty() || basename == ".." {
+        anyhow::bail!("invalid filename: {name}");
+    }
+    Ok(basename.to_string())
+}
+
+/// Connect to the send socket for a session. Either via GRITTY_SEND_SOCK
+/// (in-session) or via the control socket (local-side).
+async fn connect_send_socket(
+    ctl_socket: Option<PathBuf>,
+    host: Option<String>,
+    target: Option<String>,
+    role: u8,
+) -> anyhow::Result<tokio::net::UnixStream> {
+    // In-session: GRITTY_SEND_SOCK is set
+    if let Ok(sock_path) = std::env::var("GRITTY_SEND_SOCK") {
+        if host.is_some() {
+            anyhow::bail!("cannot specify host when inside a session");
+        }
+        let mut stream = tokio::net::UnixStream::connect(&sock_path)
+            .await
+            .map_err(|e| anyhow::anyhow!("could not connect to send socket ({sock_path}): {e}"))?;
+        use tokio::io::AsyncWriteExt;
+        stream.write_all(&[role]).await?;
+        return Ok(stream);
+    }
+
+    // Local-side: connect to control socket
+    let ctl_path = resolve_ctl_path(ctl_socket, host.as_deref())?;
+
+    // Resolve session target
+    let session = match target {
+        Some(t) => t,
+        None => {
+            // Auto-detect: list sessions, use the only one
+            let resp = server_request(&ctl_path, gritty::protocol::Frame::ListSessions).await?;
+            match resp {
+                gritty::protocol::Frame::SessionInfo { sessions } => match sessions.len() {
+                    0 => anyhow::bail!("no active sessions"),
+                    1 => {
+                        let s = &sessions[0];
+                        if s.name.is_empty() { s.id.clone() } else { s.name.clone() }
+                    }
+                    n => {
+                        let mut msg = format!("{n} sessions active, specify one with -t:\n");
+                        for s in &sessions {
+                            if s.name.is_empty() {
+                                msg.push_str(&format!("  {}\n", s.id));
+                            } else {
+                                msg.push_str(&format!("  {} ({})\n", s.name, s.id));
+                            }
+                        }
+                        anyhow::bail!("{msg}");
+                    }
+                },
+                other => anyhow::bail!("unexpected response: {other:?}"),
+            }
+        }
+    };
+
+    use futures_util::{SinkExt, StreamExt};
+    use gritty::protocol::{Frame, FrameCodec};
+    use tokio_util::codec::Framed;
+
+    let stream = tokio::net::UnixStream::connect(&ctl_path).await.map_err(|_| {
+        anyhow::anyhow!("no server running (could not connect to {})", ctl_path.display())
+    })?;
+    let mut framed = Framed::new(stream, FrameCodec);
+    gritty::handshake(&mut framed).await?;
+    framed.send(Frame::SendFile { session, role }).await?;
+
+    match Frame::expect_from(framed.next().await)? {
+        Frame::Ok => {}
+        Frame::Error { message } => anyhow::bail!("{message}"),
+        other => anyhow::bail!("unexpected response: {other:?}"),
+    }
+
+    // Extract raw stream from framed connection
+    let mut stream = framed.into_inner();
+    // Write role byte on the raw stream (server reads it via handle_send_stream)
+    use tokio::io::AsyncWriteExt;
+    stream.write_all(&[role]).await?;
+    Ok(stream)
+}
+
+async fn send_command(
+    ctl_socket: Option<PathBuf>,
+    host: Option<String>,
+    target: Option<String>,
+    files: Vec<PathBuf>,
+) -> anyhow::Result<()> {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    // Validate files exist and collect metadata
+    let mut entries: Vec<(String, u64, PathBuf)> = Vec::with_capacity(files.len());
+    for path in &files {
+        let meta =
+            std::fs::metadata(path).map_err(|e| anyhow::anyhow!("{}: {e}", path.display()))?;
+        if !meta.is_file() {
+            anyhow::bail!("{}: not a regular file", path.display());
+        }
+        let basename = sanitize_basename(&path.to_string_lossy())?;
+        entries.push((basename, meta.len(), path.clone()));
+    }
+
+    let mut stream = connect_send_socket(ctl_socket, host, target, b'S').await?;
+
+    // Write manifest: file_count, then per-file: name_len, name, file_size
+    let file_count = entries.len() as u32;
+    stream.write_all(&file_count.to_be_bytes()).await?;
+    for (name, size, _) in &entries {
+        let name_bytes = name.as_bytes();
+        stream.write_all(&(name_bytes.len() as u16).to_be_bytes()).await?;
+        stream.write_all(name_bytes).await?;
+        stream.write_all(&size.to_be_bytes()).await?;
+    }
+
+    // Wait for go signal (0x01 byte)
+    eprintln!("waiting for receiver...");
+    let mut go = [0u8; 1];
+    stream.read_exact(&mut go).await.map_err(|_| anyhow::anyhow!("no receiver connected"))?;
+    if go[0] != 0x01 {
+        anyhow::bail!("unexpected signal from server: 0x{:02x}", go[0]);
+    }
+
+    // Stream file data
+    let total_bytes: u64 = entries.iter().map(|(_, s, _)| s).sum();
+    let total_str = gritty::client::format_size(total_bytes);
+    let s = if entries.len() == 1 { "" } else { "s" };
+    eprintln!("sending {} file{s} ({total_str})", entries.len());
+
+    let mut buf = vec![0u8; 64 * 1024];
+    for (name, size, path) in &entries {
+        let size_str = gritty::client::format_size(*size);
+        eprintln!("  {name} ({size_str})");
+        let mut file = tokio::fs::File::open(path).await?;
+        let mut remaining = *size;
+        while remaining > 0 {
+            let to_read = (remaining as usize).min(buf.len());
+            let n = file.read(&mut buf[..to_read]).await?;
+            if n == 0 {
+                anyhow::bail!("unexpected EOF reading {name}");
+            }
+            stream.write_all(&buf[..n]).await?;
+            remaining -= n as u64;
+        }
+    }
+
+    eprintln!("done");
+    Ok(())
+}
+
+async fn receive_command(
+    ctl_socket: Option<PathBuf>,
+    host: Option<String>,
+    target: Option<String>,
+    dir: Option<PathBuf>,
+) -> anyhow::Result<()> {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    let dest_dir = dir.unwrap_or_else(|| PathBuf::from("."));
+    if !dest_dir.is_dir() {
+        anyhow::bail!("{}: not a directory", dest_dir.display());
+    }
+
+    let mut stream = connect_send_socket(ctl_socket, host, target, b'R').await?;
+
+    // Write dest dir + newline
+    let dest_str = dest_dir.to_string_lossy();
+    stream.write_all(dest_str.as_bytes()).await?;
+    stream.write_all(b"\n").await?;
+
+    // Wait for file data from server
+    eprintln!("waiting for sender...");
+
+    // Read: file_count (u32 BE)
+    let mut buf4 = [0u8; 4];
+    stream.read_exact(&mut buf4).await.map_err(|_| anyhow::anyhow!("no sender connected"))?;
+    let file_count = u32::from_be_bytes(buf4);
+
+    // Read per-file metadata and data
+    let mut received = 0u32;
+    let mut buf = vec![0u8; 64 * 1024];
+    loop {
+        // Read filename_len (u16 BE)
+        let mut buf2 = [0u8; 2];
+        stream.read_exact(&mut buf2).await?;
+        let name_len = u16::from_be_bytes(buf2) as usize;
+        if name_len == 0 {
+            break; // sentinel
+        }
+
+        // Read filename
+        let mut name_buf = vec![0u8; name_len];
+        stream.read_exact(&mut name_buf).await?;
+        let name = String::from_utf8(name_buf)?;
+        let name = sanitize_basename(&name)?;
+
+        // Read file_size (u64 BE)
+        let mut buf8 = [0u8; 8];
+        stream.read_exact(&mut buf8).await?;
+        let file_size = u64::from_be_bytes(buf8);
+
+        let size_str = gritty::client::format_size(file_size);
+        let s = if file_count == 1 { "" } else { "s" };
+        if received == 0 {
+            eprintln!("receiving {file_count} file{s}");
+        }
+        eprintln!("  {name} ({size_str})");
+
+        // Write file data
+        let file_path = dest_dir.join(&name);
+        let mut file = tokio::fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .mode(0o600)
+            .open(&file_path)
+            .await?;
+        let mut remaining = file_size;
+        while remaining > 0 {
+            let to_read = (remaining as usize).min(buf.len());
+            stream.read_exact(&mut buf[..to_read]).await?;
+            file.write_all(&buf[..to_read]).await?;
+            remaining -= to_read as u64;
+        }
+        received += 1;
+    }
+
+    if received == 0 {
+        eprintln!("no files received");
+    } else {
+        let s = if received == 1 { "" } else { "s" };
+        eprintln!("received {received} file{s}");
+    }
+    Ok(())
 }
 
 #[cfg(test)]

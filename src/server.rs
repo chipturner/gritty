@@ -17,10 +17,12 @@ use tokio::sync::{broadcast, mpsc};
 use tokio_util::codec::Framed;
 use tracing::{debug, info, warn};
 
-/// Wrapper to distinguish active vs tail connections arriving via channel.
+/// Wrapper to distinguish active, tail, and send connections arriving via channel.
 pub enum ClientConn {
     Active(Framed<UnixStream, FrameCodec>),
     Tail(Framed<UnixStream, FrameCodec>),
+    /// Raw stream for file transfer (local-side commands routed through daemon).
+    Send(UnixStream),
 }
 
 /// Events broadcast to tail clients.
@@ -83,6 +85,40 @@ enum OpenEvent {
 enum TunnelEvent {
     Data(Bytes),
     Closed,
+}
+
+/// File manifest entry parsed from sender protocol.
+struct FileManifest {
+    files: Vec<(String, u64)>, // (basename, size)
+}
+
+impl FileManifest {
+    fn total_bytes(&self) -> u64 {
+        self.files.iter().map(|(_, s)| s).sum()
+    }
+}
+
+/// Events from the send socket acceptor to the main relay loop.
+enum SendEvent {
+    SenderArrived { stream: UnixStream, manifest: FileManifest },
+    ReceiverArrived { stream: UnixStream },
+}
+
+/// State machine for file transfer rendezvous.
+enum TransferState {
+    Idle,
+    WaitingForReceiver { sender_stream: UnixStream, manifest: FileManifest },
+    WaitingForSender { receiver_stream: UnixStream },
+    Active { relay_handle: tokio::task::JoinHandle<()> },
+}
+
+/// Sanitize a filename: strip path separators, reject ".." and empty names.
+fn sanitize_filename(name: &str) -> Option<String> {
+    let basename = std::path::Path::new(name).file_name().and_then(|n| n.to_str()).unwrap_or(name);
+    if basename.is_empty() || basename == ".." || basename == "." {
+        return None;
+    }
+    Some(basename.to_string())
 }
 
 /// Extract redirect port from a URL's redirect_uri/redirect_url query parameter.
@@ -218,6 +254,195 @@ fn spawn_open_acceptor(
     })
 }
 
+/// Parse sender manifest from the send socket stream.
+/// Expected format after 'S' byte: file_count(u32 BE), then for each file:
+///   filename_len(u16 BE), filename(UTF-8 bytes), file_size(u64 BE)
+async fn parse_sender_manifest(stream: &mut UnixStream) -> io::Result<FileManifest> {
+    let mut buf4 = [0u8; 4];
+    stream.read_exact(&mut buf4).await?;
+    let file_count = u32::from_be_bytes(buf4);
+    if file_count == 0 || file_count > 10_000 {
+        return Err(io::Error::new(io::ErrorKind::InvalidData, "invalid file count"));
+    }
+    let mut files = Vec::with_capacity(file_count as usize);
+    for _ in 0..file_count {
+        let mut buf2 = [0u8; 2];
+        stream.read_exact(&mut buf2).await?;
+        let name_len = u16::from_be_bytes(buf2) as usize;
+        if name_len == 0 || name_len > 4096 {
+            return Err(io::Error::new(io::ErrorKind::InvalidData, "invalid filename length"));
+        }
+        let mut name_buf = vec![0u8; name_len];
+        stream.read_exact(&mut name_buf).await?;
+        let name = String::from_utf8(name_buf)
+            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+        let name = match sanitize_filename(&name) {
+            Some(n) => n,
+            None => {
+                return Err(io::Error::new(io::ErrorKind::InvalidData, "invalid filename"));
+            }
+        };
+        let mut buf8 = [0u8; 8];
+        stream.read_exact(&mut buf8).await?;
+        let file_size = u64::from_be_bytes(buf8);
+        files.push((name, file_size));
+    }
+    Ok(FileManifest { files })
+}
+
+/// Parse receiver dest_dir from the send socket stream.
+/// Expected format after 'R' byte: UTF-8 string, newline-terminated.
+async fn parse_receiver_dest(stream: &mut UnixStream) -> io::Result<String> {
+    let mut buf = Vec::with_capacity(256);
+    let mut byte = [0u8; 1];
+    loop {
+        match stream.read_exact(&mut byte).await {
+            Ok(_) => {
+                if byte[0] == b'\n' {
+                    break;
+                }
+                buf.push(byte[0]);
+                if buf.len() > 4096 {
+                    return Err(io::Error::new(io::ErrorKind::InvalidData, "dest dir too long"));
+                }
+            }
+            Err(e) if e.kind() == io::ErrorKind::UnexpectedEof => break,
+            Err(e) => return Err(e),
+        }
+    }
+    String::from_utf8(buf).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))
+}
+
+/// Spawn the send socket acceptor that accepts connections, reads role byte,
+/// then parses manifest (sender) or dest dir (receiver) and sends event.
+fn spawn_send_acceptor(
+    listener: UnixListener,
+    event_tx: mpsc::UnboundedSender<SendEvent>,
+) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        loop {
+            let (mut stream, _) = match listener.accept().await {
+                Ok(conn) => conn,
+                Err(e) => {
+                    debug!("send listener accept error: {e}");
+                    break;
+                }
+            };
+
+            if let Err(e) = crate::security::verify_peer_uid(&stream) {
+                warn!("send socket: {e}");
+                continue;
+            }
+
+            let etx = event_tx.clone();
+            tokio::spawn(async move {
+                // Read role byte
+                let mut role = [0u8; 1];
+                if stream.read_exact(&mut role).await.is_err() {
+                    return;
+                }
+                match role[0] {
+                    b'S' => match parse_sender_manifest(&mut stream).await {
+                        Ok(manifest) => {
+                            let _ = etx.send(SendEvent::SenderArrived { stream, manifest });
+                        }
+                        Err(e) => {
+                            debug!("send socket: bad sender manifest: {e}");
+                        }
+                    },
+                    b'R' => match parse_receiver_dest(&mut stream).await {
+                        Ok(_) => {
+                            let _ = etx.send(SendEvent::ReceiverArrived { stream });
+                        }
+                        Err(e) => {
+                            debug!("send socket: bad receiver dest: {e}");
+                        }
+                    },
+                    other => {
+                        debug!("send socket: unknown role byte: 0x{other:02x}");
+                    }
+                }
+            });
+        }
+    })
+}
+
+/// Spawn the transfer relay task. Reads file data from sender, writes to receiver.
+/// Sends SendOffer/SendDone/SendCancel notification frames to the active client.
+fn spawn_transfer_relay(
+    mut sender: UnixStream,
+    mut receiver: UnixStream,
+    manifest: FileManifest,
+    notify_tx: mpsc::UnboundedSender<Frame>,
+) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        use tokio::io::AsyncWriteExt;
+
+        let file_count = manifest.files.len() as u32;
+        let total_bytes = manifest.total_bytes();
+
+        // Notify active client about transfer start
+        let _ = notify_tx.send(Frame::SendOffer { file_count, total_bytes });
+
+        // Signal sender to start streaming (write 0x01 go byte)
+        if sender.write_all(&[0x01]).await.is_err() {
+            let _ = notify_tx.send(Frame::SendCancel { reason: "sender disconnected".into() });
+            return;
+        }
+
+        // Write file_count to receiver
+        if receiver.write_all(&file_count.to_be_bytes()).await.is_err() {
+            let _ = notify_tx.send(Frame::SendCancel { reason: "receiver disconnected".into() });
+            return;
+        }
+
+        // For each file: write metadata to receiver, then relay file data
+        let mut buf = vec![0u8; 64 * 1024];
+        for (name, size) in &manifest.files {
+            // Write per-file header to receiver
+            let name_bytes = name.as_bytes();
+            let mut hdr = Vec::with_capacity(2 + name_bytes.len() + 8);
+            hdr.extend_from_slice(&(name_bytes.len() as u16).to_be_bytes());
+            hdr.extend_from_slice(name_bytes);
+            hdr.extend_from_slice(&size.to_be_bytes());
+            if receiver.write_all(&hdr).await.is_err() {
+                let _ =
+                    notify_tx.send(Frame::SendCancel { reason: "receiver disconnected".into() });
+                return;
+            }
+
+            // Relay exactly file_size bytes from sender to receiver
+            let mut remaining = *size;
+            while remaining > 0 {
+                let to_read = (remaining as usize).min(buf.len());
+                match sender.read_exact(&mut buf[..to_read]).await {
+                    Ok(_) => {
+                        if receiver.write_all(&buf[..to_read]).await.is_err() {
+                            let _ = notify_tx
+                                .send(Frame::SendCancel { reason: "receiver disconnected".into() });
+                            return;
+                        }
+                        remaining -= to_read as u64;
+                    }
+                    Err(_) => {
+                        let _ = notify_tx
+                            .send(Frame::SendCancel { reason: "sender disconnected".into() });
+                        return;
+                    }
+                }
+            }
+        }
+
+        // Write sentinel: filename_len = 0
+        if receiver.write_all(&[0u8; 2]).await.is_err() {
+            let _ = notify_tx.send(Frame::SendCancel { reason: "receiver disconnected".into() });
+            return;
+        }
+
+        let _ = notify_tx.send(Frame::SendDone);
+    })
+}
+
 /// Relay broadcast events to a tail client. Handles Ping/Pong for keepalive.
 async fn tail_relay(
     mut framed: Framed<UnixStream, FrameCodec>,
@@ -267,6 +492,7 @@ pub async fn run(
     metadata_slot: Arc<OnceLock<SessionMetadata>>,
     agent_socket_path: PathBuf,
     open_socket_path: PathBuf,
+    send_socket_path: PathBuf,
 ) -> anyhow::Result<()> {
     // Allocate PTY (once, before accept loop)
     let pty = openpty(None, None)?;
@@ -304,24 +530,47 @@ pub async fn run(
     // Broadcast channel for tail clients
     let (tail_tx, _) = broadcast::channel::<TailEvent>(256);
 
+    // Send/receive file transfer state
+    let (send_event_tx, mut send_event_rx) = mpsc::unbounded_channel::<SendEvent>();
+    let (send_notify_tx, mut send_notify_rx) = mpsc::unbounded_channel::<Frame>();
+    let mut transfer_state = TransferState::Idle;
+    let mut send_acceptor: Option<tokio::task::JoinHandle<()>> = None;
+
+    // Bind send socket immediately (always available, no client flag needed)
+    if let Some(listener) = bind_agent_listener(&send_socket_path) {
+        send_acceptor = Some(spawn_send_acceptor(listener, send_event_tx.clone()));
+    }
+
     // Wait for first active client before spawning shell (so we can read Env frame).
-    // Tail clients that arrive before the first active client get subscribed to the
-    // broadcast and will receive output once the shell starts.
+    // Tail and send clients that arrive before the first active client get handled
+    // appropriately (tail subscribed to broadcast, send queued for rendezvous).
     let mut framed = loop {
-        match client_rx.recv().await {
-            Some(ClientConn::Active(f)) => {
-                info!("first client connected via channel");
-                break f;
-            }
-            Some(ClientConn::Tail(f)) => {
-                info!("tail client connected before shell spawn");
-                spawn_tail(f, &ring_buf, &tail_tx);
+        tokio::select! {
+            client = client_rx.recv() => match client {
+                Some(ClientConn::Active(f)) => {
+                    info!("first client connected via channel");
+                    break f;
+                }
+                Some(ClientConn::Tail(f)) => {
+                    info!("tail client connected before shell spawn");
+                    spawn_tail(f, &ring_buf, &tail_tx);
+                    continue;
+                }
+                Some(ClientConn::Send(stream)) => {
+                    handle_send_stream(stream, &send_event_tx);
+                    continue;
+                }
+                None => {
+                    info!("client channel closed before first client");
+                    cleanup_socket(&agent_socket_path);
+                    return Ok(());
+                }
+            },
+            event = send_event_rx.recv() => {
+                if let Some(event) = event {
+                    handle_send_event(event, &mut transfer_state, &send_notify_tx);
+                }
                 continue;
-            }
-            None => {
-                info!("client channel closed before first client");
-                cleanup_socket(&agent_socket_path);
-                return Ok(());
             }
         }
     };
@@ -356,6 +605,8 @@ pub async fn run(
     cmd.env("SSH_AUTH_SOCK", &agent_socket_path);
     // Set GRITTY_OPEN_SOCK so `gritty open` can find the open socket
     cmd.env("GRITTY_OPEN_SOCK", &open_socket_path);
+    // Set GRITTY_SEND_SOCK so `gritty send`/`gritty receive` can find the send socket
+    cmd.env("GRITTY_SEND_SOCK", &send_socket_path);
     let mut managed = ManagedChild::new(unsafe {
         cmd.pre_exec(move || {
             nix::unistd::setsid().map_err(io::Error::other)?;
@@ -442,6 +693,10 @@ pub async fn run(
                                 spawn_tail(f, &ring_buf, &tail_tx);
                                 continue;
                             }
+                            Some(ClientConn::Send(stream)) => {
+                                handle_send_stream(stream, &send_event_tx);
+                                continue;
+                            }
                             None => {
                                 info!("client channel closed");
                                 break 'drain false;
@@ -483,6 +738,12 @@ pub async fn run(
                             }
                             Err(_would_block) => continue,
                         }
+                    }
+                    event = send_event_rx.recv() => {
+                        if let Some(event) = event {
+                            handle_send_event(event, &mut transfer_state, &send_notify_tx);
+                        }
+                        continue;
                     }
                 }
             };
@@ -706,6 +967,9 @@ pub async fn run(
                             info!("tail client connected while active");
                             spawn_tail(f, &ring_buf, &tail_tx);
                         }
+                        Some(ClientConn::Send(stream)) => {
+                            handle_send_stream(stream, &send_event_tx);
+                        }
                         None => {}
                     }
                 }
@@ -773,6 +1037,24 @@ pub async fn run(
                     }
                 }
 
+                // Send/receive file transfer events
+                event = send_event_rx.recv() => {
+                    if let Some(event) = event {
+                        handle_send_event(event, &mut transfer_state, &send_notify_tx);
+                    }
+                }
+
+                // Transfer notification relay (from relay task to active client)
+                notification = send_notify_rx.recv() => {
+                    if let Some(frame) = notification {
+                        // Reset transfer state on completion/cancellation
+                        if matches!(frame, Frame::SendDone | Frame::SendCancel { .. }) {
+                            transfer_state = TransferState::Idle;
+                        }
+                        let _ = framed.send(frame).await;
+                    }
+                }
+
                 status = managed.child.wait() => {
                     let code = status?.code().unwrap_or(1);
                     info!(code, "shell exited");
@@ -820,7 +1102,93 @@ pub async fn run(
 
     cleanup_socket(&agent_socket_path);
     cleanup_socket(&open_socket_path);
+    cleanup_socket(&send_socket_path);
+    if let Some(handle) = send_acceptor.take() {
+        handle.abort();
+    }
     Ok(())
+}
+
+/// Handle a raw send stream from ClientConn::Send (local-side commands).
+/// Spawns a task to read the role byte and manifest/dest, then sends the event.
+fn handle_send_stream(mut stream: UnixStream, send_event_tx: &mpsc::UnboundedSender<SendEvent>) {
+    let etx = send_event_tx.clone();
+    tokio::spawn(async move {
+        let mut role = [0u8; 1];
+        if stream.read_exact(&mut role).await.is_err() {
+            return;
+        }
+        match role[0] {
+            b'S' => match parse_sender_manifest(&mut stream).await {
+                Ok(manifest) => {
+                    let _ = etx.send(SendEvent::SenderArrived { stream, manifest });
+                }
+                Err(e) => debug!("send stream: bad sender manifest: {e}"),
+            },
+            b'R' => match parse_receiver_dest(&mut stream).await {
+                Ok(_) => {
+                    let _ = etx.send(SendEvent::ReceiverArrived { stream });
+                }
+                Err(e) => debug!("send stream: bad receiver dest: {e}"),
+            },
+            _ => {}
+        }
+    });
+}
+
+/// Handle a send event: pair sender and receiver for rendezvous.
+fn handle_send_event(
+    event: SendEvent,
+    state: &mut TransferState,
+    notify_tx: &mpsc::UnboundedSender<Frame>,
+) {
+    match event {
+        SendEvent::SenderArrived { stream, manifest } => {
+            let old = std::mem::replace(state, TransferState::Idle);
+            match old {
+                TransferState::WaitingForSender { receiver_stream, .. } => {
+                    info!(
+                        files = manifest.files.len(),
+                        bytes = manifest.total_bytes(),
+                        "transfer: sender+receiver paired"
+                    );
+                    let handle =
+                        spawn_transfer_relay(stream, receiver_stream, manifest, notify_tx.clone());
+                    *state = TransferState::Active { relay_handle: handle };
+                }
+                _ => {
+                    // If there was an old active transfer, abort it
+                    if let TransferState::Active { relay_handle } = old {
+                        relay_handle.abort();
+                    }
+                    info!(files = manifest.files.len(), "transfer: sender waiting for receiver");
+                    *state = TransferState::WaitingForReceiver { sender_stream: stream, manifest };
+                }
+            }
+        }
+        SendEvent::ReceiverArrived { stream } => {
+            let old = std::mem::replace(state, TransferState::Idle);
+            match old {
+                TransferState::WaitingForReceiver { sender_stream, manifest } => {
+                    info!(
+                        files = manifest.files.len(),
+                        bytes = manifest.total_bytes(),
+                        "transfer: receiver+sender paired"
+                    );
+                    let handle =
+                        spawn_transfer_relay(sender_stream, stream, manifest, notify_tx.clone());
+                    *state = TransferState::Active { relay_handle: handle };
+                }
+                _ => {
+                    if let TransferState::Active { relay_handle } = old {
+                        relay_handle.abort();
+                    }
+                    info!("transfer: receiver waiting for sender");
+                    *state = TransferState::WaitingForSender { receiver_stream: stream };
+                }
+            }
+        }
+    }
 }
 
 fn bind_agent_listener(path: &Path) -> Option<UnixListener> {

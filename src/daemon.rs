@@ -273,8 +273,16 @@ pub async fn run(ctl_path: &Path, ready_fd: Option<OwnedFd>) -> anyhow::Result<(
                 let sock_dir = ctl_path.parent().expect("ctl_path must have a parent");
                 let agent_socket_path = sock_dir.join(format!("agent-{id}.sock"));
                 let open_socket_path = sock_dir.join(format!("open-{id}.sock"));
+                let send_socket_path = sock_dir.join(format!("send-{id}.sock"));
                 let handle = tokio::spawn(async move {
-                    server::run(client_rx, meta_clone, agent_socket_path, open_socket_path).await
+                    server::run(
+                        client_rx,
+                        meta_clone,
+                        agent_socket_path,
+                        open_socket_path,
+                        send_socket_path,
+                    )
+                    .await
                 });
 
                 sessions.insert(
@@ -355,6 +363,29 @@ pub async fn run(ctl_path: &Path, ready_fd: Option<OwnedFd>) -> anyhow::Result<(
                     state.handle.abort();
                     info!(id, "session killed");
                     let _ = timed_send(&mut framed, Frame::Ok).await;
+                } else {
+                    let _ = timed_send(
+                        &mut framed,
+                        Frame::Error { message: format!("no such session: {session}") },
+                    )
+                    .await;
+                }
+            }
+            Frame::SendFile { session, .. } => {
+                reap_sessions(&mut sessions);
+                if let Some(id) = resolve_session(&sessions, &session) {
+                    let state = &sessions[&id];
+                    if state.client_tx.is_closed() {
+                        sessions.remove(&id);
+                        let _ = timed_send(
+                            &mut framed,
+                            Frame::Error { message: format!("no such session: {session}") },
+                        )
+                        .await;
+                    } else if timed_send(&mut framed, Frame::Ok).await.is_ok() {
+                        let stream = framed.into_inner();
+                        let _ = state.client_tx.send(ClientConn::Send(stream));
+                    }
                 } else {
                     let _ = timed_send(
                         &mut framed,

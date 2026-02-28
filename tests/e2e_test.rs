@@ -33,6 +33,12 @@ fn unique_open_socket_path() -> PathBuf {
     TEST_DIR.path().join(format!("open-{pid}-{id}.sock"))
 }
 
+fn unique_send_socket_path() -> PathBuf {
+    let id = TEST_ID.fetch_add(1, Ordering::Relaxed);
+    let pid = std::process::id();
+    TEST_DIR.path().join(format!("send-{pid}-{id}.sock"))
+}
+
 /// Spawn a server task connected via socketpair + channel.
 /// Returns (client_tx for takeover, client-side framed, server join handle).
 async fn setup_session() -> (
@@ -46,8 +52,9 @@ async fn setup_session() -> (
     let meta_clone = Arc::clone(&meta);
     let agent_path = unique_agent_socket_path();
     let open_path = unique_open_socket_path();
+    let send_path = unique_send_socket_path();
     let handle = tokio::spawn(async move {
-        gritty::server::run(client_rx, meta_clone, agent_path, open_path).await
+        gritty::server::run(client_rx, meta_clone, agent_path, open_path, send_path).await
     });
 
     let (server_stream, client_stream) = UnixStream::pair().unwrap();
@@ -58,6 +65,34 @@ async fn setup_session() -> (
     framed.send(Frame::Env { vars: vec![] }).await.unwrap();
 
     (client_tx, framed, handle, meta)
+}
+
+/// Like setup_session but also returns the send socket path.
+async fn setup_session_with_send_path() -> (
+    mpsc::UnboundedSender<ClientConn>,
+    Framed<UnixStream, FrameCodec>,
+    JoinHandle<anyhow::Result<()>>,
+    Arc<OnceLock<gritty::server::SessionMetadata>>,
+    PathBuf,
+) {
+    let (client_tx, client_rx) = mpsc::unbounded_channel();
+    let meta = Arc::new(OnceLock::new());
+    let meta_clone = Arc::clone(&meta);
+    let agent_path = unique_agent_socket_path();
+    let open_path = unique_open_socket_path();
+    let send_path = unique_send_socket_path();
+    let send_path_clone = send_path.clone();
+    let handle = tokio::spawn(async move {
+        gritty::server::run(client_rx, meta_clone, agent_path, open_path, send_path).await
+    });
+
+    let (server_stream, client_stream) = UnixStream::pair().unwrap();
+    client_tx.send(ClientConn::Active(Framed::new(server_stream, FrameCodec))).unwrap();
+
+    let mut framed = Framed::new(client_stream, FrameCodec);
+    framed.send(Frame::Env { vars: vec![] }).await.unwrap();
+
+    (client_tx, framed, handle, meta, send_path_clone)
 }
 
 /// Spawn a server task, send an Env frame before the first Resize.
@@ -75,8 +110,9 @@ async fn setup_session_with_env(
     let meta_clone = Arc::clone(&meta);
     let agent_path = unique_agent_socket_path();
     let open_path = unique_open_socket_path();
+    let send_path = unique_send_socket_path();
     let handle = tokio::spawn(async move {
-        gritty::server::run(client_rx, meta_clone, agent_path, open_path).await
+        gritty::server::run(client_rx, meta_clone, agent_path, open_path, send_path).await
     });
 
     let (server_stream, client_stream) = UnixStream::pair().unwrap();
@@ -740,8 +776,9 @@ async fn setup_session_with_agent_path() -> (
     let agent_path = unique_agent_socket_path();
     let agent_path_clone = agent_path.clone();
     let open_path = unique_open_socket_path();
+    let send_path = unique_send_socket_path();
     let handle = tokio::spawn(async move {
-        gritty::server::run(client_rx, meta_clone, agent_path_clone, open_path).await
+        gritty::server::run(client_rx, meta_clone, agent_path_clone, open_path, send_path).await
     });
 
     let (server_stream, client_stream) = UnixStream::pair().unwrap();
@@ -892,8 +929,9 @@ async fn setup_session_with_open_path() -> (
     let agent_path = unique_agent_socket_path();
     let open_path = unique_open_socket_path();
     let open_path_clone = open_path.clone();
+    let send_path = unique_send_socket_path();
     let handle = tokio::spawn(async move {
-        gritty::server::run(client_rx, meta_clone, agent_path, open_path_clone).await
+        gritty::server::run(client_rx, meta_clone, agent_path, open_path_clone, send_path).await
     });
 
     let (server_stream, client_stream) = UnixStream::pair().unwrap();
@@ -1300,6 +1338,329 @@ async fn tunnel_not_created_when_port_not_listening() {
             other => panic!("expected OpenUrl, got: {other:?}"),
         }
     }
+
+    let _ = framed.send(Frame::Data(Bytes::from("exit\n"))).await;
+    let _ = timeout(Duration::from_secs(3), server).await;
+}
+
+// =============================================================================
+// File transfer tests
+// =============================================================================
+
+/// Helper: connect as sender, write manifest, wait for go signal, stream files.
+async fn send_files(send_path: &std::path::Path, files: &[(&str, &[u8])]) {
+    let mut stream = UnixStream::connect(send_path).await.unwrap();
+
+    // Role byte
+    stream.write_all(&[b'S']).await.unwrap();
+
+    // Manifest
+    let file_count = files.len() as u32;
+    stream.write_all(&file_count.to_be_bytes()).await.unwrap();
+    for (name, data) in files {
+        let name_bytes = name.as_bytes();
+        stream.write_all(&(name_bytes.len() as u16).to_be_bytes()).await.unwrap();
+        stream.write_all(name_bytes).await.unwrap();
+        stream.write_all(&(data.len() as u64).to_be_bytes()).await.unwrap();
+    }
+
+    // Wait for go signal
+    let mut go = [0u8; 1];
+    stream.read_exact(&mut go).await.unwrap();
+    assert_eq!(go[0], 0x01);
+
+    // Stream file data
+    for (_name, data) in files {
+        stream.write_all(data).await.unwrap();
+    }
+}
+
+/// Helper: connect as receiver, read files, return Vec<(name, data)>.
+async fn receive_files(send_path: &std::path::Path) -> Vec<(String, Vec<u8>)> {
+    let mut stream = UnixStream::connect(send_path).await.unwrap();
+
+    // Role byte
+    stream.write_all(&[b'R']).await.unwrap();
+
+    // Dest dir (empty = cwd)
+    stream.write_all(b"\n").await.unwrap();
+
+    // Read file_count
+    let mut buf4 = [0u8; 4];
+    stream.read_exact(&mut buf4).await.unwrap();
+    let file_count = u32::from_be_bytes(buf4);
+
+    let mut result = Vec::new();
+    loop {
+        let mut buf2 = [0u8; 2];
+        stream.read_exact(&mut buf2).await.unwrap();
+        let name_len = u16::from_be_bytes(buf2) as usize;
+        if name_len == 0 {
+            break;
+        }
+        let mut name_buf = vec![0u8; name_len];
+        stream.read_exact(&mut name_buf).await.unwrap();
+        let name = String::from_utf8(name_buf).unwrap();
+
+        let mut buf8 = [0u8; 8];
+        stream.read_exact(&mut buf8).await.unwrap();
+        let file_size = u64::from_be_bytes(buf8);
+
+        let mut data = vec![0u8; file_size as usize];
+        stream.read_exact(&mut data).await.unwrap();
+        result.push((name, data));
+    }
+    assert_eq!(result.len(), file_count as usize);
+    result
+}
+
+#[tokio::test]
+async fn send_receive_single_file() {
+    let _permit = CONCURRENCY.acquire().await.unwrap();
+    let (_client_tx, mut framed, server, _meta, send_path) = setup_session_with_send_path().await;
+    wait_for_shell(&mut framed).await;
+
+    // Wait for send socket to be bound
+    for _ in 0..50 {
+        if send_path.exists() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    assert!(send_path.exists(), "send socket not bound");
+
+    let file_data = b"hello world\n";
+
+    // Spawn sender and receiver concurrently (sender first)
+    let sp = send_path.clone();
+    let sender = tokio::spawn(async move {
+        send_files(&sp, &[("test.txt", file_data)]).await;
+    });
+    // Small delay so sender arrives first
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    let sp = send_path.clone();
+    let receiver = tokio::spawn(async move { receive_files(&sp).await });
+
+    let (send_result, recv_result) = tokio::join!(sender, receiver);
+    send_result.unwrap();
+    let files = recv_result.unwrap();
+
+    assert_eq!(files.len(), 1);
+    assert_eq!(files[0].0, "test.txt");
+    assert_eq!(files[0].1, file_data);
+
+    // Check for SendOffer + SendDone notification frames to the active client
+    let mut got_offer = false;
+    let mut got_done = false;
+    loop {
+        match timeout(Duration::from_secs(3), framed.next()).await {
+            Ok(Some(Ok(Frame::SendOffer { file_count, total_bytes }))) => {
+                assert_eq!(file_count, 1);
+                assert_eq!(total_bytes, file_data.len() as u64);
+                got_offer = true;
+            }
+            Ok(Some(Ok(Frame::SendDone))) => {
+                got_done = true;
+                break;
+            }
+            Ok(Some(Ok(Frame::Data(_)))) => continue,
+            Ok(Some(Ok(other))) => panic!("unexpected frame: {other:?}"),
+            _ => break,
+        }
+    }
+    assert!(got_offer, "did not receive SendOffer");
+    assert!(got_done, "did not receive SendDone");
+
+    let _ = framed.send(Frame::Data(Bytes::from("exit\n"))).await;
+    let _ = timeout(Duration::from_secs(3), server).await;
+}
+
+#[tokio::test]
+async fn send_receive_multiple_files() {
+    let _permit = CONCURRENCY.acquire().await.unwrap();
+    let (_client_tx, mut framed, server, _meta, send_path) = setup_session_with_send_path().await;
+    wait_for_shell(&mut framed).await;
+
+    for _ in 0..50 {
+        if send_path.exists() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+
+    let files_to_send: Vec<(&str, &[u8])> = vec![
+        ("a.txt", b"alpha"),
+        ("b.bin", &[0u8, 1, 2, 3, 4, 5]),
+        ("c.txt", b"gamma delta epsilon"),
+    ];
+
+    let sp = send_path.clone();
+    let f = files_to_send.clone();
+    let sender = tokio::spawn(async move {
+        send_files(&sp, &f).await;
+    });
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    let sp = send_path.clone();
+    let receiver = tokio::spawn(async move { receive_files(&sp).await });
+
+    let (s, r) = tokio::join!(sender, receiver);
+    s.unwrap();
+    let received = r.unwrap();
+
+    assert_eq!(received.len(), 3);
+    assert_eq!(received[0].0, "a.txt");
+    assert_eq!(received[0].1, b"alpha");
+    assert_eq!(received[1].0, "b.bin");
+    assert_eq!(received[1].1, &[0, 1, 2, 3, 4, 5]);
+    assert_eq!(received[2].0, "c.txt");
+    assert_eq!(received[2].1, b"gamma delta epsilon");
+
+    let _ = framed.send(Frame::Data(Bytes::from("exit\n"))).await;
+    let _ = timeout(Duration::from_secs(3), server).await;
+}
+
+#[tokio::test]
+async fn send_receive_receiver_first() {
+    let _permit = CONCURRENCY.acquire().await.unwrap();
+    let (_client_tx, mut framed, server, _meta, send_path) = setup_session_with_send_path().await;
+    wait_for_shell(&mut framed).await;
+
+    for _ in 0..50 {
+        if send_path.exists() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+
+    let file_data = b"receiver-first test data";
+
+    // Spawn receiver first this time
+    let sp = send_path.clone();
+    let receiver = tokio::spawn(async move { receive_files(&sp).await });
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    let sp = send_path.clone();
+    let sender = tokio::spawn(async move {
+        send_files(&sp, &[("recv_first.dat", file_data)]).await;
+    });
+
+    let (r, s) = tokio::join!(receiver, sender);
+    s.unwrap();
+    let files = r.unwrap();
+
+    assert_eq!(files.len(), 1);
+    assert_eq!(files[0].0, "recv_first.dat");
+    assert_eq!(files[0].1, file_data);
+
+    let _ = framed.send(Frame::Data(Bytes::from("exit\n"))).await;
+    let _ = timeout(Duration::from_secs(3), server).await;
+}
+
+#[tokio::test]
+async fn send_cancel_on_sender_disconnect() {
+    let _permit = CONCURRENCY.acquire().await.unwrap();
+    let (_client_tx, mut framed, server, _meta, send_path) = setup_session_with_send_path().await;
+    wait_for_shell(&mut framed).await;
+
+    for _ in 0..50 {
+        if send_path.exists() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+
+    // Connect sender with a 1MB file but disconnect before sending data
+    let sp = send_path.clone();
+    let sender = tokio::spawn(async move {
+        let mut stream = UnixStream::connect(&sp).await.unwrap();
+        stream.write_all(&[b'S']).await.unwrap();
+        // 1 file, 1MB
+        stream.write_all(&1u32.to_be_bytes()).await.unwrap();
+        let name = b"big.bin";
+        stream.write_all(&(name.len() as u16).to_be_bytes()).await.unwrap();
+        stream.write_all(name).await.unwrap();
+        stream.write_all(&(1024u64 * 1024).to_be_bytes()).await.unwrap();
+
+        // Wait for go signal
+        let mut go = [0u8; 1];
+        stream.read_exact(&mut go).await.unwrap();
+        // Drop stream without sending file data
+        drop(stream);
+    });
+
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    let sp = send_path.clone();
+    let receiver = tokio::spawn(async move {
+        let mut stream = UnixStream::connect(&sp).await.unwrap();
+        stream.write_all(&[b'R']).await.unwrap();
+        stream.write_all(b"\n").await.unwrap();
+        // Try to read -- should fail when sender disconnects
+        let mut buf4 = [0u8; 4];
+        let _ = stream.read_exact(&mut buf4).await;
+    });
+
+    let _ = tokio::join!(sender, receiver);
+
+    // Should get SendCancel notification
+    let mut got_cancel = false;
+    loop {
+        match timeout(Duration::from_secs(3), framed.next()).await {
+            Ok(Some(Ok(Frame::SendCancel { reason }))) => {
+                assert!(reason.contains("sender disconnected"), "got: {reason}");
+                got_cancel = true;
+                break;
+            }
+            Ok(Some(Ok(Frame::SendOffer { .. }))) => continue,
+            Ok(Some(Ok(Frame::Data(_)))) => continue,
+            _ => break,
+        }
+    }
+    assert!(got_cancel, "did not receive SendCancel");
+
+    let _ = framed.send(Frame::Data(Bytes::from("exit\n"))).await;
+    let _ = timeout(Duration::from_secs(3), server).await;
+}
+
+#[tokio::test]
+async fn send_filename_sanitized() {
+    let _permit = CONCURRENCY.acquire().await.unwrap();
+    let (_client_tx, mut framed, server, _meta, send_path) = setup_session_with_send_path().await;
+    wait_for_shell(&mut framed).await;
+
+    for _ in 0..50 {
+        if send_path.exists() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+
+    // Send a file with a path separator in the name -- server should sanitize to basename
+    let file_data = b"sanitized";
+
+    let sp = send_path.clone();
+    let sender = tokio::spawn(async move {
+        let mut stream = UnixStream::connect(&sp).await.unwrap();
+        stream.write_all(&[b'S']).await.unwrap();
+        stream.write_all(&1u32.to_be_bytes()).await.unwrap();
+        let name = b"../../etc/passwd";
+        stream.write_all(&(name.len() as u16).to_be_bytes()).await.unwrap();
+        stream.write_all(name).await.unwrap();
+        stream.write_all(&(file_data.len() as u64).to_be_bytes()).await.unwrap();
+        let mut go = [0u8; 1];
+        stream.read_exact(&mut go).await.unwrap();
+        stream.write_all(file_data).await.unwrap();
+    });
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    let sp = send_path.clone();
+    let receiver = tokio::spawn(async move { receive_files(&sp).await });
+
+    let (s, r) = tokio::join!(sender, receiver);
+    s.unwrap();
+    let files = r.unwrap();
+
+    assert_eq!(files.len(), 1);
+    // Should be sanitized to just "passwd"
+    assert_eq!(files[0].0, "passwd");
+    assert_eq!(files[0].1, b"sanitized");
 
     let _ = framed.send(Frame::Data(Bytes::from("exit\n"))).await;
     let _ = timeout(Duration::from_secs(3), server).await;

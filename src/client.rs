@@ -246,6 +246,22 @@ fn write_stdout(data: &[u8]) -> io::Result<()> {
     }
 }
 
+/// Format a byte count as a human-readable size string.
+pub fn format_size(bytes: u64) -> String {
+    const KB: u64 = 1024;
+    const MB: u64 = 1024 * KB;
+    const GB: u64 = 1024 * MB;
+    if bytes >= GB {
+        format!("{:.1}GB", bytes as f64 / GB as f64)
+    } else if bytes >= MB {
+        format!("{:.1}MB", bytes as f64 / MB as f64)
+    } else if bytes >= KB {
+        format!("{:.1}KB", bytes as f64 / KB as f64)
+    } else {
+        format!("{bytes}B")
+    }
+}
+
 fn get_terminal_size() -> (u16, u16) {
     let mut ws: libc::winsize = unsafe { std::mem::zeroed() };
     if unsafe { libc::ioctl(libc::STDIN_FILENO, libc::TIOCGWINSZ, &mut ws) } != 0
@@ -527,6 +543,19 @@ async fn relay(
                                 }
                             }
                         }
+                    }
+                    Some(Ok(Frame::SendOffer { file_count, total_bytes })) => {
+                        let size_str = format_size(total_bytes);
+                        let s = if file_count == 1 { "" } else { "s" };
+                        let msg = format!("\r\n[gritty: receiving {file_count} file{s} ({size_str})]\r\n");
+                        write_stdout(msg.as_bytes())?;
+                    }
+                    Some(Ok(Frame::SendDone)) => {
+                        write_stdout(b"\r\n[gritty: transfer complete]\r\n")?;
+                    }
+                    Some(Ok(Frame::SendCancel { reason })) => {
+                        let msg = format!("\r\n[gritty: transfer cancelled: {reason}]\r\n");
+                        write_stdout(msg.as_bytes())?;
                     }
                     Some(Ok(Frame::TunnelData(data))) => {
                         if let Some(ref tx) = tunnel_writer {

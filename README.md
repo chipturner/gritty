@@ -15,6 +15,7 @@ It works by forwarding Unix domain sockets over SSH -- no custom protocol, no op
 - **Remote development**
     - **SSH agent forwarding** (`-A`) -- tunnels your local SSH agent so `git push`, `ssh`, and other agent-dependent commands work remotely
     - **URL open forwarding** (`-O`) -- forwards `$BROWSER` / URL open requests back to your local machine
+    - **File transfer** (`gritty send` / `gritty receive`) -- quick file transfer between local and remote through the existing session connection
     - **Environment forwarding** -- TERM, LANG, COLORTERM propagated to remote shell
 - **Simple**
     - **Single binary, zero config** -- optional TOML config for defaults; no server config, no port allocation, no root required; auto-starts both the server and SSH tunnels on demand
@@ -66,6 +67,15 @@ gritty tunnels           # list active tunnels
 gritty disconnect devbox # tear down
 ```
 
+```bash
+# Send files from local to remote (run `gritty receive` inside the session)
+gritty send devbox file1.txt file2.txt
+
+# Or send from inside a session (run `gritty receive` on the other side)
+gritty send myfile.txt
+gritty receive /tmp/dest
+```
+
 `gritty ls devbox` output:
 
 ```
@@ -87,6 +97,8 @@ ID  Name    PTY         PID    Created              Status
 | `gritty list-sessions [host]` | `ls`, `list` | List sessions |
 | `gritty kill-session [host] -t <id\|name>` | | Kill a session |
 | `gritty kill-server [host]` | | Kill the server and all sessions |
+| `gritty send [host] [-t id\|name] <files...>` | | Send files to a paired receiver |
+| `gritty receive [host] [-t id\|name] [dir]` | | Receive files from a paired sender |
 | `gritty open <url>` | | Open a URL on the local machine (inside sessions) |
 | `gritty socket-path` | `socket` | Print the default server socket path |
 | `gritty info` | | Show diagnostics (version, config, server status, tunnels) |
