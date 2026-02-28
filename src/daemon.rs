@@ -42,9 +42,11 @@ struct SessionState {
 }
 
 /// Returns the base directory for gritty sockets.
-/// Prefers $XDG_RUNTIME_DIR/gritty, falls back to /tmp/gritty-$UID.
+/// Prefers $GRITTY_SOCKET_DIR, then $XDG_RUNTIME_DIR/gritty, falls back to /tmp/gritty-$UID.
 pub fn socket_dir() -> PathBuf {
-    if let Ok(xdg) = std::env::var("XDG_RUNTIME_DIR") {
+    if let Ok(dir) = std::env::var("GRITTY_SOCKET_DIR") {
+        PathBuf::from(dir)
+    } else if let Ok(xdg) = std::env::var("XDG_RUNTIME_DIR") {
         PathBuf::from(xdg).join("gritty")
     } else {
         let uid = unsafe { libc::getuid() };

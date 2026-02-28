@@ -127,7 +127,11 @@ fn remote_exec_command(
     extra_ssh_opts: &[String],
     foreground: bool,
 ) -> Command {
-    let wrapped_cmd = format!("PATH=\"{REMOTE_PATH_PREFIX}\"; {remote_cmd}");
+    let mut preamble = format!("PATH=\"{REMOTE_PATH_PREFIX}\"");
+    if let Ok(dir) = std::env::var("GRITTY_SOCKET_DIR") {
+        preamble.push_str(&format!("; export GRITTY_SOCKET_DIR=\"{dir}\""));
+    }
+    let wrapped_cmd = format!("{preamble}; {remote_cmd}");
     let mut cmd = Command::new("ssh");
     cmd.args(base_ssh_args(dest, extra_ssh_opts, foreground));
     cmd.arg(dest.ssh_dest());
@@ -339,7 +343,7 @@ async fn tunnel_monitor(
 
 const REMOTE_ENSURE_CMD: &str = "\
     SOCK=$(gritty socket-path) && \
-    (gritty ls >/dev/null 2>&1 || \
+    (gritty ls local >/dev/null 2>&1 || \
      { gritty server && sleep 0.3; }) && \
     echo \"$SOCK\" && \
     gritty protocol-version 2>/dev/null || true";
