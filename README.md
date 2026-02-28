@@ -11,6 +11,7 @@ It works by forwarding Unix domain sockets over SSH -- no custom protocol, no op
 - **Reliable**
     - **Self-healing connections** -- heartbeat detection, automatic tunnel respawn, transparent client reconnect
     - **Persistent sessions** -- shells survive client disconnect, network failure, laptop sleep
+        - Client is stateless -- reboot your laptop, update your terminal app, switch machines, and `gritty attach` from a fresh process
 - **Remote development**
     - **SSH agent forwarding** (`-A`) -- tunnels your local SSH agent so `git push`, `ssh`, and other agent-dependent commands work remotely
     - **URL open forwarding** (`-O`) -- forwards `$BROWSER` / URL open requests back to your local machine
@@ -295,7 +296,7 @@ Forwarding multiplexes over the existing session connection -- no extra tunnels.
 - [Eternal Terminal](https://eternalterminal.dev/) -- persistent SSH sessions over a custom protocol
 - [tmux](https://github.com/tmux/tmux) / [screen](https://www.gnu.org/software/screen/) -- terminal multiplexers with session persistence
 
-gritty differs by having no network protocol of its own. Where mosh and ET implement custom transport and encryption, gritty uses Unix domain sockets and delegates networking entirely to SSH. Where tmux and screen are full multiplexers with windows, panes, and key bindings, gritty does one thing: persistent sessions with auto-reconnect.
+gritty differs by having no network protocol of its own. Where mosh and ET implement custom transport and encryption, gritty uses Unix domain sockets and delegates networking entirely to SSH. Where tmux and screen are full multiplexers with windows, panes, and key bindings, gritty does one thing: persistent sessions with auto-reconnect. Another difference: mosh and ET require their original client process to stay alive (they maintain client-side state for their sync protocols), so a laptop reboot or terminal crash means starting over. gritty's client is stateless -- the server owns the entire session. Reboot, and `gritty attach` picks up exactly where you left off.
 
 **gritty + tmux** is the ideal pairing. gritty handles the connection -- self-healing tunnels, agent forwarding, auto-reconnect -- while tmux handles the workspace -- splits, windows, copy-mode, scroll-back. Run tmux inside a gritty session and close your laptop, change wifi, open it back up: your tmux splits are exactly where you left them, no re-SSH and `tmux attach` required. gritty replaces the fragile SSH pipe underneath tmux, not tmux itself.
 
