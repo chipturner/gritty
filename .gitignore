@@ -15,3 +15,5 @@ perf.data.old
 
 # Worktrees
 .worktrees/
+
+docs/plans/
