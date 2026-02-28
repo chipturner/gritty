@@ -925,11 +925,11 @@ async fn list_sessions(ctl_path: PathBuf) -> anyhow::Result<()> {
 }
 
 fn open_url(url: &str) {
-    let sock_path = match std::env::var("GRITTY_OPEN_SOCK") {
+    let sock_path = match std::env::var("GRITTY_SOCK") {
         Ok(p) => p,
         Err(_) => {
             eprintln!(
-                "error: GRITTY_OPEN_SOCK not set (are you inside a gritty session with --forward-open?)"
+                "error: GRITTY_SOCK not set (are you inside a gritty session with --forward-open?)"
             );
             std::process::exit(1);
         }
@@ -937,11 +937,12 @@ fn open_url(url: &str) {
     match std::os::unix::net::UnixStream::connect(&sock_path) {
         Ok(mut stream) => {
             use std::io::Write;
+            let _ = stream.write_all(&[gritty::protocol::SvcRequest::OpenUrl.to_byte()]);
             let _ = stream.write_all(url.as_bytes());
             let _ = stream.write_all(b"\n");
         }
         Err(e) => {
-            eprintln!("error: could not connect to open socket ({sock_path}): {e}");
+            eprintln!("error: could not connect to service socket ({sock_path}): {e}");
             std::process::exit(1);
         }
     }
@@ -1174,7 +1175,7 @@ fn sanitize_basename(name: &str) -> anyhow::Result<String> {
     Ok(basename.to_string())
 }
 
-/// Connect to the send socket for a session. Either via GRITTY_SEND_SOCK
+/// Connect to the service socket for a session. Either via GRITTY_SOCK
 /// (in-session) or via the control socket (local-side).
 async fn connect_send_socket(
     ctl_socket: Option<PathBuf>,
@@ -1182,14 +1183,14 @@ async fn connect_send_socket(
     target: Option<String>,
     role: u8,
 ) -> anyhow::Result<tokio::net::UnixStream> {
-    // In-session: GRITTY_SEND_SOCK is set
-    if let Ok(sock_path) = std::env::var("GRITTY_SEND_SOCK") {
+    // In-session: GRITTY_SOCK is set
+    if let Ok(sock_path) = std::env::var("GRITTY_SOCK") {
         if host.is_some() {
             anyhow::bail!("cannot specify host when inside a session");
         }
-        let mut stream = tokio::net::UnixStream::connect(&sock_path)
-            .await
-            .map_err(|e| anyhow::anyhow!("could not connect to send socket ({sock_path}): {e}"))?;
+        let mut stream = tokio::net::UnixStream::connect(&sock_path).await.map_err(|e| {
+            anyhow::anyhow!("could not connect to service socket ({sock_path}): {e}")
+        })?;
         use tokio::io::AsyncWriteExt;
         stream.write_all(&[role]).await?;
         return Ok(stream);
@@ -1250,7 +1251,7 @@ async fn connect_send_socket(
 
     // Extract raw stream from framed connection
     let mut stream = framed.into_inner();
-    // Write role byte on the raw stream (server reads it via handle_send_stream)
+    // Write SvcRequest discriminator on the raw stream (server reads it via handle_send_stream)
     use tokio::io::AsyncWriteExt;
     stream.write_all(&[role]).await?;
     Ok(stream)
@@ -1276,7 +1277,9 @@ async fn send_command(
         entries.push((basename, meta.len(), path.clone()));
     }
 
-    let mut stream = connect_send_socket(ctl_socket, host, target, b'S').await?;
+    let mut stream =
+        connect_send_socket(ctl_socket, host, target, gritty::protocol::SvcRequest::Send.to_byte())
+            .await?;
 
     // Write manifest: file_count, then per-file: name_len, name, file_size
     let file_count = entries.len() as u32;
@@ -1336,7 +1339,13 @@ async fn receive_command(
         anyhow::bail!("{}: not a directory", dest_dir.display());
     }
 
-    let mut stream = connect_send_socket(ctl_socket, host, target, b'R').await?;
+    let mut stream = connect_send_socket(
+        ctl_socket,
+        host,
+        target,
+        gritty::protocol::SvcRequest::Receive.to_byte(),
+    )
+    .await?;
 
     // Write dest dir + newline
     let dest_str = dest_dir.to_string_lossy();

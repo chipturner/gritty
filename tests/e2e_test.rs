@@ -27,16 +27,10 @@ fn unique_agent_socket_path() -> PathBuf {
     TEST_DIR.path().join(format!("agent-{pid}-{id}.sock"))
 }
 
-fn unique_open_socket_path() -> PathBuf {
+fn unique_svc_socket_path() -> PathBuf {
     let id = TEST_ID.fetch_add(1, Ordering::Relaxed);
     let pid = std::process::id();
-    TEST_DIR.path().join(format!("open-{pid}-{id}.sock"))
-}
-
-fn unique_send_socket_path() -> PathBuf {
-    let id = TEST_ID.fetch_add(1, Ordering::Relaxed);
-    let pid = std::process::id();
-    TEST_DIR.path().join(format!("send-{pid}-{id}.sock"))
+    TEST_DIR.path().join(format!("svc-{pid}-{id}.sock"))
 }
 
 /// Spawn a server task connected via socketpair + channel.
@@ -51,10 +45,9 @@ async fn setup_session() -> (
     let meta = Arc::new(OnceLock::new());
     let meta_clone = Arc::clone(&meta);
     let agent_path = unique_agent_socket_path();
-    let open_path = unique_open_socket_path();
-    let send_path = unique_send_socket_path();
+    let svc_path = unique_svc_socket_path();
     let handle = tokio::spawn(async move {
-        gritty::server::run(client_rx, meta_clone, agent_path, open_path, send_path).await
+        gritty::server::run(client_rx, meta_clone, agent_path, svc_path).await
     });
 
     let (server_stream, client_stream) = UnixStream::pair().unwrap();
@@ -67,8 +60,8 @@ async fn setup_session() -> (
     (client_tx, framed, handle, meta)
 }
 
-/// Like setup_session but also returns the send socket path.
-async fn setup_session_with_send_path() -> (
+/// Like setup_session but also returns the service socket path.
+async fn setup_session_with_svc_path() -> (
     mpsc::UnboundedSender<ClientConn>,
     Framed<UnixStream, FrameCodec>,
     JoinHandle<anyhow::Result<()>>,
@@ -79,11 +72,10 @@ async fn setup_session_with_send_path() -> (
     let meta = Arc::new(OnceLock::new());
     let meta_clone = Arc::clone(&meta);
     let agent_path = unique_agent_socket_path();
-    let open_path = unique_open_socket_path();
-    let send_path = unique_send_socket_path();
-    let send_path_clone = send_path.clone();
+    let svc_path = unique_svc_socket_path();
+    let svc_path_clone = svc_path.clone();
     let handle = tokio::spawn(async move {
-        gritty::server::run(client_rx, meta_clone, agent_path, open_path, send_path).await
+        gritty::server::run(client_rx, meta_clone, agent_path, svc_path).await
     });
 
     let (server_stream, client_stream) = UnixStream::pair().unwrap();
@@ -92,7 +84,7 @@ async fn setup_session_with_send_path() -> (
     let mut framed = Framed::new(client_stream, FrameCodec);
     framed.send(Frame::Env { vars: vec![] }).await.unwrap();
 
-    (client_tx, framed, handle, meta, send_path_clone)
+    (client_tx, framed, handle, meta, svc_path_clone)
 }
 
 /// Spawn a server task, send an Env frame before the first Resize.
@@ -109,10 +101,9 @@ async fn setup_session_with_env(
     let meta = Arc::new(OnceLock::new());
     let meta_clone = Arc::clone(&meta);
     let agent_path = unique_agent_socket_path();
-    let open_path = unique_open_socket_path();
-    let send_path = unique_send_socket_path();
+    let svc_path = unique_svc_socket_path();
     let handle = tokio::spawn(async move {
-        gritty::server::run(client_rx, meta_clone, agent_path, open_path, send_path).await
+        gritty::server::run(client_rx, meta_clone, agent_path, svc_path).await
     });
 
     let (server_stream, client_stream) = UnixStream::pair().unwrap();
@@ -775,10 +766,9 @@ async fn setup_session_with_agent_path() -> (
     let meta_clone = Arc::clone(&meta);
     let agent_path = unique_agent_socket_path();
     let agent_path_clone = agent_path.clone();
-    let open_path = unique_open_socket_path();
-    let send_path = unique_send_socket_path();
+    let svc_path = unique_svc_socket_path();
     let handle = tokio::spawn(async move {
-        gritty::server::run(client_rx, meta_clone, agent_path_clone, open_path, send_path).await
+        gritty::server::run(client_rx, meta_clone, agent_path_clone, svc_path).await
     });
 
     let (server_stream, client_stream) = UnixStream::pair().unwrap();
@@ -915,38 +905,10 @@ async fn agent_not_forwarded_without_flag() {
     let _ = timeout(Duration::from_secs(3), server).await;
 }
 
-/// Like setup_session but returns the open socket path for open forwarding tests.
-async fn setup_session_with_open_path() -> (
-    mpsc::UnboundedSender<ClientConn>,
-    Framed<UnixStream, FrameCodec>,
-    JoinHandle<anyhow::Result<()>>,
-    Arc<OnceLock<gritty::server::SessionMetadata>>,
-    PathBuf,
-) {
-    let (client_tx, client_rx) = mpsc::unbounded_channel();
-    let meta = Arc::new(OnceLock::new());
-    let meta_clone = Arc::clone(&meta);
-    let agent_path = unique_agent_socket_path();
-    let open_path = unique_open_socket_path();
-    let open_path_clone = open_path.clone();
-    let send_path = unique_send_socket_path();
-    let handle = tokio::spawn(async move {
-        gritty::server::run(client_rx, meta_clone, agent_path, open_path_clone, send_path).await
-    });
-
-    let (server_stream, client_stream) = UnixStream::pair().unwrap();
-    client_tx.send(ClientConn::Active(Framed::new(server_stream, FrameCodec))).unwrap();
-
-    let mut framed = Framed::new(client_stream, FrameCodec);
-    framed.send(Frame::Env { vars: vec![] }).await.unwrap();
-
-    (client_tx, framed, handle, meta, open_path)
-}
-
 #[tokio::test]
 async fn open_forwarding_url_roundtrip() {
     let _permit = CONCURRENCY.acquire().await.unwrap();
-    let (_tx, mut framed, server, _meta, open_path) = setup_session_with_open_path().await;
+    let (_tx, mut framed, server, _meta, svc_path) = setup_session_with_svc_path().await;
     wait_for_shell(&mut framed).await;
     read_available_data(&mut framed, Duration::from_secs(1)).await;
 
@@ -954,8 +916,9 @@ async fn open_forwarding_url_roundtrip() {
     framed.send(Frame::OpenForward).await.unwrap();
     tokio::time::sleep(Duration::from_millis(100)).await;
 
-    // Connect to open socket (simulating `gritty open` inside the session)
-    let mut open_conn = UnixStream::connect(&open_path).await.unwrap();
+    // Connect to svc socket (simulating `gritty open` inside the session)
+    let mut open_conn = UnixStream::connect(&svc_path).await.unwrap();
+    open_conn.write_all(&[gritty::protocol::SvcRequest::OpenUrl.to_byte()]).await.unwrap();
     open_conn.write_all(b"https://example.com\n").await.unwrap();
     drop(open_conn);
     tokio::time::sleep(Duration::from_millis(200)).await;
@@ -979,17 +942,33 @@ async fn open_forwarding_url_roundtrip() {
 #[tokio::test]
 async fn open_forwarding_not_enabled() {
     let _permit = CONCURRENCY.acquire().await.unwrap();
-    let (_tx, mut framed, server, _meta, open_path) = setup_session_with_open_path().await;
+    let (_tx, mut framed, server, _meta, svc_path) = setup_session_with_svc_path().await;
     wait_for_shell(&mut framed).await;
     read_available_data(&mut framed, Duration::from_secs(1)).await;
 
-    // Do NOT send OpenForward — open socket file should not exist.
-    assert!(!open_path.exists(), "open socket should not exist without OpenForward");
+    // Wait for svc socket to be bound
+    for _ in 0..50 {
+        if svc_path.exists() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
 
-    assert!(
-        UnixStream::connect(&open_path).await.is_err(),
-        "connect to open socket should fail without OpenForward"
-    );
+    // Svc socket IS always bound, but without OpenForward, URLs are silently ignored.
+    let mut open_conn = UnixStream::connect(&svc_path).await.unwrap();
+    open_conn.write_all(&[gritty::protocol::SvcRequest::OpenUrl.to_byte()]).await.unwrap();
+    open_conn.write_all(b"https://example.com\n").await.unwrap();
+    drop(open_conn);
+    tokio::time::sleep(Duration::from_millis(200)).await;
+
+    // Should NOT receive OpenUrl (forwarding disabled)
+    match timeout(Duration::from_millis(500), framed.next()).await {
+        Ok(Some(Ok(Frame::OpenUrl { .. }))) => {
+            panic!("should not receive OpenUrl without OpenForward")
+        }
+        Ok(Some(Ok(Frame::Data(_)))) => {}
+        _ => {}
+    }
 
     let _ = framed.send(Frame::Data(Bytes::from("exit\n"))).await;
     let _ = timeout(Duration::from_secs(3), server).await;
@@ -1179,7 +1158,7 @@ async fn tail_receives_exit_on_shell_exit() {
 #[tokio::test]
 async fn tunnel_forwarding_roundtrip() {
     let _permit = CONCURRENCY.acquire().await.unwrap();
-    let (_tx, mut framed, server, _meta, open_path) = setup_session_with_open_path().await;
+    let (_tx, mut framed, server, _meta, svc_path) = setup_session_with_svc_path().await;
     wait_for_shell(&mut framed).await;
     read_available_data(&mut framed, Duration::from_secs(1)).await;
 
@@ -1197,7 +1176,8 @@ async fn tunnel_forwarding_roundtrip() {
     let url = format!(
         "https://accounts.example.com/auth?redirect_uri=http://localhost:{port}/callback&client_id=test"
     );
-    let mut open_conn = UnixStream::connect(&open_path).await.unwrap();
+    let mut open_conn = UnixStream::connect(&svc_path).await.unwrap();
+    open_conn.write_all(&[gritty::protocol::SvcRequest::OpenUrl.to_byte()]).await.unwrap();
     open_conn.write_all(format!("{url}\n").as_bytes()).await.unwrap();
     drop(open_conn);
 
@@ -1268,7 +1248,7 @@ async fn tunnel_forwarding_roundtrip() {
 #[tokio::test]
 async fn tunnel_not_created_without_redirect_uri() {
     let _permit = CONCURRENCY.acquire().await.unwrap();
-    let (_tx, mut framed, server, _meta, open_path) = setup_session_with_open_path().await;
+    let (_tx, mut framed, server, _meta, svc_path) = setup_session_with_svc_path().await;
     wait_for_shell(&mut framed).await;
     read_available_data(&mut framed, Duration::from_secs(1)).await;
 
@@ -1277,7 +1257,8 @@ async fn tunnel_not_created_without_redirect_uri() {
     tokio::time::sleep(Duration::from_millis(100)).await;
 
     // Send URL without redirect_uri
-    let mut open_conn = UnixStream::connect(&open_path).await.unwrap();
+    let mut open_conn = UnixStream::connect(&svc_path).await.unwrap();
+    open_conn.write_all(&[gritty::protocol::SvcRequest::OpenUrl.to_byte()]).await.unwrap();
     open_conn.write_all(b"https://example.com/page\n").await.unwrap();
     drop(open_conn);
 
@@ -1303,7 +1284,7 @@ async fn tunnel_not_created_without_redirect_uri() {
 #[tokio::test]
 async fn tunnel_not_created_when_port_not_listening() {
     let _permit = CONCURRENCY.acquire().await.unwrap();
-    let (_tx, mut framed, server, _meta, open_path) = setup_session_with_open_path().await;
+    let (_tx, mut framed, server, _meta, svc_path) = setup_session_with_svc_path().await;
     wait_for_shell(&mut framed).await;
     read_available_data(&mut framed, Duration::from_secs(1)).await;
 
@@ -1320,7 +1301,8 @@ async fn tunnel_not_created_when_port_not_listening() {
     let url = format!(
         "https://auth.example.com/authorize?redirect_uri=http://localhost:{unused_port}/callback"
     );
-    let mut open_conn = UnixStream::connect(&open_path).await.unwrap();
+    let mut open_conn = UnixStream::connect(&svc_path).await.unwrap();
+    open_conn.write_all(&[gritty::protocol::SvcRequest::OpenUrl.to_byte()]).await.unwrap();
     open_conn.write_all(format!("{url}\n").as_bytes()).await.unwrap();
     drop(open_conn);
 
@@ -1348,11 +1330,11 @@ async fn tunnel_not_created_when_port_not_listening() {
 // =============================================================================
 
 /// Helper: connect as sender, write manifest, wait for go signal, stream files.
-async fn send_files(send_path: &std::path::Path, files: &[(&str, &[u8])]) {
-    let mut stream = UnixStream::connect(send_path).await.unwrap();
+async fn send_files(svc_path: &std::path::Path, files: &[(&str, &[u8])]) {
+    let mut stream = UnixStream::connect(svc_path).await.unwrap();
 
-    // Role byte
-    stream.write_all(&[b'S']).await.unwrap();
+    // SvcRequest discriminator
+    stream.write_all(&[gritty::protocol::SvcRequest::Send.to_byte()]).await.unwrap();
 
     // Manifest
     let file_count = files.len() as u32;
@@ -1376,11 +1358,11 @@ async fn send_files(send_path: &std::path::Path, files: &[(&str, &[u8])]) {
 }
 
 /// Helper: connect as receiver, read files, return Vec<(name, data)>.
-async fn receive_files(send_path: &std::path::Path) -> Vec<(String, Vec<u8>)> {
-    let mut stream = UnixStream::connect(send_path).await.unwrap();
+async fn receive_files(svc_path: &std::path::Path) -> Vec<(String, Vec<u8>)> {
+    let mut stream = UnixStream::connect(svc_path).await.unwrap();
 
-    // Role byte
-    stream.write_all(&[b'R']).await.unwrap();
+    // SvcRequest discriminator
+    stream.write_all(&[gritty::protocol::SvcRequest::Receive.to_byte()]).await.unwrap();
 
     // Dest dir (empty = cwd)
     stream.write_all(b"\n").await.unwrap();
@@ -1417,28 +1399,28 @@ async fn receive_files(send_path: &std::path::Path) -> Vec<(String, Vec<u8>)> {
 #[tokio::test]
 async fn send_receive_single_file() {
     let _permit = CONCURRENCY.acquire().await.unwrap();
-    let (_client_tx, mut framed, server, _meta, send_path) = setup_session_with_send_path().await;
+    let (_client_tx, mut framed, server, _meta, svc_path) = setup_session_with_svc_path().await;
     wait_for_shell(&mut framed).await;
 
     // Wait for send socket to be bound
     for _ in 0..50 {
-        if send_path.exists() {
+        if svc_path.exists() {
             break;
         }
         tokio::time::sleep(Duration::from_millis(100)).await;
     }
-    assert!(send_path.exists(), "send socket not bound");
+    assert!(svc_path.exists(), "send socket not bound");
 
     let file_data = b"hello world\n";
 
     // Spawn sender and receiver concurrently (sender first)
-    let sp = send_path.clone();
+    let sp = svc_path.clone();
     let sender = tokio::spawn(async move {
         send_files(&sp, &[("test.txt", file_data)]).await;
     });
     // Small delay so sender arrives first
     tokio::time::sleep(Duration::from_millis(50)).await;
-    let sp = send_path.clone();
+    let sp = svc_path.clone();
     let receiver = tokio::spawn(async move { receive_files(&sp).await });
 
     let (send_result, recv_result) = tokio::join!(sender, receiver);
@@ -1478,11 +1460,11 @@ async fn send_receive_single_file() {
 #[tokio::test]
 async fn send_receive_multiple_files() {
     let _permit = CONCURRENCY.acquire().await.unwrap();
-    let (_client_tx, mut framed, server, _meta, send_path) = setup_session_with_send_path().await;
+    let (_client_tx, mut framed, server, _meta, svc_path) = setup_session_with_svc_path().await;
     wait_for_shell(&mut framed).await;
 
     for _ in 0..50 {
-        if send_path.exists() {
+        if svc_path.exists() {
             break;
         }
         tokio::time::sleep(Duration::from_millis(100)).await;
@@ -1494,13 +1476,13 @@ async fn send_receive_multiple_files() {
         ("c.txt", b"gamma delta epsilon"),
     ];
 
-    let sp = send_path.clone();
+    let sp = svc_path.clone();
     let f = files_to_send.clone();
     let sender = tokio::spawn(async move {
         send_files(&sp, &f).await;
     });
     tokio::time::sleep(Duration::from_millis(50)).await;
-    let sp = send_path.clone();
+    let sp = svc_path.clone();
     let receiver = tokio::spawn(async move { receive_files(&sp).await });
 
     let (s, r) = tokio::join!(sender, receiver);
@@ -1522,11 +1504,11 @@ async fn send_receive_multiple_files() {
 #[tokio::test]
 async fn send_receive_receiver_first() {
     let _permit = CONCURRENCY.acquire().await.unwrap();
-    let (_client_tx, mut framed, server, _meta, send_path) = setup_session_with_send_path().await;
+    let (_client_tx, mut framed, server, _meta, svc_path) = setup_session_with_svc_path().await;
     wait_for_shell(&mut framed).await;
 
     for _ in 0..50 {
-        if send_path.exists() {
+        if svc_path.exists() {
             break;
         }
         tokio::time::sleep(Duration::from_millis(100)).await;
@@ -1535,10 +1517,10 @@ async fn send_receive_receiver_first() {
     let file_data = b"receiver-first test data";
 
     // Spawn receiver first this time
-    let sp = send_path.clone();
+    let sp = svc_path.clone();
     let receiver = tokio::spawn(async move { receive_files(&sp).await });
     tokio::time::sleep(Duration::from_millis(50)).await;
-    let sp = send_path.clone();
+    let sp = svc_path.clone();
     let sender = tokio::spawn(async move {
         send_files(&sp, &[("recv_first.dat", file_data)]).await;
     });
@@ -1558,21 +1540,21 @@ async fn send_receive_receiver_first() {
 #[tokio::test]
 async fn send_cancel_on_sender_disconnect() {
     let _permit = CONCURRENCY.acquire().await.unwrap();
-    let (_client_tx, mut framed, server, _meta, send_path) = setup_session_with_send_path().await;
+    let (_client_tx, mut framed, server, _meta, svc_path) = setup_session_with_svc_path().await;
     wait_for_shell(&mut framed).await;
 
     for _ in 0..50 {
-        if send_path.exists() {
+        if svc_path.exists() {
             break;
         }
         tokio::time::sleep(Duration::from_millis(100)).await;
     }
 
     // Connect sender with a 1MB file but disconnect before sending data
-    let sp = send_path.clone();
+    let sp = svc_path.clone();
     let sender = tokio::spawn(async move {
         let mut stream = UnixStream::connect(&sp).await.unwrap();
-        stream.write_all(&[b'S']).await.unwrap();
+        stream.write_all(&[gritty::protocol::SvcRequest::Send.to_byte()]).await.unwrap();
         // 1 file, 1MB
         stream.write_all(&1u32.to_be_bytes()).await.unwrap();
         let name = b"big.bin";
@@ -1588,10 +1570,10 @@ async fn send_cancel_on_sender_disconnect() {
     });
 
     tokio::time::sleep(Duration::from_millis(50)).await;
-    let sp = send_path.clone();
+    let sp = svc_path.clone();
     let receiver = tokio::spawn(async move {
         let mut stream = UnixStream::connect(&sp).await.unwrap();
-        stream.write_all(&[b'R']).await.unwrap();
+        stream.write_all(&[gritty::protocol::SvcRequest::Receive.to_byte()]).await.unwrap();
         stream.write_all(b"\n").await.unwrap();
         // Try to read -- should fail when sender disconnects
         let mut buf4 = [0u8; 4];
@@ -1623,11 +1605,11 @@ async fn send_cancel_on_sender_disconnect() {
 #[tokio::test]
 async fn send_filename_sanitized() {
     let _permit = CONCURRENCY.acquire().await.unwrap();
-    let (_client_tx, mut framed, server, _meta, send_path) = setup_session_with_send_path().await;
+    let (_client_tx, mut framed, server, _meta, svc_path) = setup_session_with_svc_path().await;
     wait_for_shell(&mut framed).await;
 
     for _ in 0..50 {
-        if send_path.exists() {
+        if svc_path.exists() {
             break;
         }
         tokio::time::sleep(Duration::from_millis(100)).await;
@@ -1636,10 +1618,10 @@ async fn send_filename_sanitized() {
     // Send a file with a path separator in the name -- server should sanitize to basename
     let file_data = b"sanitized";
 
-    let sp = send_path.clone();
+    let sp = svc_path.clone();
     let sender = tokio::spawn(async move {
         let mut stream = UnixStream::connect(&sp).await.unwrap();
-        stream.write_all(&[b'S']).await.unwrap();
+        stream.write_all(&[gritty::protocol::SvcRequest::Send.to_byte()]).await.unwrap();
         stream.write_all(&1u32.to_be_bytes()).await.unwrap();
         let name = b"../../etc/passwd";
         stream.write_all(&(name.len() as u16).to_be_bytes()).await.unwrap();
@@ -1650,7 +1632,7 @@ async fn send_filename_sanitized() {
         stream.write_all(file_data).await.unwrap();
     });
     tokio::time::sleep(Duration::from_millis(50)).await;
-    let sp = send_path.clone();
+    let sp = svc_path.clone();
     let receiver = tokio::spawn(async move { receive_files(&sp).await });
 
     let (s, r) = tokio::join!(sender, receiver);

@@ -111,7 +111,7 @@ ID  Name    PTY         PID    Created              Status
 | `gritty config-edit` | | Open config in `$VISUAL`/`$EDITOR` (creates from template if missing) |
 | `gritty completions <shell>` | | Generate shell completions (bash, zsh, fish, elvish, powershell) |
 
-`<host>` is a connection name from `gritty connect`, or `local` for the local server. Session is specified after a colon: `host:session`. `--ctl-socket` overrides host resolution. For `send`/`receive`, the target is optional when running inside a session (uses `GRITTY_SEND_SOCK`).
+`<host>` is a connection name from `gritty connect`, or `local` for the local server. Session is specified after a colon: `host:session`. `--ctl-socket` overrides host resolution. For `send`/`receive`, the target is optional when running inside a session (uses `GRITTY_SOCK`).
 
 **Notable options:**
 - `-A` / `--forward-agent` on `new`/`attach`: forward your local SSH agent
@@ -286,10 +286,10 @@ flowchart LR
     subgraph remote["Remote Host"]
         direction LR
         agent_sock["agent-N.sock<br/>(SSH_AUTH_SOCK)"]
-        open_sock["open-N.sock<br/>(GRITTY_OPEN_SOCK)"]
+        svc_sock["svc-N.sock<br/>(GRITTY_SOCK)"]
         S["gritty session"]
         agent_sock <-->|"-A"| S
-        open_sock -->|"-O"| S
+        svc_sock -->|"-O / send / receive"| S
     end
 
     S <-->|"relayed over<br/>session connection"| C
@@ -307,7 +307,7 @@ Forwarding multiplexes over the existing session connection -- no extra tunnels.
 
 **SSH agent** (`-A`): the session creates `agent-N.sock` and sets `SSH_AUTH_SOCK`. When a remote process (e.g. `git push`) connects, the request is relayed to the client's local SSH agent and back.
 
-**URL open** (`-O`): the session creates `open-N.sock` and sets `GRITTY_OPEN_SOCK` + `BROWSER=gritty open`. When `gritty open <url>` runs, the URL is relayed to the client which opens it locally. **OAuth callback tunneling:** if the URL contains a `redirect_uri` pointing to `localhost` or `127.0.0.1`, gritty automatically creates a single-use reverse TCP tunnel so the OAuth callback reaches the remote program. This handles the common case where a CLI tool opens a browser for OAuth login and waits for the redirect on a local port. Disable with `--no-oauth-redirect`; adjust the accept timeout with `--oauth-timeout <seconds>` (default: 180). Note that `-O` is a trust grant -- it gives processes inside the remote session the ability to open URLs on your local machine. Only use it with sessions you control.
+**URL open** (`-O`): the session uses `svc-N.sock` and sets `GRITTY_SOCK` + `BROWSER=gritty open`. When `gritty open <url>` runs, the URL is relayed to the client which opens it locally. **OAuth callback tunneling:** if the URL contains a `redirect_uri` pointing to `localhost` or `127.0.0.1`, gritty automatically creates a single-use reverse TCP tunnel so the OAuth callback reaches the remote program. This handles the common case where a CLI tool opens a browser for OAuth login and waits for the redirect on a local port. Disable with `--no-oauth-redirect`; adjust the accept timeout with `--oauth-timeout <seconds>` (default: 180). Note that `-O` is a trust grant -- it gives processes inside the remote session the ability to open URLs on your local machine. Only use it with sessions you control.
 
 ## Prior Art
 

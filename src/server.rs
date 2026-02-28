@@ -188,71 +188,8 @@ fn spawn_agent_acceptor(
     })
 }
 
-/// Maximum URL length accepted on the open socket.
+/// Maximum URL length accepted on the service socket.
 const URL_MAX_LEN: usize = 4096;
-
-/// Spawn the open acceptor task that accepts connections on the open socket,
-/// reads a URL (newline-terminated or EOF), and sends it as an event.
-fn spawn_open_acceptor(
-    listener: UnixListener,
-    event_tx: mpsc::UnboundedSender<OpenEvent>,
-) -> tokio::task::JoinHandle<()> {
-    tokio::spawn(async move {
-        loop {
-            let (mut stream, _) = match listener.accept().await {
-                Ok(conn) => conn,
-                Err(e) => {
-                    debug!("open listener accept error: {e}");
-                    break;
-                }
-            };
-
-            // Open socket uses fire-and-forget connections (connect, write URL,
-            // close). On macOS, getpeereid() can fail if the peer has already
-            // disconnected by the time accept() returns. Reject known-bad UIDs
-            // but tolerate OS-level errors (filesystem perms still protect).
-            match crate::security::verify_peer_uid(&stream) {
-                Ok(()) => {}
-                Err(e) if e.kind() == std::io::ErrorKind::PermissionDenied => {
-                    warn!("open socket: {e}");
-                    continue;
-                }
-                Err(e) => {
-                    // Intentional fallthrough: do NOT reject here. Unlike
-                    // PermissionDenied (wrong UID), this means the OS couldn't
-                    // retrieve credentials at all -- normal on macOS when the
-                    // peer has already disconnected. Socket is 0600 so only
-                    // the owning user can connect in the first place.
-                    debug!("open socket peer_cred unavailable: {e}");
-                }
-            }
-
-            let etx = event_tx.clone();
-            tokio::spawn(async move {
-                let mut buf = vec![0u8; URL_MAX_LEN];
-                let mut total = 0;
-                loop {
-                    match stream.read(&mut buf[total..]).await {
-                        Ok(0) => break,
-                        Ok(n) => {
-                            total += n;
-                            // Stop at newline or buffer full
-                            if buf[..total].contains(&b'\n') || total >= buf.len() {
-                                break;
-                            }
-                        }
-                        Err(_) => return,
-                    }
-                }
-                let s = String::from_utf8_lossy(&buf[..total]);
-                let url = s.trim();
-                if !url.is_empty() {
-                    let _ = etx.send(OpenEvent::Url(url.to_string()));
-                }
-            });
-        }
-    })
-}
 
 /// Parse sender manifest from the send socket stream.
 /// Expected format after 'S' byte: file_count(u32 BE), then for each file:
@@ -313,53 +250,85 @@ async fn parse_receiver_dest(stream: &mut UnixStream) -> io::Result<String> {
     String::from_utf8(buf).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))
 }
 
-/// Spawn the send socket acceptor that accepts connections, reads role byte,
-/// then parses manifest (sender) or dest dir (receiver) and sends event.
-fn spawn_send_acceptor(
+/// Spawn the unified service socket acceptor. Reads a SvcRequest discriminator
+/// byte then dispatches to the appropriate handler (open URL, send, or receive).
+fn spawn_svc_acceptor(
     listener: UnixListener,
-    event_tx: mpsc::UnboundedSender<SendEvent>,
+    open_event_tx: mpsc::UnboundedSender<OpenEvent>,
+    send_event_tx: mpsc::UnboundedSender<SendEvent>,
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
         loop {
             let (mut stream, _) = match listener.accept().await {
                 Ok(conn) => conn,
                 Err(e) => {
-                    debug!("send listener accept error: {e}");
+                    debug!("svc listener accept error: {e}");
                     break;
                 }
             };
 
-            if let Err(e) = crate::security::verify_peer_uid(&stream) {
-                warn!("send socket: {e}");
-                continue;
+            // Lenient peer UID check: reject known-bad UIDs but tolerate
+            // OS-level errors (fire-and-forget open connections on macOS may
+            // disconnect before getpeereid returns).
+            match crate::security::verify_peer_uid(&stream) {
+                Ok(()) => {}
+                Err(e) if e.kind() == std::io::ErrorKind::PermissionDenied => {
+                    warn!("svc socket: {e}");
+                    continue;
+                }
+                Err(e) => {
+                    debug!("svc socket peer_cred unavailable: {e}");
+                }
             }
 
-            let etx = event_tx.clone();
+            let otx = open_event_tx.clone();
+            let stx = send_event_tx.clone();
             tokio::spawn(async move {
-                // Read role byte
-                let mut role = [0u8; 1];
-                if stream.read_exact(&mut role).await.is_err() {
+                // Read discriminator byte
+                let mut disc = [0u8; 1];
+                if stream.read_exact(&mut disc).await.is_err() {
                     return;
                 }
-                match role[0] {
-                    b'S' => match parse_sender_manifest(&mut stream).await {
-                        Ok(manifest) => {
-                            let _ = etx.send(SendEvent::SenderArrived { stream, manifest });
+                match crate::protocol::SvcRequest::from_byte(disc[0]) {
+                    Some(crate::protocol::SvcRequest::OpenUrl) => {
+                        let mut buf = vec![0u8; URL_MAX_LEN];
+                        let mut total = 0;
+                        loop {
+                            match stream.read(&mut buf[total..]).await {
+                                Ok(0) => break,
+                                Ok(n) => {
+                                    total += n;
+                                    if buf[..total].contains(&b'\n') || total >= buf.len() {
+                                        break;
+                                    }
+                                }
+                                Err(_) => return,
+                            }
                         }
-                        Err(e) => {
-                            debug!("send socket: bad sender manifest: {e}");
+                        let s = String::from_utf8_lossy(&buf[..total]);
+                        let url = s.trim();
+                        if !url.is_empty() {
+                            let _ = otx.send(OpenEvent::Url(url.to_string()));
                         }
-                    },
-                    b'R' => match parse_receiver_dest(&mut stream).await {
-                        Ok(_) => {
-                            let _ = etx.send(SendEvent::ReceiverArrived { stream });
+                    }
+                    Some(crate::protocol::SvcRequest::Send) => {
+                        match parse_sender_manifest(&mut stream).await {
+                            Ok(manifest) => {
+                                let _ = stx.send(SendEvent::SenderArrived { stream, manifest });
+                            }
+                            Err(e) => debug!("svc socket: bad sender manifest: {e}"),
                         }
-                        Err(e) => {
-                            debug!("send socket: bad receiver dest: {e}");
+                    }
+                    Some(crate::protocol::SvcRequest::Receive) => {
+                        match parse_receiver_dest(&mut stream).await {
+                            Ok(_) => {
+                                let _ = stx.send(SendEvent::ReceiverArrived { stream });
+                            }
+                            Err(e) => debug!("svc socket: bad receiver dest: {e}"),
                         }
-                    },
-                    other => {
-                        debug!("send socket: unknown role byte: 0x{other:02x}");
+                    }
+                    None => {
+                        debug!("svc socket: unknown request byte: 0x{:02x}", disc[0]);
                     }
                 }
             });
@@ -491,8 +460,7 @@ pub async fn run(
     mut client_rx: mpsc::UnboundedReceiver<ClientConn>,
     metadata_slot: Arc<OnceLock<SessionMetadata>>,
     agent_socket_path: PathBuf,
-    open_socket_path: PathBuf,
-    send_socket_path: PathBuf,
+    svc_socket_path: PathBuf,
 ) -> anyhow::Result<()> {
     // Allocate PTY (once, before accept loop)
     let pty = openpty(None, None)?;
@@ -530,15 +498,17 @@ pub async fn run(
     // Broadcast channel for tail clients
     let (tail_tx, _) = broadcast::channel::<TailEvent>(256);
 
-    // Send/receive file transfer state
+    // Open and send event channels (created at session start, persist across clients)
+    let (open_event_tx, mut open_event_rx) = mpsc::unbounded_channel::<OpenEvent>();
     let (send_event_tx, mut send_event_rx) = mpsc::unbounded_channel::<SendEvent>();
     let (send_notify_tx, mut send_notify_rx) = mpsc::unbounded_channel::<Frame>();
     let mut transfer_state = TransferState::Idle;
-    let mut send_acceptor: Option<tokio::task::JoinHandle<()>> = None;
+    let mut svc_acceptor: Option<tokio::task::JoinHandle<()>> = None;
 
-    // Bind send socket immediately (always available, no client flag needed)
-    if let Some(listener) = bind_agent_listener(&send_socket_path) {
-        send_acceptor = Some(spawn_send_acceptor(listener, send_event_tx.clone()));
+    // Bind unified service socket immediately (always available)
+    if let Some(listener) = bind_agent_listener(&svc_socket_path) {
+        svc_acceptor =
+            Some(spawn_svc_acceptor(listener, open_event_tx.clone(), send_event_tx.clone()));
     }
 
     // Wait for first active client before spawning shell (so we can read Env frame).
@@ -563,6 +533,7 @@ pub async fn run(
                 None => {
                     info!("client channel closed before first client");
                     cleanup_socket(&agent_socket_path);
+                    cleanup_socket(&svc_socket_path);
                     return Ok(());
                 }
             },
@@ -603,10 +574,8 @@ pub async fn run(
     }
     // Set SSH_AUTH_SOCK to the agent socket path
     cmd.env("SSH_AUTH_SOCK", &agent_socket_path);
-    // Set GRITTY_OPEN_SOCK so `gritty open` can find the open socket
-    cmd.env("GRITTY_OPEN_SOCK", &open_socket_path);
-    // Set GRITTY_SEND_SOCK so `gritty send`/`gritty receive` can find the send socket
-    cmd.env("GRITTY_SEND_SOCK", &send_socket_path);
+    // Set GRITTY_SOCK so `gritty open`/`gritty send`/`gritty receive` find the service socket
+    cmd.env("GRITTY_SOCK", &svc_socket_path);
     let mut managed = ManagedChild::new(unsafe {
         cmd.pre_exec(move || {
             nix::unistd::setsid().map_err(io::Error::other)?;
@@ -642,10 +611,8 @@ pub async fn run(
     let mut agent_acceptor: Option<tokio::task::JoinHandle<()>> = None;
     let next_agent_channel_id = Arc::new(AtomicU32::new(0));
 
-    // Open forwarding state
+    // Open forwarding state (no acceptor -- svc_acceptor handles the socket)
     let mut open_forward_enabled = false;
-    let mut open_acceptor: Option<tokio::task::JoinHandle<()>> = None;
-    let (open_event_tx, mut open_event_rx) = mpsc::unbounded_channel::<OpenEvent>();
 
     // Tunnel state (reverse TCP tunnel for OAuth callbacks)
     let mut tunnel_port: Option<u16> = None;
@@ -656,7 +623,6 @@ pub async fn run(
                                agent_forward_enabled: &mut bool,
                                agent_acceptor: &mut Option<tokio::task::JoinHandle<()>>,
                                open_forward_enabled: &mut bool,
-                               open_acceptor: &mut Option<tokio::task::JoinHandle<()>>,
                                tunnel_writer: &mut Option<mpsc::UnboundedSender<Bytes>>,
                                tunnel_port: &mut Option<u16>| {
         agent_channels.clear();
@@ -666,10 +632,6 @@ pub async fn run(
         }
         cleanup_socket(&agent_socket_path);
         *open_forward_enabled = false;
-        if let Some(handle) = open_acceptor.take() {
-            handle.abort();
-        }
-        cleanup_socket(&open_socket_path);
         *tunnel_writer = None;
         *tunnel_port = None;
     };
@@ -847,11 +809,6 @@ pub async fn run(
                         Some(Ok(Frame::OpenForward)) => {
                             debug!("open forwarding enabled by client");
                             open_forward_enabled = true;
-                            if open_acceptor.is_none() {
-                                if let Some(listener) = bind_agent_listener(&open_socket_path) {
-                                    open_acceptor = Some(spawn_open_acceptor(listener, open_event_tx.clone()));
-                                }
-                            }
                         }
                         Some(Ok(Frame::TunnelOpen)) => {
                             if let Some(port) = tunnel_port {
@@ -957,7 +914,6 @@ pub async fn run(
                                 &mut agent_forward_enabled,
                                 &mut agent_acceptor,
                                 &mut open_forward_enabled,
-                                &mut open_acceptor,
                                 &mut tunnel_writer,
                                 &mut tunnel_port,
                             );
@@ -1073,7 +1029,6 @@ pub async fn run(
                     &mut agent_forward_enabled,
                     &mut agent_acceptor,
                     &mut open_forward_enabled,
-                    &mut open_acceptor,
                     &mut tunnel_writer,
                     &mut tunnel_port,
                 );
@@ -1101,36 +1056,39 @@ pub async fn run(
     }
 
     cleanup_socket(&agent_socket_path);
-    cleanup_socket(&open_socket_path);
-    cleanup_socket(&send_socket_path);
-    if let Some(handle) = send_acceptor.take() {
+    cleanup_socket(&svc_socket_path);
+    if let Some(handle) = svc_acceptor.take() {
         handle.abort();
     }
     Ok(())
 }
 
 /// Handle a raw send stream from ClientConn::Send (local-side commands).
-/// Spawns a task to read the role byte and manifest/dest, then sends the event.
+/// Spawns a task to read the SvcRequest discriminator and manifest/dest, then sends the event.
 fn handle_send_stream(mut stream: UnixStream, send_event_tx: &mpsc::UnboundedSender<SendEvent>) {
     let etx = send_event_tx.clone();
     tokio::spawn(async move {
-        let mut role = [0u8; 1];
-        if stream.read_exact(&mut role).await.is_err() {
+        let mut disc = [0u8; 1];
+        if stream.read_exact(&mut disc).await.is_err() {
             return;
         }
-        match role[0] {
-            b'S' => match parse_sender_manifest(&mut stream).await {
-                Ok(manifest) => {
-                    let _ = etx.send(SendEvent::SenderArrived { stream, manifest });
+        match crate::protocol::SvcRequest::from_byte(disc[0]) {
+            Some(crate::protocol::SvcRequest::Send) => {
+                match parse_sender_manifest(&mut stream).await {
+                    Ok(manifest) => {
+                        let _ = etx.send(SendEvent::SenderArrived { stream, manifest });
+                    }
+                    Err(e) => debug!("send stream: bad sender manifest: {e}"),
                 }
-                Err(e) => debug!("send stream: bad sender manifest: {e}"),
-            },
-            b'R' => match parse_receiver_dest(&mut stream).await {
-                Ok(_) => {
-                    let _ = etx.send(SendEvent::ReceiverArrived { stream });
+            }
+            Some(crate::protocol::SvcRequest::Receive) => {
+                match parse_receiver_dest(&mut stream).await {
+                    Ok(_) => {
+                        let _ = etx.send(SendEvent::ReceiverArrived { stream });
+                    }
+                    Err(e) => debug!("send stream: bad receiver dest: {e}"),
                 }
-                Err(e) => debug!("send stream: bad receiver dest: {e}"),
-            },
+            }
             _ => {}
         }
     });

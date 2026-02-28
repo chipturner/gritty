@@ -272,17 +272,9 @@ pub async fn run(ctl_path: &Path, ready_fd: Option<OwnedFd>) -> anyhow::Result<(
                 let meta_clone = Arc::clone(&metadata);
                 let sock_dir = ctl_path.parent().expect("ctl_path must have a parent");
                 let agent_socket_path = sock_dir.join(format!("agent-{id}.sock"));
-                let open_socket_path = sock_dir.join(format!("open-{id}.sock"));
-                let send_socket_path = sock_dir.join(format!("send-{id}.sock"));
+                let svc_socket_path = sock_dir.join(format!("svc-{id}.sock"));
                 let handle = tokio::spawn(async move {
-                    server::run(
-                        client_rx,
-                        meta_clone,
-                        agent_socket_path,
-                        open_socket_path,
-                        send_socket_path,
-                    )
-                    .await
+                    server::run(client_rx, meta_clone, agent_socket_path, svc_socket_path).await
                 });
 
                 sessions.insert(

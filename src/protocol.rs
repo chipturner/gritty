@@ -42,6 +42,30 @@ const MAX_FRAME_SIZE: usize = 1 << 20; // 1 MB
 /// Protocol version for handshake negotiation.
 pub const PROTOCOL_VERSION: u16 = 1;
 
+/// Discriminator byte for the unified per-session service socket (`svc-{id}.sock`).
+/// Sent as the first byte on every connection to route to the correct handler.
+#[repr(u8)]
+pub enum SvcRequest {
+    OpenUrl = 1,
+    Send = 2,
+    Receive = 3,
+}
+
+impl SvcRequest {
+    pub fn from_byte(b: u8) -> Option<Self> {
+        match b {
+            1 => Some(Self::OpenUrl),
+            2 => Some(Self::Send),
+            3 => Some(Self::Receive),
+            _ => None,
+        }
+    }
+
+    pub fn to_byte(self) -> u8 {
+        self as u8
+    }
+}
+
 /// Metadata for one session, returned in SessionInfo.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SessionEntry {
