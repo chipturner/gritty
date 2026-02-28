@@ -405,6 +405,13 @@ fn main() {
                     }
                 },
             };
+            if connection_name == "local" {
+                eprintln!(
+                    "error: 'local' is reserved for the local server; \
+                     use 'localhost.' to SSH to this machine"
+                );
+                std::process::exit(1);
+            }
             let local_sock = gritty::connect::connection_socket_path(&connection_name);
 
             let socket_dir = gritty::daemon::socket_dir();
@@ -490,10 +497,10 @@ fn main() {
 
 fn resolve_ctl_path(ctl_socket: Option<PathBuf>, host: Option<&str>) -> anyhow::Result<PathBuf> {
     match (ctl_socket, host) {
-        (Some(_), Some(_)) => anyhow::bail!("cannot specify both --ctl-socket and a host argument"),
-        (Some(p), None) => Ok(p),
+        (Some(p), _) => Ok(p),
+        (None, Some("local")) => Ok(gritty::daemon::control_socket_path()),
         (None, Some(h)) => Ok(gritty::daemon::socket_dir().join(format!("connect-{h}.sock"))),
-        (None, None) => Ok(gritty::daemon::control_socket_path()),
+        (None, None) => anyhow::bail!("specify a host (use 'local' for the local server)"),
     }
 }
 
@@ -513,8 +520,9 @@ async fn run(cli: Cli, config: gritty::config::ConfigFile) -> anyhow::Result<()>
         } => {
             let auto_start_mode = match (&cli.ctl_socket, &host) {
                 (Some(_), _) => AutoStart::None,
+                (None, Some(h)) if h == "local" => AutoStart::Server,
                 (None, Some(h)) => AutoStart::Tunnel(h.clone()),
-                (None, None) => AutoStart::Server,
+                (None, None) => AutoStart::None, // resolve_ctl_path will error
             };
             let ctl_path = resolve_ctl_path(cli.ctl_socket, host.as_deref())?;
             let resolved = config.resolve_session(host.as_deref());
@@ -567,8 +575,10 @@ async fn run(cli: Cli, config: gritty::config::ConfigFile) -> anyhow::Result<()>
         Command::KillServer { host } => {
             let ctl_path = resolve_ctl_path(cli.ctl_socket, host.as_deref())?;
             kill_server(ctl_path).await?;
-            if let Some(host) = &host {
-                gritty::connect::disconnect(host).await?;
+            if let Some(h) = &host {
+                if h != "local" {
+                    gritty::connect::disconnect(h).await?;
+                }
             }
             Ok(())
         }
@@ -1298,11 +1308,11 @@ mod tests {
     use super::*;
 
     #[test]
-    fn resolve_ctl_path_both_args_errors() {
-        let result = resolve_ctl_path(Some(PathBuf::from("/tmp/x.sock")), Some("myhost"));
-        assert!(result.is_err());
-        let msg = result.unwrap_err().to_string();
-        assert!(msg.contains("cannot specify both"), "got: {msg}");
+    fn resolve_ctl_path_ctl_socket_wins() {
+        let p = PathBuf::from("/tmp/x.sock");
+        // --ctl-socket always wins, even when host is given
+        let result = resolve_ctl_path(Some(p.clone()), Some("myhost")).unwrap();
+        assert_eq!(result, p);
     }
 
     #[test]
@@ -1320,9 +1330,17 @@ mod tests {
     }
 
     #[test]
-    fn resolve_ctl_path_neither() {
-        let result = resolve_ctl_path(None, None).unwrap();
+    fn resolve_ctl_path_local() {
+        let result = resolve_ctl_path(None, Some("local")).unwrap();
         assert_eq!(result, gritty::daemon::control_socket_path());
+    }
+
+    #[test]
+    fn resolve_ctl_path_neither_errors() {
+        let result = resolve_ctl_path(None, None);
+        assert!(result.is_err());
+        let msg = result.unwrap_err().to_string();
+        assert!(msg.contains("specify a host"), "got: {msg}");
     }
 
     #[test]

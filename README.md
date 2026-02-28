@@ -45,6 +45,12 @@ gritty connect user@devbox    # sets up tunnel named "devbox"
 gritty new devbox -t work     # creates session through tunnel
 ```
 
+For local sessions (useful for testing), use `local` as the host:
+
+```bash
+gritty new local -t scratch
+```
+
 Create, detach, reattach:
 
 ```bash
@@ -91,12 +97,12 @@ ID  Name    PTY         PID    Created              Status
 | `gritty connect user@host` | `c` | Set up SSH tunnel to remote host |
 | `gritty disconnect <name>` | `dc` | Tear down an SSH tunnel |
 | `gritty tunnels` | `tun` | List active SSH tunnels |
-| `gritty new-session [host] [-t name]` | `new` | Create a session and auto-attach (auto-starts server/tunnel if needed) |
-| `gritty attach [host] -t <id\|name>` | `a` | Attach to a session |
-| `gritty tail [host] -t <id\|name>` | `t` | Read-only stream of session output |
-| `gritty list-sessions [host]` | `ls`, `list` | List sessions |
-| `gritty kill-session [host] -t <id\|name>` | | Kill a session |
-| `gritty kill-server [host]` | | Kill the server and all sessions |
+| `gritty new-session <host> [-t name]` | `new` | Create a session and auto-attach (auto-starts server/tunnel if needed) |
+| `gritty attach <host> -t <id\|name>` | `a` | Attach to a session |
+| `gritty tail <host> -t <id\|name>` | `t` | Read-only stream of session output |
+| `gritty list-sessions <host>` | `ls`, `list` | List sessions |
+| `gritty kill-session <host> -t <id\|name>` | | Kill a session |
+| `gritty kill-server <host>` | | Kill the server and all sessions |
 | `gritty send [host] [-t id\|name] <files...>` | | Send files to a paired receiver |
 | `gritty receive [host] [-t id\|name] [dir]` | | Receive files from a paired sender |
 | `gritty open <url>` | | Open a URL on the local machine (inside sessions) |
@@ -105,7 +111,7 @@ ID  Name    PTY         PID    Created              Status
 | `gritty config-edit` | | Open config in `$VISUAL`/`$EDITOR` (creates from template if missing) |
 | `gritty completions <shell>` | | Generate shell completions (bash, zsh, fish, elvish, powershell) |
 
-The `[host]` argument is a connection name from `gritty connect` (e.g., `gritty ls devbox`). Omit it to use the local server.
+`<host>` is a connection name from `gritty connect`, or `local` for the local server. `--ctl-socket` overrides it. For `send`/`receive`, `[host]` is optional when running inside a session (uses `GRITTY_SEND_SOCK`).
 
 **Notable options:**
 - `-A` / `--forward-agent` on `new`/`attach`: forward your local SSH agent
@@ -156,7 +162,7 @@ no-server-start = true
 
 **Precedence:** CLI flag > `[host.<name>]` > `[defaults]` > built-in default. CLI flags always win. For `ssh-options`, values are appended: CLI first, then host, then defaults (SSH uses first-match, so earlier options take priority).
 
-**Host resolution:** The `[host.<name>]` key matches the gritty connection name -- what appears in `gritty tunnels` and `gritty disconnect <name>`. For local sessions (`gritty new` without a host), only `[defaults]` applies.
+**Host resolution:** The `[host.<name>]` key matches the gritty connection name -- what appears in `gritty tunnels` and `gritty disconnect <name>`. For local sessions (`gritty new local`), `[host.local]` applies if present, then `[defaults]`.
 
 A missing or malformed config file is silently ignored -- gritty remains zero-config if you want it to be. Use `gritty info` to check config status.
 
