@@ -329,6 +329,8 @@ async fn relay(
     raw_guard: &RawModeGuard,
     nb_guard: &NonBlockGuard,
     agent_socket: Option<&str>,
+    oauth_redirect: bool,
+    oauth_timeout: u64,
 ) -> anyhow::Result<Option<i32>> {
     let mut sigterm = signal(SignalKind::terminate())?;
     let mut sighup = signal(SignalKind::hangup())?;
@@ -459,64 +461,70 @@ async fn relay(
                         }
                     }
                     Some(Ok(Frame::TunnelListen { port })) => {
-                        // Bind synchronously to guarantee port is ready before OpenUrl
-                        match std::net::TcpListener::bind(("127.0.0.1", port)) {
-                            Ok(std_listener) => {
-                                debug!(port, "tunnel: bound local port");
-                                std_listener.set_nonblocking(true).ok();
-                                let listener = tokio::net::TcpListener::from_std(std_listener).unwrap();
-                                let tx = tunnel_event_tx.clone();
-                                tunnel_listener = Some(tokio::spawn(async move {
-                                    let accept = tokio::time::timeout(
-                                        Duration::from_secs(180),
-                                        listener.accept(),
-                                    ).await;
-                                    match accept {
-                                        Ok(Ok((stream, _))) => {
-                                            let (mut read_half, write_half) = stream.into_split();
-                                            let (writer_tx, mut writer_rx) = mpsc::unbounded_channel::<Bytes>();
+                        if !oauth_redirect {
+                            debug!(port, "tunnel: oauth-redirect disabled, declining");
+                            let _ = timed_send(framed, Frame::TunnelClose).await;
+                        } else {
+                            // Bind synchronously to guarantee port is ready before OpenUrl
+                            match std::net::TcpListener::bind(("127.0.0.1", port)) {
+                                Ok(std_listener) => {
+                                    debug!(port, "tunnel: bound local port");
+                                    std_listener.set_nonblocking(true).ok();
+                                    let listener = tokio::net::TcpListener::from_std(std_listener).unwrap();
+                                    let tx = tunnel_event_tx.clone();
+                                    let timeout = oauth_timeout;
+                                    tunnel_listener = Some(tokio::spawn(async move {
+                                        let accept = tokio::time::timeout(
+                                            Duration::from_secs(timeout),
+                                            listener.accept(),
+                                        ).await;
+                                        match accept {
+                                            Ok(Ok((stream, _))) => {
+                                                let (mut read_half, write_half) = stream.into_split();
+                                                let (writer_tx, mut writer_rx) = mpsc::unbounded_channel::<Bytes>();
 
-                                            // Writer task: channel -> TCP
-                                            tokio::spawn(async move {
-                                                use tokio::io::AsyncWriteExt;
-                                                let mut writer = write_half;
-                                                while let Some(data) = writer_rx.recv().await {
-                                                    if writer.write_all(&data).await.is_err() {
-                                                        break;
-                                                    }
-                                                }
-                                            });
-
-                                            let _ = tx.send(ClientTunnelEvent::Accepted(writer_tx));
-
-                                            // Reader task: TCP -> events
-                                            let mut buf = vec![0u8; 4096];
-                                            loop {
-                                                use tokio::io::AsyncReadExt;
-                                                match read_half.read(&mut buf).await {
-                                                    Ok(0) | Err(_) => {
-                                                        let _ = tx.send(ClientTunnelEvent::Closed);
-                                                        break;
-                                                    }
-                                                    Ok(n) => {
-                                                        let data = Bytes::copy_from_slice(&buf[..n]);
-                                                        if tx.send(ClientTunnelEvent::Data(data)).is_err() {
+                                                // Writer task: channel -> TCP
+                                                tokio::spawn(async move {
+                                                    use tokio::io::AsyncWriteExt;
+                                                    let mut writer = write_half;
+                                                    while let Some(data) = writer_rx.recv().await {
+                                                        if writer.write_all(&data).await.is_err() {
                                                             break;
+                                                        }
+                                                    }
+                                                });
+
+                                                let _ = tx.send(ClientTunnelEvent::Accepted(writer_tx));
+
+                                                // Reader task: TCP -> events
+                                                let mut buf = vec![0u8; 4096];
+                                                loop {
+                                                    use tokio::io::AsyncReadExt;
+                                                    match read_half.read(&mut buf).await {
+                                                        Ok(0) | Err(_) => {
+                                                            let _ = tx.send(ClientTunnelEvent::Closed);
+                                                            break;
+                                                        }
+                                                        Ok(n) => {
+                                                            let data = Bytes::copy_from_slice(&buf[..n]);
+                                                            if tx.send(ClientTunnelEvent::Data(data)).is_err() {
+                                                                break;
+                                                            }
                                                         }
                                                     }
                                                 }
                                             }
+                                            _ => {
+                                                debug!(port, "tunnel: accept timed out or failed");
+                                                let _ = tx.send(ClientTunnelEvent::Closed);
+                                            }
                                         }
-                                        _ => {
-                                            debug!(port, "tunnel: accept timed out or failed");
-                                            let _ = tx.send(ClientTunnelEvent::Closed);
-                                        }
-                                    }
-                                }));
-                            }
-                            Err(e) => {
-                                debug!(port, "tunnel: bind failed: {e}");
-                                let _ = timed_send(framed, Frame::TunnelClose).await;
+                                    }));
+                                }
+                                Err(e) => {
+                                    debug!(port, "tunnel: bind failed: {e}");
+                                    let _ = timed_send(framed, Frame::TunnelClose).await;
+                                }
                             }
                         }
                     }
@@ -632,6 +640,8 @@ pub async fn run(
     no_escape: bool,
     forward_agent: bool,
     forward_open: bool,
+    oauth_redirect: bool,
+    oauth_timeout: u64,
 ) -> anyhow::Result<i32> {
     let stdin = io::stdin();
     let stdin_fd = stdin.as_fd();
@@ -671,6 +681,8 @@ pub async fn run(
                 &raw_guard,
                 &nb_guard,
                 agent_socket.as_deref(),
+                oauth_redirect,
+                oauth_timeout,
             )
             .await?
         } else {

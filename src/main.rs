@@ -53,6 +53,14 @@ enum Command {
         #[arg(short = 'O', long)]
         forward_open: bool,
 
+        /// Disable OAuth callback tunneling (part of --forward-open)
+        #[arg(long)]
+        no_oauth_redirect: bool,
+
+        /// Timeout in seconds for OAuth callback tunnel (default: 180)
+        #[arg(long)]
+        oauth_timeout: Option<u64>,
+
         /// Wait indefinitely for the server instead of giving up after retries
         #[arg(short = 'w', long)]
         wait: bool,
@@ -82,6 +90,14 @@ enum Command {
         /// Forward URL open requests back to the local machine
         #[arg(short = 'O', long)]
         forward_open: bool,
+
+        /// Disable OAuth callback tunneling (part of --forward-open)
+        #[arg(long)]
+        no_oauth_redirect: bool,
+
+        /// Timeout in seconds for OAuth callback tunnel (default: 180)
+        #[arg(long)]
+        oauth_timeout: Option<u64>,
     },
     /// Tail a session's output (read-only, like tail -f)
     #[command(visible_alias = "t")]
@@ -466,6 +482,8 @@ async fn run(cli: Cli, config: gritty::config::ConfigFile) -> anyhow::Result<()>
             no_escape,
             forward_agent,
             forward_open,
+            no_oauth_redirect,
+            oauth_timeout,
             wait,
         } => {
             let auto_start_mode = match (&cli.ctl_socket, &host) {
@@ -480,6 +498,8 @@ async fn run(cli: Cli, config: gritty::config::ConfigFile) -> anyhow::Result<()>
                 no_escape: no_escape || resolved.no_escape,
                 forward_agent: forward_agent || resolved.forward_agent,
                 forward_open: forward_open || resolved.forward_open,
+                oauth_redirect: if no_oauth_redirect { false } else { resolved.oauth_redirect },
+                oauth_timeout: oauth_timeout.unwrap_or(resolved.oauth_timeout),
             };
             new_session(target, settings, ctl_path, auto_start_mode, wait).await
         }
@@ -488,7 +508,16 @@ async fn run(cli: Cli, config: gritty::config::ConfigFile) -> anyhow::Result<()>
             let code = tail_session(target, ctl_path).await?;
             std::process::exit(code);
         }
-        Command::Attach { host, target, no_redraw, no_escape, forward_agent, forward_open } => {
+        Command::Attach {
+            host,
+            target,
+            no_redraw,
+            no_escape,
+            forward_agent,
+            forward_open,
+            no_oauth_redirect,
+            oauth_timeout,
+        } => {
             let ctl_path = resolve_ctl_path(cli.ctl_socket, host.as_deref())?;
             let resolved = config.resolve_session(host.as_deref());
             let settings = gritty::config::SessionSettings {
@@ -496,6 +525,8 @@ async fn run(cli: Cli, config: gritty::config::ConfigFile) -> anyhow::Result<()>
                 no_escape: no_escape || resolved.no_escape,
                 forward_agent: forward_agent || resolved.forward_agent,
                 forward_open: forward_open || resolved.forward_open,
+                oauth_redirect: if no_oauth_redirect { false } else { resolved.oauth_redirect },
+                oauth_timeout: oauth_timeout.unwrap_or(resolved.oauth_timeout),
             };
             let code = attach(target, settings, ctl_path).await?;
             std::process::exit(code);
@@ -649,6 +680,8 @@ async fn new_session(
                 settings.no_escape,
                 settings.forward_agent,
                 settings.forward_open,
+                settings.oauth_redirect,
+                settings.oauth_timeout,
             )
             .await?;
             std::process::exit(code);
@@ -693,6 +726,8 @@ async fn attach(
                 settings.no_escape,
                 settings.forward_agent,
                 settings.forward_open,
+                settings.oauth_redirect,
+                settings.oauth_timeout,
             )
             .await?;
             Ok(code)

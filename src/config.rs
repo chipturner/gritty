@@ -7,12 +7,27 @@ use serde::Deserialize;
 pub const DEFAULT_CONFIG: &str = include_str!("../config.toml");
 
 /// Resolved session settings after merging all config layers.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SessionSettings {
     pub forward_agent: bool,
     pub forward_open: bool,
     pub no_escape: bool,
     pub no_redraw: bool,
+    pub oauth_redirect: bool,
+    pub oauth_timeout: u64,
+}
+
+impl Default for SessionSettings {
+    fn default() -> Self {
+        Self {
+            forward_agent: false,
+            forward_open: false,
+            no_escape: false,
+            no_redraw: false,
+            oauth_redirect: true,
+            oauth_timeout: 180,
+        }
+    }
 }
 
 /// Resolved connect settings after merging all config layers.
@@ -39,6 +54,8 @@ pub struct Defaults {
     pub forward_open: Option<bool>,
     pub no_escape: Option<bool>,
     pub no_redraw: Option<bool>,
+    pub oauth_redirect: Option<bool>,
+    pub oauth_timeout: Option<u64>,
     pub connect: Option<ConnectDefaults>,
 }
 
@@ -58,6 +75,8 @@ pub struct HostConfig {
     pub forward_open: Option<bool>,
     pub no_escape: Option<bool>,
     pub no_redraw: Option<bool>,
+    pub oauth_redirect: Option<bool>,
+    pub oauth_timeout: Option<u64>,
     pub connect: Option<ConnectDefaults>,
 }
 
@@ -107,6 +126,8 @@ impl ConfigFile {
             forward_open: pick(h.and_then(|h| h.forward_open), d.forward_open),
             no_escape: pick(h.and_then(|h| h.no_escape), d.no_escape),
             no_redraw: pick(h.and_then(|h| h.no_redraw), d.no_redraw),
+            oauth_redirect: h.and_then(|h| h.oauth_redirect).or(d.oauth_redirect).unwrap_or(true),
+            oauth_timeout: h.and_then(|h| h.oauth_timeout).or(d.oauth_timeout).unwrap_or(180),
         }
     }
 
@@ -297,6 +318,54 @@ mod tests {
         assert!(cfg.resolve_session(None).no_redraw);
         assert!(cfg.resolve_session(Some("unknown")).no_redraw);
         assert!(!cfg.resolve_session(Some("devbox")).no_redraw);
+    }
+
+    #[test]
+    fn oauth_settings_defaults() {
+        let cfg: ConfigFile = toml::from_str("").unwrap();
+        let s = cfg.resolve_session(None);
+        assert!(s.oauth_redirect);
+        assert_eq!(s.oauth_timeout, 180);
+    }
+
+    #[test]
+    fn oauth_settings_configurable() {
+        let cfg: ConfigFile = toml::from_str(
+            r#"
+            [defaults]
+            oauth-redirect = false
+            oauth-timeout = 60
+
+            [host.devbox]
+            oauth-redirect = true
+            oauth-timeout = 300
+            "#,
+        )
+        .unwrap();
+        let s = cfg.resolve_session(None);
+        assert!(!s.oauth_redirect);
+        assert_eq!(s.oauth_timeout, 60);
+
+        let s = cfg.resolve_session(Some("devbox"));
+        assert!(s.oauth_redirect);
+        assert_eq!(s.oauth_timeout, 300);
+    }
+
+    #[test]
+    fn oauth_settings_host_partial_override() {
+        let cfg: ConfigFile = toml::from_str(
+            r#"
+            [defaults]
+            oauth-timeout = 90
+
+            [host.devbox]
+            oauth-redirect = false
+            "#,
+        )
+        .unwrap();
+        let s = cfg.resolve_session(Some("devbox"));
+        assert!(!s.oauth_redirect); // from host
+        assert_eq!(s.oauth_timeout, 90); // from defaults
     }
 
     #[test]

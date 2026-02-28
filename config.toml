@@ -10,6 +10,8 @@
 # forward-open = false
 # no-escape = false
 # no-redraw = false
+# oauth-redirect = true
+# oauth-timeout = 180
 
 # Connect-specific global defaults.
 [defaults.connect]
