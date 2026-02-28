@@ -35,20 +35,20 @@ cargo install gritty-cli
 One command creates a session and connects -- auto-starting the SSH tunnel and remote server if needed:
 
 ```bash
-gritty new devbox -t work
+gritty new devbox:work
 ```
 
 This works when the host is resolvable by SSH (e.g., via `~/.ssh/config`). For `user@host` destinations, start the tunnel explicitly first:
 
 ```bash
 gritty connect user@devbox    # sets up tunnel named "devbox"
-gritty new devbox -t work     # creates session through tunnel
+gritty new devbox:work        # creates session through tunnel
 ```
 
 For local sessions (useful for testing), use `local` as the host:
 
 ```bash
-gritty new local -t scratch
+gritty new local:scratch
 ```
 
 Create, detach, reattach:
@@ -57,13 +57,13 @@ Create, detach, reattach:
 # Detach with ~. or just close your terminal
 
 # Reattach from any terminal
-gritty attach devbox -t work
+gritty attach devbox:work
 
 # Forward your SSH agent for git/ssh on the remote host
-gritty new devbox -t deploy -A
+gritty new devbox:deploy -A
 
 # Forward URL opens back to your local browser
-gritty new devbox -t docs -O
+gritty new devbox:docs -O
 
 # List sessions
 gritty ls devbox
@@ -97,26 +97,25 @@ ID  Name    PTY         PID    Created              Status
 | `gritty connect user@host` | `c` | Set up SSH tunnel to remote host |
 | `gritty disconnect <name>` | `dc` | Tear down an SSH tunnel |
 | `gritty tunnels` | `tun` | List active SSH tunnels |
-| `gritty new-session <host> [-t name]` | `new` | Create a session and auto-attach (auto-starts server/tunnel if needed) |
-| `gritty attach <host> -t <id\|name>` | `a` | Attach to a session |
-| `gritty tail <host> -t <id\|name>` | `t` | Read-only stream of session output |
+| `gritty new-session <host[:name]>` | `new` | Create a session and auto-attach (auto-starts server/tunnel if needed) |
+| `gritty attach <host:session>` | `a` | Attach to a session |
+| `gritty tail <host:session>` | `t` | Read-only stream of session output |
 | `gritty list-sessions <host>` | `ls`, `list` | List sessions |
-| `gritty kill-session <host> -t <id\|name>` | | Kill a session |
+| `gritty kill-session <host:session>` | | Kill a session |
 | `gritty kill-server <host>` | | Kill the server and all sessions |
-| `gritty send [host] [-t id\|name] <files...>` | | Send files to a paired receiver |
-| `gritty receive [host] [-t id\|name] [dir]` | | Receive files from a paired sender |
+| `gritty send [host[:session]] <files...>` | | Send files to a paired receiver |
+| `gritty receive [host[:session]] [dir]` | | Receive files from a paired sender |
 | `gritty open <url>` | | Open a URL on the local machine (inside sessions) |
 | `gritty socket-path` | `socket` | Print the default server socket path |
 | `gritty info` | | Show diagnostics (version, config, server status, tunnels) |
 | `gritty config-edit` | | Open config in `$VISUAL`/`$EDITOR` (creates from template if missing) |
 | `gritty completions <shell>` | | Generate shell completions (bash, zsh, fish, elvish, powershell) |
 
-`<host>` is a connection name from `gritty connect`, or `local` for the local server. `--ctl-socket` overrides it. For `send`/`receive`, `[host]` is optional when running inside a session (uses `GRITTY_SEND_SOCK`).
+`<host>` is a connection name from `gritty connect`, or `local` for the local server. Session is specified after a colon: `host:session`. `--ctl-socket` overrides host resolution. For `send`/`receive`, the target is optional when running inside a session (uses `GRITTY_SEND_SOCK`).
 
 **Notable options:**
 - `-A` / `--forward-agent` on `new`/`attach`: forward your local SSH agent
 - `-O` / `--forward-open` on `new`/`attach`: forward URL opens to local machine
-- `-t <name>` on `new`/`attach`/`tail`: target session by name or ID
 - `-n <name>` on `connect`: override connection name (defaults to hostname)
 - `-o <option>` on `connect`: extra SSH options (repeatable, e.g., `-o "ProxyJump=bastion"`)
 - `--no-redraw` on `new`/`attach`: don't send Ctrl-L after connecting

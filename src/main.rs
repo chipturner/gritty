@@ -30,12 +30,8 @@ enum Command {
     /// Create a new persistent session (auto-attaches)
     #[command(visible_alias = "new")]
     NewSession {
-        /// Remote host (connection name from `gritty connect`)
-        host: Option<String>,
-
-        /// Session name (optional; sessions always get an auto-incrementing id)
-        #[arg(short = 't', long = "target")]
-        target: Option<String>,
+        /// Target host, with optional session name (host or host:name)
+        target: String,
 
         /// Don't send Ctrl-L to redraw after the shell starts
         #[arg(long)]
@@ -68,11 +64,7 @@ enum Command {
     /// Attach to an existing session (detaches other clients)
     #[command(visible_alias = "a")]
     Attach {
-        /// Remote host (connection name from `gritty connect`)
-        host: Option<String>,
-
-        /// Session id or name
-        #[arg(short = 't', long = "target")]
+        /// Target host and session (host:session)
         target: String,
 
         /// Don't send Ctrl-L to redraw after attaching
@@ -102,40 +94,28 @@ enum Command {
     /// Tail a session's output (read-only, like tail -f)
     #[command(visible_alias = "t")]
     Tail {
-        /// Remote host (connection name from `gritty connect`)
-        host: Option<String>,
-
-        /// Session id or name
-        #[arg(short = 't', long = "target")]
+        /// Target host and session (host:session)
         target: String,
     },
     /// List active sessions
     #[command(visible_alias = "ls", visible_alias = "list")]
     ListSessions {
-        /// Remote host (connection name from `gritty connect`)
-        host: Option<String>,
+        /// Target host
+        target: String,
     },
     /// Kill a specific session
     KillSession {
-        /// Remote host (connection name from `gritty connect`)
-        host: Option<String>,
-
-        /// Session id or name
-        #[arg(short = 't', long = "target")]
+        /// Target host and session (host:session)
         target: String,
     },
     /// Kill the server and all sessions
     KillServer {
-        /// Remote host (connection name from `gritty connect`)
-        host: Option<String>,
+        /// Target host
+        target: String,
     },
     /// Send files to a paired receiver
     Send {
-        /// Remote host (connection name from `gritty connect`); omit when inside a session
-        host: Option<String>,
-
-        /// Session id or name (required from local side; auto-detected if only one session)
-        #[arg(short = 't', long = "target")]
+        /// Target host[:session]; omit when inside a session
         target: Option<String>,
 
         /// Files to send
@@ -144,11 +124,7 @@ enum Command {
     },
     /// Receive files from a paired sender
     Receive {
-        /// Remote host (connection name from `gritty connect`); omit when inside a session
-        host: Option<String>,
-
-        /// Session id or name (required from local side; auto-detected if only one session)
-        #[arg(short = 't', long = "target")]
+        /// Target host[:session]; omit when inside a session
         target: Option<String>,
 
         /// Destination directory (default: current directory)
@@ -495,12 +471,22 @@ fn main() {
     }
 }
 
-fn resolve_ctl_path(ctl_socket: Option<PathBuf>, host: Option<&str>) -> anyhow::Result<PathBuf> {
-    match (ctl_socket, host) {
-        (Some(p), _) => Ok(p),
-        (None, Some("local")) => Ok(gritty::daemon::control_socket_path()),
-        (None, Some(h)) => Ok(gritty::daemon::socket_dir().join(format!("connect-{h}.sock"))),
-        (None, None) => anyhow::bail!("specify a host (use 'local' for the local server)"),
+/// Parse a `host[:session]` target string. Splits on the first `:`.
+fn parse_target(s: &str) -> (String, Option<String>) {
+    match s.split_once(':') {
+        Some((host, session)) if !session.is_empty() => {
+            (host.to_string(), Some(session.to_string()))
+        }
+        Some((host, _)) => (host.to_string(), None),
+        None => (s.to_string(), None),
+    }
+}
+
+fn resolve_ctl_path(ctl_socket: Option<PathBuf>, host: &str) -> PathBuf {
+    match ctl_socket {
+        Some(p) => p,
+        None if host == "local" => gritty::daemon::control_socket_path(),
+        None => gritty::daemon::socket_dir().join(format!("connect-{host}.sock")),
     }
 }
 
@@ -508,7 +494,6 @@ async fn run(cli: Cli, config: gritty::config::ConfigFile) -> anyhow::Result<()>
     match cli.command {
         Command::Server { .. } | Command::Connect { .. } => unreachable!(),
         Command::NewSession {
-            host,
             target,
             no_redraw,
             no_escape,
@@ -518,14 +503,14 @@ async fn run(cli: Cli, config: gritty::config::ConfigFile) -> anyhow::Result<()>
             oauth_timeout,
             wait,
         } => {
-            let auto_start_mode = match (&cli.ctl_socket, &host) {
-                (Some(_), _) => AutoStart::None,
-                (None, Some(h)) if h == "local" => AutoStart::Server,
-                (None, Some(h)) => AutoStart::Tunnel(h.clone()),
-                (None, None) => AutoStart::None, // resolve_ctl_path will error
+            let (host, session) = parse_target(&target);
+            let auto_start_mode = match &cli.ctl_socket {
+                Some(_) => AutoStart::None,
+                None if host == "local" => AutoStart::Server,
+                None => AutoStart::Tunnel(host.clone()),
             };
-            let ctl_path = resolve_ctl_path(cli.ctl_socket, host.as_deref())?;
-            let resolved = config.resolve_session(host.as_deref());
+            let ctl_path = resolve_ctl_path(cli.ctl_socket, &host);
+            let resolved = config.resolve_session(Some(&host));
             let settings = gritty::config::SessionSettings {
                 no_redraw: no_redraw || resolved.no_redraw,
                 no_escape: no_escape || resolved.no_escape,
@@ -534,15 +519,22 @@ async fn run(cli: Cli, config: gritty::config::ConfigFile) -> anyhow::Result<()>
                 oauth_redirect: if no_oauth_redirect { false } else { resolved.oauth_redirect },
                 oauth_timeout: oauth_timeout.unwrap_or(resolved.oauth_timeout),
             };
-            new_session(target, settings, ctl_path, auto_start_mode, wait).await
+            new_session(session, settings, ctl_path, auto_start_mode, wait).await
         }
-        Command::Tail { host, target } => {
-            let ctl_path = resolve_ctl_path(cli.ctl_socket, host.as_deref())?;
-            let code = tail_session(target, ctl_path).await?;
+        Command::Tail { target } => {
+            let (host, session) = parse_target(&target);
+            let ctl_path = resolve_ctl_path(cli.ctl_socket, &host);
+            let session = match session {
+                Some(s) => s,
+                None => {
+                    suggest_session("tail", &host, &ctl_path).await?;
+                    unreachable!()
+                }
+            };
+            let code = tail_session(session, ctl_path).await?;
             std::process::exit(code);
         }
         Command::Attach {
-            host,
             target,
             no_redraw,
             no_escape,
@@ -551,8 +543,9 @@ async fn run(cli: Cli, config: gritty::config::ConfigFile) -> anyhow::Result<()>
             no_oauth_redirect,
             oauth_timeout,
         } => {
-            let ctl_path = resolve_ctl_path(cli.ctl_socket, host.as_deref())?;
-            let resolved = config.resolve_session(host.as_deref());
+            let (host, session) = parse_target(&target);
+            let ctl_path = resolve_ctl_path(cli.ctl_socket, &host);
+            let resolved = config.resolve_session(Some(&host));
             let settings = gritty::config::SessionSettings {
                 no_redraw: no_redraw || resolved.no_redraw,
                 no_escape: no_escape || resolved.no_escape,
@@ -561,24 +554,39 @@ async fn run(cli: Cli, config: gritty::config::ConfigFile) -> anyhow::Result<()>
                 oauth_redirect: if no_oauth_redirect { false } else { resolved.oauth_redirect },
                 oauth_timeout: oauth_timeout.unwrap_or(resolved.oauth_timeout),
             };
-            let code = attach(target, settings, ctl_path).await?;
+            let session = match session {
+                Some(s) => s,
+                None => {
+                    suggest_session("attach", &host, &ctl_path).await?;
+                    unreachable!()
+                }
+            };
+            let code = attach(session, settings, ctl_path).await?;
             std::process::exit(code);
         }
-        Command::ListSessions { host } => {
-            let ctl_path = resolve_ctl_path(cli.ctl_socket, host.as_deref())?;
+        Command::ListSessions { target } => {
+            let (host, _session) = parse_target(&target);
+            let ctl_path = resolve_ctl_path(cli.ctl_socket, &host);
             list_sessions(ctl_path).await
         }
-        Command::KillSession { host, target } => {
-            let ctl_path = resolve_ctl_path(cli.ctl_socket, host.as_deref())?;
-            kill_session(target, ctl_path).await
-        }
-        Command::KillServer { host } => {
-            let ctl_path = resolve_ctl_path(cli.ctl_socket, host.as_deref())?;
-            kill_server(ctl_path).await?;
-            if let Some(h) = &host {
-                if h != "local" {
-                    gritty::connect::disconnect(h).await?;
+        Command::KillSession { target } => {
+            let (host, session) = parse_target(&target);
+            let ctl_path = resolve_ctl_path(cli.ctl_socket, &host);
+            let session = match session {
+                Some(s) => s,
+                None => {
+                    suggest_session("kill-session", &host, &ctl_path).await?;
+                    unreachable!()
                 }
+            };
+            kill_session(session, ctl_path).await
+        }
+        Command::KillServer { target } => {
+            let (host, _session) = parse_target(&target);
+            let ctl_path = resolve_ctl_path(cli.ctl_socket, &host);
+            kill_server(ctl_path).await?;
+            if host != "local" {
+                gritty::connect::disconnect(&host).await?;
             }
             Ok(())
         }
@@ -587,11 +595,25 @@ async fn run(cli: Cli, config: gritty::config::ConfigFile) -> anyhow::Result<()>
             println!("{}", ctl_path.display());
             Ok(())
         }
-        Command::Send { host, target, files } => {
-            send_command(cli.ctl_socket, host, target, files).await
+        Command::Send { target, files } => {
+            let (ctl_socket, host, session) = match target {
+                Some(t) => {
+                    let (host, session) = parse_target(&t);
+                    (cli.ctl_socket, Some(host), session)
+                }
+                None => (cli.ctl_socket, None, None),
+            };
+            send_command(ctl_socket, host, session, files).await
         }
-        Command::Receive { host, target, dir } => {
-            receive_command(cli.ctl_socket, host, target, dir).await
+        Command::Receive { target, dir } => {
+            let (ctl_socket, host, session) = match target {
+                Some(t) => {
+                    let (host, session) = parse_target(&t);
+                    (cli.ctl_socket, Some(host), session)
+                }
+                None => (cli.ctl_socket, None, None),
+            };
+            receive_command(ctl_socket, host, session, dir).await
         }
         Command::Open { url } => {
             open_url(&url);
@@ -894,6 +916,56 @@ fn open_url(url: &str) {
     }
 }
 
+fn format_age(now: u64, created_at: u64) -> String {
+    let secs = now.saturating_sub(created_at);
+    if secs < 60 {
+        format!("{secs}s ago")
+    } else if secs < 3600 {
+        format!("{}m ago", secs / 60)
+    } else if secs < 86400 {
+        format!("{}h ago", secs / 3600)
+    } else {
+        format!("{}d ago", secs / 86400)
+    }
+}
+
+/// Print available sessions and exit with an error when a session-requiring
+/// command is invoked without the session part (e.g. `gritty attach local`
+/// instead of `gritty attach local:session`).
+async fn suggest_session(cmd: &str, host: &str, ctl_path: &Path) -> anyhow::Result<()> {
+    use gritty::protocol::Frame;
+
+    let ctl_path_buf = ctl_path.to_path_buf();
+    let resp = match server_request(&ctl_path_buf, Frame::ListSessions).await {
+        Ok(resp) => resp,
+        Err(_) => {
+            anyhow::bail!("specify a session: gritty {cmd} {host}:<session>");
+        }
+    };
+
+    match resp {
+        Frame::SessionInfo { sessions } if sessions.is_empty() => {
+            anyhow::bail!("no active sessions on {host}");
+        }
+        Frame::SessionInfo { sessions } => {
+            let now = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_secs();
+
+            let mut msg = format!("specify a session: gritty {cmd} {host}:<session>\n\n");
+            msg.push_str("  ID  Name     Age\n");
+            for s in &sessions {
+                let name = if s.name.is_empty() { "-".to_string() } else { s.name.clone() };
+                let age = format_age(now, s.created_at);
+                msg.push_str(&format!("  {}   {:<8} {}\n", s.id, name, age));
+            }
+            anyhow::bail!("{msg}");
+        }
+        _ => anyhow::bail!("specify a session: gritty {cmd} {host}:<session>"),
+    }
+}
+
 fn format_timestamp(epoch_secs: u64) -> String {
     let time = epoch_secs as libc::time_t;
     let mut tm: libc::tm = unsafe { std::mem::zeroed() };
@@ -1093,7 +1165,9 @@ async fn connect_send_socket(
     }
 
     // Local-side: connect to control socket
-    let ctl_path = resolve_ctl_path(ctl_socket, host.as_deref())?;
+    let host =
+        host.ok_or_else(|| anyhow::anyhow!("specify a host (use 'local' for the local server)"))?;
+    let ctl_path = resolve_ctl_path(ctl_socket, &host);
 
     // Resolve session target
     let session = match target {
@@ -1109,7 +1183,8 @@ async fn connect_send_socket(
                         if s.name.is_empty() { s.id.clone() } else { s.name.clone() }
                     }
                     n => {
-                        let mut msg = format!("{n} sessions active, specify one with -t:\n");
+                        let mut msg =
+                            format!("{n} sessions active, specify one with host:session:\n");
                         for s in &sessions {
                             if s.name.is_empty() {
                                 msg.push_str(&format!("  {}\n", s.id));
@@ -1308,39 +1383,85 @@ mod tests {
     use super::*;
 
     #[test]
+    fn parse_target_host_only() {
+        let (host, session) = parse_target("local");
+        assert_eq!(host, "local");
+        assert_eq!(session, None);
+    }
+
+    #[test]
+    fn parse_target_host_and_session() {
+        let (host, session) = parse_target("local:work");
+        assert_eq!(host, "local");
+        assert_eq!(session, Some("work".to_string()));
+    }
+
+    #[test]
+    fn parse_target_remote_and_id() {
+        let (host, session) = parse_target("devbox:0");
+        assert_eq!(host, "devbox");
+        assert_eq!(session, Some("0".to_string()));
+    }
+
+    #[test]
+    fn parse_target_colon_in_session_name() {
+        let (host, session) = parse_target("local:my:weird:name");
+        assert_eq!(host, "local");
+        assert_eq!(session, Some("my:weird:name".to_string()));
+    }
+
+    #[test]
+    fn parse_target_empty_session() {
+        let (host, session) = parse_target("local:");
+        assert_eq!(host, "local");
+        assert_eq!(session, None);
+    }
+
+    #[test]
     fn resolve_ctl_path_ctl_socket_wins() {
         let p = PathBuf::from("/tmp/x.sock");
-        // --ctl-socket always wins, even when host is given
-        let result = resolve_ctl_path(Some(p.clone()), Some("myhost")).unwrap();
+        let result = resolve_ctl_path(Some(p.clone()), "myhost");
         assert_eq!(result, p);
     }
 
     #[test]
     fn resolve_ctl_path_ctl_socket_only() {
         let p = PathBuf::from("/tmp/custom.sock");
-        let result = resolve_ctl_path(Some(p.clone()), None).unwrap();
+        let result = resolve_ctl_path(Some(p.clone()), "ignored");
         assert_eq!(result, p);
     }
 
     #[test]
     fn resolve_ctl_path_host_only() {
-        let result = resolve_ctl_path(None, Some("devbox")).unwrap();
+        let result = resolve_ctl_path(None, "devbox");
         let s = result.to_string_lossy();
         assert!(s.contains("connect-devbox.sock"), "got: {s}");
     }
 
     #[test]
     fn resolve_ctl_path_local() {
-        let result = resolve_ctl_path(None, Some("local")).unwrap();
+        let result = resolve_ctl_path(None, "local");
         assert_eq!(result, gritty::daemon::control_socket_path());
     }
 
     #[test]
-    fn resolve_ctl_path_neither_errors() {
-        let result = resolve_ctl_path(None, None);
-        assert!(result.is_err());
-        let msg = result.unwrap_err().to_string();
-        assert!(msg.contains("specify a host"), "got: {msg}");
+    fn format_age_seconds() {
+        assert_eq!(format_age(100, 70), "30s ago");
+    }
+
+    #[test]
+    fn format_age_minutes() {
+        assert_eq!(format_age(1000, 700), "5m ago");
+    }
+
+    #[test]
+    fn format_age_hours() {
+        assert_eq!(format_age(10000, 0), "2h ago");
+    }
+
+    #[test]
+    fn format_age_days() {
+        assert_eq!(format_age(200000, 0), "2d ago");
     }
 
     #[test]
