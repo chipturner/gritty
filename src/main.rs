@@ -1340,6 +1340,20 @@ async fn write_send_manifest(
     Ok(())
 }
 
+fn print_progress(name: &str, transferred: u64, total: u64) {
+    let pct = if total == 0 { 100 } else { (transferred * 100 / total).min(100) };
+    let bar_width = 20usize;
+    let filled = (pct as usize * bar_width / 100).min(bar_width);
+    let empty = bar_width - filled;
+    let transferred_str = gritty::client::format_size(transferred);
+    let total_str = gritty::client::format_size(total);
+    eprint!(
+        "\x1b[2K\r  {name}  \x1b[32m{}\x1b[2m{}\x1b[0m  {pct}%  {transferred_str}/{total_str}",
+        "=".repeat(filled),
+        "-".repeat(empty),
+    );
+}
+
 async fn send_command(
     ctl_socket: Option<PathBuf>,
     session: Option<String>,
@@ -1369,7 +1383,7 @@ async fn send_command(
     }
 
     // Wait for go signal -- first stream to get paired wins
-    eprintln!("waiting for receiver...");
+    eprintln!("\x1b[2mwaiting for receiver...\x1b[0m");
     let mut stream = if streams.len() == 1 {
         streams.into_iter().next().unwrap()
     } else {
@@ -1390,10 +1404,9 @@ async fn send_command(
 
     let mut buf = vec![0u8; 64 * 1024];
     for (name, size, path) in &entries {
-        let size_str = gritty::client::format_size(*size);
-        eprintln!("  {name} ({size_str})");
         let mut file = tokio::fs::File::open(path).await?;
         let mut remaining = *size;
+        let mut transferred = 0u64;
         while remaining > 0 {
             let to_read = (remaining as usize).min(buf.len());
             let n = file.read(&mut buf[..to_read]).await?;
@@ -1402,10 +1415,13 @@ async fn send_command(
             }
             stream.write_all(&buf[..n]).await?;
             remaining -= n as u64;
+            transferred += n as u64;
+            print_progress(name, transferred, *size);
         }
+        eprintln!();
     }
 
-    eprintln!("done");
+    eprintln!("\x1b[32mdone\x1b[0m");
     Ok(())
 }
 
@@ -1433,7 +1449,7 @@ async fn receive_command(
     }
 
     // Wait for file data -- first stream to get paired wins
-    eprintln!("waiting for sender...");
+    eprintln!("\x1b[2mwaiting for sender...\x1b[0m");
     let mut stream = if streams.len() == 1 {
         streams.into_iter().next().unwrap()
     } else {
@@ -1468,12 +1484,10 @@ async fn receive_command(
         stream.read_exact(&mut buf8).await?;
         let file_size = u64::from_be_bytes(buf8);
 
-        let size_str = gritty::client::format_size(file_size);
         let s = if file_count == 1 { "" } else { "s" };
         if received == 0 {
             eprintln!("receiving {file_count} file{s}");
         }
-        eprintln!("  {name} ({size_str})");
 
         // Write file data
         let file_path = dest_dir.join(&name);
@@ -1485,12 +1499,16 @@ async fn receive_command(
             .open(&file_path)
             .await?;
         let mut remaining = file_size;
+        let mut transferred = 0u64;
         while remaining > 0 {
             let to_read = (remaining as usize).min(buf.len());
             stream.read_exact(&mut buf[..to_read]).await?;
             file.write_all(&buf[..to_read]).await?;
             remaining -= to_read as u64;
+            transferred += to_read as u64;
+            print_progress(&name, transferred, file_size);
         }
+        eprintln!();
         received += 1;
     }
 
@@ -1498,7 +1516,7 @@ async fn receive_command(
         eprintln!("no files received");
     } else {
         let s = if received == 1 { "" } else { "s" };
-        eprintln!("received {received} file{s}");
+        eprintln!("\x1b[32mreceived {received} file{s}\x1b[0m");
     }
     Ok(())
 }

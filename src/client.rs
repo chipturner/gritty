@@ -262,6 +262,18 @@ pub fn format_size(bytes: u64) -> String {
     }
 }
 
+fn status_msg(text: &str) -> String {
+    format!("\r\n\x1b[2;33m[{text}]\x1b[0m\r\n")
+}
+
+fn success_msg(text: &str) -> String {
+    format!("\r\n\x1b[32m[{text}]\x1b[0m\r\n")
+}
+
+fn error_msg(text: &str) -> String {
+    format!("\r\n\x1b[31m[{text}]\x1b[0m\r\n")
+}
+
 fn get_terminal_size() -> (u16, u16) {
     let mut ws: libc::winsize = unsafe { std::mem::zeroed() };
     if unsafe { libc::ioctl(libc::STDIN_FILENO, libc::TIOCGWINSZ, &mut ws) } != 0
@@ -384,7 +396,7 @@ async fn relay(
                                         }
                                     }
                                     EscapeAction::Detach => {
-                                        write_stdout(b"\r\n[detached]\r\n")?;
+                                        write_stdout(status_msg("detached").as_bytes())?;
                                         return Ok(Some(0));
                                     }
                                     EscapeAction::Suspend => {
@@ -425,7 +437,7 @@ async fn relay(
                     }
                     Some(Ok(Frame::Detached)) => {
                         info!("detached by another client");
-                        write_stdout(b"[detached]\r\n")?;
+                        write_stdout(status_msg("detached").as_bytes())?;
                         return Ok(Some(0));
                     }
                     Some(Ok(Frame::AgentOpen { channel_id })) => {
@@ -547,15 +559,13 @@ async fn relay(
                     Some(Ok(Frame::SendOffer { file_count, total_bytes })) => {
                         let size_str = format_size(total_bytes);
                         let s = if file_count == 1 { "" } else { "s" };
-                        let msg = format!("\r\n[gritty: receiving {file_count} file{s} ({size_str})]\r\n");
-                        write_stdout(msg.as_bytes())?;
+                        write_stdout(status_msg(&format!("gritty: receiving {file_count} file{s} ({size_str})")).as_bytes())?;
                     }
                     Some(Ok(Frame::SendDone)) => {
-                        write_stdout(b"\r\n[gritty: transfer complete]\r\n")?;
+                        write_stdout(success_msg("gritty: transfer complete").as_bytes())?;
                     }
                     Some(Ok(Frame::SendCancel { reason })) => {
-                        let msg = format!("\r\n[gritty: transfer cancelled: {reason}]\r\n");
-                        write_stdout(msg.as_bytes())?;
+                        write_stdout(error_msg(&format!("gritty: transfer cancelled: {reason}")).as_bytes())?;
                     }
                     Some(Ok(Frame::TunnelData(data))) => {
                         if let Some(ref tx) = tunnel_writer {
@@ -723,20 +733,22 @@ pub async fn run(
                 // Env vars only sent on first connection; clear for reconnect
                 current_env.clear();
                 // Disconnected — try to reconnect
-                write_stdout(b"[reconnecting...]\r\n")?;
+                write_stdout(status_msg("reconnecting...").as_bytes())?;
 
                 loop {
-                    tokio::time::sleep(Duration::from_secs(1)).await;
-
-                    // Check for Ctrl-C (0x03) in raw mode
-                    {
-                        let mut peek = [0u8; 1];
-                        match io::stdin().read(&mut peek) {
-                            Ok(1) if peek[0] == 0x03 => {
-                                write_stdout(b"\r\n")?;
-                                return Ok(1);
+                    // Race sleep against stdin so Ctrl-C is instant
+                    tokio::select! {
+                        _ = tokio::time::sleep(Duration::from_secs(1)) => {}
+                        _ = async_stdin.readable() => {
+                            let mut peek = [0u8; 1];
+                            match async_stdin.get_ref().read(&mut peek) {
+                                Ok(1) if peek[0] == 0x03 => {
+                                    write_stdout(b"\r\n")?;
+                                    return Ok(1);
+                                }
+                                _ => {}
                             }
-                            _ => {}
+                            continue;
                         }
                     }
 
@@ -759,14 +771,15 @@ pub async fn run(
 
                     match new_framed.next().await {
                         Some(Ok(Frame::Ok)) => {
-                            write_stdout(b"[reconnected]\r\n")?;
+                            write_stdout(success_msg("reconnected").as_bytes())?;
                             framed = new_framed;
                             current_redraw = true;
                             break;
                         }
                         Some(Ok(Frame::Error { message })) => {
-                            let msg = format!("[session gone: {message}]\r\n");
-                            write_stdout(msg.as_bytes())?;
+                            write_stdout(
+                                error_msg(&format!("session gone: {message}")).as_bytes(),
+                            )?;
                             return Ok(1);
                         }
                         _ => continue,
@@ -862,7 +875,7 @@ pub async fn tail(
         match result {
             Some(code) => break code,
             None => {
-                eprintln!("[reconnecting...]");
+                eprintln!("\x1b[2;33m[reconnecting...]\x1b[0m");
                 loop {
                     tokio::time::sleep(Duration::from_secs(1)).await;
 
@@ -882,14 +895,14 @@ pub async fn tail(
 
                     match new_framed.next().await {
                         Some(Ok(Frame::Ok)) => {
-                            eprintln!("[reconnected]");
+                            eprintln!("\x1b[32m[reconnected]\x1b[0m");
                             framed = new_framed;
                             heartbeat_interval.reset();
                             last_pong = Instant::now();
                             break;
                         }
                         Some(Ok(Frame::Error { message })) => {
-                            eprintln!("[session gone: {message}]");
+                            eprintln!("\x1b[31m[session gone: {message}]\x1b[0m");
                             break 'outer 1;
                         }
                         _ => continue,

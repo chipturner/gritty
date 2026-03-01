@@ -735,7 +735,10 @@ pub async fn run(
                 "flushing ring buffer"
             );
             if ring_buf_dropped > 0 {
-                let msg = format!("\r\n[gritty: {} bytes of output dropped]\r\n", ring_buf_dropped);
+                let msg = format!(
+                    "\r\n\x1b[2;33m[gritty: {} bytes of output dropped]\x1b[0m\r\n",
+                    ring_buf_dropped
+                );
                 framed.send(Frame::Data(Bytes::from(msg))).await?;
                 ring_buf_dropped = 0;
             }
