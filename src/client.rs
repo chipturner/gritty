@@ -227,9 +227,8 @@ impl Drop for SuppressInputGuard {
     }
 }
 
-/// Write all bytes to stdout, retrying on WouldBlock.
-/// Needed because setting O_NONBLOCK on stdin also affects stdout
-/// when they share the same terminal file description.
+/// Write all bytes to stdout synchronously, retrying on WouldBlock with spin-sleep.
+/// Used in contexts where stdout is blocking (tail mode).
 fn write_stdout(data: &[u8]) -> io::Result<()> {
     let mut stdout = io::stdout();
     let mut written = 0;
@@ -253,6 +252,27 @@ fn write_stdout(data: &[u8]) -> io::Result<()> {
             Err(e) => return Err(e),
         }
     }
+}
+
+/// Write all bytes to stdout asynchronously via AsyncFd.
+/// Used in relay mode where stdout is non-blocking (shares fd with stdin).
+async fn write_stdout_async(fd: &AsyncFd<std::os::fd::OwnedFd>, data: &[u8]) -> io::Result<()> {
+    use std::os::fd::AsRawFd;
+    let raw = fd.as_raw_fd();
+    let mut written = 0;
+    while written < data.len() {
+        let mut guard = fd.writable().await?;
+        match guard.try_io(|_| {
+            let n =
+                unsafe { libc::write(raw, data[written..].as_ptr().cast(), data.len() - written) };
+            if n < 0 { Err(io::Error::last_os_error()) } else { Ok(n as usize) }
+        }) {
+            Ok(Ok(n)) => written += n,
+            Ok(Err(e)) => return Err(e),
+            Err(_would_block) => continue,
+        }
+    }
+    Ok(())
 }
 
 /// Format a byte count as a human-readable size string.
@@ -355,6 +375,7 @@ async fn send_init_frames(
 async fn relay(
     framed: &mut Framed<UnixStream, FrameCodec>,
     async_stdin: &AsyncFd<io::Stdin>,
+    async_stdout: &AsyncFd<std::os::fd::OwnedFd>,
     sigwinch: &mut tokio::signal::unix::Signal,
     buf: &mut [u8],
     mut escape: Option<&mut EscapeProcessor>,
@@ -409,7 +430,7 @@ async fn relay(
                                         }
                                     }
                                     EscapeAction::Detach => {
-                                        write_stdout(status_msg("detached").as_bytes())?;
+                                        write_stdout_async(async_stdout, status_msg("detached").as_bytes()).await?;
                                         return Ok(Some(0));
                                     }
                                     EscapeAction::Suspend => {
@@ -425,15 +446,16 @@ async fn relay(
                                             Some(d) => format!("{:.1}ms", d.as_secs_f64() * 1000.0),
                                             None => "n/a".to_string(),
                                         };
-                                        write_stdout(
+                                        write_stdout_async(
+                                            async_stdout,
                                             status_msg(&format!(
                                                 "session: {session}, rtt: {rtt_str}"
                                             ))
                                             .as_bytes(),
-                                        )?;
+                                        ).await?;
                                     }
                                     EscapeAction::Help => {
-                                        write_stdout(ESCAPE_HELP)?;
+                                        write_stdout_async(async_stdout, ESCAPE_HELP).await?;
                                     }
                                 }
                             }
@@ -450,7 +472,7 @@ async fn relay(
                 match frame {
                     Some(Ok(Frame::Data(data))) => {
                         debug!(len = data.len(), "socket → stdout");
-                        write_stdout(&data)?;
+                        write_stdout_async(async_stdout, &data).await?;
                     }
                     Some(Ok(Frame::Pong)) => {
                         last_rtt = Some(last_ping_sent.elapsed());
@@ -474,7 +496,7 @@ async fn relay(
                             }
                         }
                         pf_channels.clear();
-                        write_stdout(status_msg("detached").as_bytes())?;
+                        write_stdout_async(async_stdout, status_msg("detached").as_bytes()).await?;
                         return Ok(Some(0));
                     }
                     Some(Ok(Frame::AgentOpen { channel_id })) => {
@@ -589,13 +611,13 @@ async fn relay(
                     Some(Ok(Frame::SendOffer { file_count, total_bytes })) => {
                         let size_str = format_size(total_bytes);
                         let s = if file_count == 1 { "" } else { "s" };
-                        write_stdout(status_msg(&format!("gritty: receiving {file_count} file{s} ({size_str})")).as_bytes())?;
+                        write_stdout_async(async_stdout, status_msg(&format!("gritty: receiving {file_count} file{s} ({size_str})")).as_bytes()).await?;
                     }
                     Some(Ok(Frame::SendDone)) => {
-                        write_stdout(success_msg("gritty: transfer complete").as_bytes())?;
+                        write_stdout_async(async_stdout, success_msg("gritty: transfer complete").as_bytes()).await?;
                     }
                     Some(Ok(Frame::SendCancel { reason })) => {
-                        write_stdout(error_msg(&format!("gritty: transfer cancelled: {reason}")).as_bytes())?;
+                        write_stdout_async(async_stdout, error_msg(&format!("gritty: transfer cancelled: {reason}")).as_bytes()).await?;
                     }
                     Some(Ok(Frame::TunnelData(data))) => {
                         if let Some(ref tx) = tunnel_writer {
@@ -845,6 +867,9 @@ pub async fn run(
     // Declared BEFORE async_stdin so it drops AFTER AsyncFd (reverse drop order).
     let nb_guard = NonBlockGuard::set(stdin_borrowed)?;
     let async_stdin = AsyncFd::new(io::stdin())?;
+    // dup() stdout so we get an independent fd for AsyncFd (stdin may share the same fd).
+    let stdout_fd = crate::security::checked_dup(io::stdout().as_raw_fd())?;
+    let async_stdout = AsyncFd::new(stdout_fd)?;
     let mut sigwinch = signal(SignalKind::window_change())?;
     let mut buf = vec![0u8; 4096];
     let mut current_redraw = redraw;
@@ -866,6 +891,7 @@ pub async fn run(
             relay(
                 &mut framed,
                 &async_stdin,
+                &async_stdout,
                 &mut sigwinch,
                 &mut buf,
                 escape.as_mut(),
@@ -886,7 +912,7 @@ pub async fn run(
                 // Env vars only sent on first connection; clear for reconnect
                 current_env.clear();
                 // Disconnected — try to reconnect
-                write_stdout(status_msg("reconnecting...").as_bytes())?;
+                write_stdout_async(&async_stdout, status_msg("reconnecting...").as_bytes()).await?;
 
                 loop {
                     // Race sleep against stdin so Ctrl-C is instant
@@ -896,7 +922,7 @@ pub async fn run(
                             let mut peek = [0u8; 1];
                             match async_stdin.get_ref().read(&mut peek) {
                                 Ok(1) if peek[0] == 0x03 => {
-                                    write_stdout(b"\r\n")?;
+                                    write_stdout_async(&async_stdout, b"\r\n").await?;
                                     return Ok(1);
                                 }
                                 _ => {}
@@ -924,15 +950,21 @@ pub async fn run(
 
                     match new_framed.next().await {
                         Some(Ok(Frame::Ok)) => {
-                            write_stdout(success_msg("reconnected").as_bytes())?;
+                            write_stdout_async(
+                                &async_stdout,
+                                success_msg("reconnected").as_bytes(),
+                            )
+                            .await?;
                             framed = new_framed;
                             current_redraw = true;
                             break;
                         }
                         Some(Ok(Frame::Error { message })) => {
-                            write_stdout(
+                            write_stdout_async(
+                                &async_stdout,
                                 error_msg(&format!("session gone: {message}")).as_bytes(),
-                            )?;
+                            )
+                            .await?;
                             return Ok(1);
                         }
                         _ => continue,
