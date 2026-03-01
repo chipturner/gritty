@@ -564,10 +564,17 @@ pub async fn run(
     if let Some(ref dir) = home {
         cmd.current_dir(dir);
     }
-    const ALLOWED_ENV_KEYS: &[&str] = &["TERM", "LANG", "COLORTERM", "BROWSER"];
+    const ALLOWED_ENV_KEYS: &[&str] = &["TERM", "LANG", "COLORTERM"];
     for (k, v) in &env_vars {
         if ALLOWED_ENV_KEYS.contains(&k.as_str()) {
             cmd.env(k, v);
+        } else if k == "BROWSER" {
+            // Client signals open forwarding desired; resolve to server-side binary
+            let exe = std::env::current_exe()
+                .ok()
+                .and_then(|p| p.to_str().map(String::from))
+                .unwrap_or_else(|| "gritty".into());
+            cmd.env("BROWSER", format!("{exe} open"));
         } else {
             warn!(key = k, "ignoring disallowed env var from client");
         }
@@ -1099,10 +1106,10 @@ fn handle_send_stream(mut stream: UnixStream, send_event_tx: &mpsc::UnboundedSen
 fn stream_is_dead(stream: &UnixStream) -> bool {
     let mut probe = [0u8; 1];
     match stream.try_read(&mut probe) {
-        Ok(0) => true,                                                    // EOF
+        Ok(0) => true,                                                     // EOF
         Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => false, // alive
         Err(_) => true,                                                    // error
-        Ok(_) => false,                                                    // unexpected data, treat as alive
+        Ok(_) => false, // unexpected data, treat as alive
     }
 }
 
