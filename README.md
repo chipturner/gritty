@@ -74,12 +74,13 @@ gritty disconnect devbox # tear down
 ```
 
 ```bash
-# Send files from local to remote (run `gritty receive` inside the session)
-gritty send devbox file1.txt file2.txt
-
-# Or send from inside a session (run `gritty receive` on the other side)
-gritty send myfile.txt
+# Send files (auto-detects session; run `gritty receive` on the other side)
+gritty send file1.txt file2.txt
 gritty receive /tmp/dest
+
+# Explicit session when multiple exist
+gritty send --session devbox:work file1.txt file2.txt
+gritty receive --session local:0 /tmp/dest
 ```
 
 `gritty ls devbox` output:
@@ -103,15 +104,15 @@ ID  Name    PTY         PID    Created              Status
 | `gritty list-sessions <host>` | `ls`, `list` | List sessions |
 | `gritty kill-session <host:session>` | | Kill a session |
 | `gritty kill-server <host>` | | Kill the server and all sessions |
-| `gritty send [host[:session]] <files...>` | | Send files to a paired receiver |
-| `gritty receive [host[:session]] [dir]` | | Receive files from a paired sender |
+| `gritty send [--session host:session] <files...>` | | Send files to a paired receiver |
+| `gritty receive [--session host:session] [dir]` | | Receive files from a paired sender |
 | `gritty open <url>` | | Open a URL on the local machine (inside sessions) |
 | `gritty socket-path` | `socket` | Print the default server socket path |
 | `gritty info` | | Show diagnostics (version, config, server status, tunnels) |
 | `gritty config-edit` | | Open config in `$VISUAL`/`$EDITOR` (creates from template if missing) |
 | `gritty completions <shell>` | | Generate shell completions (bash, zsh, fish, elvish, powershell) |
 
-`<host>` is a connection name from `gritty connect`, or `local` for the local server. Session is specified after a colon: `host:session`. `--ctl-socket` overrides host resolution. For `send`/`receive`, the target is optional when running inside a session (uses `GRITTY_SOCK`).
+`<host>` is a connection name from `gritty connect`, or `local` for the local server. Session is specified after a colon: `host:session`. `--ctl-socket` overrides host resolution. `send`/`receive` auto-detect the session by probing all known daemons; use `--session` to disambiguate when multiple sessions exist. Inside a session (`GRITTY_SOCK` set), auto-detection is skipped.
 
 **Notable options:**
 - `-A` / `--forward-agent` on `new`/`attach`: forward your local SSH agent

@@ -115,8 +115,9 @@ enum Command {
     },
     /// Send files to a paired receiver
     Send {
-        /// Target host[:session]; omit when inside a session
-        target: Option<String>,
+        /// Session to use (host:session); auto-detected if omitted
+        #[arg(long)]
+        session: Option<String>,
 
         /// Files to send
         #[arg(required = true)]
@@ -124,8 +125,9 @@ enum Command {
     },
     /// Receive files from a paired sender
     Receive {
-        /// Target host[:session]; omit when inside a session
-        target: Option<String>,
+        /// Session to use (host:session); auto-detected if omitted
+        #[arg(long)]
+        session: Option<String>,
 
         /// Destination directory (default: current directory)
         dir: Option<PathBuf>,
@@ -626,26 +628,8 @@ async fn run(cli: Cli, config: gritty::config::ConfigFile) -> anyhow::Result<()>
             println!("{}", ctl_path.display());
             Ok(())
         }
-        Command::Send { target, files } => {
-            let (ctl_socket, host, session) = match target {
-                Some(t) => {
-                    let (host, session) = parse_target(&t);
-                    (cli.ctl_socket, Some(host), session)
-                }
-                None => (cli.ctl_socket, None, None),
-            };
-            send_command(ctl_socket, host, session, files).await
-        }
-        Command::Receive { target, dir } => {
-            let (ctl_socket, host, session) = match target {
-                Some(t) => {
-                    let (host, session) = parse_target(&t);
-                    (cli.ctl_socket, Some(host), session)
-                }
-                None => (cli.ctl_socket, None, None),
-            };
-            receive_command(ctl_socket, host, session, dir).await
-        }
+        Command::Send { session, files } => send_command(cli.ctl_socket, session, files).await,
+        Command::Receive { session, dir } => receive_command(cli.ctl_socket, session, dir).await,
         Command::Open { url } => {
             open_url(&url);
             Ok(())
@@ -1175,18 +1159,137 @@ fn sanitize_basename(name: &str) -> anyhow::Result<String> {
     Ok(basename.to_string())
 }
 
+struct DiscoveredSession {
+    host: String,
+    session_id: String,
+    ctl_path: PathBuf,
+}
+
+/// Probe a single daemon for its sessions.
+async fn probe_daemon_sessions(host: &str, ctl_path: &Path) -> Vec<DiscoveredSession> {
+    use futures_util::{SinkExt, StreamExt};
+    use gritty::protocol::{Frame, FrameCodec};
+    use tokio_util::codec::Framed;
+
+    let stream = match tokio::net::UnixStream::connect(ctl_path).await {
+        Ok(s) => s,
+        Err(_) => return vec![],
+    };
+    let mut framed = Framed::new(stream, FrameCodec);
+    if gritty::handshake(&mut framed).await.is_err() {
+        return vec![];
+    }
+    if framed.send(Frame::ListSessions).await.is_err() {
+        return vec![];
+    }
+    match Frame::expect_from(framed.next().await) {
+        Ok(Frame::SessionInfo { sessions }) => sessions
+            .into_iter()
+            .map(|s| DiscoveredSession {
+                host: host.to_string(),
+                session_id: if s.name.is_empty() { s.id } else { s.name },
+                ctl_path: ctl_path.to_path_buf(),
+            })
+            .collect(),
+        _ => vec![],
+    }
+}
+
+/// Auto-detect a single session across all known daemons.
+async fn auto_detect_session(ctl_socket: Option<&Path>) -> anyhow::Result<DiscoveredSession> {
+    let mut probes: Vec<(String, PathBuf)> = Vec::new();
+
+    if let Some(p) = ctl_socket {
+        probes.push(("local".to_string(), p.to_path_buf()));
+    } else {
+        let local = gritty::daemon::control_socket_path();
+        if local.exists() {
+            probes.push(("local".to_string(), local));
+        }
+        for info in gritty::connect::get_tunnel_info() {
+            if info.status == "healthy" {
+                let sock = gritty::connect::connection_socket_path(&info.name);
+                probes.push((info.name, sock));
+            }
+        }
+    }
+
+    if probes.is_empty() {
+        anyhow::bail!("no server running");
+    }
+
+    let futures: Vec<_> = probes
+        .iter()
+        .map(|(host, path)| {
+            let host = host.clone();
+            let path = path.clone();
+            async move {
+                tokio::time::timeout(
+                    std::time::Duration::from_secs(2),
+                    probe_daemon_sessions(&host, &path),
+                )
+                .await
+                .unwrap_or_default()
+            }
+        })
+        .collect();
+
+    let results: Vec<DiscoveredSession> =
+        futures_util::future::join_all(futures).await.into_iter().flatten().collect();
+
+    match results.len() {
+        0 => anyhow::bail!("no active sessions"),
+        1 => Ok(results.into_iter().next().unwrap()),
+        n => {
+            let mut msg = format!("{n} sessions active, specify one with --session:\n");
+            for s in &results {
+                msg.push_str(&format!("  {}:{}\n", s.host, s.session_id));
+            }
+            anyhow::bail!("{msg}");
+        }
+    }
+}
+
+/// Connect to the daemon, handshake, send SendFile, extract raw stream.
+async fn send_file_handshake(
+    ctl_path: &Path,
+    session: &str,
+    role: u8,
+) -> anyhow::Result<tokio::net::UnixStream> {
+    use futures_util::{SinkExt, StreamExt};
+    use gritty::protocol::{Frame, FrameCodec};
+    use tokio::io::AsyncWriteExt;
+    use tokio_util::codec::Framed;
+
+    let stream = tokio::net::UnixStream::connect(ctl_path).await.map_err(|_| {
+        anyhow::anyhow!("no server running (could not connect to {})", ctl_path.display())
+    })?;
+    let mut framed = Framed::new(stream, FrameCodec);
+    gritty::handshake(&mut framed).await?;
+    framed.send(Frame::SendFile { session: session.to_string(), role }).await?;
+
+    match Frame::expect_from(framed.next().await)? {
+        Frame::Ok => {}
+        Frame::Error { message } => anyhow::bail!("{message}"),
+        other => anyhow::bail!("unexpected response: {other:?}"),
+    }
+
+    let mut stream = framed.into_inner();
+    stream.write_all(&[role]).await?;
+    Ok(stream)
+}
+
 /// Connect to the service socket for a session. Either via GRITTY_SOCK
-/// (in-session) or via the control socket (local-side).
+/// (in-session), explicit --session flag, or auto-detect.
 async fn connect_send_socket(
     ctl_socket: Option<PathBuf>,
-    host: Option<String>,
-    target: Option<String>,
+    session_flag: Option<String>,
     role: u8,
 ) -> anyhow::Result<tokio::net::UnixStream> {
     // In-session: GRITTY_SOCK is set
     if let Ok(sock_path) = std::env::var("GRITTY_SOCK") {
-        if host.is_some() {
-            anyhow::bail!("cannot specify host when inside a session");
+        if session_flag.is_some() {
+            anyhow::bail!("cannot specify --session inside a session");
         }
         let mut stream = tokio::net::UnixStream::connect(&sock_path).await.map_err(|e| {
             anyhow::anyhow!("could not connect to service socket ({sock_path}): {e}")
@@ -1196,71 +1299,23 @@ async fn connect_send_socket(
         return Ok(stream);
     }
 
-    // Local-side: connect to control socket
-    let host =
-        host.ok_or_else(|| anyhow::anyhow!("specify a host (use 'local' for the local server)"))?;
-    let ctl_path = resolve_ctl_path(ctl_socket, Some(&host))?;
-
-    // Resolve session target
-    let session = match target {
-        Some(t) => t,
-        None => {
-            // Auto-detect: list sessions, use the only one
-            let resp = server_request(&ctl_path, gritty::protocol::Frame::ListSessions).await?;
-            match resp {
-                gritty::protocol::Frame::SessionInfo { sessions } => match sessions.len() {
-                    0 => anyhow::bail!("no active sessions"),
-                    1 => {
-                        let s = &sessions[0];
-                        if s.name.is_empty() { s.id.clone() } else { s.name.clone() }
-                    }
-                    n => {
-                        let mut msg =
-                            format!("{n} sessions active, specify one with host:session:\n");
-                        for s in &sessions {
-                            if s.name.is_empty() {
-                                msg.push_str(&format!("  {}\n", s.id));
-                            } else {
-                                msg.push_str(&format!("  {} ({})\n", s.name, s.id));
-                            }
-                        }
-                        anyhow::bail!("{msg}");
-                    }
-                },
-                other => anyhow::bail!("unexpected response: {other:?}"),
-            }
-        }
-    };
-
-    use futures_util::{SinkExt, StreamExt};
-    use gritty::protocol::{Frame, FrameCodec};
-    use tokio_util::codec::Framed;
-
-    let stream = tokio::net::UnixStream::connect(&ctl_path).await.map_err(|_| {
-        anyhow::anyhow!("no server running (could not connect to {})", ctl_path.display())
-    })?;
-    let mut framed = Framed::new(stream, FrameCodec);
-    gritty::handshake(&mut framed).await?;
-    framed.send(Frame::SendFile { session, role }).await?;
-
-    match Frame::expect_from(framed.next().await)? {
-        Frame::Ok => {}
-        Frame::Error { message } => anyhow::bail!("{message}"),
-        other => anyhow::bail!("unexpected response: {other:?}"),
+    // Explicit --session flag
+    if let Some(target) = session_flag {
+        let (host, session) = parse_target(&target);
+        let session = session
+            .ok_or_else(|| anyhow::anyhow!("--session requires host:session (e.g. local:0)"))?;
+        let ctl_path = resolve_ctl_path(ctl_socket, Some(&host))?;
+        return send_file_handshake(&ctl_path, &session, role).await;
     }
 
-    // Extract raw stream from framed connection
-    let mut stream = framed.into_inner();
-    // Write SvcRequest discriminator on the raw stream (server reads it via handle_send_stream)
-    use tokio::io::AsyncWriteExt;
-    stream.write_all(&[role]).await?;
-    Ok(stream)
+    // Auto-detect
+    let discovered = auto_detect_session(ctl_socket.as_deref()).await?;
+    send_file_handshake(&discovered.ctl_path, &discovered.session_id, role).await
 }
 
 async fn send_command(
     ctl_socket: Option<PathBuf>,
-    host: Option<String>,
-    target: Option<String>,
+    session: Option<String>,
     files: Vec<PathBuf>,
 ) -> anyhow::Result<()> {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -1278,7 +1333,7 @@ async fn send_command(
     }
 
     let mut stream =
-        connect_send_socket(ctl_socket, host, target, gritty::protocol::SvcRequest::Send.to_byte())
+        connect_send_socket(ctl_socket, session, gritty::protocol::SvcRequest::Send.to_byte())
             .await?;
 
     // Write manifest: file_count, then per-file: name_len, name, file_size
@@ -1328,8 +1383,7 @@ async fn send_command(
 
 async fn receive_command(
     ctl_socket: Option<PathBuf>,
-    host: Option<String>,
-    target: Option<String>,
+    session: Option<String>,
     dir: Option<PathBuf>,
 ) -> anyhow::Result<()> {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -1339,13 +1393,9 @@ async fn receive_command(
         anyhow::bail!("{}: not a directory", dest_dir.display());
     }
 
-    let mut stream = connect_send_socket(
-        ctl_socket,
-        host,
-        target,
-        gritty::protocol::SvcRequest::Receive.to_byte(),
-    )
-    .await?;
+    let mut stream =
+        connect_send_socket(ctl_socket, session, gritty::protocol::SvcRequest::Receive.to_byte())
+            .await?;
 
     // Write dest dir + newline
     let dest_str = dest_dir.to_string_lossy();
