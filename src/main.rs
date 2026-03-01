@@ -1082,21 +1082,10 @@ async fn suggest_session(cmd: &str, host: &str, ctl_path: &Path) -> anyhow::Resu
 }
 
 fn format_timestamp(epoch_secs: u64) -> String {
-    let time = epoch_secs as libc::time_t;
-    let mut tm: libc::tm = unsafe { std::mem::zeroed() };
-    let result = unsafe { libc::localtime_r(&time, &mut tm) };
-    if result.is_null() {
+    let Ok(ts) = jiff::Timestamp::from_second(epoch_secs as i64) else {
         return "-".to_string();
-    }
-    format!(
-        "{:04}-{:02}-{:02} {:02}:{:02}:{:02}",
-        tm.tm_year + 1900,
-        tm.tm_mon + 1,
-        tm.tm_mday,
-        tm.tm_hour,
-        tm.tm_min,
-        tm.tm_sec,
-    )
+    };
+    ts.to_zoned(jiff::tz::TimeZone::system()).strftime("%Y-%m-%d %H:%M:%S").to_string()
 }
 
 async fn tail_session(target: String, ctl_path: PathBuf) -> anyhow::Result<i32> {

@@ -257,18 +257,7 @@ fn write_stdout(data: &[u8]) -> io::Result<()> {
 
 /// Format a byte count as a human-readable size string.
 pub fn format_size(bytes: u64) -> String {
-    const KB: u64 = 1024;
-    const MB: u64 = 1024 * KB;
-    const GB: u64 = 1024 * MB;
-    if bytes >= GB {
-        format!("{:.1}GB", bytes as f64 / GB as f64)
-    } else if bytes >= MB {
-        format!("{:.1}MB", bytes as f64 / MB as f64)
-    } else if bytes >= KB {
-        format!("{:.1}KB", bytes as f64 / KB as f64)
-    } else {
-        format!("{bytes}B")
-    }
+    humansize::format_size(bytes, humansize::BINARY)
 }
 
 fn status_msg(text: &str) -> String {
@@ -284,14 +273,7 @@ fn error_msg(text: &str) -> String {
 }
 
 fn get_terminal_size() -> (u16, u16) {
-    let mut ws: libc::winsize = unsafe { std::mem::zeroed() };
-    if unsafe { libc::ioctl(libc::STDIN_FILENO, libc::TIOCGWINSZ, &mut ws) } != 0
-        || ws.ws_col == 0
-        || ws.ws_row == 0
-    {
-        return (80, 24);
-    }
-    (ws.ws_col, ws.ws_row)
+    terminal_size::terminal_size().map(|(w, h)| (w.0, h.0)).unwrap_or((80, 24))
 }
 
 /// Send a frame with a timeout. Returns false if the send failed or timed out.
@@ -531,14 +513,7 @@ async fn relay(
                     Some(Ok(Frame::OpenUrl { url })) => {
                         if url.starts_with("http://") || url.starts_with("https://") {
                             debug!("opening URL locally: {url}");
-                            let cmd = if cfg!(target_os = "macos") { "open" } else { "xdg-open" };
-                            let _ = std::process::Command::new(cmd)
-                                .arg("--")
-                                .arg(&url)
-                                .stdin(std::process::Stdio::null())
-                                .stdout(std::process::Stdio::null())
-                                .stderr(std::process::Stdio::null())
-                                .spawn();
+                            let _ = opener::open(&url);
                         } else {
                             debug!("rejected non-http(s) URL: {url}");
                         }
