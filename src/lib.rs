@@ -76,6 +76,8 @@ where
                 break;
             }
         }
+        // Graceful half-close: send FIN instead of RST
+        let _ = write_half.shutdown().await;
     });
 
     writer_tx
@@ -181,5 +183,39 @@ mod tests {
                 .unwrap();
 
         assert_eq!(&buf[..n], b"hello");
+    }
+
+    #[tokio::test]
+    async fn spawn_channel_relay_writer_half_close() {
+        use tokio::io::AsyncReadExt;
+        use tokio::net::UnixStream;
+
+        let (read_stream, _feed_stream) = UnixStream::pair().unwrap();
+        let (write_stream, mut drain_stream) = UnixStream::pair().unwrap();
+        let (read_half, _) = read_stream.into_split();
+        let (_, write_half) = write_stream.into_split();
+
+        let writer_tx = spawn_channel_relay(7, read_half, write_half, |_, _| true, |_| {});
+
+        // Send data then drop the sender (triggers half-close)
+        writer_tx.send(bytes::Bytes::from_static(b"request")).unwrap();
+        drop(writer_tx);
+
+        // Read the data
+        let mut buf = vec![0u8; 32];
+        let n =
+            tokio::time::timeout(std::time::Duration::from_secs(2), drain_stream.read(&mut buf))
+                .await
+                .unwrap()
+                .unwrap();
+        assert_eq!(&buf[..n], b"request");
+
+        // Read again -- should get EOF (graceful shutdown), not error
+        let n =
+            tokio::time::timeout(std::time::Duration::from_secs(2), drain_stream.read(&mut buf))
+                .await
+                .unwrap()
+                .unwrap();
+        assert_eq!(n, 0, "expected EOF from graceful half-close");
     }
 }
