@@ -5,8 +5,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 ## What is gritty
 
 gritty provides persistent TTY sessions over Unix domain sockets. Single binary, tmux-like CLI:
-- `gritty server` — starts the server (self-daemonizes by default, returns after socket is bound). Alias: `s`
-- `gritty server --foreground` — runs server in the foreground (for debugging or process managers)
+- `gritty server` — starts the server (self-daemonizes by default, returns after socket is bound). Alias: `s`. `-f`/`--foreground` runs in the foreground (for debugging or process managers).
 - `gritty new-session <host[:name]>` — creates a persistent session and auto-attaches. `<host>` is required: a connection name from `gritty connect`, or `local` for the local server. Optional `:name` creates a named session. Auto-starts the server if none is running: `local` runs `gritty server`; other hosts run `gritty connect <host>`. Alias: `new`. `-A`/`--forward-agent` forwards local SSH agent. `-O`/`--forward-open` forwards URL opens to local machine. `--no-redraw` suppresses Ctrl-L redraw. `--no-escape` disables escape sequences. `--no-oauth-redirect` disables OAuth callback tunneling. `--oauth-timeout <seconds>` sets OAuth callback accept timeout (default: 180). `-w`/`--wait` waits indefinitely for the server instead of giving up after retries.
 - `gritty attach <host:session>` — attaches to a session, detaches other clients. Waits indefinitely for the server if not yet running. Alias: `a`. `-A`/`--forward-agent` forwards local SSH agent. `-O`/`--forward-open` forwards URL opens to local machine. `--no-redraw` suppresses Ctrl-L redraw. `--no-escape` disables escape sequences. `--no-oauth-redirect` disables OAuth callback tunneling. `--oauth-timeout <seconds>` sets OAuth callback accept timeout (default: 180).
 - `gritty tail <host:session>` — read-only stream of a session's PTY output (like `tail -f`). Alias: `t`. Does not detach the active client. Multiple tails can watch simultaneously. Streams raw PTY output -- not useful for TUI apps.
@@ -15,7 +14,7 @@ gritty provides persistent TTY sessions over Unix domain sockets. Single binary,
 - `gritty open <url>` — opens a URL on the local machine (for use inside gritty sessions with `--forward-open`). Reads `GRITTY_SOCK` from env.
 - `gritty local-forward <port>` — forward a TCP port from session to client. Port spec: `8080` (same on both ends) or `8080:3000` (listen:target). Runs inside a session (`GRITTY_SOCK` required). Ctrl-C stops the forward. Alias: `lf`
 - `gritty remote-forward <port>` — forward a TCP port from client to session. Same port spec syntax. Alias: `rf`
-- `gritty connect user@host` — SSH tunnel: self-backgrounds, auto-starts remote server, sets up tunnel, prints socket path and returns. Alias: `c`. Optional `-n <name>` overrides connection name (defaults to hostname). `--foreground` keeps it in the foreground. `--dry-run` prints the SSH commands instead of running them.
+- `gritty connect <destination>` — SSH tunnel: self-backgrounds, auto-starts remote server, sets up tunnel, prints socket path and returns. Destination is `[user@]host[:port]`. Alias: `c`. `-n <name>` overrides connection name (defaults to hostname). `-o`/`--ssh-option` adds extra SSH options (repeatable). `--no-server-start` skips auto-starting the remote server. `-f`/`--foreground` keeps it in the foreground. `--dry-run` prints the SSH commands instead of running them.
 - `gritty disconnect <name>` — tears down an SSH tunnel by connection name. Alias: `dc`
 - `gritty tunnels` — lists active SSH tunnels with name/destination/status. Alias: `tun`
 - `gritty list-sessions <host>` — lists active sessions with id/name/PTY/PID/status. Aliases: `ls`, `list`
@@ -29,7 +28,7 @@ gritty provides persistent TTY sessions over Unix domain sockets. Single binary,
 
 Sessions get auto-incrementing integer IDs (0, 1, 2...) with optional human-friendly names via `host:name`.
 
-Global option: `--ctl-socket <path>` overrides the default server socket path.
+Global options: `--ctl-socket <path>` overrides the default server socket path. `-v`/`--verbose` enables debug logging.
 
 Client commands (`new-session`, `attach`, `tail`, `list-sessions`, `kill-session`, `kill-server`) accept an optional positional `<host[:session]>` argument. `<host>` is a connection name from `gritty connect`, or `local` for the local server. `<session>` (after the colon) identifies the session by name or ID (e.g., `gritty attach local:work`, `gritty new devbox:myproject`). The target is required unless `--ctl-socket` is provided (which overrides host resolution). Commands that require a session (`attach`, `tail`, `kill-session`) show available sessions if the session part is omitted. `send`/`receive` keep the target optional for in-session use. `gritty connect local` is rejected -- "local" is reserved for the local server keyword.
 

@@ -1,86 +1,55 @@
 # gritty
 
-Persistent, self-healing terminal sessions over SSH for smooth remote development.
+Persistent, self-healing terminal sessions that make remote hosts feel local.
 
-gritty gives you seamless, robust remote shell sessions that survive network changes, laptop sleep, and SSH disconnects. Close your laptop, change networks, reconnect your VPN -- gritty detects the dead connection, respawns the SSH tunnel, and picks up where you left off.  gritty also optionally forwards your `ssh-agent` and will handle remote requests to open URLs via `$BROWSER`.
+gritty gives you remote shell sessions that survive network changes, laptop sleep, and SSH disconnects -- then brings your local tools along for the ride. Your SSH agent works remotely. URLs open in your local browser. OAuth flows complete seamlessly. Ports forward through the session. Files transfer without scp. Close your laptop, change wifi, open it back up: you're exactly where you left off.
 
-It works by forwarding Unix domain sockets over SSH -- no custom protocol, no open ports, no certificates, no configuration. If you can `ssh` to a host, you can use gritty for reliable remote development.
-
-## Features
-
-- **Reliable**
-    - **Self-healing connections** -- heartbeat detection, automatic tunnel respawn, transparent client reconnect
-    - **Persistent sessions** -- shells survive client disconnect, network failure, laptop sleep
-        - Client is stateless -- reboot your laptop, update your terminal app, switch machines, and `gritty attach` from a fresh process
-- **Remote development**
-    - **SSH agent forwarding** (`-A`) -- tunnels your local SSH agent so `git push`, `ssh`, and other agent-dependent commands work remotely
-    - **URL open forwarding** (`-O`) -- forwards `$BROWSER` / URL open requests back to your local machine
-    - **File transfer** (`gritty send` / `gritty receive`) -- quick file transfer between local and remote through the existing session connection
-    - **Environment forwarding** -- TERM, LANG, COLORTERM propagated to remote shell
-- **Simple**
-    - **Single binary, zero config** -- optional TOML config for defaults; no server config, no port allocation, no root required; auto-starts both the server and SSH tunnels on demand
-    - **No network protocol** -- Unix domain sockets locally, SSH handles encryption and auth
-- **Session management**
-    - **Multiple named sessions** -- create, list, attach, kill by name or ID
-    - **SSH-style escape sequences** -- `~.` detach, `~^Z` suspend, `~?` help
-
-## Quick Start
+It works by forwarding Unix domain sockets over SSH -- no custom protocol, no open ports, no certificates, no configuration. If you can `ssh` to a host, you can use gritty.
 
 ```bash
 cargo install gritty-cli
 ```
 
-### Connect to a remote host
+## Quick Start
 
-One command creates a session and connects -- auto-starting the SSH tunnel and remote server if needed:
-
-```bash
-gritty new devbox:work
-```
-
-This works when the host is resolvable by SSH (e.g., via `~/.ssh/config`). For `user@host` destinations, start the tunnel explicitly first:
+One command creates a session and connects -- auto-starting the SSH tunnel and remote server:
 
 ```bash
-gritty connect user@devbox    # sets up tunnel named "devbox"
-gritty new devbox:work        # creates session through tunnel
+gritty new devbox:work              # create session, connect through SSH
 ```
 
-For local sessions (useful for testing), use `local` as the host:
+That's it. The tunnel and remote server start automatically. The host must be resolvable by SSH (e.g., via `~/.ssh/config`). For `user@host` destinations, set up the tunnel first: `gritty connect user@devbox`.
+
+Now make it feel local:
 
 ```bash
-gritty new local:scratch
+gritty new devbox:work -A -O        # forward SSH agent + browser/OAuth
+
+# Inside the session:
+git push                            # uses your local SSH keys via -A
+gh auth login                       # OAuth opens in your local browser via -O
+gritty lf 8080                      # access remote port 8080 on localhost:8080
+gritty rf 5432                      # expose local postgres to the session
 ```
 
-Create, detach, reattach:
+Transfer files through the session (run one side locally, one remotely):
+
+```bash
+gritty send file1.txt file2.txt     # auto-detects which session to use
+gritty receive /tmp/dest
+
+command | gritty send --stdin        # pipe mode
+gritty receive --stdout | command
+```
+
+Detach and reattach from anywhere:
 
 ```bash
 # Detach with ~. or just close your terminal
 
-# Reattach from any terminal
-gritty attach devbox:work
-
-# Forward your SSH agent for git/ssh on the remote host
-gritty new devbox:deploy -A
-
-# Forward URL opens back to your local browser
-gritty new devbox:docs -O
-
-# List sessions
-gritty ls devbox
-
-# Manage tunnels
-gritty tunnels           # list active tunnels
-gritty disconnect devbox # tear down
-```
-
-```bash
-# Send files (auto-detects session; run `gritty receive` on the other side)
-gritty send file1.txt file2.txt
-gritty receive /tmp/dest
-
-# Explicit session when multiple exist
-gritty send --session devbox:work file1.txt file2.txt
-gritty receive --session local:0 /tmp/dest
+gritty attach devbox:work           # reattach from any terminal, any machine
+gritty ls devbox                    # list sessions
+gritty tunnels                      # list active tunnels
 ```
 
 `gritty ls devbox` output:
@@ -91,55 +60,92 @@ ID  Name    PTY         PID    Created              Status
 1   deploy  /dev/pts/5  48305  2026-02-21 14:33:41  detached
 ```
 
+For local sessions (useful for testing): `gritty new local:scratch`
+
+## Features
+
+- **Self-healing connections** -- heartbeat detection, automatic tunnel respawn, transparent reconnect
+- **Persistent sessions** -- shells survive disconnect, network failure, laptop sleep; reattach from any terminal or machine
+- **SSH agent forwarding** (`-A`) -- `git push`, `ssh`, and other agent-dependent commands work remotely
+- **URL open forwarding** (`-O`) -- `$BROWSER` requests forwarded to your local machine, with automatic OAuth callback tunneling
+- **Port forwarding** -- `gritty local-forward` / `gritty remote-forward` for TCP ports, multiplexed over the session
+- **File transfer** -- `gritty send` / `gritty receive` through the session connection, with `--stdin`/`--stdout` pipe mode
+- **Read-only tail** -- `gritty tail` streams session output without detaching the active client
+- **Environment forwarding** -- TERM, LANG, COLORTERM propagated to the remote shell
+- **Single binary, zero config** -- optional TOML config for per-host defaults; no port allocation, no root required
+- **No network protocol** -- Unix domain sockets locally, SSH handles encryption and auth
+- **Multiple named sessions** -- create, list, attach, kill by name or ID
+- **SSH-style escape sequences** -- `~.` detach, `~^Z` suspend, `~?` help
+
 ## Commands
 
 | Command | Aliases | Description |
 |---------|---------|-------------|
-| `gritty connect user@host` | `c` | Set up SSH tunnel to remote host |
-| `gritty disconnect <name>` | `dc` | Tear down an SSH tunnel |
-| `gritty tunnels` | `tun` | List active SSH tunnels |
-| `gritty new-session <host[:name]>` | `new` | Create a session and auto-attach (auto-starts server/tunnel if needed) |
-| `gritty attach <host:session>` | `a` | Attach to a session |
+| `gritty new-session <host[:name]>` | `new` | Create a session and auto-attach |
+| `gritty attach <host:session>` | `a` | Attach to a session (detaches other clients) |
 | `gritty tail <host:session>` | `t` | Read-only stream of session output |
 | `gritty list-sessions <host>` | `ls`, `list` | List sessions |
 | `gritty kill-session <host:session>` | | Kill a session |
 | `gritty kill-server <host>` | | Kill the server and all sessions |
-| `gritty send [--session host:session] <files...>` | | Send files to a paired receiver |
-| `gritty receive [--session host:session] [dir]` | | Receive files from a paired sender |
+| `gritty connect <destination>` | `c` | Set up SSH tunnel to remote host |
+| `gritty disconnect <name>` | `dc` | Tear down an SSH tunnel |
+| `gritty tunnels` | `tun` | List active SSH tunnels |
+| `gritty send [files...]` | | Send files to a paired receiver |
+| `gritty receive [dir]` | | Receive files from a paired sender |
+| `gritty local-forward <port>` | `lf` | Forward a TCP port from session to client |
+| `gritty remote-forward <port>` | `rf` | Forward a TCP port from client to session |
 | `gritty open <url>` | | Open a URL on the local machine (inside sessions) |
-| `gritty socket-path` | `socket` | Print the default server socket path |
 | `gritty info` | | Show diagnostics (version, config, server status, tunnels) |
 | `gritty config-edit` | | Open config in `$VISUAL`/`$EDITOR` (creates from template if missing) |
 | `gritty completions <shell>` | | Generate shell completions (bash, zsh, fish, elvish, powershell) |
 
-`<host>` is a connection name from `gritty connect`, or `local` for the local server. Session is specified after a colon: `host:session`. `--ctl-socket` overrides host resolution. `send`/`receive` auto-detect by registering on all active sessions and pairing with whichever gets a counterpart first; use `--session host:session` to target a specific one. Inside a session (`GRITTY_SOCK` set), auto-detection is skipped.
+`<host>` is a connection name from `gritty connect`, or `local` for the local server. Session is specified after a colon: `host:session`. Auto-starts server/tunnel on `new`; `attach` waits for an existing server. `send`/`receive` auto-detect the session across all active daemons; use `--session host:session` to target a specific one.
 
-**Notable options:**
-- `-A` / `--forward-agent` on `new`/`attach`: forward your local SSH agent
-- `-O` / `--forward-open` on `new`/`attach`: forward URL opens to local machine
-- `-n <name>` on `connect`: override connection name (defaults to hostname)
-- `-o <option>` on `connect`: extra SSH options (repeatable, e.g., `-o "ProxyJump=bastion"`)
-- `--no-redraw` on `new`/`attach`: don't send Ctrl-L after connecting
-- `--no-escape` on `new`/`attach`: disable escape sequence processing
-- `--no-oauth-redirect` on `new`/`attach`: disable OAuth callback tunneling (part of `-O`)
-- `--oauth-timeout <seconds>` on `new`/`attach`: OAuth callback accept timeout (default: 180)
-- `-w` / `--wait` on `new`: wait indefinitely for the server (default: give up after retries)
+**Global options:**
+- `-v` / `--verbose`: enable debug logging
+- `--ctl-socket <path>`: override the server socket path
+
+**Session options** (`new`/`attach`):
+- `-A` / `--forward-agent`: forward your local SSH agent
+- `-O` / `--forward-open`: forward URL opens to local machine
+- `--no-redraw`: don't send Ctrl-L after connecting
+- `--no-escape`: disable escape sequence processing
+- `--no-oauth-redirect`: disable OAuth callback tunneling (part of `-O`)
+- `--oauth-timeout <seconds>`: OAuth callback accept timeout (default: 180)
+- `-w` / `--wait` (`new` only): wait indefinitely for the server
+
+**Connect options:**
+- `-n <name>`: override connection name (defaults to hostname)
+- `-o <option>` / `--ssh-option`: extra SSH options (repeatable, e.g., `-o "ProxyJump=bastion"`)
+- `--no-server-start`: don't auto-start the remote server
+- `--dry-run`: print SSH commands instead of running them
+- `-f` / `--foreground`: run in the foreground instead of backgrounding
+
+**Send/receive options:**
+- `--session host:session`: target a specific session
+- `--stdin` (`send`): read data from stdin instead of files
+- `--stdout` (`receive`): write data to stdout instead of files
+
+**Port forwarding:** port spec is `PORT` (same on both ends) or `LISTEN:TARGET`. Runs inside a session (`GRITTY_SOCK` required). Ctrl-C stops the forward.
 
 ## Configuration
 
-gritty works out of the box with no config file. Optionally, you can set persistent defaults in `$XDG_CONFIG_HOME/gritty/config.toml` (default: `~/.config/gritty/config.toml`). Run `gritty config-edit` to create and open the config file.
+gritty works out of the box with no config file. Optionally, set persistent defaults in `$XDG_CONFIG_HOME/gritty/config.toml` (default: `~/.config/gritty/config.toml`). Run `gritty config-edit` to create and open the config file.
 
 ```toml
 # Global defaults for all sessions/connections.
 [defaults]
-forward-agent = false
-forward-open = true
-no-escape = false
+# forward-agent = false
+# forward-open = false
+# no-escape = false
+# no-redraw = false
+# oauth-redirect = true
+# oauth-timeout = 180
 
 # Connect-specific global defaults.
 [defaults.connect]
-ssh-options = []
-no-server-start = false
+# ssh-options = []
+# no-server-start = false
 
 # Per-host overrides, keyed by connection name.
 # Connection name = hostname from destination, or -n override.
@@ -158,13 +164,9 @@ no-escape = true
 no-server-start = true
 ```
 
-**Configurable settings:** `forward-agent`, `forward-open`, `no-escape`, `no-redraw`, `oauth-redirect`, `oauth-timeout` (session), `ssh-options`, `no-server-start` (connect).
+**Precedence:** CLI flag > `[host.<name>]` > `[defaults]` > built-in default. For `ssh-options`, values are appended (CLI first, then host, then defaults; SSH first-match gives earlier options priority).
 
-**Precedence:** CLI flag > `[host.<name>]` > `[defaults]` > built-in default. CLI flags always win. For `ssh-options`, values are appended: CLI first, then host, then defaults (SSH uses first-match, so earlier options take priority).
-
-**Host resolution:** The `[host.<name>]` key matches the gritty connection name -- what appears in `gritty tunnels` and `gritty disconnect <name>`. For local sessions (`gritty new local`), `[host.local]` applies if present, then `[defaults]`.
-
-A missing or malformed config file is silently ignored -- gritty remains zero-config if you want it to be. Use `gritty info` to check config status.
+A missing or malformed config file is silently ignored. Use `gritty info` to check config status.
 
 ## Escape Sequences
 
@@ -244,7 +246,7 @@ flowchart LR
 
 <sub>Orange = SSH tunnel (TCP) · Blue = Unix domain socket</sub>
 
-A daemon listens on a single Unix socket (`ctl.sock`). Clients send a control frame declaring intent (new session, attach, list); the daemon hands off the raw socket connection to the target session and gets out of the loop. Each session owns a PTY with a login shell that persists across disconnects -- while no client is attached, the server drains PTY output into a userspace ring buffer (1MB cap) so the shell never blocks. On reconnect, buffered output is flushed to the new client.
+A daemon listens on a single Unix socket (`ctl.sock`). Clients send a control frame declaring intent (new session, attach, list); the daemon hands off the raw socket connection to the target session and gets out of the loop. Each session owns a PTY with a login shell that persists across disconnects -- while no client is attached, the server drains PTY output into a ring buffer so the shell never blocks. On reconnect, buffered output is flushed to the new client.
 
 For remote access, `gritty connect` forwards the remote socket over SSH. All commands work identically over the tunnel.
 
@@ -290,7 +292,7 @@ flowchart LR
         svc_sock["svc-N.sock<br/>(GRITTY_SOCK)"]
         S["gritty session"]
         agent_sock <-->|"-A"| S
-        svc_sock -->|"-O / send / receive"| S
+        svc_sock -->|"-O / send / receive / lf / rf"| S
     end
 
     S <-->|"relayed over<br/>session connection"| C
@@ -308,7 +310,7 @@ Forwarding multiplexes over the existing session connection -- no extra tunnels.
 
 **SSH agent** (`-A`): the session creates `agent-N.sock` and sets `SSH_AUTH_SOCK`. When a remote process (e.g. `git push`) connects, the request is relayed to the client's local SSH agent and back.
 
-**URL open** (`-O`): the session uses `svc-N.sock` and sets `GRITTY_SOCK` + `BROWSER=gritty open`. When `gritty open <url>` runs, the URL is relayed to the client which opens it locally. **OAuth callback tunneling:** if the URL contains a `redirect_uri` pointing to `localhost` or `127.0.0.1`, gritty automatically creates a single-use reverse TCP tunnel so the OAuth callback reaches the remote program. This handles the common case where a CLI tool opens a browser for OAuth login and waits for the redirect on a local port. Disable with `--no-oauth-redirect`; adjust the accept timeout with `--oauth-timeout <seconds>` (default: 180). Note that `-O` is a trust grant -- it gives processes inside the remote session the ability to open URLs on your local machine. Only use it with sessions you control.
+**URL open** (`-O`): the session sets `GRITTY_SOCK` and `BROWSER=gritty open`. When `gritty open <url>` runs, the URL is relayed to the client which opens it locally. **OAuth callback tunneling:** if the URL contains a `redirect_uri` pointing to `localhost` or `127.0.0.1`, gritty automatically creates a single-use reverse TCP tunnel so the OAuth callback reaches the remote program. This handles the common case where a CLI tool opens a browser for OAuth login and waits for the redirect on a local port. Disable with `--no-oauth-redirect`; adjust the accept timeout with `--oauth-timeout <seconds>` (default: 180). Note that `-O` is a trust grant -- it gives processes inside the remote session the ability to open URLs on your local machine. Only use it with sessions you control.
 
 ## Prior Art
 
@@ -320,12 +322,9 @@ gritty differs by having no network protocol of its own. Where mosh and ET imple
 
 **gritty + tmux** is the ideal pairing. gritty handles the connection -- self-healing tunnels, agent forwarding, auto-reconnect -- while tmux handles the workspace -- splits, windows, copy-mode, scroll-back. Run tmux inside a gritty session and close your laptop, change wifi, open it back up: your tmux splits are exactly where you left them, no re-SSH and `tmux attach` required. gritty replaces the fragile SSH pipe underneath tmux, not tmux itself.
 
-## Status & Roadmap
+## Status
 
 Early stage. Works on Linux and macOS. No Windows support yet -- patches welcome. Available on [crates.io](https://crates.io/crates/gritty-cli).
-
-**Planned:**
-- **Zero-downtime upgrades** -- server re-execs itself, preserving sessions across upgrades
 
 ## License
 
