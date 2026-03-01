@@ -1094,6 +1094,18 @@ fn handle_send_stream(mut stream: UnixStream, send_event_tx: &mpsc::UnboundedSen
     });
 }
 
+/// Check if a stream's peer has disconnected (EOF or error).
+/// Returns true if the stream is dead and should be discarded.
+fn stream_is_dead(stream: &UnixStream) -> bool {
+    let mut probe = [0u8; 1];
+    match stream.try_read(&mut probe) {
+        Ok(0) => true,                                                    // EOF
+        Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => false, // alive
+        Err(_) => true,                                                    // error
+        Ok(_) => false,                                                    // unexpected data, treat as alive
+    }
+}
+
 /// Handle a send event: pair sender and receiver for rendezvous.
 fn handle_send_event(
     event: SendEvent,
@@ -1104,7 +1116,9 @@ fn handle_send_event(
         SendEvent::SenderArrived { stream, manifest } => {
             let old = std::mem::replace(state, TransferState::Idle);
             match old {
-                TransferState::WaitingForSender { receiver_stream, .. } => {
+                TransferState::WaitingForSender { receiver_stream }
+                    if !stream_is_dead(&receiver_stream) =>
+                {
                     info!(
                         files = manifest.files.len(),
                         bytes = manifest.total_bytes(),
@@ -1115,7 +1129,6 @@ fn handle_send_event(
                     *state = TransferState::Active { relay_handle: handle };
                 }
                 _ => {
-                    // If there was an old active transfer, abort it
                     if let TransferState::Active { relay_handle } = old {
                         relay_handle.abort();
                     }
@@ -1127,7 +1140,9 @@ fn handle_send_event(
         SendEvent::ReceiverArrived { stream } => {
             let old = std::mem::replace(state, TransferState::Idle);
             match old {
-                TransferState::WaitingForReceiver { sender_stream, manifest } => {
+                TransferState::WaitingForReceiver { sender_stream, manifest }
+                    if !stream_is_dead(&sender_stream) =>
+                {
                     info!(
                         files = manifest.files.len(),
                         bytes = manifest.total_bytes(),

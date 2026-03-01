@@ -1647,3 +1647,110 @@ async fn send_filename_sanitized() {
     let _ = framed.send(Frame::Data(Bytes::from("exit\n"))).await;
     let _ = timeout(Duration::from_secs(3), server).await;
 }
+
+#[tokio::test]
+async fn stale_receiver_does_not_poison_next_transfer() {
+    let _permit = CONCURRENCY.acquire().await.unwrap();
+    let (_client_tx, mut framed, server, _meta, svc_path) = setup_session_with_svc_path().await;
+    wait_for_shell(&mut framed).await;
+
+    for _ in 0..50 {
+        if svc_path.exists() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    assert!(svc_path.exists(), "svc socket not bound");
+
+    // Step 1: Connect a receiver and immediately drop it.
+    // This simulates the local side's auto-detect connecting to multiple sessions
+    // and dropping the unpaired ones after select_first_ready picks a different session.
+    {
+        let mut stream = UnixStream::connect(&svc_path).await.unwrap();
+        stream.write_all(&[gritty::protocol::SvcRequest::Receive.to_byte()]).await.unwrap();
+        stream.write_all(b"/tmp\n").await.unwrap();
+        // Drop stream -- server enters WaitingForSender with a dead receiver
+    }
+
+    // Give server time to process ReceiverArrived
+    tokio::time::sleep(Duration::from_millis(200)).await;
+
+    // Step 2: Now do a real transfer. The sender arrives and should NOT pair
+    // with the stale dead receiver. Instead it should wait, then pair with the
+    // real receiver that arrives next.
+    let file_data = b"stale test data\n";
+    let sp = svc_path.clone();
+    let sender = tokio::spawn(async move {
+        send_files(&sp, &[("stale_test.txt", file_data)]).await;
+    });
+
+    tokio::time::sleep(Duration::from_millis(50)).await;
+
+    let sp = svc_path.clone();
+    let receiver = tokio::spawn(async move { receive_files(&sp).await });
+
+    let (send_result, recv_result) = tokio::join!(sender, receiver);
+    send_result.unwrap();
+    let files = recv_result.unwrap();
+
+    assert_eq!(files.len(), 1);
+    assert_eq!(files[0].0, "stale_test.txt");
+    assert_eq!(files[0].1, file_data);
+
+    let _ = framed.send(Frame::Data(Bytes::from("exit\n"))).await;
+    let _ = timeout(Duration::from_secs(3), server).await;
+}
+
+#[tokio::test]
+async fn stale_sender_does_not_poison_next_transfer() {
+    let _permit = CONCURRENCY.acquire().await.unwrap();
+    let (_client_tx, mut framed, server, _meta, svc_path) = setup_session_with_svc_path().await;
+    wait_for_shell(&mut framed).await;
+
+    for _ in 0..50 {
+        if svc_path.exists() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    assert!(svc_path.exists(), "svc socket not bound");
+
+    // Step 1: Connect a sender with manifest and immediately drop it.
+    {
+        let mut stream = UnixStream::connect(&svc_path).await.unwrap();
+        stream.write_all(&[gritty::protocol::SvcRequest::Send.to_byte()]).await.unwrap();
+        // Manifest: 1 file, "ghost.txt", 100 bytes
+        stream.write_all(&1u32.to_be_bytes()).await.unwrap();
+        let name = b"ghost.txt";
+        stream.write_all(&(name.len() as u16).to_be_bytes()).await.unwrap();
+        stream.write_all(name).await.unwrap();
+        stream.write_all(&100u64.to_be_bytes()).await.unwrap();
+        // Drop stream -- server enters WaitingForReceiver with a dead sender
+    }
+
+    // Give server time to process SenderArrived
+    tokio::time::sleep(Duration::from_millis(200)).await;
+
+    // Step 2: Real transfer should succeed despite stale sender state.
+    let file_data = b"real data\n";
+    let sp = svc_path.clone();
+    let sender = tokio::spawn(async move {
+        send_files(&sp, &[("real.txt", file_data)]).await;
+    });
+
+    tokio::time::sleep(Duration::from_millis(50)).await;
+
+    let sp = svc_path.clone();
+    let receiver = tokio::spawn(async move { receive_files(&sp).await });
+
+    let (send_result, recv_result) = tokio::join!(sender, receiver);
+    send_result.unwrap();
+    let files = recv_result.unwrap();
+
+    assert_eq!(files.len(), 1);
+    assert_eq!(files[0].0, "real.txt");
+    assert_eq!(files[0].1, file_data);
+
+    let _ = framed.send(Frame::Data(Bytes::from("exit\n"))).await;
+    let _ = timeout(Duration::from_secs(3), server).await;
+}
