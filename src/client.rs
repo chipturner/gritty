@@ -554,49 +554,57 @@ async fn relay(
                                     let tx = tunnel_event_tx.clone();
                                     let timeout = oauth_timeout;
                                     tunnel_listener = Some(tokio::spawn(async move {
-                                        let accept = tokio::time::timeout(
-                                            Duration::from_secs(timeout),
-                                            listener.accept(),
-                                        ).await;
-                                        match accept {
-                                            Ok(Ok((stream, _))) => {
-                                                let (mut read_half, write_half) = stream.into_split();
-                                                let (writer_tx, mut writer_rx) = mpsc::unbounded_channel::<Bytes>();
+                                        let deadline = tokio::time::Instant::now() + Duration::from_secs(timeout);
+                                        loop {
+                                            let accept = tokio::time::timeout_at(
+                                                deadline,
+                                                listener.accept(),
+                                            ).await;
+                                            match accept {
+                                                Ok(Ok((stream, _))) => {
+                                                    let (read_half, write_half) = stream.into_split();
+                                                    let (writer_tx, mut writer_rx) = mpsc::unbounded_channel::<Bytes>();
 
-                                                // Writer task: channel -> TCP
-                                                tokio::spawn(async move {
-                                                    use tokio::io::AsyncWriteExt;
-                                                    let mut writer = write_half;
-                                                    while let Some(data) = writer_rx.recv().await {
-                                                        if writer.write_all(&data).await.is_err() {
-                                                            break;
-                                                        }
-                                                    }
-                                                });
-
-                                                let _ = tx.send(ClientTunnelEvent::Accepted(writer_tx));
-
-                                                // Reader task: TCP -> events
-                                                let mut buf = vec![0u8; 4096];
-                                                loop {
-                                                    use tokio::io::AsyncReadExt;
-                                                    match read_half.read(&mut buf).await {
-                                                        Ok(0) | Err(_) => {
-                                                            let _ = tx.send(ClientTunnelEvent::Closed);
-                                                            break;
-                                                        }
-                                                        Ok(n) => {
-                                                            let data = Bytes::copy_from_slice(&buf[..n]);
-                                                            if tx.send(ClientTunnelEvent::Data(data)).is_err() {
+                                                    // Writer task: channel -> TCP
+                                                    tokio::spawn(async move {
+                                                        use tokio::io::AsyncWriteExt;
+                                                        let mut writer = write_half;
+                                                        while let Some(data) = writer_rx.recv().await {
+                                                            if writer.write_all(&data).await.is_err() {
                                                                 break;
                                                             }
                                                         }
-                                                    }
+                                                    });
+
+                                                    let _ = tx.send(ClientTunnelEvent::Accepted(writer_tx));
+
+                                                    // Reader task: TCP -> events (spawned so we
+                                                    // can keep accepting new connections)
+                                                    let reader_tx = tx.clone();
+                                                    tokio::spawn(async move {
+                                                        use tokio::io::AsyncReadExt;
+                                                        let mut read_half = read_half;
+                                                        let mut buf = vec![0u8; 4096];
+                                                        loop {
+                                                            match read_half.read(&mut buf).await {
+                                                                Ok(0) | Err(_) => {
+                                                                    break;
+                                                                }
+                                                                Ok(n) => {
+                                                                    let data = Bytes::copy_from_slice(&buf[..n]);
+                                                                    if reader_tx.send(ClientTunnelEvent::Data(data)).is_err() {
+                                                                        break;
+                                                                    }
+                                                                }
+                                                            }
+                                                        }
+                                                    });
                                                 }
-                                            }
-                                            _ => {
-                                                debug!(port, "tunnel: accept timed out or failed");
-                                                let _ = tx.send(ClientTunnelEvent::Closed);
+                                                _ => {
+                                                    debug!(port, "tunnel: accept timed out or failed");
+                                                    let _ = tx.send(ClientTunnelEvent::Closed);
+                                                    break;
+                                                }
                                             }
                                         }
                                     }));
@@ -757,6 +765,12 @@ async fn relay(
             event = tunnel_event_rx.recv() => {
                 match event {
                     Some(ClientTunnelEvent::Accepted(writer_tx)) => {
+                        // Close previous connection's server side if any
+                        if tunnel_writer.take().is_some()
+                            && !timed_send(framed, Frame::TunnelClose).await
+                        {
+                            return Ok(None);
+                        }
                         tunnel_writer = Some(writer_tx);
                         if !timed_send(framed, Frame::TunnelOpen).await {
                             return Ok(None);
