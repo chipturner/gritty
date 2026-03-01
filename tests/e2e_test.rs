@@ -2238,14 +2238,12 @@ async fn local_forward_different_listen_and_target_ports() {
     let target_port = 19883u16; // different from listen_port
 
     // Request local-forward: listen on 19882, target 19883
-    let mut svc_stream =
-        request_port_forward(&svc_path, 0, listen_port, target_port).await;
+    let mut svc_stream = request_port_forward(&svc_path, 0, listen_port, target_port).await;
     let resp = read_svc_response(&mut svc_stream).await;
     assert!(resp.is_ok(), "local-forward bind failed: {resp:?}");
 
     // Connect to the listen port
-    let _tcp =
-        tokio::net::TcpStream::connect(("127.0.0.1", listen_port)).await.unwrap();
+    let _tcp = tokio::net::TcpStream::connect(("127.0.0.1", listen_port)).await.unwrap();
 
     // PortForwardOpen should carry target_port (19883), not listen_port
     let open_target = loop {
@@ -2255,7 +2253,10 @@ async fn local_forward_different_listen_and_target_ports() {
             other => panic!("expected PortForwardOpen, got: {other:?}"),
         }
     };
-    assert_eq!(open_target, target_port, "PortForwardOpen should carry target_port, not listen_port");
+    assert_eq!(
+        open_target, target_port,
+        "PortForwardOpen should carry target_port, not listen_port"
+    );
     assert_ne!(open_target, listen_port);
 
     drop(svc_stream);

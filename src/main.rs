@@ -119,8 +119,11 @@ enum Command {
         #[arg(long)]
         session: Option<String>,
 
+        /// Read data from stdin instead of files
+        #[arg(long)]
+        stdin: bool,
+
         /// Files to send
-        #[arg(required = true)]
         files: Vec<PathBuf>,
     },
     /// Receive files from a paired sender
@@ -128,6 +131,10 @@ enum Command {
         /// Session to use (host:session); auto-detected if omitted
         #[arg(long)]
         session: Option<String>,
+
+        /// Write received data to stdout instead of files
+        #[arg(long)]
+        stdout: bool,
 
         /// Destination directory (default: current directory)
         dir: Option<PathBuf>,
@@ -640,8 +647,12 @@ async fn run(cli: Cli, config: gritty::config::ConfigFile) -> anyhow::Result<()>
             println!("{}", ctl_path.display());
             Ok(())
         }
-        Command::Send { session, files } => send_command(cli.ctl_socket, session, files).await,
-        Command::Receive { session, dir } => receive_command(cli.ctl_socket, session, dir).await,
+        Command::Send { session, stdin, files } => {
+            send_command(cli.ctl_socket, session, stdin, files).await
+        }
+        Command::Receive { session, stdout, dir } => {
+            receive_command(cli.ctl_socket, session, stdout, dir).await
+        }
         Command::Open { url } => {
             open_url(&url);
             Ok(())
@@ -1449,9 +1460,26 @@ fn print_progress(name: &str, transferred: u64, total: u64) {
 async fn send_command(
     ctl_socket: Option<PathBuf>,
     session: Option<String>,
+    use_stdin: bool,
     files: Vec<PathBuf>,
 ) -> anyhow::Result<()> {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    if use_stdin && !files.is_empty() {
+        anyhow::bail!("--stdin cannot be used with file arguments");
+    }
+    if !use_stdin && files.is_empty() {
+        anyhow::bail!("either provide files or use --stdin");
+    }
+
+    // Read stdin data upfront if needed (wire protocol requires size)
+    let stdin_data = if use_stdin {
+        let mut data = Vec::new();
+        tokio::io::stdin().read_to_end(&mut data).await?;
+        Some(data)
+    } else {
+        None
+    };
 
     // Validate files exist and collect metadata
     let mut entries: Vec<(String, u64, PathBuf)> = Vec::with_capacity(files.len());
@@ -1470,8 +1498,15 @@ async fn send_command(
             .await?;
 
     // Write manifest on all streams
-    for stream in &mut streams {
-        write_send_manifest(stream, &entries).await?;
+    if let Some(ref data) = stdin_data {
+        let stdin_entries = vec![("stdin".to_string(), data.len() as u64, PathBuf::new())];
+        for stream in &mut streams {
+            write_send_manifest(stream, &stdin_entries).await?;
+        }
+    } else {
+        for stream in &mut streams {
+            write_send_manifest(stream, &entries).await?;
+        }
     }
 
     // Wait for go signal -- first stream to get paired wins
@@ -1488,29 +1523,35 @@ async fn send_command(
         anyhow::bail!("unexpected signal from server: 0x{:02x}", go[0]);
     }
 
-    // Stream file data
-    let total_bytes: u64 = entries.iter().map(|(_, s, _)| s).sum();
-    let total_str = gritty::client::format_size(total_bytes);
-    let s = if entries.len() == 1 { "" } else { "s" };
-    eprintln!("sending {} file{s} ({total_str})", entries.len());
+    // Stream data
+    if let Some(data) = stdin_data {
+        let total_str = gritty::client::format_size(data.len() as u64);
+        eprintln!("sending stdin ({total_str})");
+        stream.write_all(&data).await?;
+    } else {
+        let total_bytes: u64 = entries.iter().map(|(_, s, _)| s).sum();
+        let total_str = gritty::client::format_size(total_bytes);
+        let s = if entries.len() == 1 { "" } else { "s" };
+        eprintln!("sending {} file{s} ({total_str})", entries.len());
 
-    let mut buf = vec![0u8; 64 * 1024];
-    for (name, size, path) in &entries {
-        let mut file = tokio::fs::File::open(path).await?;
-        let mut remaining = *size;
-        let mut transferred = 0u64;
-        while remaining > 0 {
-            let to_read = (remaining as usize).min(buf.len());
-            let n = file.read(&mut buf[..to_read]).await?;
-            if n == 0 {
-                anyhow::bail!("unexpected EOF reading {name}");
+        let mut buf = vec![0u8; 64 * 1024];
+        for (name, size, path) in &entries {
+            let mut file = tokio::fs::File::open(path).await?;
+            let mut remaining = *size;
+            let mut transferred = 0u64;
+            while remaining > 0 {
+                let to_read = (remaining as usize).min(buf.len());
+                let n = file.read(&mut buf[..to_read]).await?;
+                if n == 0 {
+                    anyhow::bail!("unexpected EOF reading {name}");
+                }
+                stream.write_all(&buf[..n]).await?;
+                remaining -= n as u64;
+                transferred += n as u64;
+                print_progress(name, transferred, *size);
             }
-            stream.write_all(&buf[..n]).await?;
-            remaining -= n as u64;
-            transferred += n as u64;
-            print_progress(name, transferred, *size);
+            eprintln!();
         }
-        eprintln!();
     }
 
     eprintln!("\x1b[32mdone\x1b[0m");
@@ -1520,12 +1561,13 @@ async fn send_command(
 async fn receive_command(
     ctl_socket: Option<PathBuf>,
     session: Option<String>,
+    use_stdout: bool,
     dir: Option<PathBuf>,
 ) -> anyhow::Result<()> {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
     let dest_dir = dir.unwrap_or_else(|| PathBuf::from("."));
-    if !dest_dir.is_dir() {
+    if !use_stdout && !dest_dir.is_dir() {
         anyhow::bail!("{}: not a directory", dest_dir.display());
     }
 
@@ -1556,6 +1598,7 @@ async fn receive_command(
     // Read per-file metadata and data
     let mut received = 0u32;
     let mut buf = vec![0u8; 64 * 1024];
+    let mut stdout = if use_stdout { Some(tokio::io::stdout()) } else { None };
     loop {
         // Read filename_len (u16 BE)
         let mut buf2 = [0u8; 2];
@@ -1576,39 +1619,52 @@ async fn receive_command(
         stream.read_exact(&mut buf8).await?;
         let file_size = u64::from_be_bytes(buf8);
 
-        let s = if file_count == 1 { "" } else { "s" };
-        if received == 0 {
-            eprintln!("receiving {file_count} file{s}");
-        }
+        if let Some(ref mut out) = stdout {
+            // Write data to stdout
+            let mut remaining = file_size;
+            while remaining > 0 {
+                let to_read = (remaining as usize).min(buf.len());
+                stream.read_exact(&mut buf[..to_read]).await?;
+                out.write_all(&buf[..to_read]).await?;
+                remaining -= to_read as u64;
+            }
+        } else {
+            let s = if file_count == 1 { "" } else { "s" };
+            if received == 0 {
+                eprintln!("receiving {file_count} file{s}");
+            }
 
-        // Write file data
-        let file_path = dest_dir.join(&name);
-        let mut file = tokio::fs::OpenOptions::new()
-            .write(true)
-            .create(true)
-            .truncate(true)
-            .mode(0o600)
-            .open(&file_path)
-            .await?;
-        let mut remaining = file_size;
-        let mut transferred = 0u64;
-        while remaining > 0 {
-            let to_read = (remaining as usize).min(buf.len());
-            stream.read_exact(&mut buf[..to_read]).await?;
-            file.write_all(&buf[..to_read]).await?;
-            remaining -= to_read as u64;
-            transferred += to_read as u64;
-            print_progress(&name, transferred, file_size);
+            // Write file data
+            let file_path = dest_dir.join(&name);
+            let mut file = tokio::fs::OpenOptions::new()
+                .write(true)
+                .create(true)
+                .truncate(true)
+                .mode(0o600)
+                .open(&file_path)
+                .await?;
+            let mut remaining = file_size;
+            let mut transferred = 0u64;
+            while remaining > 0 {
+                let to_read = (remaining as usize).min(buf.len());
+                stream.read_exact(&mut buf[..to_read]).await?;
+                file.write_all(&buf[..to_read]).await?;
+                remaining -= to_read as u64;
+                transferred += to_read as u64;
+                print_progress(&name, transferred, file_size);
+            }
+            eprintln!();
         }
-        eprintln!();
         received += 1;
     }
 
-    if received == 0 {
-        eprintln!("no files received");
-    } else {
-        let s = if received == 1 { "" } else { "s" };
-        eprintln!("\x1b[32mreceived {received} file{s}\x1b[0m");
+    if !use_stdout {
+        if received == 0 {
+            eprintln!("no files received");
+        } else {
+            let s = if received == 1 { "" } else { "s" };
+            eprintln!("\x1b[32mreceived {received} file{s}\x1b[0m");
+        }
     }
     Ok(())
 }
