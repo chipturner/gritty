@@ -639,9 +639,13 @@ async fn run(cli: Cli, config: gritty::config::ConfigFile) -> anyhow::Result<()>
             }
         }
         Command::ListSessions { target } => {
-            let host = target.as_deref().map(|t| parse_target(t).0);
-            let ctl_path = resolve_ctl_path(cli.ctl_socket, host.as_deref())?;
-            list_sessions(ctl_path).await
+            if target.is_none() && cli.ctl_socket.is_none() {
+                list_all_sessions().await
+            } else {
+                let host = target.as_deref().map(|t| parse_target(t).0);
+                let ctl_path = resolve_ctl_path(cli.ctl_socket, host.as_deref())?;
+                list_sessions(ctl_path).await
+            }
         }
         Command::KillSession { target } => {
             let (host, session) = match &target {
@@ -980,6 +984,125 @@ async fn list_sessions(ctl_path: PathBuf) -> anyhow::Result<()> {
             anyhow::bail!("unexpected response from server: {other:?}");
         }
     }
+}
+
+async fn list_all_sessions() -> anyhow::Result<()> {
+    use gritty::protocol::{Frame, FrameCodec, SessionEntry};
+
+    let mut probes: Vec<(String, PathBuf)> = Vec::new();
+    let local = gritty::daemon::control_socket_path();
+    if local.exists() {
+        probes.push(("local".to_string(), local));
+    }
+    for info in gritty::connect::get_tunnel_info() {
+        if info.status == "healthy" {
+            probes.push((info.name.clone(), gritty::connect::connection_socket_path(&info.name)));
+        }
+    }
+
+    if probes.is_empty() {
+        anyhow::bail!("no server running");
+    }
+
+    let futures: Vec<_> = probes
+        .into_iter()
+        .map(|(host, path)| async move {
+            let result = tokio::time::timeout(std::time::Duration::from_secs(2), async {
+                let stream = tokio::net::UnixStream::connect(&path).await.ok()?;
+                let mut framed = tokio_util::codec::Framed::new(stream, FrameCodec);
+                gritty::handshake(&mut framed).await.ok()?;
+                futures_util::SinkExt::send(&mut framed, Frame::ListSessions).await.ok()?;
+                match Frame::expect_from(futures_util::StreamExt::next(&mut framed).await) {
+                    Ok(Frame::SessionInfo { sessions }) => Some(sessions),
+                    _ => None,
+                }
+            })
+            .await;
+            let sessions: Vec<SessionEntry> = result.ok().flatten().unwrap_or_default();
+            (host, sessions)
+        })
+        .collect();
+
+    let results: Vec<(String, Vec<SessionEntry>)> = futures_util::future::join_all(futures).await;
+
+    let all_empty = results.iter().all(|(_, s)| s.is_empty());
+    if all_empty {
+        println!("no active sessions");
+        return Ok(());
+    }
+
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+
+    let multi_host = results.iter().filter(|(_, s)| !s.is_empty()).count() > 1;
+
+    // Build row data: (host, id, name, pty, pid, created, status)
+    let rows: Vec<_> = results
+        .iter()
+        .flat_map(|(host, sessions)| {
+            sessions.iter().map(move |s| {
+                let name = if s.name.is_empty() { "-".to_string() } else { s.name.clone() };
+                let (pty, pid, created, status) = if s.shell_pid == 0 {
+                    ("-".to_string(), "-".to_string(), "-".to_string(), "starting".to_string())
+                } else {
+                    let status = if s.attached {
+                        if s.last_heartbeat > 0 {
+                            let ago = now.saturating_sub(s.last_heartbeat);
+                            format!("attached (heartbeat {ago}s ago)")
+                        } else {
+                            "attached".to_string()
+                        }
+                    } else {
+                        "detached".to_string()
+                    };
+                    (
+                        s.pty_path.clone(),
+                        s.shell_pid.to_string(),
+                        format_timestamp(s.created_at),
+                        status,
+                    )
+                };
+                (host.clone(), s.id.clone(), name, pty, pid, created, status)
+            })
+        })
+        .collect();
+
+    // Compute column widths
+    let w_host = if multi_host { rows.iter().map(|r| r.0.len()).max().unwrap().max(4) } else { 0 };
+    let w_id = rows.iter().map(|r| r.1.len()).max().unwrap().max(2);
+    let w_name = rows.iter().map(|r| r.2.len()).max().unwrap().max(4);
+    let w_pty = rows.iter().map(|r| r.3.len()).max().unwrap().max(3);
+    let w_pid = rows.iter().map(|r| r.4.len()).max().unwrap().max(3);
+    let w_created = rows.iter().map(|r| r.5.len()).max().unwrap().max(7);
+
+    if multi_host {
+        println!(
+            "{:<w_host$}  {:<w_id$}  {:<w_name$}  {:<w_pty$}  {:<w_pid$}  {:<w_created$}  Status",
+            "Host", "ID", "Name", "PTY", "PID", "Created",
+        );
+        for (host, id, name, pty, pid, created, status) in &rows {
+            println!(
+                "{:<w_host$}  {:<w_id$}  {:<w_name$}  {:<w_pty$}  {:<w_pid$}  {:<w_created$}  {status}",
+                host, id, name, pty, pid, created,
+            );
+        }
+    } else {
+        let host = &rows[0].0;
+        println!("Host: {host}");
+        println!(
+            "{:<w_id$}  {:<w_name$}  {:<w_pty$}  {:<w_pid$}  {:<w_created$}  Status",
+            "ID", "Name", "PTY", "PID", "Created",
+        );
+        for (_, id, name, pty, pid, created, status) in &rows {
+            println!(
+                "{:<w_id$}  {:<w_name$}  {:<w_pty$}  {:<w_pid$}  {:<w_created$}  {status}",
+                id, name, pty, pid, created,
+            );
+        }
+    }
+    Ok(())
 }
 
 /// Parse a port spec: "PORT" or "LISTEN_PORT:TARGET_PORT".

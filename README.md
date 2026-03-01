@@ -84,7 +84,7 @@ For local sessions (useful for testing): `gritty new local:scratch`
 | `gritty new-session <host[:name]>` | `new` | Create a session and auto-attach |
 | `gritty attach <host:session>` | `a` | Attach to a session (`-c` creates if missing) |
 | `gritty tail <host:session>` | `t` | Read-only stream of session output |
-| `gritty list-sessions <host>` | `ls`, `list` | List sessions |
+| `gritty list-sessions [host]` | `ls`, `list` | List sessions (no args = all daemons) |
 | `gritty kill-session <host:session>` | | Kill a session |
 | `gritty kill-server <host>` | | Kill the server and all sessions |
 | `gritty connect <destination>` | `c` | Set up SSH tunnel to remote host |

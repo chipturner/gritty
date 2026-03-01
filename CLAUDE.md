@@ -17,7 +17,7 @@ gritty provides persistent TTY sessions over Unix domain sockets. Single binary,
 - `gritty connect <destination>` — SSH tunnel: self-backgrounds, auto-starts remote server, sets up tunnel, prints socket path and returns. Destination is `[user@]host[:port]`. Alias: `c`. `-n <name>` overrides connection name (defaults to hostname). `-o`/`--ssh-option` adds extra SSH options (repeatable). `--no-server-start` skips auto-starting the remote server. `-f`/`--foreground` keeps it in the foreground. `--dry-run` prints the SSH commands instead of running them.
 - `gritty disconnect <name>` — tears down an SSH tunnel by connection name. Alias: `dc`
 - `gritty tunnels` — lists active SSH tunnels with name/destination/status. Alias: `tun`
-- `gritty list-sessions <host>` — lists active sessions with id/name/PTY/PID/status. Aliases: `ls`, `list`
+- `gritty list-sessions [host]` — lists active sessions with id/name/PTY/PID/status. Without arguments, shows sessions from all known daemons (local + healthy tunnels). Aliases: `ls`, `list`
 - `gritty kill-session <host:session>` — kills a specific session
 - `gritty protocol-version` — prints the protocol version number (integer)
 - `gritty socket-path` — prints the default server socket path. Alias: `socket`
