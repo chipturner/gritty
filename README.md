@@ -312,13 +312,28 @@ Forwarding multiplexes over the existing session connection -- no extra tunnels.
 
 **URL open** (`-O`): the session sets `GRITTY_SOCK` and `BROWSER=gritty open`. When `gritty open <url>` runs, the URL is relayed to the client which opens it locally. **OAuth callback tunneling:** if the URL contains a `redirect_uri` pointing to `localhost` or `127.0.0.1`, gritty automatically creates a single-use reverse TCP tunnel so the OAuth callback reaches the remote program. This handles the common case where a CLI tool opens a browser for OAuth login and waits for the redirect on a local port. Disable with `--no-oauth-redirect`; adjust the accept timeout with `--oauth-timeout <seconds>` (default: 180). Note that `-O` is a trust grant -- it gives processes inside the remote session the ability to open URLs on your local machine. Only use it with sessions you control.
 
-## Prior Art
+## Comparison
 
-- [mosh](https://mosh.org/) -- persistent remote terminal using UDP and SSP
-- [Eternal Terminal](https://eternalterminal.dev/) -- persistent SSH sessions over a custom protocol
-- [tmux](https://github.com/tmux/tmux) / [screen](https://www.gnu.org/software/screen/) -- terminal multiplexers with session persistence
+|  | **gritty** | [**mosh**](https://mosh.org/) | [**ET**](https://eternalterminal.dev/) | **autossh + tmux** |
+|--|:--:|:--:|:--:|:--:|
+| Survives network change | yes | yes | yes | yes |
+| Survives client reboot | yes | no | no | yes |
+| Auto-reconnect | yes | yes | yes | autossh only |
+| SSH agent forwarding | yes | [no](https://github.com/mobile-shell/mosh/issues/120) | [no](https://github.com/MisterTea/EternalTerminal/issues/41) | [stale socket](https://werat.dev/blog/happy-ssh-agent-forwarding/) |
+| Browser / URL forwarding | yes | no | no | no |
+| OAuth callback tunneling | yes | no | no | no |
+| Port forwarding | yes | no | yes | SSH -L/-R |
+| File transfer | yes | no | no | scp/rsync |
+| Predictive local echo | no | yes | no | no |
+| Scroll-back / panes | no | no | no | tmux |
+| No extra ports / firewall | yes | no (UDP) | no (TCP) | yes |
+| IP roaming (mobile) | reconnect | seamless | reconnect | reconnect |
+| Windows client | no | no | no | yes |
+| Maturity | early | mature | mature | mature |
 
-gritty differs by having no network protocol of its own. Where mosh and ET implement custom transport and encryption, gritty uses Unix domain sockets and delegates networking entirely to SSH. Where tmux and screen are full multiplexers with windows, panes, and key bindings, gritty does one thing: persistent sessions with auto-reconnect. Another difference: mosh and ET require their original client process to stay alive (they maintain client-side state for their sync protocols), so a laptop reboot or terminal crash means starting over. gritty's client is stateless -- the server owns the entire session. Reboot, and `gritty attach` picks up exactly where you left off.
+**Where gritty wins:** seamless local-tool integration. SSH agent forwarding that survives reconnects without stale sockets. Browser opens and OAuth flows that just work remotely. Port forwarding and file transfer multiplexed over the session -- no extra tunnels or tools. Stateless client -- reboot your laptop, `gritty attach` picks up where you left off.
+
+**Where gritty loses:** no predictive local echo (mosh is unbeatable on high-latency links), no scroll-back or window management (use tmux inside gritty), no Windows support, and it's early-stage software.
 
 **gritty + tmux** is the ideal pairing. gritty handles the connection -- self-healing tunnels, agent forwarding, auto-reconnect -- while tmux handles the workspace -- splits, windows, copy-mode, scroll-back. Run tmux inside a gritty session and close your laptop, change wifi, open it back up: your tmux splits are exactly where you left them, no re-SSH and `tmux attach` required. gritty replaces the fragile SSH pipe underneath tmux, not tmux itself.
 
