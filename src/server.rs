@@ -83,6 +83,8 @@ enum OpenEvent {
 
 /// Events from tunnel TCP connection tasks to the main relay loop.
 enum TunnelEvent {
+    Connected(tokio::net::TcpStream),
+    ConnectFailed,
     Data(Bytes),
     Closed,
 }
@@ -93,6 +95,10 @@ enum PortForwardEvent {
     Requested { stream: UnixStream, direction: u8, listen_port: u16, target_port: u16 },
     /// TCP connection accepted on a listening port.
     Accepted { forward_id: u32, channel_id: u32, writer_tx: mpsc::UnboundedSender<Bytes> },
+    /// Background TCP connect completed (remote-fwd PortForwardOpen).
+    Connected { forward_id: u32, channel_id: u32, stream: tokio::net::TcpStream },
+    /// Background TCP connect failed.
+    ConnectFailed { channel_id: u32 },
     /// Data from a TCP connection.
     Data { channel_id: u32, data: Bytes },
     /// TCP connection closed.
@@ -952,50 +958,13 @@ pub async fn run(
                         }
                         Some(Ok(Frame::TunnelOpen)) => {
                             if let Some(port) = tunnel_port {
-                                match tokio::net::TcpStream::connect(("127.0.0.1", port)).await {
-                                    Ok(stream) => {
-                                        debug!(port, "tunnel connected to local port");
-                                        let (mut read_half, write_half) = stream.into_split();
-                                        let (writer_tx, mut writer_rx) = mpsc::unbounded_channel::<Bytes>();
-                                        tunnel_writer = Some(writer_tx);
-
-                                        // Writer task: channel -> TCP
-                                        tokio::spawn(async move {
-                                            use tokio::io::AsyncWriteExt;
-                                            let mut writer = write_half;
-                                            while let Some(data) = writer_rx.recv().await {
-                                                if writer.write_all(&data).await.is_err() {
-                                                    break;
-                                                }
-                                            }
-                                        });
-
-                                        // Reader task: TCP -> TunnelEvent
-                                        let tx = tunnel_event_tx.clone();
-                                        tokio::spawn(async move {
-                                            let mut buf = vec![0u8; 4096];
-                                            loop {
-                                                match read_half.read(&mut buf).await {
-                                                    Ok(0) | Err(_) => {
-                                                        let _ = tx.send(TunnelEvent::Closed);
-                                                        break;
-                                                    }
-                                                    Ok(n) => {
-                                                        let data = Bytes::copy_from_slice(&buf[..n]);
-                                                        if tx.send(TunnelEvent::Data(data)).is_err() {
-                                                            break;
-                                                        }
-                                                    }
-                                                }
-                                            }
-                                        });
+                                let tx = tunnel_event_tx.clone();
+                                tokio::spawn(async move {
+                                    match tokio::net::TcpStream::connect(("127.0.0.1", port)).await {
+                                        Ok(stream) => { let _ = tx.send(TunnelEvent::Connected(stream)); }
+                                        Err(_) => { let _ = tx.send(TunnelEvent::ConnectFailed); }
                                     }
-                                    Err(e) => {
-                                        debug!(port, "tunnel connect failed: {e}");
-                                        let _ = framed.send(Frame::TunnelClose).await;
-                                        tunnel_port = None;
-                                    }
-                                }
+                                });
                             }
                         }
                         Some(Ok(Frame::TunnelData(data))) => {
@@ -1022,28 +991,13 @@ pub async fn run(
                         // Port forward: new TCP connection from client side (remote-fwd)
                         Some(Ok(Frame::PortForwardOpen { forward_id, channel_id, target_port })) => {
                             if port_forwards.contains_key(&forward_id) {
-                                match tokio::net::TcpStream::connect(("127.0.0.1", target_port)).await {
-                                    Ok(stream) => {
-                                        let (read_half, write_half) = stream.into_split();
-                                        let data_tx = pf_event_tx.clone();
-                                        let close_tx = pf_event_tx.clone();
-                                        let writer_tx = crate::spawn_channel_relay(
-                                            channel_id,
-                                            read_half,
-                                            write_half,
-                                            move |id, data| data_tx.send(PortForwardEvent::Data { channel_id: id, data }).is_ok(),
-                                            move |id| { let _ = close_tx.send(PortForwardEvent::Closed { channel_id: id }); },
-                                        );
-                                        pf_channels.insert(channel_id, (forward_id, writer_tx));
-                                        if let Some(pf) = port_forwards.get_mut(&forward_id) {
-                                            pf.channels.insert(channel_id, pf_channels.get(&channel_id).unwrap().1.clone());
-                                        }
+                                let tx = pf_event_tx.clone();
+                                tokio::spawn(async move {
+                                    match tokio::net::TcpStream::connect(("127.0.0.1", target_port)).await {
+                                        Ok(stream) => { let _ = tx.send(PortForwardEvent::Connected { forward_id, channel_id, stream }); }
+                                        Err(_) => { let _ = tx.send(PortForwardEvent::ConnectFailed { channel_id }); }
                                     }
-                                    Err(e) => {
-                                        debug!(forward_id, channel_id, target_port, "pf connect failed: {e}");
-                                        let _ = framed.send(Frame::PortForwardClose { channel_id }).await;
-                                    }
-                                }
+                                });
                             }
                         }
                         // Port forward: channel data from client
@@ -1196,6 +1150,49 @@ pub async fn run(
                 // Tunnel events from TCP relay tasks
                 event = tunnel_event_rx.recv() => {
                     match event {
+                        Some(TunnelEvent::Connected(stream)) => {
+                            if let Some(port) = tunnel_port {
+                                debug!(port, "tunnel connected to local port");
+                                let (mut read_half, write_half) = stream.into_split();
+                                let (writer_tx, mut writer_rx) = mpsc::unbounded_channel::<Bytes>();
+                                tunnel_writer = Some(writer_tx);
+
+                                // Writer task: channel -> TCP
+                                tokio::spawn(async move {
+                                    use tokio::io::AsyncWriteExt;
+                                    let mut writer = write_half;
+                                    while let Some(data) = writer_rx.recv().await {
+                                        if writer.write_all(&data).await.is_err() {
+                                            break;
+                                        }
+                                    }
+                                });
+
+                                // Reader task: TCP -> TunnelEvent
+                                let tx = tunnel_event_tx.clone();
+                                tokio::spawn(async move {
+                                    let mut buf = vec![0u8; 4096];
+                                    loop {
+                                        match read_half.read(&mut buf).await {
+                                            Ok(0) | Err(_) => {
+                                                let _ = tx.send(TunnelEvent::Closed);
+                                                break;
+                                            }
+                                            Ok(n) => {
+                                                let data = Bytes::copy_from_slice(&buf[..n]);
+                                                if tx.send(TunnelEvent::Data(data)).is_err() {
+                                                    break;
+                                                }
+                                            }
+                                        }
+                                    }
+                                });
+                            }
+                        }
+                        Some(TunnelEvent::ConnectFailed) => {
+                            let _ = framed.send(Frame::TunnelClose).await;
+                            tunnel_port = None;
+                        }
                         Some(TunnelEvent::Data(data)) => {
                             let _ = framed.send(Frame::TunnelData(data)).await;
                         }
@@ -1283,6 +1280,27 @@ pub async fn run(
                                     forward_id, channel_id, target_port: pf.target_port,
                                 }).await;
                             }
+                        }
+                        Some(PortForwardEvent::Connected { forward_id, channel_id, stream }) => {
+                            if port_forwards.contains_key(&forward_id) {
+                                let (read_half, write_half) = stream.into_split();
+                                let data_tx = pf_event_tx.clone();
+                                let close_tx = pf_event_tx.clone();
+                                let writer_tx = crate::spawn_channel_relay(
+                                    channel_id,
+                                    read_half,
+                                    write_half,
+                                    move |id, data| data_tx.send(PortForwardEvent::Data { channel_id: id, data }).is_ok(),
+                                    move |id| { let _ = close_tx.send(PortForwardEvent::Closed { channel_id: id }); },
+                                );
+                                pf_channels.insert(channel_id, (forward_id, writer_tx));
+                                if let Some(pf) = port_forwards.get_mut(&forward_id) {
+                                    pf.channels.insert(channel_id, pf_channels.get(&channel_id).unwrap().1.clone());
+                                }
+                            }
+                        }
+                        Some(PortForwardEvent::ConnectFailed { channel_id }) => {
+                            let _ = framed.send(Frame::PortForwardClose { channel_id }).await;
                         }
                         Some(PortForwardEvent::Data { channel_id, data }) => {
                             if pf_channels.contains_key(&channel_id) {
