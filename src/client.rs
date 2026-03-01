@@ -20,6 +20,7 @@ use tracing::{debug, info};
 const ESCAPE_HELP: &[u8] = b"\r\nSupported escape sequences:\r\n\
     ~.  - detach from session\r\n\
     ~^Z - suspend client\r\n\
+    ~#  - session status and RTT\r\n\
     ~?  - this message\r\n\
     ~~  - send the escape character by typing it twice\r\n\
 (Note that escapes are only recognized immediately after newline.)\r\n";
@@ -36,6 +37,7 @@ enum EscapeAction {
     Data(Vec<u8>),
     Detach,
     Suspend,
+    Status,
     Help,
 }
 
@@ -90,6 +92,13 @@ impl EscapeProcessor {
                                 actions.push(EscapeAction::Data(std::mem::take(&mut data_buf)));
                             }
                             actions.push(EscapeAction::Suspend);
+                            self.state = EscapeState::Normal;
+                        }
+                        b'#' => {
+                            if !data_buf.is_empty() {
+                                actions.push(EscapeAction::Data(std::mem::take(&mut data_buf)));
+                            }
+                            actions.push(EscapeAction::Status);
                             self.state = EscapeState::Normal;
                         }
                         b'?' => {
@@ -372,6 +381,7 @@ async fn relay(
     agent_socket: Option<&str>,
     oauth_redirect: bool,
     oauth_timeout: u64,
+    session: &str,
 ) -> anyhow::Result<Option<i32>> {
     let mut sigterm = signal(SignalKind::terminate())?;
     let mut sighup = signal(SignalKind::hangup())?;
@@ -379,6 +389,8 @@ async fn relay(
     let mut heartbeat_interval = tokio::time::interval(HEARTBEAT_INTERVAL);
     heartbeat_interval.reset(); // first tick is immediate otherwise; delay it
     let mut last_pong = Instant::now();
+    let mut last_ping_sent = Instant::now();
+    let mut last_rtt: Option<Duration> = None;
 
     // Agent channel management
     let mut agent_channels: HashMap<u32, mpsc::UnboundedSender<Bytes>> = HashMap::new();
@@ -426,6 +438,18 @@ async fn relay(
                                             return Ok(None);
                                         }
                                     }
+                                    EscapeAction::Status => {
+                                        let rtt_str = match last_rtt {
+                                            Some(d) => format!("{:.1}ms", d.as_secs_f64() * 1000.0),
+                                            None => "n/a".to_string(),
+                                        };
+                                        write_stdout(
+                                            status_msg(&format!(
+                                                "session: {session}, rtt: {rtt_str}"
+                                            ))
+                                            .as_bytes(),
+                                        )?;
+                                    }
                                     EscapeAction::Help => {
                                         write_stdout(ESCAPE_HELP)?;
                                     }
@@ -447,7 +471,8 @@ async fn relay(
                         write_stdout(&data)?;
                     }
                     Some(Ok(Frame::Pong)) => {
-                        debug!("pong received");
+                        last_rtt = Some(last_ping_sent.elapsed());
+                        debug!(rtt_ms = last_rtt.unwrap().as_secs_f64() * 1000.0, "pong received");
                         last_pong = Instant::now();
                     }
                     Some(Ok(Frame::Exit { code })) => {
@@ -802,6 +827,7 @@ async fn relay(
                     debug!("heartbeat timeout");
                     return Ok(None);
                 }
+                last_ping_sent = Instant::now();
                 if !timed_send(framed, Frame::Ping).await {
                     return Ok(None);
                 }
@@ -873,6 +899,7 @@ pub async fn run(
                 agent_socket.as_deref(),
                 oauth_redirect,
                 oauth_timeout,
+                session,
             )
             .await?
         } else {
@@ -1114,6 +1141,13 @@ mod tests {
         let mut ep = EscapeProcessor { state: EscapeState::Normal };
         let actions = ep.process(b"\n~\x1a");
         assert_eq!(actions, vec![EscapeAction::Data(b"\n".to_vec()), EscapeAction::Suspend,]);
+    }
+
+    #[test]
+    fn tilde_status() {
+        let mut ep = EscapeProcessor { state: EscapeState::Normal };
+        let actions = ep.process(b"\n~#");
+        assert_eq!(actions, vec![EscapeAction::Data(b"\n".to_vec()), EscapeAction::Status,]);
     }
 
     #[test]
