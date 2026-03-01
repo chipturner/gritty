@@ -1160,13 +1160,12 @@ fn sanitize_basename(name: &str) -> anyhow::Result<String> {
 }
 
 struct DiscoveredSession {
-    host: String,
     session_id: String,
     ctl_path: PathBuf,
 }
 
 /// Probe a single daemon for its sessions.
-async fn probe_daemon_sessions(host: &str, ctl_path: &Path) -> Vec<DiscoveredSession> {
+async fn probe_daemon_sessions(ctl_path: &Path) -> Vec<DiscoveredSession> {
     use futures_util::{SinkExt, StreamExt};
     use gritty::protocol::{Frame, FrameCodec};
     use tokio_util::codec::Framed;
@@ -1186,7 +1185,6 @@ async fn probe_daemon_sessions(host: &str, ctl_path: &Path) -> Vec<DiscoveredSes
         Ok(Frame::SessionInfo { sessions }) => sessions
             .into_iter()
             .map(|s| DiscoveredSession {
-                host: host.to_string(),
                 session_id: if s.name.is_empty() { s.id } else { s.name },
                 ctl_path: ctl_path.to_path_buf(),
             })
@@ -1195,21 +1193,22 @@ async fn probe_daemon_sessions(host: &str, ctl_path: &Path) -> Vec<DiscoveredSes
     }
 }
 
-/// Auto-detect a single session across all known daemons.
-async fn auto_detect_session(ctl_socket: Option<&Path>) -> anyhow::Result<DiscoveredSession> {
-    let mut probes: Vec<(String, PathBuf)> = Vec::new();
+/// Discover all sessions across all known daemons.
+async fn discover_all_sessions(
+    ctl_socket: Option<&Path>,
+) -> anyhow::Result<Vec<DiscoveredSession>> {
+    let mut probes: Vec<PathBuf> = Vec::new();
 
     if let Some(p) = ctl_socket {
-        probes.push(("local".to_string(), p.to_path_buf()));
+        probes.push(p.to_path_buf());
     } else {
         let local = gritty::daemon::control_socket_path();
         if local.exists() {
-            probes.push(("local".to_string(), local));
+            probes.push(local);
         }
         for info in gritty::connect::get_tunnel_info() {
             if info.status == "healthy" {
-                let sock = gritty::connect::connection_socket_path(&info.name);
-                probes.push((info.name, sock));
+                probes.push(gritty::connect::connection_socket_path(&info.name));
             }
         }
     }
@@ -1219,35 +1218,21 @@ async fn auto_detect_session(ctl_socket: Option<&Path>) -> anyhow::Result<Discov
     }
 
     let futures: Vec<_> = probes
-        .iter()
-        .map(|(host, path)| {
-            let host = host.clone();
-            let path = path.clone();
-            async move {
-                tokio::time::timeout(
-                    std::time::Duration::from_secs(2),
-                    probe_daemon_sessions(&host, &path),
-                )
+        .into_iter()
+        .map(|path| async move {
+            tokio::time::timeout(std::time::Duration::from_secs(2), probe_daemon_sessions(&path))
                 .await
                 .unwrap_or_default()
-            }
         })
         .collect();
 
     let results: Vec<DiscoveredSession> =
         futures_util::future::join_all(futures).await.into_iter().flatten().collect();
 
-    match results.len() {
-        0 => anyhow::bail!("no active sessions"),
-        1 => Ok(results.into_iter().next().unwrap()),
-        n => {
-            let mut msg = format!("{n} sessions active, specify one with --session:\n");
-            for s in &results {
-                msg.push_str(&format!("  {}:{}\n", s.host, s.session_id));
-            }
-            anyhow::bail!("{msg}");
-        }
+    if results.is_empty() {
+        anyhow::bail!("no active sessions");
     }
+    Ok(results)
 }
 
 /// Connect to the daemon, handshake, send SendFile, extract raw stream.
@@ -1279,13 +1264,13 @@ async fn send_file_handshake(
     Ok(stream)
 }
 
-/// Connect to the service socket for a session. Either via GRITTY_SOCK
-/// (in-session), explicit --session flag, or auto-detect.
-async fn connect_send_socket(
+/// Connect to service sockets for transfer. Returns one or more streams.
+/// In-session or explicit --session returns one; auto-detect returns all.
+async fn connect_send_sockets(
     ctl_socket: Option<PathBuf>,
     session_flag: Option<String>,
     role: u8,
-) -> anyhow::Result<tokio::net::UnixStream> {
+) -> anyhow::Result<Vec<tokio::net::UnixStream>> {
     // In-session: GRITTY_SOCK is set
     if let Ok(sock_path) = std::env::var("GRITTY_SOCK") {
         if session_flag.is_some() {
@@ -1296,7 +1281,7 @@ async fn connect_send_socket(
         })?;
         use tokio::io::AsyncWriteExt;
         stream.write_all(&[role]).await?;
-        return Ok(stream);
+        return Ok(vec![stream]);
     }
 
     // Explicit --session flag
@@ -1305,12 +1290,58 @@ async fn connect_send_socket(
         let session = session
             .ok_or_else(|| anyhow::anyhow!("--session requires host:session (e.g. local:0)"))?;
         let ctl_path = resolve_ctl_path(ctl_socket, Some(&host))?;
-        return send_file_handshake(&ctl_path, &session, role).await;
+        let stream = send_file_handshake(&ctl_path, &session, role).await?;
+        return Ok(vec![stream]);
     }
 
-    // Auto-detect
-    let discovered = auto_detect_session(ctl_socket.as_deref()).await?;
-    send_file_handshake(&discovered.ctl_path, &discovered.session_id, role).await
+    // Auto-detect: connect to ALL sessions
+    let sessions = discover_all_sessions(ctl_socket.as_deref()).await?;
+    let mut streams = Vec::new();
+    for s in &sessions {
+        if let Ok(stream) = send_file_handshake(&s.ctl_path, &s.session_id, role).await {
+            streams.push(stream);
+        }
+    }
+    if streams.is_empty() {
+        anyhow::bail!("no active sessions");
+    }
+    Ok(streams)
+}
+
+/// Wait for the first stream to become readable, return it (drop the rest).
+async fn select_first_ready(
+    streams: Vec<tokio::net::UnixStream>,
+) -> anyhow::Result<tokio::net::UnixStream> {
+    use futures_util::future::select_all;
+
+    let futs: Vec<_> = streams
+        .into_iter()
+        .map(|stream| {
+            Box::pin(async move {
+                stream.readable().await?;
+                Ok::<_, std::io::Error>(stream)
+            })
+        })
+        .collect();
+
+    let (result, _, _) = select_all(futs).await;
+    Ok(result?)
+}
+
+async fn write_send_manifest(
+    stream: &mut tokio::net::UnixStream,
+    entries: &[(String, u64, PathBuf)],
+) -> anyhow::Result<()> {
+    use tokio::io::AsyncWriteExt;
+    let file_count = entries.len() as u32;
+    stream.write_all(&file_count.to_be_bytes()).await?;
+    for (name, size, _) in entries {
+        let name_bytes = name.as_bytes();
+        stream.write_all(&(name_bytes.len() as u16).to_be_bytes()).await?;
+        stream.write_all(name_bytes).await?;
+        stream.write_all(&size.to_be_bytes()).await?;
+    }
+    Ok(())
 }
 
 async fn send_command(
@@ -1332,22 +1363,23 @@ async fn send_command(
         entries.push((basename, meta.len(), path.clone()));
     }
 
-    let mut stream =
-        connect_send_socket(ctl_socket, session, gritty::protocol::SvcRequest::Send.to_byte())
+    let mut streams =
+        connect_send_sockets(ctl_socket, session, gritty::protocol::SvcRequest::Send.to_byte())
             .await?;
 
-    // Write manifest: file_count, then per-file: name_len, name, file_size
-    let file_count = entries.len() as u32;
-    stream.write_all(&file_count.to_be_bytes()).await?;
-    for (name, size, _) in &entries {
-        let name_bytes = name.as_bytes();
-        stream.write_all(&(name_bytes.len() as u16).to_be_bytes()).await?;
-        stream.write_all(name_bytes).await?;
-        stream.write_all(&size.to_be_bytes()).await?;
+    // Write manifest on all streams
+    for stream in &mut streams {
+        write_send_manifest(stream, &entries).await?;
     }
 
-    // Wait for go signal (0x01 byte)
+    // Wait for go signal -- first stream to get paired wins
     eprintln!("waiting for receiver...");
+    let mut stream = if streams.len() == 1 {
+        streams.into_iter().next().unwrap()
+    } else {
+        select_first_ready(streams).await?
+    };
+
     let mut go = [0u8; 1];
     stream.read_exact(&mut go).await.map_err(|_| anyhow::anyhow!("no receiver connected"))?;
     if go[0] != 0x01 {
@@ -1393,17 +1425,24 @@ async fn receive_command(
         anyhow::bail!("{}: not a directory", dest_dir.display());
     }
 
-    let mut stream =
-        connect_send_socket(ctl_socket, session, gritty::protocol::SvcRequest::Receive.to_byte())
+    let mut streams =
+        connect_send_sockets(ctl_socket, session, gritty::protocol::SvcRequest::Receive.to_byte())
             .await?;
 
-    // Write dest dir + newline
+    // Write dest dir on all streams
     let dest_str = dest_dir.to_string_lossy();
-    stream.write_all(dest_str.as_bytes()).await?;
-    stream.write_all(b"\n").await?;
+    for stream in &mut streams {
+        stream.write_all(dest_str.as_bytes()).await?;
+        stream.write_all(b"\n").await?;
+    }
 
-    // Wait for file data from server
+    // Wait for file data -- first stream to get paired wins
     eprintln!("waiting for sender...");
+    let mut stream = if streams.len() == 1 {
+        streams.into_iter().next().unwrap()
+    } else {
+        select_first_ready(streams).await?
+    };
 
     // Read: file_count (u32 BE)
     let mut buf4 = [0u8; 4];

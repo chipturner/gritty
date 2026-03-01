@@ -112,7 +112,7 @@ ID  Name    PTY         PID    Created              Status
 | `gritty config-edit` | | Open config in `$VISUAL`/`$EDITOR` (creates from template if missing) |
 | `gritty completions <shell>` | | Generate shell completions (bash, zsh, fish, elvish, powershell) |
 
-`<host>` is a connection name from `gritty connect`, or `local` for the local server. Session is specified after a colon: `host:session`. `--ctl-socket` overrides host resolution. `send`/`receive` auto-detect the session by probing all known daemons; use `--session` to disambiguate when multiple sessions exist. Inside a session (`GRITTY_SOCK` set), auto-detection is skipped.
+`<host>` is a connection name from `gritty connect`, or `local` for the local server. Session is specified after a colon: `host:session`. `--ctl-socket` overrides host resolution. `send`/`receive` auto-detect by registering on all active sessions and pairing with whichever gets a counterpart first; use `--session host:session` to target a specific one. Inside a session (`GRITTY_SOCK` set), auto-detection is skipped.
 
 **Notable options:**
 - `-A` / `--forward-agent` on `new`/`attach`: forward your local SSH agent
