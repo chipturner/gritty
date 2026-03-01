@@ -28,8 +28,8 @@ gritty new devbox:work -A -O        # forward SSH agent + browser/OAuth
 # Inside the session:
 git push                            # uses your local SSH keys via -A
 gh auth login                       # OAuth opens in your local browser via -O
-gritty lf 8080                      # access remote port 8080 on localhost:8080
-gritty rf 5432                      # expose local postgres to the session
+gritty lf 8080                      # quick-check a remote web server locally
+gritty rf 5432                      # let the session reach local postgres
 ```
 
 Transfer files through the session (run one side locally, one remotely):
@@ -68,7 +68,7 @@ For local sessions (useful for testing): `gritty new local:scratch`
 - **Persistent sessions** -- shells survive disconnect, network failure, laptop sleep; reattach from any terminal or machine
 - **SSH agent forwarding** (`-A`) -- `git push`, `ssh`, and other agent-dependent commands work remotely
 - **URL open forwarding** (`-O`) -- `$BROWSER` requests forwarded to your local machine, with automatic OAuth callback tunneling
-- **Port forwarding** -- `gritty local-forward` / `gritty remote-forward` for TCP ports, multiplexed over the session
+- **Port forwarding** -- `gritty local-forward` / `gritty remote-forward` for transient TCP forwards through the session; for persistent ports, configure SSH forwarding on the tunnel via `-o` or config
 - **File transfer** -- `gritty send` / `gritty receive` through the session connection, with `--stdin`/`--stdout` pipe mode
 - **Read-only tail** -- `gritty tail` streams session output without detaching the active client
 - **Environment forwarding** -- TERM, LANG, COLORTERM propagated to the remote shell
@@ -126,7 +126,7 @@ For local sessions (useful for testing): `gritty new local:scratch`
 - `--stdin` (`send`): read data from stdin instead of files
 - `--stdout` (`receive`): write data to stdout instead of files
 
-**Port forwarding:** port spec is `PORT` (same on both ends) or `LISTEN:TARGET`. Runs inside a session (`GRITTY_SOCK` required). Ctrl-C stops the forward.
+**Port forwarding:** port spec is `PORT` (same on both ends) or `LISTEN:TARGET`. Runs inside a session (`GRITTY_SOCK` required). Ctrl-C stops the forward. These are transient, on-demand forwards -- great for quick checks during development. For always-on port forwarding, configure it on the SSH tunnel instead: `gritty connect devbox -o "LocalForward=8080 localhost:8080"` or add it to `ssh-options` in your config file.
 
 ## Configuration
 
