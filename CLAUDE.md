@@ -35,12 +35,24 @@ Similar to Eternal Terminal but socket-based. Sessions are persistent (shell sur
 
 ## Build & Test
 
+Rust edition 2024, MSRV 1.85. Uses `just` as the task runner.
+
 ```bash
-cargo build
-cargo test                           # all tests
-cargo test --test protocol_test      # codec unit tests
-cargo test --test daemon_test        # daemon integration tests
-cargo test --test e2e_test           # e2e session tests
+just check                           # clippy + full test suite (pre-push gate)
+just fmt                             # format all source files
+just test                            # all tests (pass args to filter: just test session)
+just test-protocol                   # codec unit tests only
+just test-daemon                     # daemon integration tests only
+just test-e2e                        # e2e session tests only
+just test-ssh                        # SSH integration tests (requires sshd + ssh localhost)
+just test-socat                      # socat tunnel disruption tests (requires socat)
+just stress 10                       # run full suite N times, report pass/fail tally
+just coverage                        # test coverage summary
+just coverage-html                   # HTML coverage report
+```
+
+Usage examples:
+```bash
 cargo run -- server                   # start server (self-backgrounds, prints PID)
 cargo run -- server --foreground      # start server in foreground
 cargo run -- new local:myproject      # create named session (requires server)
@@ -54,7 +66,7 @@ cargo run -- kill-server local       # kill server
 cargo run -- tunnels                  # list active SSH tunnels
 cargo run -- disconnect devbox       # tear down a tunnel
 RUST_LOG=debug cargo run -- server -f # debug mode (foreground)
-tmux start-server\; source-file quicktest.tmux  # manual 2-pane test (server + client)
+just quicktest                        # manual 3-pane tmux test (server + socat + client)
 ```
 
 ## Architecture
@@ -114,44 +126,28 @@ Seven modules behind a lib crate (`src/lib.rs` -- also hosts `collect_env_vars()
 
 ## Current Status
 
-Full CLI with tmux-like ergonomics. Single-socket architecture. Protocol version handshake (Hello/HelloAck) on every connection with `PROTOCOL_VERSION = 1`. Daemon accept loop with 5s send timeouts. Self-daemonizing server with `--foreground` option. PID file and clean signal handling (SIGTERM/SIGINT). Ping/Pong heartbeat with auto-reconnect. Ring buffer truncation marker on reconnect when output was lost. Login shell with client environment forwarding. SSH agent forwarding (`--forward-agent` / `-A`). URL open forwarding (`--forward-open` / `-O`, `gritty open <url>`). SSH-style escape sequences (`~.` detach, `~^Z` suspend, `~?` help). Read-only tail (`gritty tail <host:session>`) streams PTY output via broadcast channel. Self-backgrounding SSH connect with lockfile-based liveness (`gritty connect` forks, prints socket path, returns; `gritty disconnect` tears down; `gritty tunnels` lists status). Remote version check with mismatch warning. TOML config file with global defaults and per-host overrides. File transfer (`gritty send` / `gritty receive`) via per-session send socket with rendezvous pairing. All modules implemented and tested.
+All modules implemented and tested. Full CLI with tmux-like ergonomics, single-socket architecture, self-daemonizing server, SSH tunneling, agent/URL forwarding, OAuth callback tunneling, file transfer, TOML config, and read-only tail.
 
 ## Development Notes
 
-- **`main()` structure** — `main()` is sync (no `#[tokio::main]`). For `Command::Server` and `Command::Connect`, CLI is parsed synchronously, `daemonize()` forks before tokio runtime creation, then `Runtime::new()` + `block_on(...)`. For all other commands, runtime is created normally and delegates to `async fn run()`.
-- **`daemonize()` function** — in `main.rs` (private). Signature: `daemonize(on_ready: impl FnOnce(Pid), output_path: Option<&Path>) -> Result<OwnedFd>`. Uses `nix::unistd::pipe()` + `fork()` + `setsid()`. `on_ready` callback runs in parent after readiness byte received. Child returns `OwnedFd` (write end) which is passed to `daemon::run()` or `connect::run()` as `ready_fd`. When `output_path` is `Some`, stdout/stderr are redirected to that file via `nix::fcntl::open` with `O_WRONLY | O_CREAT | O_APPEND` (mode 0o600); when `None`, they go to `/dev/null`. stdin always goes to `/dev/null`. Must fork before tokio runtime (no threads). Uses `nix::unistd::pipe()` (POSIX-portable), not `pipe2()` (Linux-only). Used by both `gritty server` and `gritty connect`.
-- **`daemon::run()` signature** — takes `ctl_path: &Path` + `ready_fd: Option<OwnedFd>`. After `bind_unix_listener`, writes readiness byte to `ready_fd` (if present), then writes PID file. Tests pass `None` for `ready_fd`.
-- **`client::run()` signature** — takes `session: &str` + `Framed<UnixStream, FrameCodec>` + `redraw: bool` + `ctl_path: &Path` + `env_vars: Vec<(String, String)>` + `no_escape: bool` + `forward_agent: bool` + `forward_open: bool` + `oauth_redirect: bool` + `oauth_timeout: u64`. Called from `new_session()` (redraw=!(no_redraw || resolved.no_redraw), env_vars=[TERM,LANG,COLORTERM] + optionally BROWSER, no_escape/forward_agent/forward_open/oauth_redirect/oauth_timeout from CLI+config) and `attach()` (redraw=!(no_redraw || resolved.no_redraw), env_vars=[], same flags from CLI+config) in main.rs. The `ctl_path` enables auto-reconnect.
-- **`client::tail()` signature** — takes `session: &str` + `Framed<UnixStream, FrameCodec>` + `ctl_path: &Path`. No raw mode, no stdin, no escape processor, no forwarding. Streams Data to stdout, handles Ping/Pong, auto-reconnects with `Frame::Tail`. Called from `tail_session()` in main.rs.
-- **`server::run()` signature** — takes `mpsc::UnboundedReceiver<ClientConn>` + `Arc<OnceLock<SessionMetadata>>` + `PathBuf` (agent socket path) + `PathBuf` (svc socket path). `ClientConn` wraps `Active(Framed)` vs `Tail(Framed)` vs `Send(UnixStream)`. Called directly by e2e tests (via `UnixStream::pair()` + channel) and spawned by daemon. Changing its signature requires updating both.
-- **`connect::run()` signature** — takes `ConnectOpts` + `ready_fd: Option<OwnedFd>`. Returns `anyhow::Result<i32>`. Writes readiness byte to `ready_fd` after tunnel is live. Does not negotiate sessions or run the client relay.
-- **`ConnectOpts` fields** — `destination: String`, `no_server_start: bool`, `ssh_options: Vec<String>`, `name: Option<String>`, `dry_run: bool`, `foreground: bool`. The `name` field overrides the connection name (defaults to hostname from destination). `dry_run` prints the SSH commands instead of running them. `foreground` controls SSH stdio: when true, stdin/stderr inherit the terminal for interactive auth; when false, `BatchMode=yes` is added so SSH fails fast.
-- **`connect::disconnect()` signature** — takes `name: &str`. Sends SIGTERM, polls lockfile, escalates to SIGKILL.
-- **`connect::list_tunnels()`** — enumerates lock files, probes each, prints table. Synchronous (no async needed).
-- **`connect::connection_socket_path()`** — public helper for main.rs to compute socket path in parent process after fork.
-- **`init_tracing()` function** — in `main.rs` (private). Signature: `init_tracing(verbose: bool, log_path: Option<&Path>)`. Filter priority: `RUST_LOG` env var > `-v` flag (`gritty=debug`) > default (`gritty=info`). When `log_path` is `Some`, writes to file via `Mutex<File>` with `.with_ansi(false)`, `.with_line_number(true)`, `.with_file(true)`, `.with_target(true)`. When `None`, writes to stderr with ANSI. Called after `daemonize()` at each callsite: daemon mode passes `Some(&log_path)`, foreground passes `None`.
-- **`parse_target()` in main.rs** — splits a `host[:session]` string on the first `:`. Returns `(String, Option<String>)`. Called per command arm in `run()` to extract host and session from the unified positional arg.
-- **`resolve_ctl_path()` in main.rs** — resolves control socket path from `(ctl_socket: Option<PathBuf>, host: Option<&str>)`. Returns `anyhow::Result<PathBuf>`. `--ctl-socket` always wins (host can be `None`), `"local"` = default control socket, other host = `socket_dir()/connect-{host}.sock`, both `None` = error. Called per command arm in `run()`.
-- **`suggest_session()` in main.rs** — async helper for commands requiring a session (attach, tail, kill-session). When session is omitted, connects to server, lists sessions, prints friendly error with available sessions and usage hint, then exits.
-- **`connect_send_sockets()` in main.rs** — signature: `(ctl_socket: Option<PathBuf>, session_flag: Option<String>, role: u8) -> Result<Vec<UnixStream>>`. Three paths: (1) in-session (`GRITTY_SOCK` set) connects to svc socket directly, rejects `--session`, returns vec of one; (2) explicit `--session` flag parses `host:session` and calls `send_file_handshake()`, returns vec of one; (3) auto-detect calls `discover_all_sessions()` then `send_file_handshake()` for each, returns all connected streams.
-- **`select_first_ready()` in main.rs** — takes `Vec<UnixStream>`, uses `futures_util::future::select_all` to race `readable()` on all streams, returns the first to become readable (drops the rest).
-- **`discover_all_sessions()` in main.rs** — probes all known daemons (local + healthy tunnels) concurrently with 2s timeout per probe. Returns `Vec<DiscoveredSession>`. Uses `probe_daemon_sessions()` for each daemon. Bails if no servers running or no active sessions.
-- **`probe_daemon_sessions()` in main.rs** — connects to a single daemon, handshakes, sends `ListSessions`, maps each `SessionEntry` into a `DiscoveredSession { session_id, ctl_path }`. Returns empty vec on any failure.
-- **`send_file_handshake()` in main.rs** — connects to daemon at `ctl_path`, handshakes, sends `Frame::SendFile { session, role }`, reads Ok/Error response, extracts raw `UnixStream` from `Framed`, writes role byte. Reused by both `--session` and auto-detect paths.
-- **`write_send_manifest()` in main.rs** — writes the sender manifest (file_count + per-file name/size) to a stream. Extracted so it can be written to multiple streams in the multi-session case.
-- **`REMOTE_ENSURE_CMD`** — runs `gritty socket-path` to get the socket path, probes `gritty ls` to check if a server is already running, conditionally starts one with `gritty server && sleep 0.3` (self-daemonizing, no `nohup` needed), echoes the socket path, then appends `gritty protocol-version` output (second line, parsed by `ensure_remote_ready`).
+### Critical invariants
+- **`security` module is load-bearing** — all socket binding and directory creation goes through it. Never use `UnixListener::bind` or `create_dir_all` directly.
+- **Reap before lookup** — `reap_sessions()` MUST be called before any operation that resolves a session (Attach, KillSession, ListSessions). Stale sessions in the HashMap cause silent failures.
+- **Channel closed check** — Before sending `Frame::Ok` for Attach, check `client_tx.is_closed()`. If true, the session died between reap and lookup; send `Frame::Error` instead.
+- **`Stdio::from(OwnedFd)`** — server uses safe `Stdio::from()` instead of `Stdio::from_raw_fd()`. Don't reintroduce `FromRawFd` in server.rs.
+- **Fork before tokio** — `daemonize()` MUST fork before creating the tokio runtime (no threads allowed across fork). `main()` is sync (no `#[tokio::main]`).
+
+### Changing protocol/signatures
 - **`Frame` enum changes** — adding variants requires updating: encoder, decoder, protocol tests, and all `match frame` sites in server.rs, client.rs, daemon.rs, main.rs.
 - **`SessionInfo` wire format** — 7 tab-separated fields per line: `id\tname\tpty_path\tshell_pid\tcreated_at\tattached\tlast_heartbeat`. Changing `SessionEntry` fields requires updating both encoder and decoder in protocol.rs.
+- **`server::run()` signature** — called directly by e2e tests (via `UnixStream::pair()` + channel) and spawned by daemon. Changing its signature requires updating both.
+
+### Testing
+- **Test-first for bug fixes** — write a failing test first, implement the fix, confirm it passes. Regression tests go in daemon_test.rs (for daemon races) or e2e_test.rs (for session/relay bugs).
 - **E2e tests use socketpair + channel** — no socket files needed, no cleanup issues. `UnixStream::pair()` creates both ends, server side sent via `mpsc` channel to `server::run()`.
-- **Daemon tests still use a real daemon socket** — each test gets its own `tempfile::tempdir()` containing the control socket. Agent/svc sockets are also created within the tempdir (derived from ctl_path's parent). Tests pass `None` for `ready_fd`. All daemon test helpers (`control_request()`, `attach_session()`) perform Hello handshake before sending control frames via `do_handshake()`.
+- **Daemon tests use a real socket** — each test gets its own `tempfile::tempdir()`. Tests pass `None` for `ready_fd`. All helpers perform Hello handshake via `do_handshake()`.
 - **Daemon tests are timing-sensitive** — use `tokio::time::sleep` to wait for daemon/session binding. If tests flake, increase sleep durations.
-- **`security` module is load-bearing** — all socket binding and directory creation goes through it. Never use `UnixListener::bind` or `create_dir_all` directly.
-- **`Stdio::from(OwnedFd)`** — server uses safe `Stdio::from()` instead of `Stdio::from_raw_fd()`. Don't reintroduce `FromRawFd` in server.rs.
-- **Reap before lookup** — `reap_sessions()` MUST be called before any operation that resolves a session (Attach, KillSession, ListSessions). Stale sessions in the HashMap cause silent failures (Ok sent, then connection drops because the mpsc channel is closed).
-- **Channel closed check** — Before sending `Frame::Ok` for Attach, check `client_tx.is_closed()`. If true, the session died between reap and lookup; send `Frame::Error` instead.
+- **SSH/socat tests need external tools** — `just test-ssh` requires `sshd` + localhost SSH; `just test-socat` requires `socat`. Both skip gracefully if missing.
+
+### Style
 - **Error handling in main.rs** — `main()` returns `()`. Errors print as `error: <message>` via `eprintln!`, no backtraces. Never use `-> anyhow::Result` on `main()` in a CLI tool.
-- **Connect integration tests need SSH** — unit tests cover parsing and command building. Full integration requires a remote host, so deferred to manual testing.
-- **`config` module** — `ConfigFile` loaded once in `main()`, passed to `run()` and `info()`. Each command arm merges config with CLI flags. Session booleans use `cli_flag || config_value` (except `oauth_redirect` which uses `if no_oauth_redirect { false } else { config_value }`; default true). `oauth_timeout` uses `cli.unwrap_or(config_value)` (default 180). SSH options use append: CLI first, then host, then defaults. `config_path()` uses `XDG_CONFIG_HOME` with `HOME/.config` fallback. Missing/malformed config silently defaults (preserves zero-config). Unknown TOML keys ignored (forward-compatible via `#[serde(default)]`).
-- **`--no-redraw` on `new-session`** — added for consistency with `attach`. The `redraw` param flows through to `client::run()`.
-- **`config_edit()` in main.rs** — sync function (no async). Creates config dir + file from `DEFAULT_CONFIG` template if missing, then execs `$VISUAL` / `$EDITOR` / `vi`. Not routed through `run()` async path.
-- **Test-first for bug fixes** — When fixing bugs, write a failing test first that reproduces the bug, then implement the fix, then confirm the test passes. Regression tests go in daemon_test.rs (for daemon races) or e2e_test.rs (for session/relay bugs).
