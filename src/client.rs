@@ -437,6 +437,11 @@ async fn relay(
                     }
                     Some(Ok(Frame::Detached)) => {
                         info!("detached by another client");
+                        agent_channels.clear();
+                        drop(tunnel_writer.take());
+                        if let Some(handle) = tunnel_listener.take() {
+                            handle.abort();
+                        }
                         write_stdout(status_msg("detached").as_bytes())?;
                         return Ok(Some(0));
                     }
