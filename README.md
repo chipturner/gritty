@@ -90,7 +90,7 @@ For local sessions (useful for testing): `gritty new local:scratch`
 | `gritty connect <destination>` | `c` | Set up SSH tunnel to remote host |
 | `gritty disconnect <name>` | `dc` | Tear down an SSH tunnel |
 | `gritty tunnels` | `tun` | List active SSH tunnels |
-| `gritty send [files...]` | | Send files to a paired receiver |
+| `gritty send [-r] [files...]` | | Send files/directories to a paired receiver |
 | `gritty receive [dir]` | | Receive files from a paired sender |
 | `gritty local-forward <port>` | `lf` | Forward a TCP port from session to client |
 | `gritty remote-forward <port>` | `rf` | Forward a TCP port from client to session |

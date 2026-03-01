@@ -127,6 +127,10 @@ enum Command {
         #[arg(long)]
         stdin: bool,
 
+        /// Recursively send directories
+        #[arg(short = 'r', long)]
+        recursive: bool,
+
         /// Files to send
         files: Vec<PathBuf>,
     },
@@ -682,8 +686,8 @@ async fn run(cli: Cli, config: gritty::config::ConfigFile) -> anyhow::Result<()>
             println!("{}", ctl_path.display());
             Ok(())
         }
-        Command::Send { session, stdin, files } => {
-            send_command(cli.ctl_socket, session, stdin, files).await
+        Command::Send { session, stdin, recursive, files } => {
+            send_command(cli.ctl_socket, session, stdin, recursive, files).await
         }
         Command::Receive { session, stdout, dir } => {
             receive_command(cli.ctl_socket, session, stdout, dir).await
@@ -1417,6 +1421,53 @@ fn sanitize_basename(name: &str) -> anyhow::Result<String> {
     Ok(basename.to_string())
 }
 
+/// Sanitize a relative path for file transfer. Allows `/` separators for
+/// directory structure but rejects `..` components and absolute paths.
+fn sanitize_relpath(name: &str) -> anyhow::Result<String> {
+    if name.is_empty() {
+        anyhow::bail!("empty filename");
+    }
+    let path = Path::new(name);
+    if path.is_absolute() {
+        anyhow::bail!("absolute path rejected: {name}");
+    }
+    for component in path.components() {
+        match component {
+            std::path::Component::ParentDir => {
+                anyhow::bail!("path traversal rejected: {name}");
+            }
+            std::path::Component::Normal(_) => {}
+            _ => {
+                anyhow::bail!("invalid path component in: {name}");
+            }
+        }
+    }
+    Ok(name.to_string())
+}
+
+/// Recursively walk a directory, collecting `(relative_path, absolute_path)` pairs.
+/// Skips symlinks.
+fn walk_dir(base: &Path, dir: &Path) -> anyhow::Result<Vec<(String, PathBuf)>> {
+    let mut results = Vec::new();
+    for entry in std::fs::read_dir(dir).map_err(|e| anyhow::anyhow!("{}: {e}", dir.display()))? {
+        let entry = entry?;
+        let file_type = entry.file_type()?;
+        if file_type.is_symlink() {
+            continue;
+        }
+        let path = entry.path();
+        if file_type.is_dir() {
+            results.extend(walk_dir(base, &path)?);
+        } else if file_type.is_file() {
+            let rel = path
+                .strip_prefix(base)
+                .map_err(|_| anyhow::anyhow!("failed to compute relative path"))?;
+            results.push((rel.to_string_lossy().to_string(), path));
+        }
+    }
+    Ok(results)
+}
+
 struct DiscoveredSession {
     session_id: String,
     ctl_path: PathBuf,
@@ -1620,6 +1671,7 @@ async fn send_command(
     ctl_socket: Option<PathBuf>,
     session: Option<String>,
     use_stdin: bool,
+    recursive: bool,
     files: Vec<PathBuf>,
 ) -> anyhow::Result<()> {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -1645,11 +1697,25 @@ async fn send_command(
     for path in &files {
         let meta =
             std::fs::metadata(path).map_err(|e| anyhow::anyhow!("{}: {e}", path.display()))?;
-        if !meta.is_file() {
-            anyhow::bail!("{}: not a regular file", path.display());
+        if meta.is_dir() {
+            if !recursive {
+                anyhow::bail!("{}: is a directory (use -r to send recursively)", path.display());
+            }
+            // Use the directory name as the prefix for relative paths
+            let base = path.parent().unwrap_or(Path::new("."));
+            for (rel, abs) in walk_dir(base, path)? {
+                let size = std::fs::metadata(&abs)?.len();
+                entries.push((rel, size, abs));
+            }
+        } else if meta.is_file() {
+            let basename = sanitize_basename(&path.to_string_lossy())?;
+            entries.push((basename, meta.len(), path.clone()));
+        } else {
+            anyhow::bail!("{}: not a regular file or directory", path.display());
         }
-        let basename = sanitize_basename(&path.to_string_lossy())?;
-        entries.push((basename, meta.len(), path.clone()));
+    }
+    if !use_stdin && entries.is_empty() {
+        anyhow::bail!("no files to send");
     }
 
     let mut streams =
@@ -1771,7 +1837,7 @@ async fn receive_command(
         let mut name_buf = vec![0u8; name_len];
         stream.read_exact(&mut name_buf).await?;
         let name = String::from_utf8(name_buf)?;
-        let name = sanitize_basename(&name)?;
+        let name = sanitize_relpath(&name)?;
 
         // Read file_size (u64 BE)
         let mut buf8 = [0u8; 8];
@@ -1793,8 +1859,11 @@ async fn receive_command(
                 eprintln!("receiving {file_count} file{s}");
             }
 
-            // Write file data
+            // Write file data (create parent dirs for nested paths)
             let file_path = dest_dir.join(&name);
+            if let Some(parent) = file_path.parent() {
+                tokio::fs::create_dir_all(parent).await?;
+            }
             let mut file = tokio::fs::OpenOptions::new()
                 .write(true)
                 .create(true)
