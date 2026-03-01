@@ -67,6 +67,10 @@ enum Command {
         /// Target host and session (host:session)
         target: Option<String>,
 
+        /// Create the session if it doesn't exist
+        #[arg(short = 'c', long)]
+        create: bool,
+
         /// Don't send Ctrl-L to redraw after attaching
         #[arg(long)]
         no_redraw: bool,
@@ -573,6 +577,7 @@ async fn run(cli: Cli, config: gritty::config::ConfigFile) -> anyhow::Result<()>
         }
         Command::Attach {
             target,
+            create,
             no_redraw,
             no_escape,
             forward_agent,
@@ -587,7 +592,7 @@ async fn run(cli: Cli, config: gritty::config::ConfigFile) -> anyhow::Result<()>
                 }
                 None => (None, None),
             };
-            let ctl_path = resolve_ctl_path(cli.ctl_socket, host.as_deref())?;
+            let ctl_path = resolve_ctl_path(cli.ctl_socket.clone(), host.as_deref())?;
             let resolved = config.resolve_session(host.as_deref());
             let settings = gritty::config::SessionSettings {
                 no_redraw: no_redraw || resolved.no_redraw,
@@ -599,13 +604,39 @@ async fn run(cli: Cli, config: gritty::config::ConfigFile) -> anyhow::Result<()>
             };
             let session = match session {
                 Some(s) => s,
+                None if create => {
+                    // --create with no session name: create unnamed session
+                    let auto_start_mode = match (&cli.ctl_socket, host.as_deref()) {
+                        (Some(_), _) => AutoStart::None,
+                        (None, Some("local")) => AutoStart::Server,
+                        (None, Some(h)) => AutoStart::Tunnel(h.to_string()),
+                        (None, None) => anyhow::bail!("specify a host or use --ctl-socket"),
+                    };
+                    new_session(None, settings, ctl_path, auto_start_mode, false).await?;
+                    unreachable!()
+                }
                 None => {
                     suggest_session("attach", host.as_deref().unwrap_or("host"), &ctl_path).await?;
                     unreachable!()
                 }
             };
-            let code = attach(session, settings, ctl_path).await?;
-            std::process::exit(code);
+            match attach(&session, &settings, &ctl_path).await {
+                Ok(code) => std::process::exit(code),
+                Err(AttachError::NoSuchSession) if create => {
+                    let auto_start_mode = match (&cli.ctl_socket, host.as_deref()) {
+                        (Some(_), _) => AutoStart::None,
+                        (None, Some("local")) => AutoStart::Server,
+                        (None, Some(h)) => AutoStart::Tunnel(h.to_string()),
+                        (None, None) => anyhow::bail!("specify a host or use --ctl-socket"),
+                    };
+                    new_session(Some(session), settings, ctl_path, auto_start_mode, false).await?;
+                    unreachable!()
+                }
+                Err(AttachError::NoSuchSession) => {
+                    anyhow::bail!("no such session: {session}")
+                }
+                Err(AttachError::Other(e)) => Err(e)?,
+            }
         }
         Command::ListSessions { target } => {
             let host = target.as_deref().map(|t| parse_target(t).0);
@@ -681,6 +712,13 @@ async fn run(cli: Cli, config: gritty::config::ConfigFile) -> anyhow::Result<()>
             Ok(())
         }
     }
+}
+
+/// Attach-specific error type so callers can distinguish "no such session"
+/// from other failures (used by `--create` to fall through to session creation).
+enum AttachError {
+    NoSuchSession,
+    Other(anyhow::Error),
 }
 
 /// What to auto-start when new-session can't connect.
@@ -797,17 +835,17 @@ async fn new_session(
 }
 
 async fn attach(
-    target: String,
-    settings: gritty::config::SessionSettings,
-    ctl_path: PathBuf,
-) -> anyhow::Result<i32> {
+    target: &str,
+    settings: &gritty::config::SessionSettings,
+    ctl_path: &Path,
+) -> Result<i32, AttachError> {
     use futures_util::{SinkExt, StreamExt};
     use gritty::protocol::{Frame, FrameCodec};
     use tokio::net::UnixStream;
     use tokio_util::codec::Framed;
 
     let stream = loop {
-        match UnixStream::connect(&ctl_path).await {
+        match UnixStream::connect(ctl_path).await {
             Ok(s) => break s,
             Err(_) => {
                 eprintln!("waiting for server ({})... ctrl-c to abort", ctl_path.display());
@@ -816,17 +854,20 @@ async fn attach(
         }
     };
     let mut framed = Framed::new(stream, FrameCodec);
-    gritty::handshake(&mut framed).await?;
-    framed.send(Frame::Attach { session: target.clone() }).await?;
+    gritty::handshake(&mut framed).await.map_err(AttachError::Other)?;
+    framed
+        .send(Frame::Attach { session: target.to_string() })
+        .await
+        .map_err(|e| AttachError::Other(e.into()))?;
 
-    match Frame::expect_from(framed.next().await)? {
+    match Frame::expect_from(framed.next().await).map_err(AttachError::Other)? {
         Frame::Ok => {
             eprintln!("[attached]");
             let code = gritty::client::run(
-                &target,
+                target,
                 framed,
                 !settings.no_redraw,
-                &ctl_path,
+                ctl_path,
                 vec![],
                 settings.no_escape,
                 settings.forward_agent,
@@ -834,11 +875,17 @@ async fn attach(
                 settings.oauth_redirect,
                 settings.oauth_timeout,
             )
-            .await?;
+            .await
+            .map_err(AttachError::Other)?;
             Ok(code)
         }
-        Frame::Error { message } => anyhow::bail!("{message}"),
-        other => anyhow::bail!("unexpected response from server: {other:?}"),
+        Frame::Error { message } if message.starts_with("no such session:") => {
+            Err(AttachError::NoSuchSession)
+        }
+        Frame::Error { message } => Err(AttachError::Other(anyhow::anyhow!("{message}"))),
+        other => {
+            Err(AttachError::Other(anyhow::anyhow!("unexpected response from server: {other:?}")))
+        }
     }
 }
 

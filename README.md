@@ -82,7 +82,7 @@ For local sessions (useful for testing): `gritty new local:scratch`
 | Command | Aliases | Description |
 |---------|---------|-------------|
 | `gritty new-session <host[:name]>` | `new` | Create a session and auto-attach |
-| `gritty attach <host:session>` | `a` | Attach to a session (detaches other clients) |
+| `gritty attach <host:session>` | `a` | Attach to a session (`-c` creates if missing) |
 | `gritty tail <host:session>` | `t` | Read-only stream of session output |
 | `gritty list-sessions <host>` | `ls`, `list` | List sessions |
 | `gritty kill-session <host:session>` | | Kill a session |
