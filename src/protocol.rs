@@ -35,6 +35,12 @@ const TYPE_OK: u8 = 0x22;
 const TYPE_ERROR: u8 = 0x23;
 const TYPE_HELLO_ACK: u8 = 0x24;
 const TYPE_SEND_FILE: u8 = 0x25;
+const TYPE_PORT_FORWARD_LISTEN: u8 = 0x1C;
+const TYPE_PORT_FORWARD_READY: u8 = 0x1D;
+const TYPE_PORT_FORWARD_OPEN: u8 = 0x1E;
+const TYPE_PORT_FORWARD_DATA: u8 = 0x1F;
+const TYPE_PORT_FORWARD_CLOSE: u8 = 0x26;
+const TYPE_PORT_FORWARD_STOP: u8 = 0x27;
 
 const HEADER_LEN: usize = 5; // type(1) + length(4)
 const MAX_FRAME_SIZE: usize = 1 << 20; // 1 MB
@@ -49,6 +55,7 @@ pub enum SvcRequest {
     OpenUrl = 1,
     Send = 2,
     Receive = 3,
+    PortForward = 4,
 }
 
 impl SvcRequest {
@@ -57,6 +64,7 @@ impl SvcRequest {
             1 => Some(Self::OpenUrl),
             2 => Some(Self::Send),
             3 => Some(Self::Receive),
+            4 => Some(Self::PortForward),
             _ => None,
         }
     }
@@ -139,6 +147,35 @@ pub enum Frame {
     /// File transfer cancelled (server → client).
     SendCancel {
         reason: String,
+    },
+    /// Server asks client to set up a port forward listener (server → client for remote-fwd).
+    PortForwardListen {
+        forward_id: u32,
+        listen_port: u16,
+        target_port: u16,
+    },
+    /// Client confirms port forward listener is ready (client → server).
+    PortForwardReady {
+        forward_id: u32,
+    },
+    /// New TCP connection on a port forward (bidirectional).
+    PortForwardOpen {
+        forward_id: u32,
+        channel_id: u32,
+        target_port: u16,
+    },
+    /// Port forward channel data (bidirectional).
+    PortForwardData {
+        channel_id: u32,
+        data: Bytes,
+    },
+    /// Close a port forward channel (bidirectional).
+    PortForwardClose {
+        channel_id: u32,
+    },
+    /// Tear down an entire port forward (server → client).
+    PortForwardStop {
+        forward_id: u32,
     },
     /// Protocol version handshake (client → server, first frame on connection).
     Hello {
@@ -352,6 +389,78 @@ impl Decoder for FrameCodec {
             }
             TYPE_SEND_DONE => Ok(Some(Frame::SendDone)),
             TYPE_SEND_CANCEL => Ok(Some(Frame::SendCancel { reason: decode_string(payload)? })),
+            TYPE_PORT_FORWARD_LISTEN => {
+                if payload.len() != 8 {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "port forward listen frame must be 8 bytes",
+                    ));
+                }
+                let forward_id =
+                    u32::from_be_bytes([payload[0], payload[1], payload[2], payload[3]]);
+                let listen_port = u16::from_be_bytes([payload[4], payload[5]]);
+                let target_port = u16::from_be_bytes([payload[6], payload[7]]);
+                Ok(Some(Frame::PortForwardListen { forward_id, listen_port, target_port }))
+            }
+            TYPE_PORT_FORWARD_READY => {
+                if payload.len() != 4 {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "port forward ready frame must be 4 bytes",
+                    ));
+                }
+                let forward_id =
+                    u32::from_be_bytes([payload[0], payload[1], payload[2], payload[3]]);
+                Ok(Some(Frame::PortForwardReady { forward_id }))
+            }
+            TYPE_PORT_FORWARD_OPEN => {
+                if payload.len() != 10 {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "port forward open frame must be 10 bytes",
+                    ));
+                }
+                let forward_id =
+                    u32::from_be_bytes([payload[0], payload[1], payload[2], payload[3]]);
+                let channel_id =
+                    u32::from_be_bytes([payload[4], payload[5], payload[6], payload[7]]);
+                let target_port = u16::from_be_bytes([payload[8], payload[9]]);
+                Ok(Some(Frame::PortForwardOpen { forward_id, channel_id, target_port }))
+            }
+            TYPE_PORT_FORWARD_DATA => {
+                if payload.len() < 4 {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "port forward data frame must be at least 4 bytes",
+                    ));
+                }
+                let channel_id =
+                    u32::from_be_bytes([payload[0], payload[1], payload[2], payload[3]]);
+                let data = payload.freeze().slice(4..);
+                Ok(Some(Frame::PortForwardData { channel_id, data }))
+            }
+            TYPE_PORT_FORWARD_CLOSE => {
+                if payload.len() != 4 {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "port forward close frame must be 4 bytes",
+                    ));
+                }
+                let channel_id =
+                    u32::from_be_bytes([payload[0], payload[1], payload[2], payload[3]]);
+                Ok(Some(Frame::PortForwardClose { channel_id }))
+            }
+            TYPE_PORT_FORWARD_STOP => {
+                if payload.len() != 4 {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "port forward stop frame must be 4 bytes",
+                    ));
+                }
+                let forward_id =
+                    u32::from_be_bytes([payload[0], payload[1], payload[2], payload[3]]);
+                Ok(Some(Frame::PortForwardStop { forward_id }))
+            }
             TYPE_SEND_FILE => {
                 if payload.is_empty() {
                     return Err(io::Error::new(
@@ -507,6 +616,41 @@ impl Encoder<Frame> for FrameCodec {
             }
             Frame::SendDone => encode_empty(dst, TYPE_SEND_DONE),
             Frame::SendCancel { reason } => encode_str(dst, TYPE_SEND_CANCEL, &reason),
+            Frame::PortForwardListen { forward_id, listen_port, target_port } => {
+                dst.put_u8(TYPE_PORT_FORWARD_LISTEN);
+                dst.put_u32(8); // u32 + u16 + u16
+                dst.put_u32(forward_id);
+                dst.put_u16(listen_port);
+                dst.put_u16(target_port);
+            }
+            Frame::PortForwardReady { forward_id } => {
+                dst.put_u8(TYPE_PORT_FORWARD_READY);
+                dst.put_u32(4);
+                dst.put_u32(forward_id);
+            }
+            Frame::PortForwardOpen { forward_id, channel_id, target_port } => {
+                dst.put_u8(TYPE_PORT_FORWARD_OPEN);
+                dst.put_u32(10); // u32 + u32 + u16
+                dst.put_u32(forward_id);
+                dst.put_u32(channel_id);
+                dst.put_u16(target_port);
+            }
+            Frame::PortForwardData { channel_id, data } => {
+                dst.put_u8(TYPE_PORT_FORWARD_DATA);
+                dst.put_u32(4 + data.len() as u32);
+                dst.put_u32(channel_id);
+                dst.extend_from_slice(&data);
+            }
+            Frame::PortForwardClose { channel_id } => {
+                dst.put_u8(TYPE_PORT_FORWARD_CLOSE);
+                dst.put_u32(4);
+                dst.put_u32(channel_id);
+            }
+            Frame::PortForwardStop { forward_id } => {
+                dst.put_u8(TYPE_PORT_FORWARD_STOP);
+                dst.put_u32(4);
+                dst.put_u32(forward_id);
+            }
             Frame::SendFile { session, role } => {
                 let slen = session.len();
                 dst.put_u8(TYPE_SEND_FILE);

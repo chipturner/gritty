@@ -866,3 +866,120 @@ fn tunnel_listen_wrong_payload_size() {
     let err = codec.decode(&mut buf).unwrap_err();
     assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
 }
+
+#[test]
+fn roundtrip_port_forward_listen() {
+    let mut codec = FrameCodec;
+    let mut buf = BytesMut::new();
+    let original = Frame::PortForwardListen { forward_id: 1, listen_port: 8080, target_port: 3000 };
+    codec.encode(original.clone(), &mut buf).unwrap();
+    assert_eq!(buf.len(), 13); // type(1) + len(4) + forward_id(4) + listen(2) + target(2)
+    assert_eq!(buf[0], 0x1C);
+    let decoded = codec.decode(&mut buf).unwrap().unwrap();
+    assert_eq!(original, decoded);
+}
+
+#[test]
+fn roundtrip_port_forward_ready() {
+    let mut codec = FrameCodec;
+    let mut buf = BytesMut::new();
+    let original = Frame::PortForwardReady { forward_id: 42 };
+    codec.encode(original.clone(), &mut buf).unwrap();
+    assert_eq!(buf.len(), 9); // type(1) + len(4) + forward_id(4)
+    assert_eq!(buf[0], 0x1D);
+    let decoded = codec.decode(&mut buf).unwrap().unwrap();
+    assert_eq!(original, decoded);
+}
+
+#[test]
+fn roundtrip_port_forward_open() {
+    let mut codec = FrameCodec;
+    let mut buf = BytesMut::new();
+    let original = Frame::PortForwardOpen { forward_id: 1, channel_id: 7, target_port: 3000 };
+    codec.encode(original.clone(), &mut buf).unwrap();
+    assert_eq!(buf.len(), 15); // type(1) + len(4) + forward_id(4) + channel_id(4) + target(2)
+    assert_eq!(buf[0], 0x1E);
+    let decoded = codec.decode(&mut buf).unwrap().unwrap();
+    assert_eq!(original, decoded);
+}
+
+#[test]
+fn roundtrip_port_forward_data() {
+    let mut codec = FrameCodec;
+    let mut buf = BytesMut::new();
+    let original = Frame::PortForwardData { channel_id: 3, data: Bytes::from("pf-payload") };
+    codec.encode(original.clone(), &mut buf).unwrap();
+    // type(1) + len(4) + channel_id(4) + data(10) = 19
+    assert_eq!(buf.len(), 19);
+    assert_eq!(buf[0], 0x1F);
+    let decoded = codec.decode(&mut buf).unwrap().unwrap();
+    assert_eq!(original, decoded);
+}
+
+#[test]
+fn roundtrip_port_forward_data_empty() {
+    let mut codec = FrameCodec;
+    let mut buf = BytesMut::new();
+    let original = Frame::PortForwardData { channel_id: 0, data: Bytes::new() };
+    codec.encode(original.clone(), &mut buf).unwrap();
+    assert_eq!(buf.len(), 9); // type(1) + len(4) + channel_id(4)
+    let decoded = codec.decode(&mut buf).unwrap().unwrap();
+    assert_eq!(original, decoded);
+}
+
+#[test]
+fn roundtrip_port_forward_close() {
+    let mut codec = FrameCodec;
+    let mut buf = BytesMut::new();
+    let original = Frame::PortForwardClose { channel_id: 99 };
+    codec.encode(original.clone(), &mut buf).unwrap();
+    assert_eq!(buf.len(), 9); // type(1) + len(4) + channel_id(4)
+    assert_eq!(buf[0], 0x26);
+    let decoded = codec.decode(&mut buf).unwrap().unwrap();
+    assert_eq!(original, decoded);
+}
+
+#[test]
+fn roundtrip_port_forward_stop() {
+    let mut codec = FrameCodec;
+    let mut buf = BytesMut::new();
+    let original = Frame::PortForwardStop { forward_id: 5 };
+    codec.encode(original.clone(), &mut buf).unwrap();
+    assert_eq!(buf.len(), 9); // type(1) + len(4) + forward_id(4)
+    assert_eq!(buf[0], 0x27);
+    let decoded = codec.decode(&mut buf).unwrap().unwrap();
+    assert_eq!(original, decoded);
+}
+
+#[test]
+fn port_forward_listen_wrong_payload_size() {
+    let mut codec = FrameCodec;
+    let mut buf = BytesMut::new();
+    buf.put_u8(0x1C); // TYPE_PORT_FORWARD_LISTEN
+    buf.put_u32(4); // wrong: should be 8
+    buf.put_slice(&[0x00; 4]);
+    let err = codec.decode(&mut buf).unwrap_err();
+    assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
+}
+
+#[test]
+fn port_forward_open_wrong_payload_size() {
+    let mut codec = FrameCodec;
+    let mut buf = BytesMut::new();
+    buf.put_u8(0x1E); // TYPE_PORT_FORWARD_OPEN
+    buf.put_u32(4); // wrong: should be 10
+    buf.put_slice(&[0x00; 4]);
+    let err = codec.decode(&mut buf).unwrap_err();
+    assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
+}
+
+#[test]
+fn port_forward_data_too_short() {
+    let mut codec = FrameCodec;
+    let mut buf = BytesMut::new();
+    buf.put_u8(0x1F); // TYPE_PORT_FORWARD_DATA
+    buf.put_u32(2); // less than 4 bytes
+    buf.put_slice(&[0x00, 0x00]);
+    let err = codec.decode(&mut buf).unwrap_err();
+    assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
+}

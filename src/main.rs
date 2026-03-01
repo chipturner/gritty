@@ -137,6 +137,18 @@ enum Command {
         /// URL to open
         url: String,
     },
+    /// Forward a port from the session to the client (listen on session, connect on client)
+    #[command(visible_alias = "lf")]
+    LocalForward {
+        /// Port spec: PORT or LISTEN_PORT:TARGET_PORT
+        port: String,
+    },
+    /// Forward a port from the client to the session (listen on client, connect on session)
+    #[command(visible_alias = "rf")]
+    RemoteForward {
+        /// Port spec: PORT or LISTEN_PORT:TARGET_PORT
+        port: String,
+    },
     /// Print the default socket path
     #[command(visible_alias = "socket")]
     SocketPath,
@@ -634,6 +646,14 @@ async fn run(cli: Cli, config: gritty::config::ConfigFile) -> anyhow::Result<()>
             open_url(&url);
             Ok(())
         }
+        Command::LocalForward { port } => {
+            let (listen_port, target_port) = parse_port_spec(&port)?;
+            port_forward_command(0, listen_port, target_port).await
+        }
+        Command::RemoteForward { port } => {
+            let (listen_port, target_port) = parse_port_spec(&port)?;
+            port_forward_command(1, listen_port, target_port).await
+        }
         Command::Disconnect { name } => gritty::connect::disconnect(&name).await,
         Command::Tunnels => {
             gritty::connect::list_tunnels();
@@ -902,6 +922,78 @@ async fn list_sessions(ctl_path: PathBuf) -> anyhow::Result<()> {
             anyhow::bail!("unexpected response from server: {other:?}");
         }
     }
+}
+
+/// Parse a port spec: "PORT" or "LISTEN_PORT:TARGET_PORT".
+fn parse_port_spec(spec: &str) -> anyhow::Result<(u16, u16)> {
+    if let Some((a, b)) = spec.split_once(':') {
+        let listen: u16 = a.parse().map_err(|_| anyhow::anyhow!("invalid listen port: {a}"))?;
+        let target: u16 = b.parse().map_err(|_| anyhow::anyhow!("invalid target port: {b}"))?;
+        Ok((listen, target))
+    } else {
+        let port: u16 = spec.parse().map_err(|_| anyhow::anyhow!("invalid port: {spec}"))?;
+        Ok((port, port))
+    }
+}
+
+/// Run a port forward command. Connects to GRITTY_SOCK, sends the request,
+/// reads the response, prints status, and blocks until SIGINT or EOF.
+async fn port_forward_command(
+    direction: u8,
+    listen_port: u16,
+    target_port: u16,
+) -> anyhow::Result<()> {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    let sock_path = match std::env::var("GRITTY_SOCK") {
+        Ok(p) => p,
+        Err(_) => {
+            anyhow::bail!("GRITTY_SOCK not set (are you inside a gritty session?)");
+        }
+    };
+
+    let mut stream = tokio::net::UnixStream::connect(&sock_path).await?;
+
+    // Write: [discriminator][direction][listen_port BE][target_port BE]
+    let mut header = [0u8; 6];
+    header[0] = gritty::protocol::SvcRequest::PortForward.to_byte();
+    header[1] = direction;
+    header[2..4].copy_from_slice(&listen_port.to_be_bytes());
+    header[4..6].copy_from_slice(&target_port.to_be_bytes());
+    stream.write_all(&header).await?;
+
+    // Read response: 0x01 = success, 0x02 + message = error
+    let mut resp = [0u8; 1];
+    stream.read_exact(&mut resp).await?;
+    if resp[0] == 0x02 {
+        let mut msg = Vec::new();
+        stream.read_to_end(&mut msg).await?;
+        let msg = String::from_utf8_lossy(&msg);
+        anyhow::bail!("{msg}");
+    }
+    if resp[0] != 0x01 {
+        anyhow::bail!("unexpected response: 0x{:02x}", resp[0]);
+    }
+
+    let dir_str = if direction == 0 { "local" } else { "remote" };
+    let port_str = if listen_port == target_port {
+        format!("{listen_port}")
+    } else {
+        format!("{listen_port}:{target_port}")
+    };
+    eprintln!("{dir_str}-forward {port_str} active (ctrl-c to stop)");
+
+    // Block until SIGINT or stream EOF
+    let mut sigint = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::interrupt())?;
+    let mut sigterm = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
+    let mut buf = [0u8; 1];
+    tokio::select! {
+        _ = sigint.recv() => {}
+        _ = sigterm.recv() => {}
+        _ = stream.read(&mut buf) => {}
+    }
+    // Stream drop closes the connection, triggering server-side cleanup
+    Ok(())
 }
 
 fn open_url(url: &str) {
@@ -1625,5 +1717,26 @@ mod tests {
         let s = format_timestamp(1_700_000_000);
         assert_eq!(s.len(), 19, "got: {s}");
         assert!(s.starts_with("202"), "got: {s}");
+    }
+
+    #[test]
+    fn parse_port_spec_single() {
+        let (l, t) = parse_port_spec("8080").unwrap();
+        assert_eq!(l, 8080);
+        assert_eq!(t, 8080);
+    }
+
+    #[test]
+    fn parse_port_spec_pair() {
+        let (l, t) = parse_port_spec("9090:3000").unwrap();
+        assert_eq!(l, 9090);
+        assert_eq!(t, 3000);
+    }
+
+    #[test]
+    fn parse_port_spec_invalid() {
+        assert!(parse_port_spec("abc").is_err());
+        assert!(parse_port_spec("80:xyz").is_err());
+        assert!(parse_port_spec("99999").is_err());
     }
 }

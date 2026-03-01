@@ -87,6 +87,31 @@ enum TunnelEvent {
     Closed,
 }
 
+/// Events from port forward TCP acceptors and connections to the main relay loop.
+enum PortForwardEvent {
+    /// Svc socket requested a port forward.
+    Requested { stream: UnixStream, direction: u8, listen_port: u16, target_port: u16 },
+    /// TCP connection accepted on a listening port.
+    Accepted { forward_id: u32, channel_id: u32, writer_tx: mpsc::UnboundedSender<Bytes> },
+    /// Data from a TCP connection.
+    Data { channel_id: u32, data: Bytes },
+    /// TCP connection closed.
+    Closed { channel_id: u32 },
+    /// Svc socket dropped -- teardown forward.
+    Stopped { forward_id: u32 },
+}
+
+/// Per-forward state tracked by the server.
+struct PortForwardState {
+    /// Handle for the TCP listener task (aborted on teardown).
+    listener_handle: Option<tokio::task::JoinHandle<()>>,
+    /// Active TCP relay channels.
+    channels: HashMap<u32, mpsc::UnboundedSender<Bytes>>,
+    /// Handle for the svc stop watcher (aborted on teardown).
+    stop_handle: Option<tokio::task::JoinHandle<()>>,
+    target_port: u16,
+}
+
 /// File manifest entry parsed from sender protocol.
 struct FileManifest {
     files: Vec<(String, u64)>, // (basename, size)
@@ -188,6 +213,65 @@ fn spawn_agent_acceptor(
     })
 }
 
+/// Spawn a TCP acceptor for port forwarding. Each accepted connection assigns
+/// a channel_id and spawns a bidirectional relay via `spawn_channel_relay`.
+fn spawn_pf_tcp_acceptor(
+    listener: tokio::net::TcpListener,
+    forward_id: u32,
+    next_channel_id: Arc<AtomicU32>,
+    event_tx: mpsc::UnboundedSender<PortForwardEvent>,
+) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        loop {
+            let (stream, _) = match listener.accept().await {
+                Ok(conn) => conn,
+                Err(e) => {
+                    debug!(forward_id, "pf tcp listener accept error: {e}");
+                    break;
+                }
+            };
+
+            let channel_id = next_channel_id.fetch_add(1, Ordering::Relaxed);
+            let (read_half, write_half) = stream.into_split();
+            let data_tx = event_tx.clone();
+            let close_tx = event_tx.clone();
+            let writer_tx = crate::spawn_channel_relay(
+                channel_id,
+                read_half,
+                write_half,
+                move |id, data| {
+                    data_tx.send(PortForwardEvent::Data { channel_id: id, data }).is_ok()
+                },
+                move |id| {
+                    let _ = close_tx.send(PortForwardEvent::Closed { channel_id: id });
+                },
+            );
+
+            if event_tx
+                .send(PortForwardEvent::Accepted { forward_id, channel_id, writer_tx })
+                .is_err()
+            {
+                break;
+            }
+        }
+    })
+}
+
+/// Spawn a task that watches a svc stream for EOF and sends a Stopped event.
+fn spawn_pf_svc_watcher(
+    stream: UnixStream,
+    forward_id: u32,
+    event_tx: mpsc::UnboundedSender<PortForwardEvent>,
+) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        let mut stream = stream;
+        let mut buf = [0u8; 1];
+        // Block until EOF or error
+        let _ = stream.read(&mut buf).await;
+        let _ = event_tx.send(PortForwardEvent::Stopped { forward_id });
+    })
+}
+
 /// Maximum URL length accepted on the service socket.
 const URL_MAX_LEN: usize = 4096;
 
@@ -251,11 +335,12 @@ async fn parse_receiver_dest(stream: &mut UnixStream) -> io::Result<String> {
 }
 
 /// Spawn the unified service socket acceptor. Reads a SvcRequest discriminator
-/// byte then dispatches to the appropriate handler (open URL, send, or receive).
+/// byte then dispatches to the appropriate handler.
 fn spawn_svc_acceptor(
     listener: UnixListener,
     open_event_tx: mpsc::UnboundedSender<OpenEvent>,
     send_event_tx: mpsc::UnboundedSender<SendEvent>,
+    pf_event_tx: mpsc::UnboundedSender<PortForwardEvent>,
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
         loop {
@@ -283,6 +368,7 @@ fn spawn_svc_acceptor(
 
             let otx = open_event_tx.clone();
             let stx = send_event_tx.clone();
+            let ptx = pf_event_tx.clone();
             tokio::spawn(async move {
                 // Read discriminator byte
                 let mut disc = [0u8; 1];
@@ -326,6 +412,22 @@ fn spawn_svc_acceptor(
                             }
                             Err(e) => debug!("svc socket: bad receiver dest: {e}"),
                         }
+                    }
+                    Some(crate::protocol::SvcRequest::PortForward) => {
+                        // Wire: [direction: u8][listen_port: u16 BE][target_port: u16 BE]
+                        let mut hdr = [0u8; 5];
+                        if stream.read_exact(&mut hdr).await.is_err() {
+                            return;
+                        }
+                        let direction = hdr[0];
+                        let listen_port = u16::from_be_bytes([hdr[1], hdr[2]]);
+                        let target_port = u16::from_be_bytes([hdr[3], hdr[4]]);
+                        let _ = ptx.send(PortForwardEvent::Requested {
+                            stream,
+                            direction,
+                            listen_port,
+                            target_port,
+                        });
                     }
                     None => {
                         debug!("svc socket: unknown request byte: 0x{:02x}", disc[0]);
@@ -505,10 +607,23 @@ pub async fn run(
     let mut transfer_state = TransferState::Idle;
     let mut svc_acceptor: Option<tokio::task::JoinHandle<()>> = None;
 
+    // Port forward event channel and state
+    let (pf_event_tx, mut pf_event_rx) = mpsc::unbounded_channel::<PortForwardEvent>();
+    let mut port_forwards: HashMap<u32, PortForwardState> = HashMap::new();
+    let mut pf_channels: HashMap<u32, (u32, mpsc::UnboundedSender<Bytes>)> = HashMap::new(); // channel_id -> (forward_id, writer_tx)
+    let next_pf_channel_id = Arc::new(AtomicU32::new(0));
+    let mut next_forward_id: u32 = 0;
+    // Pending remote-forward: forward_id -> svc stream (waiting for PortForwardReady)
+    let mut pf_pending_remote: HashMap<u32, UnixStream> = HashMap::new();
+
     // Bind unified service socket immediately (always available)
     if let Some(listener) = bind_agent_listener(&svc_socket_path) {
-        svc_acceptor =
-            Some(spawn_svc_acceptor(listener, open_event_tx.clone(), send_event_tx.clone()));
+        svc_acceptor = Some(spawn_svc_acceptor(
+            listener,
+            open_event_tx.clone(),
+            send_event_tx.clone(),
+            pf_event_tx.clone(),
+        ));
     }
 
     // Wait for first active client before spawning shell (so we can read Env frame).
@@ -626,22 +741,37 @@ pub async fn run(
     let (tunnel_event_tx, mut tunnel_event_rx) = mpsc::unbounded_channel::<TunnelEvent>();
     let mut tunnel_writer: Option<mpsc::UnboundedSender<Bytes>> = None;
 
-    let teardown_forwarding = |agent_channels: &mut HashMap<u32, mpsc::UnboundedSender<Bytes>>,
-                               agent_forward_enabled: &mut bool,
-                               agent_acceptor: &mut Option<tokio::task::JoinHandle<()>>,
-                               open_forward_enabled: &mut bool,
-                               tunnel_writer: &mut Option<mpsc::UnboundedSender<Bytes>>,
-                               tunnel_port: &mut Option<u16>| {
-        agent_channels.clear();
-        *agent_forward_enabled = false;
-        if let Some(handle) = agent_acceptor.take() {
-            handle.abort();
-        }
-        cleanup_socket(&agent_socket_path);
-        *open_forward_enabled = false;
-        *tunnel_writer = None;
-        *tunnel_port = None;
-    };
+    let teardown_forwarding =
+        |agent_channels: &mut HashMap<u32, mpsc::UnboundedSender<Bytes>>,
+         agent_forward_enabled: &mut bool,
+         agent_acceptor: &mut Option<tokio::task::JoinHandle<()>>,
+         open_forward_enabled: &mut bool,
+         tunnel_writer: &mut Option<mpsc::UnboundedSender<Bytes>>,
+         tunnel_port: &mut Option<u16>,
+         port_forwards: &mut HashMap<u32, PortForwardState>,
+         pf_channels: &mut HashMap<u32, (u32, mpsc::UnboundedSender<Bytes>)>,
+         pf_pending_remote: &mut HashMap<u32, UnixStream>| {
+            agent_channels.clear();
+            *agent_forward_enabled = false;
+            if let Some(handle) = agent_acceptor.take() {
+                handle.abort();
+            }
+            cleanup_socket(&agent_socket_path);
+            *open_forward_enabled = false;
+            *tunnel_writer = None;
+            *tunnel_port = None;
+            // Clean up all port forwards
+            for (_, pf) in port_forwards.drain() {
+                if let Some(h) = pf.listener_handle {
+                    h.abort();
+                }
+                if let Some(h) = pf.stop_handle {
+                    h.abort();
+                }
+            }
+            pf_channels.clear();
+            pf_pending_remote.clear();
+        };
 
     // Outer loop: accept clients via channel. PTY persists across reconnects.
     // First iteration skips client-wait (first client already connected above).
@@ -877,6 +1007,78 @@ pub async fn run(
                             tunnel_writer = None;
                             tunnel_port = None;
                         }
+                        // Port forward: client confirms listener ready (remote-fwd)
+                        Some(Ok(Frame::PortForwardReady { forward_id })) => {
+                            if let Some(mut svc_stream) = pf_pending_remote.remove(&forward_id) {
+                                use tokio::io::AsyncWriteExt;
+                                let _ = svc_stream.write_all(&[0x01]).await;
+                                // Spawn svc watcher for teardown
+                                let stop_handle = spawn_pf_svc_watcher(svc_stream, forward_id, pf_event_tx.clone());
+                                if let Some(pf) = port_forwards.get_mut(&forward_id) {
+                                    pf.stop_handle = Some(stop_handle);
+                                }
+                            }
+                        }
+                        // Port forward: new TCP connection from client side (remote-fwd)
+                        Some(Ok(Frame::PortForwardOpen { forward_id, channel_id, target_port })) => {
+                            if port_forwards.contains_key(&forward_id) {
+                                match tokio::net::TcpStream::connect(("127.0.0.1", target_port)).await {
+                                    Ok(stream) => {
+                                        let (read_half, write_half) = stream.into_split();
+                                        let data_tx = pf_event_tx.clone();
+                                        let close_tx = pf_event_tx.clone();
+                                        let writer_tx = crate::spawn_channel_relay(
+                                            channel_id,
+                                            read_half,
+                                            write_half,
+                                            move |id, data| data_tx.send(PortForwardEvent::Data { channel_id: id, data }).is_ok(),
+                                            move |id| { let _ = close_tx.send(PortForwardEvent::Closed { channel_id: id }); },
+                                        );
+                                        pf_channels.insert(channel_id, (forward_id, writer_tx));
+                                        if let Some(pf) = port_forwards.get_mut(&forward_id) {
+                                            pf.channels.insert(channel_id, pf_channels.get(&channel_id).unwrap().1.clone());
+                                        }
+                                    }
+                                    Err(e) => {
+                                        debug!(forward_id, channel_id, target_port, "pf connect failed: {e}");
+                                        let _ = framed.send(Frame::PortForwardClose { channel_id }).await;
+                                    }
+                                }
+                            }
+                        }
+                        // Port forward: channel data from client
+                        Some(Ok(Frame::PortForwardData { channel_id, data })) => {
+                            if let Some((_, tx)) = pf_channels.get(&channel_id) {
+                                let _ = tx.send(data);
+                            }
+                        }
+                        // Port forward: channel closed by client
+                        Some(Ok(Frame::PortForwardClose { channel_id })) => {
+                            if let Some((forward_id, _)) = pf_channels.remove(&channel_id) {
+                                if let Some(pf) = port_forwards.get_mut(&forward_id) {
+                                    pf.channels.remove(&channel_id);
+                                }
+                            }
+                        }
+                        // Port forward: client declining a forward
+                        Some(Ok(Frame::PortForwardStop { forward_id })) => {
+                            if let Some(mut svc_stream) = pf_pending_remote.remove(&forward_id) {
+                                use tokio::io::AsyncWriteExt;
+                                let _ = svc_stream.write_all(&[0x02]).await;
+                                let _ = svc_stream.write_all(b"client declined forward").await;
+                            }
+                            if let Some(pf) = port_forwards.remove(&forward_id) {
+                                if let Some(h) = pf.listener_handle {
+                                    h.abort();
+                                }
+                                if let Some(h) = pf.stop_handle {
+                                    h.abort();
+                                }
+                                for ch_id in pf.channels.keys() {
+                                    pf_channels.remove(ch_id);
+                                }
+                            }
+                        }
                         // Client disconnected or sent Exit
                         Some(Ok(Frame::Exit { .. })) | None => {
                             break RelayExit::ClientGone;
@@ -926,6 +1128,9 @@ pub async fn run(
                                 &mut open_forward_enabled,
                                 &mut tunnel_writer,
                                 &mut tunnel_port,
+                                &mut port_forwards,
+                                &mut pf_channels,
+                                &mut pf_pending_remote,
                             );
                             framed = new_framed;
                         }
@@ -1021,6 +1226,96 @@ pub async fn run(
                     }
                 }
 
+                // Port forward events from TCP acceptors, connections, and svc watchers
+                event = pf_event_rx.recv() => {
+                    match event {
+                        Some(PortForwardEvent::Requested { stream, direction, listen_port, target_port }) => {
+                            use tokio::io::AsyncWriteExt;
+                            let fwd_id = next_forward_id;
+                            next_forward_id += 1;
+                            if direction == 0 {
+                                // Local-forward: server binds TCP, forwards to client
+                                match tokio::net::TcpListener::bind(("127.0.0.1", listen_port)).await {
+                                    Ok(listener) => {
+                                        debug!(fwd_id, listen_port, target_port, "local-forward: bound");
+                                        let handle = spawn_pf_tcp_acceptor(
+                                            listener, fwd_id, next_pf_channel_id.clone(), pf_event_tx.clone(),
+                                        );
+                                        // Respond success to svc client
+                                        let mut s = stream;
+                                        let _ = s.write_all(&[0x01]).await;
+                                        let stream = s;
+                                        let stop_handle = spawn_pf_svc_watcher(stream, fwd_id, pf_event_tx.clone());
+                                        port_forwards.insert(fwd_id, PortForwardState {
+                                            listener_handle: Some(handle),
+                                            channels: HashMap::new(),
+                                            stop_handle: Some(stop_handle),
+                                            target_port,
+                                        });
+                                    }
+                                    Err(e) => {
+                                        debug!(listen_port, "local-forward: bind failed: {e}");
+                                        let mut s = stream;
+                                        let msg = format!("bind failed: {e}");
+                                        let _ = s.write_all(&[0x02]).await;
+                                        let _ = s.write_all(msg.as_bytes()).await;
+                                    }
+                                }
+                            } else {
+                                // Remote-forward: tell client to bind, wait for Ready
+                                let _ = framed.send(Frame::PortForwardListen {
+                                    forward_id: fwd_id, listen_port, target_port,
+                                }).await;
+                                pf_pending_remote.insert(fwd_id, stream);
+                                port_forwards.insert(fwd_id, PortForwardState {
+                                    listener_handle: None,
+                                    channels: HashMap::new(),
+                                    stop_handle: None,
+                                    target_port,
+                                });
+                            }
+                        }
+                        Some(PortForwardEvent::Accepted { forward_id, channel_id, writer_tx }) => {
+                            if let Some(pf) = port_forwards.get_mut(&forward_id) {
+                                pf.channels.insert(channel_id, writer_tx.clone());
+                                pf_channels.insert(channel_id, (forward_id, writer_tx));
+                                let _ = framed.send(Frame::PortForwardOpen {
+                                    forward_id, channel_id, target_port: pf.target_port,
+                                }).await;
+                            }
+                        }
+                        Some(PortForwardEvent::Data { channel_id, data }) => {
+                            if pf_channels.contains_key(&channel_id) {
+                                let _ = framed.send(Frame::PortForwardData { channel_id, data }).await;
+                            }
+                        }
+                        Some(PortForwardEvent::Closed { channel_id }) => {
+                            if let Some((forward_id, _)) = pf_channels.remove(&channel_id) {
+                                let _ = framed.send(Frame::PortForwardClose { channel_id }).await;
+                                if let Some(pf) = port_forwards.get_mut(&forward_id) {
+                                    pf.channels.remove(&channel_id);
+                                }
+                            }
+                        }
+                        Some(PortForwardEvent::Stopped { forward_id }) => {
+                            debug!(forward_id, "port forward stopped (svc socket dropped)");
+                            if let Some(pf) = port_forwards.remove(&forward_id) {
+                                if let Some(h) = pf.listener_handle {
+                                    h.abort();
+                                }
+                                if let Some(h) = pf.stop_handle {
+                                    h.abort();
+                                }
+                                for ch_id in pf.channels.keys() {
+                                    pf_channels.remove(ch_id);
+                                }
+                                let _ = framed.send(Frame::PortForwardStop { forward_id }).await;
+                            }
+                        }
+                        None => {}
+                    }
+                }
+
                 status = managed.child.wait() => {
                     let code = status?.code().unwrap_or(1);
                     info!(code, "shell exited");
@@ -1041,6 +1336,9 @@ pub async fn run(
                     &mut open_forward_enabled,
                     &mut tunnel_writer,
                     &mut tunnel_port,
+                    &mut port_forwards,
+                    &mut pf_channels,
+                    &mut pf_pending_remote,
                 );
                 info!("client disconnected, waiting for reconnect");
                 continue;

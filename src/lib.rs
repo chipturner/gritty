@@ -30,18 +30,20 @@ pub fn collect_env_vars() -> Vec<(String, String)> {
         .collect()
 }
 
-/// Spawn bidirectional relay tasks for a Unix stream channel.
+/// Spawn bidirectional relay tasks for a stream channel.
 ///
 /// Reader task reads from the stream and calls `on_data`/`on_close`.
 /// Writer task drains the returned sender and writes to the stream.
-pub fn spawn_channel_relay<F, G>(
+pub fn spawn_channel_relay<R, W, F, G>(
     channel_id: u32,
-    read_half: tokio::net::unix::OwnedReadHalf,
-    write_half: tokio::net::unix::OwnedWriteHalf,
+    read_half: R,
+    write_half: W,
     on_data: F,
     on_close: G,
 ) -> tokio::sync::mpsc::UnboundedSender<bytes::Bytes>
 where
+    R: tokio::io::AsyncRead + Unpin + Send + 'static,
+    W: tokio::io::AsyncWrite + Unpin + Send + 'static,
     F: Fn(u32, bytes::Bytes) -> bool + Send + 'static,
     G: Fn(u32) + Send + 'static,
 {
