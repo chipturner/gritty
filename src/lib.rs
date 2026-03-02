@@ -5,6 +5,7 @@ pub mod daemon;
 pub mod protocol;
 pub mod security;
 pub mod server;
+pub mod table;
 
 /// Perform a protocol version handshake with the server.
 ///

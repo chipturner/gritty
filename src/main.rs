@@ -931,7 +931,7 @@ async fn list_sessions(ctl_path: PathBuf) -> anyhow::Result<()> {
                     .as_secs();
 
                 // Build row data
-                let rows: Vec<_> = sessions
+                let rows: Vec<Vec<String>> = sessions
                     .iter()
                     .map(|s| {
                         let name = if s.name.is_empty() { "-".to_string() } else { s.name.clone() };
@@ -960,27 +960,14 @@ async fn list_sessions(ctl_path: PathBuf) -> anyhow::Result<()> {
                                 status,
                             )
                         };
-                        (s.id.clone(), name, pty, pid, created, status)
+                        vec![s.id.clone(), name, pty, pid, created, status]
                     })
                     .collect();
 
-                // Compute column widths
-                let w_id = rows.iter().map(|r| r.0.len()).max().unwrap().max(2);
-                let w_name = rows.iter().map(|r| r.1.len()).max().unwrap().max(4);
-                let w_pty = rows.iter().map(|r| r.2.len()).max().unwrap().max(3);
-                let w_pid = rows.iter().map(|r| r.3.len()).max().unwrap().max(3);
-                let w_created = rows.iter().map(|r| r.4.len()).max().unwrap().max(7);
-
-                println!(
-                    "{:<w_id$}  {:<w_name$}  {:<w_pty$}  {:<w_pid$}  {:<w_created$}  Status",
-                    "ID", "Name", "PTY", "PID", "Created",
+                gritty::table::print_table(
+                    &["ID", "Name", "PTY", "PID", "Created", "Status"],
+                    &rows,
                 );
-                for (id, name, pty, pid, created, status) in &rows {
-                    println!(
-                        "{:<w_id$}  {:<w_name$}  {:<w_pty$}  {:<w_pid$}  {:<w_created$}  {status}",
-                        id, name, pty, pid, created,
-                    );
-                }
             }
             Ok(())
         }
@@ -1042,8 +1029,8 @@ async fn list_all_sessions() -> anyhow::Result<()> {
 
     let multi_host = results.iter().filter(|(_, s)| !s.is_empty()).count() > 1;
 
-    // Build row data: (host, id, name, pty, pid, created, status)
-    let rows: Vec<_> = results
+    // Build row data: [host, id, name, pty, pid, created, status]
+    let rows: Vec<Vec<String>> = results
         .iter()
         .flat_map(|(host, sessions)| {
             sessions.iter().map(move |s| {
@@ -1068,43 +1055,21 @@ async fn list_all_sessions() -> anyhow::Result<()> {
                         status,
                     )
                 };
-                (host.clone(), s.id.clone(), name, pty, pid, created, status)
+                vec![host.clone(), s.id.clone(), name, pty, pid, created, status]
             })
         })
         .collect();
 
-    // Compute column widths
-    let w_host = if multi_host { rows.iter().map(|r| r.0.len()).max().unwrap().max(4) } else { 0 };
-    let w_id = rows.iter().map(|r| r.1.len()).max().unwrap().max(2);
-    let w_name = rows.iter().map(|r| r.2.len()).max().unwrap().max(4);
-    let w_pty = rows.iter().map(|r| r.3.len()).max().unwrap().max(3);
-    let w_pid = rows.iter().map(|r| r.4.len()).max().unwrap().max(3);
-    let w_created = rows.iter().map(|r| r.5.len()).max().unwrap().max(7);
-
     if multi_host {
-        println!(
-            "{:<w_host$}  {:<w_id$}  {:<w_name$}  {:<w_pty$}  {:<w_pid$}  {:<w_created$}  Status",
-            "Host", "ID", "Name", "PTY", "PID", "Created",
+        gritty::table::print_table(
+            &["Host", "ID", "Name", "PTY", "PID", "Created", "Status"],
+            &rows,
         );
-        for (host, id, name, pty, pid, created, status) in &rows {
-            println!(
-                "{:<w_host$}  {:<w_id$}  {:<w_name$}  {:<w_pty$}  {:<w_pid$}  {:<w_created$}  {status}",
-                host, id, name, pty, pid, created,
-            );
-        }
     } else {
-        let host = &rows[0].0;
+        let host = &rows[0][0];
         println!("Host: {host}");
-        println!(
-            "{:<w_id$}  {:<w_name$}  {:<w_pty$}  {:<w_pid$}  {:<w_created$}  Status",
-            "ID", "Name", "PTY", "PID", "Created",
-        );
-        for (_, id, name, pty, pid, created, status) in &rows {
-            println!(
-                "{:<w_id$}  {:<w_name$}  {:<w_pty$}  {:<w_pid$}  {:<w_created$}  {status}",
-                id, name, pty, pid, created,
-            );
-        }
+        let trimmed: Vec<Vec<String>> = rows.iter().map(|r| r[1..].to_vec()).collect();
+        gritty::table::print_table(&["ID", "Name", "PTY", "PID", "Created", "Status"], &trimmed);
     }
     Ok(())
 }

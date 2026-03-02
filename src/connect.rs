@@ -833,13 +833,11 @@ pub fn list_tunnels() {
         return;
     }
 
-    let w_name = infos.iter().map(|i| i.name.len()).max().unwrap().max(4);
-    let w_dest = infos.iter().map(|i| i.destination.len()).max().unwrap().max(11);
-
-    println!("{:<w_name$}  {:<w_dest$}  Status", "Name", "Destination");
-    for info in &infos {
-        println!("{:<w_name$}  {:<w_dest$}  {}", info.name, info.destination, info.status);
-    }
+    let rows: Vec<Vec<String>> = infos
+        .iter()
+        .map(|i| vec![i.name.clone(), i.destination.clone(), i.status.clone()])
+        .collect();
+    crate::table::print_table(&["Name", "Destination", "Status"], &rows);
 }
 
 // ---------------------------------------------------------------------------
