@@ -248,6 +248,61 @@ fn decode_string(payload: BytesMut) -> Result<String, io::Error> {
     String::from_utf8(payload.to_vec()).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))
 }
 
+fn expect_len(payload: &BytesMut, expected: usize, name: &str) -> Result<(), io::Error> {
+    if payload.len() != expected {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("{name} frame must be {expected} bytes"),
+        ));
+    }
+    Ok(())
+}
+
+fn expect_min_len(payload: &BytesMut, min: usize, name: &str) -> Result<(), io::Error> {
+    if payload.len() < min {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("{name} frame must be at least {min} bytes"),
+        ));
+    }
+    Ok(())
+}
+
+fn read_u16(payload: &[u8], offset: usize) -> u16 {
+    u16::from_be_bytes([payload[offset], payload[offset + 1]])
+}
+
+fn read_u32(payload: &[u8], offset: usize) -> u32 {
+    u32::from_be_bytes([
+        payload[offset],
+        payload[offset + 1],
+        payload[offset + 2],
+        payload[offset + 3],
+    ])
+}
+
+fn read_i32(payload: &[u8], offset: usize) -> i32 {
+    i32::from_be_bytes([
+        payload[offset],
+        payload[offset + 1],
+        payload[offset + 2],
+        payload[offset + 3],
+    ])
+}
+
+fn read_u64(payload: &[u8], offset: usize) -> u64 {
+    u64::from_be_bytes([
+        payload[offset],
+        payload[offset + 1],
+        payload[offset + 2],
+        payload[offset + 3],
+        payload[offset + 4],
+        payload[offset + 5],
+        payload[offset + 6],
+        payload[offset + 7],
+    ])
+}
+
 impl Decoder for FrameCodec {
     type Item = Frame;
     type Error = io::Error;
@@ -278,25 +333,12 @@ impl Decoder for FrameCodec {
         match frame_type {
             TYPE_DATA => Ok(Some(Frame::Data(payload.freeze()))),
             TYPE_RESIZE => {
-                if payload.len() != 4 {
-                    return Err(io::Error::new(
-                        io::ErrorKind::InvalidData,
-                        "resize frame must be 4 bytes",
-                    ));
-                }
-                let cols = u16::from_be_bytes([payload[0], payload[1]]);
-                let rows = u16::from_be_bytes([payload[2], payload[3]]);
-                Ok(Some(Frame::Resize { cols, rows }))
+                expect_len(&payload, 4, "resize")?;
+                Ok(Some(Frame::Resize { cols: read_u16(&payload, 0), rows: read_u16(&payload, 2) }))
             }
             TYPE_EXIT => {
-                if payload.len() != 4 {
-                    return Err(io::Error::new(
-                        io::ErrorKind::InvalidData,
-                        "exit frame must be 4 bytes",
-                    ));
-                }
-                let code = i32::from_be_bytes([payload[0], payload[1], payload[2], payload[3]]);
-                Ok(Some(Frame::Exit { code }))
+                expect_len(&payload, 4, "exit")?;
+                Ok(Some(Frame::Exit { code: read_i32(&payload, 0) }))
             }
             TYPE_DETACHED => Ok(Some(Frame::Detached)),
             TYPE_PING => Ok(Some(Frame::Ping)),
@@ -318,180 +360,85 @@ impl Decoder for FrameCodec {
             }
             TYPE_AGENT_FORWARD => Ok(Some(Frame::AgentForward)),
             TYPE_AGENT_OPEN => {
-                if payload.len() != 4 {
-                    return Err(io::Error::new(
-                        io::ErrorKind::InvalidData,
-                        "agent open frame must be 4 bytes",
-                    ));
-                }
-                let channel_id =
-                    u32::from_be_bytes([payload[0], payload[1], payload[2], payload[3]]);
-                Ok(Some(Frame::AgentOpen { channel_id }))
+                expect_len(&payload, 4, "agent open")?;
+                Ok(Some(Frame::AgentOpen { channel_id: read_u32(&payload, 0) }))
             }
             TYPE_AGENT_DATA => {
-                if payload.len() < 4 {
-                    return Err(io::Error::new(
-                        io::ErrorKind::InvalidData,
-                        "agent data frame must be at least 4 bytes",
-                    ));
-                }
-                let channel_id =
-                    u32::from_be_bytes([payload[0], payload[1], payload[2], payload[3]]);
+                expect_min_len(&payload, 4, "agent data")?;
+                let channel_id = read_u32(&payload, 0);
                 let data = payload.freeze().slice(4..);
                 Ok(Some(Frame::AgentData { channel_id, data }))
             }
             TYPE_AGENT_CLOSE => {
-                if payload.len() != 4 {
-                    return Err(io::Error::new(
-                        io::ErrorKind::InvalidData,
-                        "agent close frame must be 4 bytes",
-                    ));
-                }
-                let channel_id =
-                    u32::from_be_bytes([payload[0], payload[1], payload[2], payload[3]]);
-                Ok(Some(Frame::AgentClose { channel_id }))
+                expect_len(&payload, 4, "agent close")?;
+                Ok(Some(Frame::AgentClose { channel_id: read_u32(&payload, 0) }))
             }
             TYPE_OPEN_FORWARD => Ok(Some(Frame::OpenForward)),
             TYPE_OPEN_URL => Ok(Some(Frame::OpenUrl { url: decode_string(payload)? })),
             TYPE_TUNNEL_LISTEN => {
-                if payload.len() != 2 {
-                    return Err(io::Error::new(
-                        io::ErrorKind::InvalidData,
-                        "tunnel listen frame must be 2 bytes",
-                    ));
-                }
-                let port = u16::from_be_bytes([payload[0], payload[1]]);
-                Ok(Some(Frame::TunnelListen { port }))
+                expect_len(&payload, 2, "tunnel listen")?;
+                Ok(Some(Frame::TunnelListen { port: read_u16(&payload, 0) }))
             }
             TYPE_TUNNEL_OPEN => Ok(Some(Frame::TunnelOpen)),
             TYPE_TUNNEL_DATA => Ok(Some(Frame::TunnelData(payload.freeze()))),
             TYPE_TUNNEL_CLOSE => Ok(Some(Frame::TunnelClose)),
             TYPE_SEND_OFFER => {
-                if payload.len() != 12 {
-                    return Err(io::Error::new(
-                        io::ErrorKind::InvalidData,
-                        "send offer frame must be 12 bytes",
-                    ));
-                }
-                let file_count =
-                    u32::from_be_bytes([payload[0], payload[1], payload[2], payload[3]]);
-                let total_bytes = u64::from_be_bytes([
-                    payload[4],
-                    payload[5],
-                    payload[6],
-                    payload[7],
-                    payload[8],
-                    payload[9],
-                    payload[10],
-                    payload[11],
-                ]);
-                Ok(Some(Frame::SendOffer { file_count, total_bytes }))
+                expect_len(&payload, 12, "send offer")?;
+                Ok(Some(Frame::SendOffer {
+                    file_count: read_u32(&payload, 0),
+                    total_bytes: read_u64(&payload, 4),
+                }))
             }
             TYPE_SEND_DONE => Ok(Some(Frame::SendDone)),
             TYPE_SEND_CANCEL => Ok(Some(Frame::SendCancel { reason: decode_string(payload)? })),
             TYPE_PORT_FORWARD_LISTEN => {
-                if payload.len() != 8 {
-                    return Err(io::Error::new(
-                        io::ErrorKind::InvalidData,
-                        "port forward listen frame must be 8 bytes",
-                    ));
-                }
-                let forward_id =
-                    u32::from_be_bytes([payload[0], payload[1], payload[2], payload[3]]);
-                let listen_port = u16::from_be_bytes([payload[4], payload[5]]);
-                let target_port = u16::from_be_bytes([payload[6], payload[7]]);
-                Ok(Some(Frame::PortForwardListen { forward_id, listen_port, target_port }))
+                expect_len(&payload, 8, "port forward listen")?;
+                Ok(Some(Frame::PortForwardListen {
+                    forward_id: read_u32(&payload, 0),
+                    listen_port: read_u16(&payload, 4),
+                    target_port: read_u16(&payload, 6),
+                }))
             }
             TYPE_PORT_FORWARD_READY => {
-                if payload.len() != 4 {
-                    return Err(io::Error::new(
-                        io::ErrorKind::InvalidData,
-                        "port forward ready frame must be 4 bytes",
-                    ));
-                }
-                let forward_id =
-                    u32::from_be_bytes([payload[0], payload[1], payload[2], payload[3]]);
-                Ok(Some(Frame::PortForwardReady { forward_id }))
+                expect_len(&payload, 4, "port forward ready")?;
+                Ok(Some(Frame::PortForwardReady { forward_id: read_u32(&payload, 0) }))
             }
             TYPE_PORT_FORWARD_OPEN => {
-                if payload.len() != 10 {
-                    return Err(io::Error::new(
-                        io::ErrorKind::InvalidData,
-                        "port forward open frame must be 10 bytes",
-                    ));
-                }
-                let forward_id =
-                    u32::from_be_bytes([payload[0], payload[1], payload[2], payload[3]]);
-                let channel_id =
-                    u32::from_be_bytes([payload[4], payload[5], payload[6], payload[7]]);
-                let target_port = u16::from_be_bytes([payload[8], payload[9]]);
-                Ok(Some(Frame::PortForwardOpen { forward_id, channel_id, target_port }))
+                expect_len(&payload, 10, "port forward open")?;
+                Ok(Some(Frame::PortForwardOpen {
+                    forward_id: read_u32(&payload, 0),
+                    channel_id: read_u32(&payload, 4),
+                    target_port: read_u16(&payload, 8),
+                }))
             }
             TYPE_PORT_FORWARD_DATA => {
-                if payload.len() < 4 {
-                    return Err(io::Error::new(
-                        io::ErrorKind::InvalidData,
-                        "port forward data frame must be at least 4 bytes",
-                    ));
-                }
-                let channel_id =
-                    u32::from_be_bytes([payload[0], payload[1], payload[2], payload[3]]);
+                expect_min_len(&payload, 4, "port forward data")?;
+                let channel_id = read_u32(&payload, 0);
                 let data = payload.freeze().slice(4..);
                 Ok(Some(Frame::PortForwardData { channel_id, data }))
             }
             TYPE_PORT_FORWARD_CLOSE => {
-                if payload.len() != 4 {
-                    return Err(io::Error::new(
-                        io::ErrorKind::InvalidData,
-                        "port forward close frame must be 4 bytes",
-                    ));
-                }
-                let channel_id =
-                    u32::from_be_bytes([payload[0], payload[1], payload[2], payload[3]]);
-                Ok(Some(Frame::PortForwardClose { channel_id }))
+                expect_len(&payload, 4, "port forward close")?;
+                Ok(Some(Frame::PortForwardClose { channel_id: read_u32(&payload, 0) }))
             }
             TYPE_PORT_FORWARD_STOP => {
-                if payload.len() != 4 {
-                    return Err(io::Error::new(
-                        io::ErrorKind::InvalidData,
-                        "port forward stop frame must be 4 bytes",
-                    ));
-                }
-                let forward_id =
-                    u32::from_be_bytes([payload[0], payload[1], payload[2], payload[3]]);
-                Ok(Some(Frame::PortForwardStop { forward_id }))
+                expect_len(&payload, 4, "port forward stop")?;
+                Ok(Some(Frame::PortForwardStop { forward_id: read_u32(&payload, 0) }))
             }
             TYPE_SEND_FILE => {
-                if payload.is_empty() {
-                    return Err(io::Error::new(
-                        io::ErrorKind::InvalidData,
-                        "send file frame must have at least 1 byte",
-                    ));
-                }
+                expect_min_len(&payload, 1, "send file")?;
                 let role = payload[payload.len() - 1];
                 let session = String::from_utf8(payload[..payload.len() - 1].to_vec())
                     .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
                 Ok(Some(Frame::SendFile { session, role }))
             }
             TYPE_HELLO => {
-                if payload.len() != 2 {
-                    return Err(io::Error::new(
-                        io::ErrorKind::InvalidData,
-                        "hello frame must be 2 bytes",
-                    ));
-                }
-                let version = u16::from_be_bytes([payload[0], payload[1]]);
-                Ok(Some(Frame::Hello { version }))
+                expect_len(&payload, 2, "hello")?;
+                Ok(Some(Frame::Hello { version: read_u16(&payload, 0) }))
             }
             TYPE_HELLO_ACK => {
-                if payload.len() != 2 {
-                    return Err(io::Error::new(
-                        io::ErrorKind::InvalidData,
-                        "hello ack frame must be 2 bytes",
-                    ));
-                }
-                let version = u16::from_be_bytes([payload[0], payload[1]]);
-                Ok(Some(Frame::HelloAck { version }))
+                expect_len(&payload, 2, "hello ack")?;
+                Ok(Some(Frame::HelloAck { version: read_u16(&payload, 0) }))
             }
             TYPE_NEW_SESSION => Ok(Some(Frame::NewSession { name: decode_string(payload)? })),
             TYPE_ATTACH => Ok(Some(Frame::Attach { session: decode_string(payload)? })),
