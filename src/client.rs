@@ -227,33 +227,6 @@ impl Drop for SuppressInputGuard {
     }
 }
 
-/// Write all bytes to stdout synchronously, retrying on WouldBlock with spin-sleep.
-/// Used in contexts where stdout is blocking (tail mode).
-fn write_stdout(data: &[u8]) -> io::Result<()> {
-    let mut stdout = io::stdout();
-    let mut written = 0;
-    while written < data.len() {
-        match stdout.write(&data[written..]) {
-            Ok(n) => written += n,
-            Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
-                std::thread::sleep(Duration::from_millis(1));
-            }
-            Err(e) if e.kind() == io::ErrorKind::Interrupted => {}
-            Err(e) => return Err(e),
-        }
-    }
-    loop {
-        match stdout.flush() {
-            Ok(()) => return Ok(()),
-            Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
-                std::thread::sleep(Duration::from_millis(1));
-            }
-            Err(e) if e.kind() == io::ErrorKind::Interrupted => {}
-            Err(e) => return Err(e),
-        }
-    }
-}
-
 /// Write all bytes to stdout asynchronously via AsyncFd.
 /// Used in relay mode where stdout is non-blocking (shares fd with stdin).
 async fn write_stdout_async(fd: &AsyncFd<std::os::fd::OwnedFd>, data: &[u8]) -> io::Result<()> {
@@ -1074,6 +1047,7 @@ pub async fn tail(
     let mut sigint = signal(SignalKind::interrupt())?;
     let mut sigterm = signal(SignalKind::terminate())?;
     let mut sighup = signal(SignalKind::hangup())?;
+    let mut stdout = tokio::io::stdout();
 
     let code = 'outer: loop {
         let result = 'relay: loop {
@@ -1081,7 +1055,8 @@ pub async fn tail(
                 frame = framed.next() => {
                     match frame {
                         Some(Ok(Frame::Data(data))) => {
-                            write_stdout(&data)?;
+                            use tokio::io::AsyncWriteExt;
+                            stdout.write_all(&data).await?;
                         }
                         Some(Ok(Frame::Pong)) => {
                             last_pong = Instant::now();
@@ -1163,7 +1138,10 @@ pub async fn tail(
 
     // Reset terminal state: clear attributes and show cursor.
     // PTY output may have left colors/bold set or cursor hidden.
-    let _ = write_stdout(b"\x1b[0m\x1b[?25h");
+    {
+        use tokio::io::AsyncWriteExt;
+        let _ = stdout.write_all(b"\x1b[0m\x1b[?25h").await;
+    }
     Ok(code)
 }
 
