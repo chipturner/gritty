@@ -118,6 +118,87 @@ struct PortForwardState {
     target_port: u16,
 }
 
+/// Grouped state for SSH agent forwarding within a session.
+struct AgentForwardState {
+    enabled: bool,
+    channels: HashMap<u32, mpsc::UnboundedSender<Bytes>>,
+    acceptor: Option<tokio::task::JoinHandle<()>>,
+    next_channel_id: Arc<AtomicU32>,
+    socket_path: PathBuf,
+}
+
+impl AgentForwardState {
+    fn new(socket_path: PathBuf) -> Self {
+        Self {
+            enabled: false,
+            channels: HashMap::new(),
+            acceptor: None,
+            next_channel_id: Arc::new(AtomicU32::new(0)),
+            socket_path,
+        }
+    }
+
+    fn teardown(&mut self) {
+        self.channels.clear();
+        self.enabled = false;
+        if let Some(handle) = self.acceptor.take() {
+            handle.abort();
+        }
+        cleanup_socket(&self.socket_path);
+    }
+}
+
+/// Grouped state for the OAuth callback reverse tunnel.
+struct TunnelRelayState {
+    port: Option<u16>,
+    writer: Option<mpsc::UnboundedSender<Bytes>>,
+}
+
+impl TunnelRelayState {
+    fn new() -> Self {
+        Self { port: None, writer: None }
+    }
+
+    fn teardown(&mut self) {
+        self.writer = None;
+        self.port = None;
+    }
+}
+
+/// Grouped state for TCP port forwarding (local and remote).
+struct PortForwardTable {
+    forwards: HashMap<u32, PortForwardState>,
+    channels: HashMap<u32, (u32, mpsc::UnboundedSender<Bytes>)>,
+    pending_remote: HashMap<u32, UnixStream>,
+    next_forward_id: u32,
+    next_channel_id: Arc<AtomicU32>,
+}
+
+impl PortForwardTable {
+    fn new() -> Self {
+        Self {
+            forwards: HashMap::new(),
+            channels: HashMap::new(),
+            pending_remote: HashMap::new(),
+            next_forward_id: 0,
+            next_channel_id: Arc::new(AtomicU32::new(0)),
+        }
+    }
+
+    fn teardown(&mut self) {
+        for (_, pf) in self.forwards.drain() {
+            if let Some(h) = pf.listener_handle {
+                h.abort();
+            }
+            if let Some(h) = pf.stop_handle {
+                h.abort();
+            }
+        }
+        self.channels.clear();
+        self.pending_remote.clear();
+    }
+}
+
 /// File manifest entry parsed from sender protocol.
 struct FileManifest {
     files: Vec<(String, u64)>, // (basename, size)
@@ -600,8 +681,16 @@ pub async fn run(
     let mut ring_buf_dropped: usize = 0;
     const RING_BUF_CAP: usize = 1 << 20; // 1 MB
 
-    // Agent event channel persists across acceptor lifetimes
+    // Agent forwarding state
+    let mut agent = AgentForwardState::new(agent_socket_path);
     let (agent_event_tx, mut agent_event_rx) = mpsc::unbounded_channel::<AgentEvent>();
+
+    // Open forwarding state (no acceptor -- svc_acceptor handles the socket)
+    let mut open_forward_enabled = false;
+
+    // Tunnel state (reverse TCP tunnel for OAuth callbacks)
+    let (tunnel_event_tx, mut tunnel_event_rx) = mpsc::unbounded_channel::<TunnelEvent>();
+    let mut tunnel = TunnelRelayState::new();
 
     // Broadcast channel for tail clients
     let (tail_tx, _) = broadcast::channel::<TailEvent>(256);
@@ -615,12 +704,7 @@ pub async fn run(
 
     // Port forward event channel and state
     let (pf_event_tx, mut pf_event_rx) = mpsc::unbounded_channel::<PortForwardEvent>();
-    let mut port_forwards: HashMap<u32, PortForwardState> = HashMap::new();
-    let mut pf_channels: HashMap<u32, (u32, mpsc::UnboundedSender<Bytes>)> = HashMap::new(); // channel_id -> (forward_id, writer_tx)
-    let next_pf_channel_id = Arc::new(AtomicU32::new(0));
-    let mut next_forward_id: u32 = 0;
-    // Pending remote-forward: forward_id -> svc stream (waiting for PortForwardReady)
-    let mut pf_pending_remote: HashMap<u32, UnixStream> = HashMap::new();
+    let mut pf = PortForwardTable::new();
 
     // Bind unified service socket immediately (always available)
     if let Some(listener) = bind_agent_listener(&svc_socket_path) {
@@ -653,7 +737,7 @@ pub async fn run(
                 }
                 None => {
                     info!("client channel closed before first client");
-                    cleanup_socket(&agent_socket_path);
+                    cleanup_socket(&agent.socket_path);
                     cleanup_socket(&svc_socket_path);
                     return Ok(());
                 }
@@ -701,7 +785,7 @@ pub async fn run(
         }
     }
     // Set SSH_AUTH_SOCK to the agent socket path
-    cmd.env("SSH_AUTH_SOCK", &agent_socket_path);
+    cmd.env("SSH_AUTH_SOCK", &agent.socket_path);
     // Set GRITTY_SOCK so `gritty open`/`gritty send`/`gritty receive` find the service socket
     cmd.env("GRITTY_SOCK", &svc_socket_path);
     let mut managed = ManagedChild::new(unsafe {
@@ -732,52 +816,6 @@ pub async fn run(
 
     // First client is already connected — enter relay directly
     metadata_slot.get().unwrap().attached.store(true, Ordering::Relaxed);
-
-    // Agent forwarding state
-    let mut agent_forward_enabled = false;
-    let mut agent_channels: HashMap<u32, mpsc::UnboundedSender<Bytes>> = HashMap::new();
-    let mut agent_acceptor: Option<tokio::task::JoinHandle<()>> = None;
-    let next_agent_channel_id = Arc::new(AtomicU32::new(0));
-
-    // Open forwarding state (no acceptor -- svc_acceptor handles the socket)
-    let mut open_forward_enabled = false;
-
-    // Tunnel state (reverse TCP tunnel for OAuth callbacks)
-    let mut tunnel_port: Option<u16> = None;
-    let (tunnel_event_tx, mut tunnel_event_rx) = mpsc::unbounded_channel::<TunnelEvent>();
-    let mut tunnel_writer: Option<mpsc::UnboundedSender<Bytes>> = None;
-
-    let teardown_forwarding =
-        |agent_channels: &mut HashMap<u32, mpsc::UnboundedSender<Bytes>>,
-         agent_forward_enabled: &mut bool,
-         agent_acceptor: &mut Option<tokio::task::JoinHandle<()>>,
-         open_forward_enabled: &mut bool,
-         tunnel_writer: &mut Option<mpsc::UnboundedSender<Bytes>>,
-         tunnel_port: &mut Option<u16>,
-         port_forwards: &mut HashMap<u32, PortForwardState>,
-         pf_channels: &mut HashMap<u32, (u32, mpsc::UnboundedSender<Bytes>)>,
-         pf_pending_remote: &mut HashMap<u32, UnixStream>| {
-            agent_channels.clear();
-            *agent_forward_enabled = false;
-            if let Some(handle) = agent_acceptor.take() {
-                handle.abort();
-            }
-            cleanup_socket(&agent_socket_path);
-            *open_forward_enabled = false;
-            *tunnel_writer = None;
-            *tunnel_port = None;
-            // Clean up all port forwards
-            for (_, pf) in port_forwards.drain() {
-                if let Some(h) = pf.listener_handle {
-                    h.abort();
-                }
-                if let Some(h) = pf.stop_handle {
-                    h.abort();
-                }
-            }
-            pf_channels.clear();
-            pf_pending_remote.clear();
-        };
 
     // Outer loop: accept clients via channel. PTY persists across reconnects.
     // First iteration skips client-wait (first client already connected above).
@@ -935,29 +973,29 @@ pub async fn run(
                         }
                         Some(Ok(Frame::AgentForward)) => {
                             debug!("agent forwarding enabled by client");
-                            agent_forward_enabled = true;
+                            agent.enabled = true;
                             // Bind agent socket so SSH_AUTH_SOCK points to a live file
-                            if agent_acceptor.is_none() {
-                                if let Some(listener) = bind_agent_listener(&agent_socket_path) {
-                                    agent_acceptor = Some(spawn_agent_acceptor(listener, agent_event_tx.clone(), next_agent_channel_id.clone()));
+                            if agent.acceptor.is_none() {
+                                if let Some(listener) = bind_agent_listener(&agent.socket_path) {
+                                    agent.acceptor = Some(spawn_agent_acceptor(listener, agent_event_tx.clone(), agent.next_channel_id.clone()));
                                 }
                             }
                         }
                         Some(Ok(Frame::AgentData { channel_id, data })) => {
-                            if let Some(tx) = agent_channels.get(&channel_id) {
+                            if let Some(tx) = agent.channels.get(&channel_id) {
                                 let _ = tx.send(data);
                             }
                         }
                         Some(Ok(Frame::AgentClose { channel_id })) => {
                             // Drop the sender, writer task sees closed channel and exits
-                            agent_channels.remove(&channel_id);
+                            agent.channels.remove(&channel_id);
                         }
                         Some(Ok(Frame::OpenForward)) => {
                             debug!("open forwarding enabled by client");
                             open_forward_enabled = true;
                         }
                         Some(Ok(Frame::TunnelOpen)) => {
-                            if let Some(port) = tunnel_port {
+                            if let Some(port) = tunnel.port {
                                 let tx = tunnel_event_tx.clone();
                                 tokio::spawn(async move {
                                     match tokio::net::TcpStream::connect(("127.0.0.1", port)).await {
@@ -968,29 +1006,29 @@ pub async fn run(
                             }
                         }
                         Some(Ok(Frame::TunnelData(data))) => {
-                            if let Some(ref tx) = tunnel_writer {
+                            if let Some(ref tx) = tunnel.writer {
                                 let _ = tx.send(data);
                             }
                         }
                         Some(Ok(Frame::TunnelClose)) => {
-                            tunnel_writer = None;
-                            tunnel_port = None;
+                            tunnel.writer = None;
+                            tunnel.port = None;
                         }
                         // Port forward: client confirms listener ready (remote-fwd)
                         Some(Ok(Frame::PortForwardReady { forward_id })) => {
-                            if let Some(mut svc_stream) = pf_pending_remote.remove(&forward_id) {
+                            if let Some(mut svc_stream) = pf.pending_remote.remove(&forward_id) {
                                 use tokio::io::AsyncWriteExt;
                                 let _ = svc_stream.write_all(&[0x01]).await;
                                 // Spawn svc watcher for teardown
                                 let stop_handle = spawn_pf_svc_watcher(svc_stream, forward_id, pf_event_tx.clone());
-                                if let Some(pf) = port_forwards.get_mut(&forward_id) {
-                                    pf.stop_handle = Some(stop_handle);
+                                if let Some(fwd) = pf.forwards.get_mut(&forward_id) {
+                                    fwd.stop_handle = Some(stop_handle);
                                 }
                             }
                         }
                         // Port forward: new TCP connection from client side (remote-fwd)
                         Some(Ok(Frame::PortForwardOpen { forward_id, channel_id, target_port })) => {
-                            if port_forwards.contains_key(&forward_id) {
+                            if pf.forwards.contains_key(&forward_id) {
                                 let tx = pf_event_tx.clone();
                                 tokio::spawn(async move {
                                     match tokio::net::TcpStream::connect(("127.0.0.1", target_port)).await {
@@ -1002,34 +1040,34 @@ pub async fn run(
                         }
                         // Port forward: channel data from client
                         Some(Ok(Frame::PortForwardData { channel_id, data })) => {
-                            if let Some((_, tx)) = pf_channels.get(&channel_id) {
+                            if let Some((_, tx)) = pf.channels.get(&channel_id) {
                                 let _ = tx.send(data);
                             }
                         }
                         // Port forward: channel closed by client
                         Some(Ok(Frame::PortForwardClose { channel_id })) => {
-                            if let Some((forward_id, _)) = pf_channels.remove(&channel_id) {
-                                if let Some(pf) = port_forwards.get_mut(&forward_id) {
-                                    pf.channels.remove(&channel_id);
+                            if let Some((forward_id, _)) = pf.channels.remove(&channel_id) {
+                                if let Some(fwd) = pf.forwards.get_mut(&forward_id) {
+                                    fwd.channels.remove(&channel_id);
                                 }
                             }
                         }
                         // Port forward: client declining a forward
                         Some(Ok(Frame::PortForwardStop { forward_id })) => {
-                            if let Some(mut svc_stream) = pf_pending_remote.remove(&forward_id) {
+                            if let Some(mut svc_stream) = pf.pending_remote.remove(&forward_id) {
                                 use tokio::io::AsyncWriteExt;
                                 let _ = svc_stream.write_all(&[0x02]).await;
                                 let _ = svc_stream.write_all(b"client declined forward").await;
                             }
-                            if let Some(pf) = port_forwards.remove(&forward_id) {
-                                if let Some(h) = pf.listener_handle {
+                            if let Some(fwd) = pf.forwards.remove(&forward_id) {
+                                if let Some(h) = fwd.listener_handle {
                                     h.abort();
                                 }
-                                if let Some(h) = pf.stop_handle {
+                                if let Some(h) = fwd.stop_handle {
                                     h.abort();
                                 }
-                                for ch_id in pf.channels.keys() {
-                                    pf_channels.remove(ch_id);
+                                for ch_id in fwd.channels.keys() {
+                                    pf.channels.remove(ch_id);
                                 }
                             }
                         }
@@ -1075,17 +1113,10 @@ pub async fn run(
                         Some(ClientConn::Active(new_framed)) => {
                             info!("new client via channel, detaching old client");
                             let _ = framed.send(Frame::Detached).await;
-                            teardown_forwarding(
-                                &mut agent_channels,
-                                &mut agent_forward_enabled,
-                                &mut agent_acceptor,
-                                &mut open_forward_enabled,
-                                &mut tunnel_writer,
-                                &mut tunnel_port,
-                                &mut port_forwards,
-                                &mut pf_channels,
-                                &mut pf_pending_remote,
-                            );
+                            agent.teardown();
+                            tunnel.teardown();
+                            pf.teardown();
+                            open_forward_enabled = false;
                             framed = new_framed;
                         }
                         Some(ClientConn::Tail(f)) => {
@@ -1103,19 +1134,19 @@ pub async fn run(
                 event = agent_event_rx.recv() => {
                     match event {
                         Some(AgentEvent::Accepted { channel_id, writer_tx }) => {
-                            if agent_forward_enabled {
-                                agent_channels.insert(channel_id, writer_tx);
+                            if agent.enabled {
+                                agent.channels.insert(channel_id, writer_tx);
                                 let _ = framed.send(Frame::AgentOpen { channel_id }).await;
                             }
                             // If forwarding not enabled, drop writer_tx (closes the connection)
                         }
                         Some(AgentEvent::Data { channel_id, data }) => {
-                            if agent_forward_enabled && agent_channels.contains_key(&channel_id) {
+                            if agent.enabled && agent.channels.contains_key(&channel_id) {
                                 let _ = framed.send(Frame::AgentData { channel_id, data }).await;
                             }
                         }
                         Some(AgentEvent::Closed { channel_id }) => {
-                            if agent_channels.remove(&channel_id).is_some() {
+                            if agent.channels.remove(&channel_id).is_some() {
                                 let _ = framed.send(Frame::AgentClose { channel_id }).await;
                             }
                         }
@@ -1134,7 +1165,7 @@ pub async fn run(
                                 if let Some(port) = extract_redirect_port(&url) {
                                     if port_in_use(port) {
                                         debug!(port, "setting up reverse tunnel for OAuth callback");
-                                        tunnel_port = Some(port);
+                                        tunnel.port = Some(port);
                                         let _ = framed.send(Frame::TunnelListen { port }).await;
                                     }
                                 }
@@ -1151,11 +1182,11 @@ pub async fn run(
                 event = tunnel_event_rx.recv() => {
                     match event {
                         Some(TunnelEvent::Connected(stream)) => {
-                            if let Some(port) = tunnel_port {
+                            if let Some(port) = tunnel.port {
                                 debug!(port, "tunnel connected to local port");
                                 let (mut read_half, write_half) = stream.into_split();
                                 let (writer_tx, mut writer_rx) = mpsc::unbounded_channel::<Bytes>();
-                                tunnel_writer = Some(writer_tx);
+                                tunnel.writer = Some(writer_tx);
 
                                 // Writer task: channel -> TCP
                                 tokio::spawn(async move {
@@ -1191,15 +1222,15 @@ pub async fn run(
                         }
                         Some(TunnelEvent::ConnectFailed) => {
                             let _ = framed.send(Frame::TunnelClose).await;
-                            tunnel_port = None;
+                            tunnel.port = None;
                         }
                         Some(TunnelEvent::Data(data)) => {
                             let _ = framed.send(Frame::TunnelData(data)).await;
                         }
                         Some(TunnelEvent::Closed) => {
                             let _ = framed.send(Frame::TunnelClose).await;
-                            tunnel_writer = None;
-                            tunnel_port = None;
+                            tunnel.writer = None;
+                            tunnel.port = None;
                         }
                         None => {}
                     }
@@ -1228,22 +1259,22 @@ pub async fn run(
                     match event {
                         Some(PortForwardEvent::Requested { stream, direction, listen_port, target_port }) => {
                             use tokio::io::AsyncWriteExt;
-                            let fwd_id = next_forward_id;
-                            next_forward_id += 1;
+                            let fwd_id = pf.next_forward_id;
+                            pf.next_forward_id += 1;
                             if direction == 0 {
                                 // Local-forward: server binds TCP, forwards to client
                                 match tokio::net::TcpListener::bind(("127.0.0.1", listen_port)).await {
                                     Ok(listener) => {
                                         debug!(fwd_id, listen_port, target_port, "local-forward: bound");
                                         let handle = spawn_pf_tcp_acceptor(
-                                            listener, fwd_id, next_pf_channel_id.clone(), pf_event_tx.clone(),
+                                            listener, fwd_id, pf.next_channel_id.clone(), pf_event_tx.clone(),
                                         );
                                         // Respond success to svc client
                                         let mut s = stream;
                                         let _ = s.write_all(&[0x01]).await;
                                         let stream = s;
                                         let stop_handle = spawn_pf_svc_watcher(stream, fwd_id, pf_event_tx.clone());
-                                        port_forwards.insert(fwd_id, PortForwardState {
+                                        pf.forwards.insert(fwd_id, PortForwardState {
                                             listener_handle: Some(handle),
                                             channels: HashMap::new(),
                                             stop_handle: Some(stop_handle),
@@ -1263,8 +1294,8 @@ pub async fn run(
                                 let _ = framed.send(Frame::PortForwardListen {
                                     forward_id: fwd_id, listen_port, target_port,
                                 }).await;
-                                pf_pending_remote.insert(fwd_id, stream);
-                                port_forwards.insert(fwd_id, PortForwardState {
+                                pf.pending_remote.insert(fwd_id, stream);
+                                pf.forwards.insert(fwd_id, PortForwardState {
                                     listener_handle: None,
                                     channels: HashMap::new(),
                                     stop_handle: None,
@@ -1273,16 +1304,16 @@ pub async fn run(
                             }
                         }
                         Some(PortForwardEvent::Accepted { forward_id, channel_id, writer_tx }) => {
-                            if let Some(pf) = port_forwards.get_mut(&forward_id) {
-                                pf.channels.insert(channel_id, writer_tx.clone());
-                                pf_channels.insert(channel_id, (forward_id, writer_tx));
+                            if let Some(fwd) = pf.forwards.get_mut(&forward_id) {
+                                fwd.channels.insert(channel_id, writer_tx.clone());
+                                pf.channels.insert(channel_id, (forward_id, writer_tx));
                                 let _ = framed.send(Frame::PortForwardOpen {
-                                    forward_id, channel_id, target_port: pf.target_port,
+                                    forward_id, channel_id, target_port: fwd.target_port,
                                 }).await;
                             }
                         }
                         Some(PortForwardEvent::Connected { forward_id, channel_id, stream }) => {
-                            if port_forwards.contains_key(&forward_id) {
+                            if pf.forwards.contains_key(&forward_id) {
                                 let (read_half, write_half) = stream.into_split();
                                 let data_tx = pf_event_tx.clone();
                                 let close_tx = pf_event_tx.clone();
@@ -1293,9 +1324,9 @@ pub async fn run(
                                     move |id, data| data_tx.send(PortForwardEvent::Data { channel_id: id, data }).is_ok(),
                                     move |id| { let _ = close_tx.send(PortForwardEvent::Closed { channel_id: id }); },
                                 );
-                                pf_channels.insert(channel_id, (forward_id, writer_tx));
-                                if let Some(pf) = port_forwards.get_mut(&forward_id) {
-                                    pf.channels.insert(channel_id, pf_channels.get(&channel_id).unwrap().1.clone());
+                                pf.channels.insert(channel_id, (forward_id, writer_tx.clone()));
+                                if let Some(fwd) = pf.forwards.get_mut(&forward_id) {
+                                    fwd.channels.insert(channel_id, writer_tx);
                                 }
                             }
                         }
@@ -1303,29 +1334,29 @@ pub async fn run(
                             let _ = framed.send(Frame::PortForwardClose { channel_id }).await;
                         }
                         Some(PortForwardEvent::Data { channel_id, data }) => {
-                            if pf_channels.contains_key(&channel_id) {
+                            if pf.channels.contains_key(&channel_id) {
                                 let _ = framed.send(Frame::PortForwardData { channel_id, data }).await;
                             }
                         }
                         Some(PortForwardEvent::Closed { channel_id }) => {
-                            if let Some((forward_id, _)) = pf_channels.remove(&channel_id) {
+                            if let Some((forward_id, _)) = pf.channels.remove(&channel_id) {
                                 let _ = framed.send(Frame::PortForwardClose { channel_id }).await;
-                                if let Some(pf) = port_forwards.get_mut(&forward_id) {
-                                    pf.channels.remove(&channel_id);
+                                if let Some(fwd) = pf.forwards.get_mut(&forward_id) {
+                                    fwd.channels.remove(&channel_id);
                                 }
                             }
                         }
                         Some(PortForwardEvent::Stopped { forward_id }) => {
                             debug!(forward_id, "port forward stopped (svc socket dropped)");
-                            if let Some(pf) = port_forwards.remove(&forward_id) {
-                                if let Some(h) = pf.listener_handle {
+                            if let Some(fwd) = pf.forwards.remove(&forward_id) {
+                                if let Some(h) = fwd.listener_handle {
                                     h.abort();
                                 }
-                                if let Some(h) = pf.stop_handle {
+                                if let Some(h) = fwd.stop_handle {
                                     h.abort();
                                 }
-                                for ch_id in pf.channels.keys() {
-                                    pf_channels.remove(ch_id);
+                                for ch_id in fwd.channels.keys() {
+                                    pf.channels.remove(ch_id);
                                 }
                                 let _ = framed.send(Frame::PortForwardStop { forward_id }).await;
                             }
@@ -1347,17 +1378,10 @@ pub async fn run(
                 if let Some(meta) = metadata_slot.get() {
                     meta.attached.store(false, Ordering::Relaxed);
                 }
-                teardown_forwarding(
-                    &mut agent_channels,
-                    &mut agent_forward_enabled,
-                    &mut agent_acceptor,
-                    &mut open_forward_enabled,
-                    &mut tunnel_writer,
-                    &mut tunnel_port,
-                    &mut port_forwards,
-                    &mut pf_channels,
-                    &mut pf_pending_remote,
-                );
+                agent.teardown();
+                tunnel.teardown();
+                pf.teardown();
+                open_forward_enabled = false;
                 info!("client disconnected, waiting for reconnect");
                 continue;
             }
@@ -1381,7 +1405,7 @@ pub async fn run(
         }
     }
 
-    cleanup_socket(&agent_socket_path);
+    cleanup_socket(&agent.socket_path);
     cleanup_socket(&svc_socket_path);
     if let Some(handle) = svc_acceptor.take() {
         handle.abort();

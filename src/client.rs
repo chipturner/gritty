@@ -340,6 +340,66 @@ struct ClientPortForwardState {
     target_port: u16,
 }
 
+/// Grouped state for agent channel management on the client side.
+struct ClientAgentState {
+    channels: HashMap<u32, mpsc::UnboundedSender<Bytes>>,
+}
+
+impl ClientAgentState {
+    fn new() -> Self {
+        Self { channels: HashMap::new() }
+    }
+
+    fn teardown(&mut self) {
+        self.channels.clear();
+    }
+}
+
+/// Grouped state for the OAuth callback tunnel on the client side.
+struct ClientTunnelState {
+    listener: Option<tokio::task::JoinHandle<()>>,
+    writer: Option<mpsc::UnboundedSender<Bytes>>,
+}
+
+impl ClientTunnelState {
+    fn new() -> Self {
+        Self { listener: None, writer: None }
+    }
+
+    fn teardown(&mut self) {
+        drop(self.writer.take());
+        if let Some(handle) = self.listener.take() {
+            handle.abort();
+        }
+    }
+}
+
+/// Grouped state for TCP port forwarding on the client side.
+struct ClientPortForwardTable {
+    forwards: HashMap<u32, ClientPortForwardState>,
+    channels: HashMap<u32, (u32, mpsc::UnboundedSender<Bytes>)>,
+    next_channel_id: std::sync::Arc<std::sync::atomic::AtomicU32>,
+}
+
+impl ClientPortForwardTable {
+    fn new() -> Self {
+        Self {
+            forwards: HashMap::new(),
+            channels: HashMap::new(),
+            next_channel_id: std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0)),
+        }
+    }
+
+    fn teardown(&mut self) {
+        for (_, fwd) in self.forwards.drain() {
+            if let Some(h) = fwd.listener_handle {
+                h.abort();
+            }
+        }
+        self.channels.clear();
+    }
+}
+
 /// Send session setup frames (env, agent/open forwarding, resize, redraw).
 /// Returns false if the connection dropped during setup.
 async fn send_init_frames(
@@ -396,19 +456,16 @@ async fn relay(
     let mut last_rtt: Option<Duration> = None;
 
     // Agent channel management
-    let mut agent_channels: HashMap<u32, mpsc::UnboundedSender<Bytes>> = HashMap::new();
+    let mut agent = ClientAgentState::new();
     let (agent_event_tx, mut agent_event_rx) = mpsc::unbounded_channel::<AgentEvent>();
 
     // Tunnel state (reverse TCP tunnel for OAuth callbacks)
-    let mut tunnel_listener: Option<tokio::task::JoinHandle<()>> = None;
+    let mut tunnel = ClientTunnelState::new();
     let (tunnel_event_tx, mut tunnel_event_rx) = mpsc::unbounded_channel::<ClientTunnelEvent>();
-    let mut tunnel_writer: Option<mpsc::UnboundedSender<Bytes>> = None;
 
     // Port forward state
     let (pf_event_tx, mut pf_event_rx) = mpsc::unbounded_channel::<ClientPortForwardEvent>();
-    let mut pf_forwards: HashMap<u32, ClientPortForwardState> = HashMap::new();
-    let mut pf_channels: HashMap<u32, (u32, mpsc::UnboundedSender<Bytes>)> = HashMap::new(); // channel_id -> (forward_id, writer_tx)
-    let next_pf_channel_id = std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0));
+    let mut pf = ClientPortForwardTable::new();
 
     loop {
         tokio::select! {
@@ -485,17 +542,9 @@ async fn relay(
                     }
                     Some(Ok(Frame::Detached)) => {
                         info!("detached by another client");
-                        agent_channels.clear();
-                        drop(tunnel_writer.take());
-                        if let Some(handle) = tunnel_listener.take() {
-                            handle.abort();
-                        }
-                        for (_, pf) in pf_forwards.drain() {
-                            if let Some(h) = pf.listener_handle {
-                                h.abort();
-                            }
-                        }
-                        pf_channels.clear();
+                        agent.teardown();
+                        tunnel.teardown();
+                        pf.teardown();
                         write_stdout_async(async_stdout, status_msg("detached").as_bytes()).await?;
                         return Ok(Some(0));
                     }
@@ -513,7 +562,7 @@ async fn relay(
                                         move |id, data| data_tx.send(AgentEvent::Data { channel_id: id, data }).is_ok(),
                                         move |id| { let _ = close_tx.send(AgentEvent::Closed { channel_id: id }); },
                                     );
-                                    agent_channels.insert(channel_id, writer_tx);
+                                    agent.channels.insert(channel_id, writer_tx);
                                 }
                                 Err(e) => {
                                     debug!("failed to connect to local agent: {e}");
@@ -525,12 +574,12 @@ async fn relay(
                         }
                     }
                     Some(Ok(Frame::AgentData { channel_id, data })) => {
-                        if let Some(tx) = agent_channels.get(&channel_id) {
+                        if let Some(tx) = agent.channels.get(&channel_id) {
                             let _ = tx.send(data);
                         }
                     }
                     Some(Ok(Frame::AgentClose { channel_id })) => {
-                        agent_channels.remove(&channel_id);
+                        agent.channels.remove(&channel_id);
                     }
                     Some(Ok(Frame::OpenUrl { url })) => {
                         if url.starts_with("http://") || url.starts_with("https://") {
@@ -553,7 +602,7 @@ async fn relay(
                                     let listener = tokio::net::TcpListener::from_std(std_listener).unwrap();
                                     let tx = tunnel_event_tx.clone();
                                     let timeout = oauth_timeout;
-                                    tunnel_listener = Some(tokio::spawn(async move {
+                                    tunnel.listener = Some(tokio::spawn(async move {
                                         let deadline = tokio::time::Instant::now() + Duration::from_secs(timeout);
                                         loop {
                                             let accept = tokio::time::timeout_at(
@@ -628,13 +677,13 @@ async fn relay(
                         write_stdout_async(async_stdout, error_msg(&format!("gritty: transfer cancelled: {reason}")).as_bytes()).await?;
                     }
                     Some(Ok(Frame::TunnelData(data))) => {
-                        if let Some(ref tx) = tunnel_writer {
+                        if let Some(ref tx) = tunnel.writer {
                             let _ = tx.send(data);
                         }
                     }
                     Some(Ok(Frame::TunnelClose)) => {
-                        tunnel_writer = None;
-                        if let Some(handle) = tunnel_listener.take() {
+                        tunnel.writer = None;
+                        if let Some(handle) = tunnel.listener.take() {
                             handle.abort();
                         }
                     }
@@ -646,7 +695,7 @@ async fn relay(
                                 std_listener.set_nonblocking(true).ok();
                                 let listener = tokio::net::TcpListener::from_std(std_listener).unwrap();
                                 let tx = pf_event_tx.clone();
-                                let nid = next_pf_channel_id.clone();
+                                let nid = pf.next_channel_id.clone();
                                 let handle = tokio::spawn(async move {
                                     loop {
                                         let (stream, _) = match listener.accept().await {
@@ -669,7 +718,7 @@ async fn relay(
                                         }
                                     }
                                 });
-                                pf_forwards.insert(forward_id, ClientPortForwardState {
+                                pf.forwards.insert(forward_id, ClientPortForwardState {
                                     listener_handle: Some(handle),
                                     target_port,
                                 });
@@ -685,7 +734,7 @@ async fn relay(
                     }
                     // Port forward: new TCP connection from server side (local-fwd)
                     Some(Ok(Frame::PortForwardOpen { forward_id, channel_id, target_port })) => {
-                        if pf_forwards.contains_key(&forward_id) || forward_id == u32::MAX {
+                        if pf.forwards.contains_key(&forward_id) || forward_id == u32::MAX {
                             // forward_id == u32::MAX is a "don't track" sentinel for local-fwd
                             match tokio::net::TcpStream::connect(("127.0.0.1", target_port)).await {
                                 Ok(stream) => {
@@ -699,7 +748,7 @@ async fn relay(
                                         move |id, data| data_tx.send(ClientPortForwardEvent::Data { channel_id: id, data }).is_ok(),
                                         move |id| { let _ = close_tx.send(ClientPortForwardEvent::Closed { channel_id: id }); },
                                     );
-                                    pf_channels.insert(channel_id, (forward_id, writer_tx));
+                                    pf.channels.insert(channel_id, (forward_id, writer_tx));
                                 }
                                 Err(e) => {
                                     debug!(channel_id, target_port, "pf connect failed: {e}");
@@ -710,23 +759,23 @@ async fn relay(
                     }
                     // Port forward: channel data from server
                     Some(Ok(Frame::PortForwardData { channel_id, data })) => {
-                        if let Some((_, tx)) = pf_channels.get(&channel_id) {
+                        if let Some((_, tx)) = pf.channels.get(&channel_id) {
                             let _ = tx.send(data);
                         }
                     }
                     // Port forward: channel closed by server
                     Some(Ok(Frame::PortForwardClose { channel_id })) => {
-                        pf_channels.remove(&channel_id);
+                        pf.channels.remove(&channel_id);
                     }
                     // Port forward: teardown from server
                     Some(Ok(Frame::PortForwardStop { forward_id })) => {
-                        if let Some(pf) = pf_forwards.remove(&forward_id) {
-                            if let Some(h) = pf.listener_handle {
+                        if let Some(fwd) = pf.forwards.remove(&forward_id) {
+                            if let Some(h) = fwd.listener_handle {
                                 h.abort();
                             }
                         }
                         // Remove channels belonging to this forward
-                        pf_channels.retain(|_, (fid, _)| *fid != forward_id);
+                        pf.channels.retain(|_, (fid, _)| *fid != forward_id);
                     }
                     Some(Ok(_)) => {} // ignore control/resize frames
                     Some(Err(e)) => {
@@ -744,14 +793,14 @@ async fn relay(
             event = agent_event_rx.recv() => {
                 match event {
                     Some(AgentEvent::Data { channel_id, data }) => {
-                        if agent_channels.contains_key(&channel_id)
+                        if agent.channels.contains_key(&channel_id)
                             && !timed_send(framed, Frame::AgentData { channel_id, data }).await
                         {
                             return Ok(None);
                         }
                     }
                     Some(AgentEvent::Closed { channel_id }) => {
-                        if agent_channels.remove(&channel_id).is_some()
+                        if agent.channels.remove(&channel_id).is_some()
                             && !timed_send(framed, Frame::AgentClose { channel_id }).await
                         {
                             return Ok(None);
@@ -766,12 +815,12 @@ async fn relay(
                 match event {
                     Some(ClientTunnelEvent::Accepted(writer_tx)) => {
                         // Close previous connection's server side if any
-                        if tunnel_writer.take().is_some()
+                        if tunnel.writer.take().is_some()
                             && !timed_send(framed, Frame::TunnelClose).await
                         {
                             return Ok(None);
                         }
-                        tunnel_writer = Some(writer_tx);
+                        tunnel.writer = Some(writer_tx);
                         if !timed_send(framed, Frame::TunnelOpen).await {
                             return Ok(None);
                         }
@@ -782,8 +831,8 @@ async fn relay(
                         }
                     }
                     Some(ClientTunnelEvent::Closed) => {
-                        tunnel_writer = None;
-                        if let Some(handle) = tunnel_listener.take() {
+                        tunnel.writer = None;
+                        if let Some(handle) = tunnel.listener.take() {
                             handle.abort();
                         }
                         if !timed_send(framed, Frame::TunnelClose).await {
@@ -798,24 +847,25 @@ async fn relay(
             event = pf_event_rx.recv() => {
                 match event {
                     Some(ClientPortForwardEvent::Accepted { forward_id, channel_id, writer_tx }) => {
-                        if let Some(pf) = pf_forwards.get(&forward_id) {
-                            pf_channels.insert(channel_id, (forward_id, writer_tx));
+                        if let Some(fwd) = pf.forwards.get(&forward_id) {
+                            let target_port = fwd.target_port;
+                            pf.channels.insert(channel_id, (forward_id, writer_tx));
                             if !timed_send(framed, Frame::PortForwardOpen {
-                                forward_id, channel_id, target_port: pf.target_port,
+                                forward_id, channel_id, target_port,
                             }).await {
                                 return Ok(None);
                             }
                         }
                     }
                     Some(ClientPortForwardEvent::Data { channel_id, data }) => {
-                        if pf_channels.contains_key(&channel_id)
+                        if pf.channels.contains_key(&channel_id)
                             && !timed_send(framed, Frame::PortForwardData { channel_id, data }).await
                         {
                             return Ok(None);
                         }
                     }
                     Some(ClientPortForwardEvent::Closed { channel_id }) => {
-                        if pf_channels.remove(&channel_id).is_some()
+                        if pf.channels.remove(&channel_id).is_some()
                             && !timed_send(framed, Frame::PortForwardClose { channel_id }).await
                         {
                             return Ok(None);
