@@ -8,13 +8,10 @@ use std::sync::{Arc, LazyLock, OnceLock};
 use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::UnixStream;
-use tokio::sync::{Semaphore, mpsc};
+use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 use tokio::time::timeout;
 use tokio_util::codec::Framed;
-
-/// Limit concurrent e2e tests to avoid PTY/CPU exhaustion under parallel load.
-static CONCURRENCY: LazyLock<Semaphore> = LazyLock::new(|| Semaphore::new(4));
 
 static TEST_ID: AtomicU32 = AtomicU32::new(0);
 
@@ -161,7 +158,6 @@ async fn expect_exit_frame(
 
 #[tokio::test]
 async fn server_spawns_shell_and_relays_output() {
-    let _permit = CONCURRENCY.acquire().await.unwrap();
     let (_tx, mut framed, server, _meta) = setup_session().await;
     wait_for_shell(&mut framed).await;
     read_available_data(&mut framed, Duration::from_millis(500)).await;
@@ -172,7 +168,6 @@ async fn server_spawns_shell_and_relays_output() {
 
 #[tokio::test]
 async fn server_relays_command_output() {
-    let _permit = CONCURRENCY.acquire().await.unwrap();
     let (_tx, mut framed, server, _meta) = setup_session().await;
     wait_for_shell(&mut framed).await;
     read_available_data(&mut framed, Duration::from_secs(1)).await;
@@ -192,7 +187,6 @@ async fn server_relays_command_output() {
 
 #[tokio::test]
 async fn server_sends_exit_frame_on_shell_exit() {
-    let _permit = CONCURRENCY.acquire().await.unwrap();
     let (_tx, mut framed, _server, _meta) = setup_session().await;
     wait_for_shell(&mut framed).await;
     read_available_data(&mut framed, Duration::from_secs(1)).await;
@@ -205,7 +199,6 @@ async fn server_sends_exit_frame_on_shell_exit() {
 
 #[tokio::test]
 async fn reconnect_preserves_shell_session() {
-    let _permit = CONCURRENCY.acquire().await.unwrap();
     let (client_tx, mut framed, server, _meta) = setup_session().await;
     wait_for_shell(&mut framed).await;
     read_available_data(&mut framed, Duration::from_secs(1)).await;
@@ -243,7 +236,6 @@ async fn reconnect_preserves_shell_session() {
 
 #[tokio::test]
 async fn server_exits_when_shell_dies_while_disconnected() {
-    let _permit = CONCURRENCY.acquire().await.unwrap();
     let (_tx, mut framed, server, _meta) = setup_session().await;
     wait_for_shell(&mut framed).await;
     read_available_data(&mut framed, Duration::from_secs(1)).await;
@@ -261,7 +253,6 @@ async fn server_exits_when_shell_dies_while_disconnected() {
 
 #[tokio::test]
 async fn second_client_detaches_first() {
-    let _permit = CONCURRENCY.acquire().await.unwrap();
     let (client_tx, mut client1, server, _meta) = setup_session().await;
     wait_for_shell(&mut client1).await;
     read_available_data(&mut client1, Duration::from_secs(1)).await;
@@ -304,7 +295,6 @@ async fn second_client_detaches_first() {
 
 #[tokio::test]
 async fn exit_code_zero_sends_exit_frame() {
-    let _permit = CONCURRENCY.acquire().await.unwrap();
     let (_tx, mut framed, _server, _meta) = setup_session().await;
     wait_for_shell(&mut framed).await;
     read_available_data(&mut framed, Duration::from_secs(1)).await;
@@ -317,7 +307,6 @@ async fn exit_code_zero_sends_exit_frame() {
 
 #[tokio::test]
 async fn exit_code_signal_death() {
-    let _permit = CONCURRENCY.acquire().await.unwrap();
     let (_tx, mut framed, _server, meta) = setup_session().await;
     wait_for_shell(&mut framed).await;
     read_available_data(&mut framed, Duration::from_secs(1)).await;
@@ -337,7 +326,6 @@ async fn exit_code_signal_death() {
 
 #[tokio::test]
 async fn rapid_reconnect_cycles() {
-    let _permit = CONCURRENCY.acquire().await.unwrap();
     let (client_tx, mut framed, server, _meta) = setup_session().await;
     wait_for_shell(&mut framed).await;
     read_available_data(&mut framed, Duration::from_secs(1)).await;
@@ -371,7 +359,6 @@ async fn rapid_reconnect_cycles() {
 
 #[tokio::test]
 async fn control_frame_on_session_is_ignored() {
-    let _permit = CONCURRENCY.acquire().await.unwrap();
     let (_tx, mut framed, server, _meta) = setup_session().await;
     wait_for_shell(&mut framed).await;
     read_available_data(&mut framed, Duration::from_secs(1)).await;
@@ -398,7 +385,6 @@ async fn control_frame_on_session_is_ignored() {
 
 #[tokio::test]
 async fn pty_buffer_saturation_and_resume() {
-    let _permit = CONCURRENCY.acquire().await.unwrap();
     let (client_tx, mut framed, server, _meta) = setup_session().await;
     wait_for_shell(&mut framed).await;
     read_available_data(&mut framed, Duration::from_secs(1)).await;
@@ -435,7 +421,6 @@ async fn pty_buffer_saturation_and_resume() {
 
 #[tokio::test]
 async fn pty_ring_buffer_drains_during_disconnect() {
-    let _permit = CONCURRENCY.acquire().await.unwrap();
     let (client_tx, mut framed, server, _meta) = setup_session().await;
     wait_for_shell(&mut framed).await;
     read_available_data(&mut framed, Duration::from_secs(1)).await;
@@ -475,7 +460,6 @@ async fn pty_ring_buffer_drains_during_disconnect() {
 
 #[tokio::test]
 async fn pty_ring_buffer_caps_at_limit() {
-    let _permit = CONCURRENCY.acquire().await.unwrap();
     let (client_tx, mut framed, server, _meta) = setup_session().await;
     wait_for_shell(&mut framed).await;
     read_available_data(&mut framed, Duration::from_secs(1)).await;
@@ -516,7 +500,6 @@ async fn pty_ring_buffer_caps_at_limit() {
 
 #[tokio::test]
 async fn resize_propagates_to_pty() {
-    let _permit = CONCURRENCY.acquire().await.unwrap();
     let (_tx, mut framed, server, _meta) = setup_session().await;
     wait_for_shell(&mut framed).await;
     read_available_data(&mut framed, Duration::from_secs(1)).await;
@@ -538,7 +521,6 @@ async fn resize_propagates_to_pty() {
 
 #[tokio::test]
 async fn metadata_reflects_attached_state() {
-    let _permit = CONCURRENCY.acquire().await.unwrap();
     let (client_tx, mut framed, server, meta) = setup_session().await;
 
     // Wait for metadata to be set
@@ -572,7 +554,6 @@ async fn metadata_reflects_attached_state() {
 
 #[tokio::test]
 async fn client_explicit_exit_frame() {
-    let _permit = CONCURRENCY.acquire().await.unwrap();
     let (client_tx, mut framed, server, _meta) = setup_session().await;
     wait_for_shell(&mut framed).await;
     read_available_data(&mut framed, Duration::from_secs(1)).await;
@@ -605,7 +586,6 @@ async fn client_explicit_exit_frame() {
 
 #[tokio::test]
 async fn high_throughput_data_relay() {
-    let _permit = CONCURRENCY.acquire().await.unwrap();
     let (_tx, mut framed, server, _meta) = setup_session().await;
     wait_for_shell(&mut framed).await;
     read_available_data(&mut framed, Duration::from_secs(1)).await;
@@ -651,7 +631,6 @@ async fn high_throughput_data_relay() {
 
 #[tokio::test]
 async fn ping_pong_heartbeat() {
-    let _permit = CONCURRENCY.acquire().await.unwrap();
     let (_tx, mut framed, server, meta) = setup_session().await;
     wait_for_shell(&mut framed).await;
     read_available_data(&mut framed, Duration::from_secs(1)).await;
@@ -683,7 +662,6 @@ async fn ping_pong_heartbeat() {
 
 #[tokio::test]
 async fn env_vars_forwarded() {
-    let _permit = CONCURRENCY.acquire().await.unwrap();
     let (_tx, mut framed, server, _meta) =
         setup_session_with_env(vec![("TERM".to_string(), "xterm-test-42".to_string())]).await;
     wait_for_shell(&mut framed).await;
@@ -704,7 +682,6 @@ async fn env_vars_forwarded() {
 
 #[tokio::test]
 async fn disallowed_env_vars_rejected() {
-    let _permit = CONCURRENCY.acquire().await.unwrap();
     let (_tx, mut framed, server, _meta) = setup_session_with_env(vec![
         ("TERM".to_string(), "xterm-test-env".to_string()),
         ("LD_PRELOAD".to_string(), "/tmp/evil.so".to_string()),
@@ -737,7 +714,6 @@ async fn disallowed_env_vars_rejected() {
 
 #[tokio::test]
 async fn login_shell_starts_in_home() {
-    let _permit = CONCURRENCY.acquire().await.unwrap();
     let (_tx, mut framed, server, _meta) = setup_session().await;
     wait_for_shell(&mut framed).await;
     read_available_data(&mut framed, Duration::from_secs(1)).await;
@@ -782,7 +758,6 @@ async fn setup_session_with_agent_path() -> (
 
 #[tokio::test]
 async fn agent_forwarding_data_roundtrip() {
-    let _permit = CONCURRENCY.acquire().await.unwrap();
     let (_tx, mut framed, server, _meta, agent_path) = setup_session_with_agent_path().await;
     wait_for_shell(&mut framed).await;
     read_available_data(&mut framed, Duration::from_secs(1)).await;
@@ -841,7 +816,6 @@ async fn agent_forwarding_data_roundtrip() {
 
 #[tokio::test]
 async fn agent_close_on_remote_disconnect() {
-    let _permit = CONCURRENCY.acquire().await.unwrap();
     let (_tx, mut framed, server, _meta, agent_path) = setup_session_with_agent_path().await;
     wait_for_shell(&mut framed).await;
     read_available_data(&mut framed, Duration::from_secs(1)).await;
@@ -887,7 +861,6 @@ async fn agent_close_on_remote_disconnect() {
 
 #[tokio::test]
 async fn agent_not_forwarded_without_flag() {
-    let _permit = CONCURRENCY.acquire().await.unwrap();
     let (_tx, mut framed, server, _meta, agent_path) = setup_session_with_agent_path().await;
     wait_for_shell(&mut framed).await;
     read_available_data(&mut framed, Duration::from_secs(1)).await;
@@ -907,7 +880,6 @@ async fn agent_not_forwarded_without_flag() {
 
 #[tokio::test]
 async fn open_forwarding_url_roundtrip() {
-    let _permit = CONCURRENCY.acquire().await.unwrap();
     let (_tx, mut framed, server, _meta, svc_path) = setup_session_with_svc_path().await;
     wait_for_shell(&mut framed).await;
     read_available_data(&mut framed, Duration::from_secs(1)).await;
@@ -941,7 +913,6 @@ async fn open_forwarding_url_roundtrip() {
 
 #[tokio::test]
 async fn open_forwarding_not_enabled() {
-    let _permit = CONCURRENCY.acquire().await.unwrap();
     let (_tx, mut framed, server, _meta, svc_path) = setup_session_with_svc_path().await;
     wait_for_shell(&mut framed).await;
     read_available_data(&mut framed, Duration::from_secs(1)).await;
@@ -976,7 +947,6 @@ async fn open_forwarding_not_enabled() {
 
 #[tokio::test]
 async fn ping_pong_response_is_fast() {
-    let _permit = CONCURRENCY.acquire().await.unwrap();
     let (_tx, mut framed, server, _meta) = setup_session().await;
     wait_for_shell(&mut framed).await;
     read_available_data(&mut framed, Duration::from_secs(1)).await;
@@ -1001,7 +971,6 @@ async fn ping_pong_response_is_fast() {
 
 #[tokio::test]
 async fn multiple_pings_get_multiple_pongs() {
-    let _permit = CONCURRENCY.acquire().await.unwrap();
     let (_tx, mut framed, server, _meta) = setup_session().await;
     wait_for_shell(&mut framed).await;
     read_available_data(&mut framed, Duration::from_secs(1)).await;
@@ -1033,7 +1002,6 @@ async fn multiple_pings_get_multiple_pongs() {
 
 #[tokio::test]
 async fn ring_buffer_overflow_shows_truncation_marker() {
-    let _permit = CONCURRENCY.acquire().await.unwrap();
     let (client_tx, mut framed, server, _meta) = setup_session().await;
     wait_for_shell(&mut framed).await;
     read_available_data(&mut framed, Duration::from_secs(1)).await;
@@ -1073,7 +1041,6 @@ async fn ring_buffer_overflow_shows_truncation_marker() {
 
 #[tokio::test]
 async fn tail_receives_output() {
-    let _permit = CONCURRENCY.acquire().await.unwrap();
     let (client_tx, mut framed, server, _meta) = setup_session().await;
     wait_for_shell(&mut framed).await;
     read_available_data(&mut framed, Duration::from_secs(1)).await;
@@ -1108,7 +1075,6 @@ async fn tail_receives_output() {
 
 #[tokio::test]
 async fn tail_does_not_detach_active_client() {
-    let _permit = CONCURRENCY.acquire().await.unwrap();
     let (client_tx, mut framed, server, _meta) = setup_session().await;
     wait_for_shell(&mut framed).await;
     read_available_data(&mut framed, Duration::from_secs(1)).await;
@@ -1135,7 +1101,6 @@ async fn tail_does_not_detach_active_client() {
 
 #[tokio::test]
 async fn tail_receives_exit_on_shell_exit() {
-    let _permit = CONCURRENCY.acquire().await.unwrap();
     let (client_tx, mut framed, _server, _meta) = setup_session().await;
     wait_for_shell(&mut framed).await;
     read_available_data(&mut framed, Duration::from_secs(1)).await;
@@ -1157,7 +1122,6 @@ async fn tail_receives_exit_on_shell_exit() {
 
 #[tokio::test]
 async fn tunnel_forwarding_roundtrip() {
-    let _permit = CONCURRENCY.acquire().await.unwrap();
     let (_tx, mut framed, server, _meta, svc_path) = setup_session_with_svc_path().await;
     wait_for_shell(&mut framed).await;
     read_available_data(&mut framed, Duration::from_secs(1)).await;
@@ -1247,7 +1211,6 @@ async fn tunnel_forwarding_roundtrip() {
 
 #[tokio::test]
 async fn tunnel_not_created_without_redirect_uri() {
-    let _permit = CONCURRENCY.acquire().await.unwrap();
     let (_tx, mut framed, server, _meta, svc_path) = setup_session_with_svc_path().await;
     wait_for_shell(&mut framed).await;
     read_available_data(&mut framed, Duration::from_secs(1)).await;
@@ -1283,7 +1246,6 @@ async fn tunnel_not_created_without_redirect_uri() {
 
 #[tokio::test]
 async fn tunnel_not_created_when_port_not_listening() {
-    let _permit = CONCURRENCY.acquire().await.unwrap();
     let (_tx, mut framed, server, _meta, svc_path) = setup_session_with_svc_path().await;
     wait_for_shell(&mut framed).await;
     read_available_data(&mut framed, Duration::from_secs(1)).await;
@@ -1398,7 +1360,6 @@ async fn receive_files(svc_path: &std::path::Path) -> Vec<(String, Vec<u8>)> {
 
 #[tokio::test]
 async fn send_receive_single_file() {
-    let _permit = CONCURRENCY.acquire().await.unwrap();
     let (_client_tx, mut framed, server, _meta, svc_path) = setup_session_with_svc_path().await;
     wait_for_shell(&mut framed).await;
 
@@ -1459,7 +1420,6 @@ async fn send_receive_single_file() {
 
 #[tokio::test]
 async fn send_receive_multiple_files() {
-    let _permit = CONCURRENCY.acquire().await.unwrap();
     let (_client_tx, mut framed, server, _meta, svc_path) = setup_session_with_svc_path().await;
     wait_for_shell(&mut framed).await;
 
@@ -1503,7 +1463,6 @@ async fn send_receive_multiple_files() {
 
 #[tokio::test]
 async fn send_receive_receiver_first() {
-    let _permit = CONCURRENCY.acquire().await.unwrap();
     let (_client_tx, mut framed, server, _meta, svc_path) = setup_session_with_svc_path().await;
     wait_for_shell(&mut framed).await;
 
@@ -1539,7 +1498,6 @@ async fn send_receive_receiver_first() {
 
 #[tokio::test]
 async fn send_cancel_on_sender_disconnect() {
-    let _permit = CONCURRENCY.acquire().await.unwrap();
     let (_client_tx, mut framed, server, _meta, svc_path) = setup_session_with_svc_path().await;
     wait_for_shell(&mut framed).await;
 
@@ -1604,7 +1562,6 @@ async fn send_cancel_on_sender_disconnect() {
 
 #[tokio::test]
 async fn send_filename_sanitized() {
-    let _permit = CONCURRENCY.acquire().await.unwrap();
     let (_client_tx, mut framed, server, _meta, svc_path) = setup_session_with_svc_path().await;
     wait_for_shell(&mut framed).await;
 
@@ -1650,7 +1607,6 @@ async fn send_filename_sanitized() {
 
 #[tokio::test]
 async fn stale_receiver_does_not_poison_next_transfer() {
-    let _permit = CONCURRENCY.acquire().await.unwrap();
     let (_client_tx, mut framed, server, _meta, svc_path) = setup_session_with_svc_path().await;
     wait_for_shell(&mut framed).await;
 
@@ -1703,7 +1659,6 @@ async fn stale_receiver_does_not_poison_next_transfer() {
 
 #[tokio::test]
 async fn stale_sender_does_not_poison_next_transfer() {
-    let _permit = CONCURRENCY.acquire().await.unwrap();
     let (_client_tx, mut framed, server, _meta, svc_path) = setup_session_with_svc_path().await;
     wait_for_shell(&mut framed).await;
 
@@ -1796,7 +1751,6 @@ async fn read_svc_response(stream: &mut UnixStream) -> Result<(), String> {
 
 #[tokio::test]
 async fn local_forward_data_roundtrip() {
-    let _permit = CONCURRENCY.acquire().await.unwrap();
     let (_tx, mut framed, server, _meta, svc_path) = setup_session_with_svc_path().await;
     wait_for_shell(&mut framed).await;
     read_available_data(&mut framed, Duration::from_secs(1)).await;
@@ -1896,7 +1850,6 @@ async fn local_forward_data_roundtrip() {
 
 #[tokio::test]
 async fn remote_forward_data_roundtrip() {
-    let _permit = CONCURRENCY.acquire().await.unwrap();
     let (_tx, mut framed, server, _meta, svc_path) = setup_session_with_svc_path().await;
     wait_for_shell(&mut framed).await;
     read_available_data(&mut framed, Duration::from_secs(1)).await;
@@ -2007,7 +1960,6 @@ async fn remote_forward_data_roundtrip() {
 
 #[tokio::test]
 async fn port_forward_svc_drop_teardown() {
-    let _permit = CONCURRENCY.acquire().await.unwrap();
     let (_tx, mut framed, server, _meta, svc_path) = setup_session_with_svc_path().await;
     wait_for_shell(&mut framed).await;
     read_available_data(&mut framed, Duration::from_secs(1)).await;
@@ -2049,7 +2001,6 @@ async fn port_forward_svc_drop_teardown() {
 
 #[tokio::test]
 async fn port_forward_client_disconnect_cleanup() {
-    let _permit = CONCURRENCY.acquire().await.unwrap();
     let (client_tx, mut framed, server, _meta, svc_path) = setup_session_with_svc_path().await;
     wait_for_shell(&mut framed).await;
     read_available_data(&mut framed, Duration::from_secs(1)).await;
@@ -2110,7 +2061,6 @@ async fn port_forward_client_disconnect_cleanup() {
 
 #[tokio::test]
 async fn local_forward_multiple_concurrent_connections() {
-    let _permit = CONCURRENCY.acquire().await.unwrap();
     let (_tx, mut framed, server, _meta, svc_path) = setup_session_with_svc_path().await;
     wait_for_shell(&mut framed).await;
     read_available_data(&mut framed, Duration::from_secs(1)).await;
@@ -2222,7 +2172,6 @@ async fn local_forward_multiple_concurrent_connections() {
 
 #[tokio::test]
 async fn local_forward_different_listen_and_target_ports() {
-    let _permit = CONCURRENCY.acquire().await.unwrap();
     let (_tx, mut framed, server, _meta, svc_path) = setup_session_with_svc_path().await;
     wait_for_shell(&mut framed).await;
     read_available_data(&mut framed, Duration::from_secs(1)).await;

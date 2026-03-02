@@ -36,7 +36,7 @@ Similar to Eternal Terminal but socket-based. Sessions are persistent (shell sur
 
 ## Build & Test
 
-Rust edition 2024, MSRV 1.85. Uses `just` as the task runner.
+Rust edition 2024, MSRV 1.85. Uses `just` as the task runner. Tests run via `cargo-nextest` (per-test process isolation); concurrency limits for PTY-heavy tests are configured in `.config/nextest.toml`.
 
 ```bash
 just check                           # clippy + full test suite (pre-push gate)
@@ -45,8 +45,9 @@ just test                            # all tests (pass args to filter: just test
 just test-protocol                   # codec unit tests only
 just test-daemon                     # daemon integration tests only
 just test-e2e                        # e2e session tests only
-just test-ssh                        # SSH integration tests (requires sshd + ssh localhost)
+just test-ssh                        # SSH integration tests (auto-detects ssh localhost)
 just test-socat                      # socat tunnel disruption tests (requires socat)
+just test-socat-bridge               # socat bridge tests (requires socat)
 just stress 10                       # run full suite N times, report pass/fail tally
 just coverage                        # test coverage summary
 just coverage-html                   # HTML coverage report
@@ -148,8 +149,9 @@ All modules implemented and tested. Full CLI with tmux-like ergonomics, single-s
 - **Test-first for bug fixes** — write a failing test first, implement the fix, confirm it passes. Regression tests go in daemon_test.rs (for daemon races) or e2e_test.rs (for session/relay bugs).
 - **E2e tests use socketpair + channel** — no socket files needed, no cleanup issues. `UnixStream::pair()` creates both ends, server side sent via `mpsc` channel to `server::run()`.
 - **Daemon tests use a real socket** — each test gets its own `tempfile::tempdir()`. Tests pass `None` for `ready_fd`. All helpers perform Hello handshake via `do_handshake()`.
-- **Daemon tests are timing-sensitive** — use `tokio::time::sleep` to wait for daemon/session binding. If tests flake, increase sleep durations.
-- **SSH/socat tests need external tools** — `just test-ssh` requires `sshd` + localhost SSH; `just test-socat` requires `socat`. Both skip gracefully if missing.
+- **Daemon tests poll for readiness** — `wait_for_daemon()` polls until the socket is connectable instead of blind sleeps. Remaining sleeps in polling loops use deadline-based retries.
+- **Nextest concurrency** — `.config/nextest.toml` limits e2e + daemon tests to 2 concurrent (PTY/shell resource pressure) and socat/SSH tests to serial, with 2 retries for flaky timing-sensitive tests. Each nextest test is a separate process, so in-process synchronization (semaphores, static state) doesn't work across tests.
+- **SSH/socat tests auto-detect** — `just test-ssh` auto-detects `ssh localhost` availability (set `GRITTY_SSH_TEST=0` to force-skip); `just test-socat`/`just test-socat-bridge` auto-detect `socat`. All skip gracefully if the tool is missing.
 
 ### Style
 - **Error handling in main.rs** — `main()` returns `()`. Errors print as `error: <message>` via `eprintln!`, no backtraces. Never use `-> anyhow::Result` on `main()` in a CLI tool.

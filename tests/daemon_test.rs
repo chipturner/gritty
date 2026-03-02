@@ -1,15 +1,10 @@
 use bytes::Bytes;
 use futures_util::{SinkExt, StreamExt};
 use gritty::protocol::{Frame, FrameCodec, PROTOCOL_VERSION};
-use std::sync::LazyLock;
 use std::time::Duration;
 use tokio::net::UnixStream;
-use tokio::sync::Semaphore;
 use tokio::time::timeout;
 use tokio_util::codec::Framed;
-
-/// Limit concurrent daemon tests to avoid PTY/CPU exhaustion under parallel load.
-static CONCURRENCY: LazyLock<Semaphore> = LazyLock::new(|| Semaphore::new(3));
 
 /// Create an isolated temp directory with a control socket path inside it.
 /// The TempDir must be kept alive for the duration of the test.
@@ -17,6 +12,22 @@ fn test_ctl() -> (tempfile::TempDir, std::path::PathBuf) {
     let tmp = tempfile::tempdir().unwrap();
     let ctl_path = tmp.path().join("ctl.sock");
     (tmp, ctl_path)
+}
+
+/// Poll until the daemon socket exists and is connectable.
+async fn wait_for_daemon(ctl_path: &std::path::Path) {
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    loop {
+        if ctl_path.exists() {
+            if UnixStream::connect(ctl_path).await.is_ok() {
+                return;
+            }
+        }
+        if tokio::time::Instant::now() >= deadline {
+            panic!("daemon did not start within 5s");
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
 }
 
 /// Perform Hello handshake on a framed connection.
@@ -52,10 +63,7 @@ async fn drain_data(framed: &mut Framed<UnixStream, FrameCodec>, wait: Duration)
 async fn create_session(ctl_path: &std::path::Path, name: &str) -> String {
     let resp = control_request(ctl_path, Frame::NewSession { name: name.to_string() }).await;
     match resp {
-        Frame::SessionCreated { id } => {
-            tokio::time::sleep(Duration::from_millis(200)).await;
-            id
-        }
+        Frame::SessionCreated { id } => id,
         other => panic!("expected SessionCreated, got {other:?}"),
     }
 }
@@ -95,17 +103,15 @@ async fn attach_session(
 /// Kill a session by id or name.
 async fn kill_cleanup(ctl_path: &std::path::Path, session: &str) {
     let _ = control_request(ctl_path, Frame::KillSession { session: session.to_string() }).await;
-    tokio::time::sleep(Duration::from_millis(100)).await;
 }
 
 #[tokio::test]
 async fn daemon_creates_and_lists_sessions() {
-    let _permit = CONCURRENCY.acquire().await.unwrap();
     let (_tmp, ctl_path) = test_ctl();
 
     let ctl = ctl_path.clone();
     let _daemon = tokio::spawn(async move { gritty::daemon::run(&ctl, None).await });
-    tokio::time::sleep(Duration::from_millis(200)).await;
+    wait_for_daemon(&ctl_path).await;
 
     let id = create_session(&ctl_path, "mytest").await;
 
@@ -125,12 +131,11 @@ async fn daemon_creates_and_lists_sessions() {
 
 #[tokio::test]
 async fn daemon_rejects_duplicate_name() {
-    let _permit = CONCURRENCY.acquire().await.unwrap();
     let (_tmp, ctl_path) = test_ctl();
 
     let ctl = ctl_path.clone();
     let _daemon = tokio::spawn(async move { gritty::daemon::run(&ctl, None).await });
-    tokio::time::sleep(Duration::from_millis(200)).await;
+    wait_for_daemon(&ctl_path).await;
 
     let id = create_session(&ctl_path, "dupname").await;
 
@@ -143,12 +148,11 @@ async fn daemon_rejects_duplicate_name() {
 
 #[tokio::test]
 async fn daemon_rejects_name_with_tab() {
-    let _permit = CONCURRENCY.acquire().await.unwrap();
     let (_tmp, ctl_path) = test_ctl();
 
     let ctl = ctl_path.clone();
     let _daemon = tokio::spawn(async move { gritty::daemon::run(&ctl, None).await });
-    tokio::time::sleep(Duration::from_millis(200)).await;
+    wait_for_daemon(&ctl_path).await;
 
     let resp =
         control_request(&ctl_path, Frame::NewSession { name: "bad\tname".to_string() }).await;
@@ -159,12 +163,11 @@ async fn daemon_rejects_name_with_tab() {
 
 #[tokio::test]
 async fn daemon_rejects_name_with_newline() {
-    let _permit = CONCURRENCY.acquire().await.unwrap();
     let (_tmp, ctl_path) = test_ctl();
 
     let ctl = ctl_path.clone();
     let _daemon = tokio::spawn(async move { gritty::daemon::run(&ctl, None).await });
-    tokio::time::sleep(Duration::from_millis(200)).await;
+    wait_for_daemon(&ctl_path).await;
 
     let resp =
         control_request(&ctl_path, Frame::NewSession { name: "bad\nname".to_string() }).await;
@@ -178,12 +181,11 @@ async fn daemon_rejects_name_with_newline() {
 
 #[tokio::test]
 async fn daemon_allows_multiple_unnamed_sessions() {
-    let _permit = CONCURRENCY.acquire().await.unwrap();
     let (_tmp, ctl_path) = test_ctl();
 
     let ctl = ctl_path.clone();
     let _daemon = tokio::spawn(async move { gritty::daemon::run(&ctl, None).await });
-    tokio::time::sleep(Duration::from_millis(200)).await;
+    wait_for_daemon(&ctl_path).await;
 
     // Create two unnamed sessions (empty name)
     let id1 = create_session(&ctl_path, "").await;
@@ -204,12 +206,11 @@ async fn daemon_allows_multiple_unnamed_sessions() {
 
 #[tokio::test]
 async fn daemon_kills_session() {
-    let _permit = CONCURRENCY.acquire().await.unwrap();
     let (_tmp, ctl_path) = test_ctl();
 
     let ctl = ctl_path.clone();
     let _daemon = tokio::spawn(async move { gritty::daemon::run(&ctl, None).await });
-    tokio::time::sleep(Duration::from_millis(200)).await;
+    wait_for_daemon(&ctl_path).await;
 
     let id = create_session(&ctl_path, "killme").await;
 
@@ -229,12 +230,11 @@ async fn daemon_kills_session() {
 
 #[tokio::test]
 async fn daemon_kills_session_by_name() {
-    let _permit = CONCURRENCY.acquire().await.unwrap();
     let (_tmp, ctl_path) = test_ctl();
 
     let ctl = ctl_path.clone();
     let _daemon = tokio::spawn(async move { gritty::daemon::run(&ctl, None).await });
-    tokio::time::sleep(Duration::from_millis(200)).await;
+    wait_for_daemon(&ctl_path).await;
 
     let _id = create_session(&ctl_path, "named-kill").await;
 
@@ -255,12 +255,11 @@ async fn daemon_kills_session_by_name() {
 
 #[tokio::test]
 async fn daemon_kills_server() {
-    let _permit = CONCURRENCY.acquire().await.unwrap();
     let (_tmp, ctl_path) = test_ctl();
 
     let ctl = ctl_path.clone();
     let daemon = tokio::spawn(async move { gritty::daemon::run(&ctl, None).await });
-    tokio::time::sleep(Duration::from_millis(200)).await;
+    wait_for_daemon(&ctl_path).await;
 
     let _id = create_session(&ctl_path, "doomed").await;
 
@@ -275,12 +274,11 @@ async fn daemon_kills_server() {
 
 #[tokio::test]
 async fn create_after_kill_same_name() {
-    let _permit = CONCURRENCY.acquire().await.unwrap();
     let (_tmp, ctl_path) = test_ctl();
 
     let ctl = ctl_path.clone();
     let _daemon = tokio::spawn(async move { gritty::daemon::run(&ctl, None).await });
-    tokio::time::sleep(Duration::from_millis(200)).await;
+    wait_for_daemon(&ctl_path).await;
 
     let id1 = create_session(&ctl_path, "reuse").await;
 
@@ -314,12 +312,11 @@ async fn create_after_kill_same_name() {
 
 #[tokio::test]
 async fn multiple_concurrent_sessions() {
-    let _permit = CONCURRENCY.acquire().await.unwrap();
     let (_tmp, ctl_path) = test_ctl();
 
     let ctl = ctl_path.clone();
     let _daemon = tokio::spawn(async move { gritty::daemon::run(&ctl, None).await });
-    tokio::time::sleep(Duration::from_millis(200)).await;
+    wait_for_daemon(&ctl_path).await;
 
     let id1 = create_session(&ctl_path, "sess-a").await;
     let id2 = create_session(&ctl_path, "sess-b").await;
@@ -357,12 +354,11 @@ async fn multiple_concurrent_sessions() {
 
 #[tokio::test]
 async fn daemon_unexpected_frame() {
-    let _permit = CONCURRENCY.acquire().await.unwrap();
     let (_tmp, ctl_path) = test_ctl();
 
     let ctl = ctl_path.clone();
     let _daemon = tokio::spawn(async move { gritty::daemon::run(&ctl, None).await });
-    tokio::time::sleep(Duration::from_millis(200)).await;
+    wait_for_daemon(&ctl_path).await;
 
     // Send a Data frame (makes no sense on control socket)
     let resp = control_request(&ctl_path, Frame::Data(Bytes::from("hello"))).await;
@@ -390,12 +386,11 @@ async fn daemon_unexpected_frame() {
 
 #[tokio::test]
 async fn kill_server_no_sessions() {
-    let _permit = CONCURRENCY.acquire().await.unwrap();
     let (_tmp, ctl_path) = test_ctl();
 
     let ctl = ctl_path.clone();
     let daemon = tokio::spawn(async move { gritty::daemon::run(&ctl, None).await });
-    tokio::time::sleep(Duration::from_millis(200)).await;
+    wait_for_daemon(&ctl_path).await;
 
     let resp = control_request(&ctl_path, Frame::KillServer).await;
     assert_eq!(resp, Frame::Ok);
@@ -408,12 +403,11 @@ async fn kill_server_no_sessions() {
 
 #[tokio::test]
 async fn kill_nonexistent_session() {
-    let _permit = CONCURRENCY.acquire().await.unwrap();
     let (_tmp, ctl_path) = test_ctl();
 
     let ctl = ctl_path.clone();
     let _daemon = tokio::spawn(async move { gritty::daemon::run(&ctl, None).await });
-    tokio::time::sleep(Duration::from_millis(200)).await;
+    wait_for_daemon(&ctl_path).await;
 
     let resp = control_request(&ctl_path, Frame::KillSession { session: "999".to_string() }).await;
     assert!(
@@ -424,12 +418,11 @@ async fn kill_nonexistent_session() {
 
 #[tokio::test]
 async fn session_natural_exit_reaps_from_list() {
-    let _permit = CONCURRENCY.acquire().await.unwrap();
     let (_tmp, ctl_path) = test_ctl();
 
     let ctl = ctl_path.clone();
     let _daemon = tokio::spawn(async move { gritty::daemon::run(&ctl, None).await });
-    tokio::time::sleep(Duration::from_millis(200)).await;
+    wait_for_daemon(&ctl_path).await;
 
     let _id = create_session(&ctl_path, "reapme").await;
 
@@ -472,12 +465,11 @@ async fn session_natural_exit_reaps_from_list() {
 
 #[tokio::test]
 async fn list_before_session_ready() {
-    let _permit = CONCURRENCY.acquire().await.unwrap();
     let (_tmp, ctl_path) = test_ctl();
 
     let ctl = ctl_path.clone();
     let _daemon = tokio::spawn(async move { gritty::daemon::run(&ctl, None).await });
-    tokio::time::sleep(Duration::from_millis(200)).await;
+    wait_for_daemon(&ctl_path).await;
 
     // Create session via NewSession (don't wait the usual 200ms from helper)
     let resp = control_request(&ctl_path, Frame::NewSession { name: "early".to_string() }).await;
@@ -502,12 +494,11 @@ async fn list_before_session_ready() {
 
 #[tokio::test]
 async fn kill_session_while_client_connected() {
-    let _permit = CONCURRENCY.acquire().await.unwrap();
     let (_tmp, ctl_path) = test_ctl();
 
     let ctl = ctl_path.clone();
     let _daemon = tokio::spawn(async move { gritty::daemon::run(&ctl, None).await });
-    tokio::time::sleep(Duration::from_millis(200)).await;
+    wait_for_daemon(&ctl_path).await;
 
     let id = create_session(&ctl_path, "kill-conn").await;
 
@@ -538,12 +529,11 @@ async fn kill_session_while_client_connected() {
 
 #[tokio::test]
 async fn session_metadata_has_pty_and_pid() {
-    let _permit = CONCURRENCY.acquire().await.unwrap();
     let (_tmp, ctl_path) = test_ctl();
 
     let ctl = ctl_path.clone();
     let _daemon = tokio::spawn(async move { gritty::daemon::run(&ctl, None).await });
-    tokio::time::sleep(Duration::from_millis(200)).await;
+    wait_for_daemon(&ctl_path).await;
 
     let id = create_session(&ctl_path, "metacheck").await;
 
@@ -572,12 +562,11 @@ async fn session_metadata_has_pty_and_pid() {
 
 #[tokio::test]
 async fn attach_to_session() {
-    let _permit = CONCURRENCY.acquire().await.unwrap();
     let (_tmp, ctl_path) = test_ctl();
 
     let ctl = ctl_path.clone();
     let _daemon = tokio::spawn(async move { gritty::daemon::run(&ctl, None).await });
-    tokio::time::sleep(Duration::from_millis(200)).await;
+    wait_for_daemon(&ctl_path).await;
 
     let id = create_session(&ctl_path, "attachme").await;
 
@@ -602,12 +591,11 @@ async fn attach_to_session() {
 
 #[tokio::test]
 async fn attach_by_name() {
-    let _permit = CONCURRENCY.acquire().await.unwrap();
     let (_tmp, ctl_path) = test_ctl();
 
     let ctl = ctl_path.clone();
     let _daemon = tokio::spawn(async move { gritty::daemon::run(&ctl, None).await });
-    tokio::time::sleep(Duration::from_millis(200)).await;
+    wait_for_daemon(&ctl_path).await;
 
     let id = create_session(&ctl_path, "namedattach").await;
 
@@ -632,12 +620,11 @@ async fn attach_by_name() {
 
 #[tokio::test]
 async fn attach_nonexistent_returns_error() {
-    let _permit = CONCURRENCY.acquire().await.unwrap();
     let (_tmp, ctl_path) = test_ctl();
 
     let ctl = ctl_path.clone();
     let _daemon = tokio::spawn(async move { gritty::daemon::run(&ctl, None).await });
-    tokio::time::sleep(Duration::from_millis(200)).await;
+    wait_for_daemon(&ctl_path).await;
 
     let resp =
         control_request(&ctl_path, Frame::Attach { session: "nonexistent".to_string() }).await;
@@ -651,12 +638,11 @@ async fn attach_nonexistent_returns_error() {
 /// not Ok followed by a silent disconnect.
 #[tokio::test]
 async fn attach_dead_session_returns_error() {
-    let _permit = CONCURRENCY.acquire().await.unwrap();
     let (_tmp, ctl_path) = test_ctl();
 
     let ctl = ctl_path.clone();
     let _daemon = tokio::spawn(async move { gritty::daemon::run(&ctl, None).await });
-    tokio::time::sleep(Duration::from_millis(200)).await;
+    wait_for_daemon(&ctl_path).await;
 
     let id = create_session(&ctl_path, "dying").await;
 
@@ -696,12 +682,11 @@ async fn attach_dead_session_returns_error() {
 /// not Ok for a stale entry.
 #[tokio::test]
 async fn kill_dead_session_returns_error() {
-    let _permit = CONCURRENCY.acquire().await.unwrap();
     let (_tmp, ctl_path) = test_ctl();
 
     let ctl = ctl_path.clone();
     let _daemon = tokio::spawn(async move { gritty::daemon::run(&ctl, None).await });
-    tokio::time::sleep(Duration::from_millis(200)).await;
+    wait_for_daemon(&ctl_path).await;
 
     let id = create_session(&ctl_path, "dying2").await;
 
@@ -739,12 +724,11 @@ async fn kill_dead_session_returns_error() {
 
 #[tokio::test]
 async fn list_sessions_shows_heartbeat() {
-    let _permit = CONCURRENCY.acquire().await.unwrap();
     let (_tmp, ctl_path) = test_ctl();
 
     let ctl = ctl_path.clone();
     let _daemon = tokio::spawn(async move { gritty::daemon::run(&ctl, None).await });
-    tokio::time::sleep(Duration::from_millis(200)).await;
+    wait_for_daemon(&ctl_path).await;
 
     let id = create_session(&ctl_path, "hbtest").await;
 
@@ -781,12 +765,11 @@ async fn list_sessions_shows_heartbeat() {
 
 #[tokio::test]
 async fn reconnect_via_daemon_after_disconnect() {
-    let _permit = CONCURRENCY.acquire().await.unwrap();
     let (_tmp, ctl_path) = test_ctl();
 
     let ctl = ctl_path.clone();
     let _daemon = tokio::spawn(async move { gritty::daemon::run(&ctl, None).await });
-    tokio::time::sleep(Duration::from_millis(200)).await;
+    wait_for_daemon(&ctl_path).await;
 
     let id = create_session(&ctl_path, "reconn").await;
 
@@ -832,12 +815,11 @@ async fn reconnect_via_daemon_after_disconnect() {
 
 #[tokio::test]
 async fn reconnect_after_session_killed_returns_error() {
-    let _permit = CONCURRENCY.acquire().await.unwrap();
     let (_tmp, ctl_path) = test_ctl();
 
     let ctl = ctl_path.clone();
     let _daemon = tokio::spawn(async move { gritty::daemon::run(&ctl, None).await });
-    tokio::time::sleep(Duration::from_millis(200)).await;
+    wait_for_daemon(&ctl_path).await;
 
     let id = create_session(&ctl_path, "doomed-reconn").await;
 
@@ -864,12 +846,11 @@ async fn reconnect_after_session_killed_returns_error() {
 
 #[tokio::test]
 async fn tail_request() {
-    let _permit = CONCURRENCY.acquire().await.unwrap();
     let (_tmp, ctl_path) = test_ctl();
 
     let ctl = ctl_path.clone();
     let _daemon = tokio::spawn(async move { gritty::daemon::run(&ctl, None).await });
-    tokio::time::sleep(Duration::from_millis(200)).await;
+    wait_for_daemon(&ctl_path).await;
 
     let id = create_session(&ctl_path, "tailtarget").await;
 
@@ -882,12 +863,11 @@ async fn tail_request() {
 
 #[tokio::test]
 async fn tail_nonexistent_returns_error() {
-    let _permit = CONCURRENCY.acquire().await.unwrap();
     let (_tmp, ctl_path) = test_ctl();
 
     let ctl = ctl_path.clone();
     let _daemon = tokio::spawn(async move { gritty::daemon::run(&ctl, None).await });
-    tokio::time::sleep(Duration::from_millis(200)).await;
+    wait_for_daemon(&ctl_path).await;
 
     let resp = control_request(&ctl_path, Frame::Tail { session: "nonexistent".to_string() }).await;
     assert!(
@@ -898,12 +878,11 @@ async fn tail_nonexistent_returns_error() {
 
 #[tokio::test]
 async fn daemon_rejects_non_hello_first_frame() {
-    let _permit = CONCURRENCY.acquire().await.unwrap();
     let (_tmp, ctl_path) = test_ctl();
 
     let ctl = ctl_path.clone();
     let _daemon = tokio::spawn(async move { gritty::daemon::run(&ctl, None).await });
-    tokio::time::sleep(Duration::from_millis(200)).await;
+    wait_for_daemon(&ctl_path).await;
 
     // Send a ListSessions frame without Hello first
     let stream = UnixStream::connect(&ctl_path).await.unwrap();

@@ -10,7 +10,7 @@ build:
 # Clippy (strict) then full test suite — the pre-push gate
 check:
     cargo clippy -- -D warnings
-    cargo test
+    cargo nextest run
 
 # Format all source files
 fmt:
@@ -22,31 +22,31 @@ fmt-check:
 
 # Run tests (pass args to filter, e.g. `just test session_natural`)
 test *args:
-    cargo test {{ args }}
+    cargo nextest run {{ args }}
 
 # Protocol codec unit tests only
 test-protocol:
-    cargo test --test protocol_test
+    cargo nextest run --test protocol_test
 
 # E2E session integration tests only
 test-e2e:
-    cargo test --test e2e_test
+    cargo nextest run --test e2e_test
 
 # Daemon integration tests only
 test-daemon:
-    cargo test --test daemon_test
+    cargo nextest run --test daemon_test
 
-# SSH integration tests (requires sshd + ssh localhost)
+# SSH integration tests (requires sshd + ssh localhost; skips gracefully if missing)
 test-ssh:
-    GRITTY_SSH_TEST=1 cargo test --test ssh_integration_test -- --test-threads=1
+    cargo nextest run --test ssh_integration_test -j 1
 
 # Socat tunnel disruption tests (requires socat; skips gracefully if missing)
 test-socat:
-    cargo test --test socat_tunnel_test -- --test-threads=1
+    cargo nextest run --test socat_tunnel_test -j 1
 
 # Socat bridge integration tests (requires socat; skips gracefully if missing)
 test-socat-bridge:
-    cargo test --test socat_bridge_test -- --test-threads=1
+    cargo nextest run --test socat_bridge_test -j 1
 
 # Run full suite N times and report pass/fail tally
 stress count="10":
@@ -54,7 +54,7 @@ stress count="10":
     pass=0 fail=0
     for i in $(seq 1 {{ count }}); do
         echo -n "Run $i/{{ count }}: "
-        if cargo test 2>&1 | grep -q "FAILED"; then
+        if ! cargo nextest run &>/dev/null; then
             echo "FAILED"
             ((fail++))
         else
@@ -79,11 +79,11 @@ quicktest:
 
 # Test coverage summary
 coverage:
-    cargo llvm-cov
+    cargo llvm-cov nextest
 
 # Test coverage with HTML report
 coverage-html:
-    cargo llvm-cov --html
+    cargo llvm-cov nextest --html
     @echo "Report: target/llvm-cov/html/index.html"
 
 # Clean coverage artifacts
@@ -98,7 +98,7 @@ cargo-upgrade *args:
     cargo-upgrade upgrade {{ args }}
     cargo update
     cargo clippy -- -D warnings
-    cargo test
+    cargo nextest run
 
 # Clean all build artifacts
 clean:

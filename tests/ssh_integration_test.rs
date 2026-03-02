@@ -1,11 +1,22 @@
 use std::path::PathBuf;
-use std::process::{Command, Output};
+use std::process::{Command, Output, Stdio};
 use std::time::Duration;
 
-macro_rules! skip_unless_ssh {
+macro_rules! skip_if_no_ssh {
     () => {
-        if std::env::var("GRITTY_SSH_TEST").is_err() {
-            eprintln!("skipping (set GRITTY_SSH_TEST=1 to enable)");
+        if std::env::var("GRITTY_SSH_TEST").as_deref() == Ok("0") {
+            eprintln!("skipping (GRITTY_SSH_TEST=0)");
+            return;
+        }
+        if !Command::new("ssh")
+            .args(["-o", "BatchMode=yes", "-o", "ConnectTimeout=2", "localhost", "true"])
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .map(|s| s.success())
+            .unwrap_or(false)
+        {
+            eprintln!("skipping (ssh localhost not available)");
             return;
         }
     };
@@ -71,7 +82,7 @@ impl TestEnv {
 
 #[test]
 fn connect_and_list_tunnels() {
-    skip_unless_ssh!();
+    skip_if_no_ssh!();
 
     let env = TestEnv::new();
     let name = "ssh-test-list";
@@ -96,7 +107,7 @@ fn connect_and_list_tunnels() {
 
 #[test]
 fn connect_list_sessions_empty() {
-    skip_unless_ssh!();
+    skip_if_no_ssh!();
 
     let env = TestEnv::new();
     let name = "ssh-test-empty";
@@ -113,7 +124,7 @@ fn connect_list_sessions_empty() {
 
 #[test]
 fn connect_disconnect_reconnect() {
-    skip_unless_ssh!();
+    skip_if_no_ssh!();
 
     let env = TestEnv::new();
     let name = "ssh-test-reconnect";
@@ -135,7 +146,7 @@ fn connect_disconnect_reconnect() {
 
 #[test]
 fn connect_with_custom_name() {
-    skip_unless_ssh!();
+    skip_if_no_ssh!();
 
     let env = TestEnv::new();
     let name = "mydev-test";
@@ -158,7 +169,7 @@ fn connect_with_custom_name() {
 
 #[test]
 fn connect_info_shows_tunnel() {
-    skip_unless_ssh!();
+    skip_if_no_ssh!();
 
     let env = TestEnv::new();
     let name = "ssh-test-info";
@@ -173,7 +184,7 @@ fn connect_info_shows_tunnel() {
 
 #[test]
 fn connect_foreground_mode() {
-    skip_unless_ssh!();
+    skip_if_no_ssh!();
 
     let env = TestEnv::new();
     let name = "ssh-test-fg";

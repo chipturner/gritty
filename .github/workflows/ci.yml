@@ -25,6 +25,8 @@ jobs:
 
       - uses: Swatinem/rust-cache@v2
 
+      - uses: taiki-e/install-action@nextest
+
       - name: Format
         if: matrix.os == 'ubuntu-latest'
         run: cargo fmt --check
@@ -33,7 +35,7 @@ jobs:
         run: cargo clippy -- -D warnings
 
       - name: Test
-        run: cargo test --locked
+        run: cargo nextest run --locked
 
   ssh-integration:
     name: SSH Integration (${{ matrix.os }})
@@ -79,6 +81,8 @@ jobs:
           # Verify SSH works
           ssh -o BatchMode=yes -o StrictHostKeyChecking=no localhost whoami
 
+      - uses: taiki-e/install-action@nextest
+
       - name: Build and install gritty
         run: |
           cargo build
@@ -87,7 +91,7 @@ jobs:
           echo "$HOME/.local/bin" >> "$GITHUB_PATH"
 
       - name: SSH integration tests
-        run: GRITTY_SSH_TEST=1 cargo test --test ssh_integration_test -- --test-threads=1
+        run: cargo nextest run --test ssh_integration_test -j 1
 
   socat-tunnel:
     name: Socat Tunnel Tests
@@ -99,6 +103,8 @@ jobs:
 
       - uses: Swatinem/rust-cache@v2
 
+      - uses: taiki-e/install-action@nextest
+
       - name: Install socat
         run: sudo apt-get update && sudo apt-get install -y socat
 
@@ -106,7 +112,7 @@ jobs:
         run: cargo build
 
       - name: Socat tunnel tests
-        run: cargo test --test socat_tunnel_test -- --test-threads=1
+        run: cargo nextest run --test socat_tunnel_test -j 1
 
   socat-bridge:
     name: Socat Bridge Tests
@@ -118,6 +124,8 @@ jobs:
 
       - uses: Swatinem/rust-cache@v2
 
+      - uses: taiki-e/install-action@nextest
+
       - name: Install socat
         run: sudo apt-get update && sudo apt-get install -y socat
 
@@ -125,4 +133,4 @@ jobs:
         run: cargo build
 
       - name: Socat bridge tests
-        run: cargo test --test socat_bridge_test -- --test-threads=1
+        run: cargo nextest run --test socat_bridge_test -j 1
