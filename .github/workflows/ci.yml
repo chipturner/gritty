@@ -99,8 +99,30 @@ jobs:
 
       - uses: Swatinem/rust-cache@v2
 
+      - name: Install socat
+        run: sudo apt-get update && sudo apt-get install -y socat
+
       - name: Build
         run: cargo build
 
       - name: Socat tunnel tests
         run: cargo test --test socat_tunnel_test -- --test-threads=1
+
+  socat-bridge:
+    name: Socat Bridge Tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Install socat
+        run: sudo apt-get update && sudo apt-get install -y socat
+
+      - name: Build
+        run: cargo build
+
+      - name: Socat bridge tests
+        run: cargo test --test socat_bridge_test -- --test-threads=1

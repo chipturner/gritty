@@ -44,6 +44,10 @@ test-ssh:
 test-socat:
     cargo test --test socat_tunnel_test -- --test-threads=1
 
+# Socat bridge integration tests (requires socat; skips gracefully if missing)
+test-socat-bridge:
+    cargo test --test socat_bridge_test -- --test-threads=1
+
 # Run full suite N times and report pass/fail tally
 stress count="10":
     #!/usr/bin/env zsh

@@ -45,15 +45,23 @@ fn start_server(ctl_sock: &std::path::Path) -> Child {
 }
 
 fn start_socat_proxy(listen: &std::path::Path, connect: &std::path::Path) -> Child {
-    Command::new("socat")
-        .args([
-            &format!("UNIX-LISTEN:{},fork", listen.display()),
-            &format!("UNIX-CONNECT:{}", connect.display()),
-        ])
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .spawn()
-        .expect("failed to start socat proxy")
+    use std::os::unix::process::CommandExt;
+    unsafe {
+        Command::new("socat")
+            .args([
+                &format!("UNIX-LISTEN:{},fork", listen.display()),
+                &format!("UNIX-CONNECT:{}", connect.display()),
+            ])
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            // Make socat a process group leader so killpg() reaps forked children.
+            .pre_exec(|| {
+                libc::setpgid(0, 0);
+                Ok(())
+            })
+            .spawn()
+            .expect("failed to start socat proxy")
+    }
 }
 
 fn wait_for_socket(path: &std::path::Path, timeout_secs: u64) {
@@ -92,7 +100,7 @@ struct SocatGuard(Child);
 
 impl Drop for SocatGuard {
     fn drop(&mut self) {
-        let _ = self.0.kill();
+        unsafe { libc::killpg(self.0.id() as libc::pid_t, libc::SIGKILL) };
         let _ = self.0.wait();
     }
 }
