@@ -862,7 +862,9 @@ pub async fn run(
                             }
                             Ok(Ok(n)) => {
                                 let chunk = Bytes::copy_from_slice(&buf[..n]);
-                                let _ = tail_tx.send(TailEvent::Data(chunk.clone()));
+                                if tail_tx.receiver_count() > 0 {
+                                    let _ = tail_tx.send(TailEvent::Data(chunk.clone()));
+                                }
                                 ring_buf_size += chunk.len();
                                 ring_buf.push_back(chunk);
                                 while ring_buf_size > RING_BUF_CAP {
@@ -1093,7 +1095,9 @@ pub async fn run(
                         Ok(Ok(n)) => {
                             debug!(len = n, "pty -> socket");
                             let chunk = Bytes::copy_from_slice(&buf[..n]);
-                            let _ = tail_tx.send(TailEvent::Data(chunk.clone()));
+                            if tail_tx.receiver_count() > 0 {
+                                let _ = tail_tx.send(TailEvent::Data(chunk.clone()));
+                            }
                             framed.send(Frame::Data(chunk)).await?;
                         }
                         Ok(Err(e)) => {
