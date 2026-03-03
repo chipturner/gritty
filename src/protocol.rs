@@ -244,6 +244,54 @@ fn encode_str(dst: &mut BytesMut, ty: u8, s: &str) {
     dst.extend_from_slice(s.as_bytes());
 }
 
+fn encode_blob(dst: &mut BytesMut, ty: u8, data: &[u8]) {
+    dst.put_u8(ty);
+    dst.put_u32(data.len() as u32);
+    dst.extend_from_slice(data);
+}
+
+fn encode_prefix_blob(dst: &mut BytesMut, ty: u8, prefix: u32, data: &[u8]) {
+    dst.put_u8(ty);
+    dst.put_u32(4 + data.len() as u32);
+    dst.put_u32(prefix);
+    dst.extend_from_slice(data);
+}
+
+fn encode_env(dst: &mut BytesMut, vars: &[(String, String)]) {
+    let body_len: usize = 4 + vars.iter().map(|(k, v)| 2 + k.len() + 2 + v.len()).sum::<usize>();
+    dst.put_u8(TYPE_ENV);
+    dst.put_u32(body_len as u32);
+    dst.put_u32(vars.len() as u32);
+    for (k, v) in vars {
+        dst.put_u16(k.len() as u16);
+        dst.extend_from_slice(k.as_bytes());
+        dst.put_u16(v.len() as u16);
+        dst.extend_from_slice(v.as_bytes());
+    }
+}
+
+fn encode_session_info(dst: &mut BytesMut, sessions: &[SessionEntry]) {
+    let body_len: usize = 4 + sessions
+        .iter()
+        .map(|e| 2 + e.id.len() + 2 + e.name.len() + 2 + e.pty_path.len() + 21)
+        .sum::<usize>();
+    dst.put_u8(TYPE_SESSION_INFO);
+    dst.put_u32(body_len as u32);
+    dst.put_u32(sessions.len() as u32);
+    for e in sessions {
+        dst.put_u16(e.id.len() as u16);
+        dst.extend_from_slice(e.id.as_bytes());
+        dst.put_u16(e.name.len() as u16);
+        dst.extend_from_slice(e.name.as_bytes());
+        dst.put_u16(e.pty_path.len() as u16);
+        dst.extend_from_slice(e.pty_path.as_bytes());
+        dst.put_u32(e.shell_pid);
+        dst.put_u64(e.created_at);
+        dst.put_u8(if e.attached { 1 } else { 0 });
+        dst.put_u64(e.last_heartbeat);
+    }
+}
+
 fn decode_string(payload: BytesMut) -> Result<String, io::Error> {
     String::from_utf8(payload.to_vec()).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))
 }
@@ -303,6 +351,145 @@ fn read_u64(payload: &[u8], offset: usize) -> u64 {
     ])
 }
 
+/// Auto-offset-tracking reader for decoding fixed-field payloads.
+struct PayloadReader<'a> {
+    data: &'a [u8],
+    off: usize,
+}
+
+impl<'a> PayloadReader<'a> {
+    fn new(data: &'a [u8]) -> Self {
+        Self { data, off: 0 }
+    }
+
+    fn u16(&mut self) -> u16 {
+        let v = read_u16(self.data, self.off);
+        self.off += 2;
+        v
+    }
+
+    fn u32(&mut self) -> u32 {
+        let v = read_u32(self.data, self.off);
+        self.off += 4;
+        v
+    }
+
+    fn i32(&mut self) -> i32 {
+        let v = read_i32(self.data, self.off);
+        self.off += 4;
+        v
+    }
+
+    fn u64(&mut self) -> u64 {
+        let v = read_u64(self.data, self.off);
+        self.off += 8;
+        v
+    }
+
+    fn offset(&self) -> usize {
+        self.off
+    }
+}
+
+/// Encode a fixed-field frame: writes type byte, auto-computes payload length, writes fields.
+macro_rules! encode_fields {
+    ($dst:expr, $ty:expr $(, $val:expr => $method:ident)*) => {{
+        let payload_len: u32 = 0 $(+ encode_fields!(@size $method))*;
+        $dst.put_u8($ty);
+        $dst.put_u32(payload_len);
+        $($dst.$method($val);)*
+    }};
+    (@size put_u8) => { 1 };
+    (@size put_u16) => { 2 };
+    (@size put_u32) => { 4 };
+    (@size put_i32) => { 4 };
+    (@size put_u64) => { 8 };
+}
+
+fn decode_env(payload: BytesMut) -> Result<Option<Frame>, io::Error> {
+    let p = &payload[..];
+    if p.len() < 4 {
+        return Err(io::Error::new(io::ErrorKind::InvalidData, "env frame too short"));
+    }
+    let count = read_u32(p, 0) as usize;
+    let mut off = 4;
+    let mut vars = Vec::with_capacity(count);
+    for _ in 0..count {
+        if off + 2 > p.len() {
+            return Err(io::Error::new(io::ErrorKind::InvalidData, "env frame truncated"));
+        }
+        let klen = read_u16(p, off) as usize;
+        off += 2;
+        if off + klen + 2 > p.len() {
+            return Err(io::Error::new(io::ErrorKind::InvalidData, "env frame truncated"));
+        }
+        let key = String::from_utf8(p[off..off + klen].to_vec())
+            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+        off += klen;
+        let vlen = read_u16(p, off) as usize;
+        off += 2;
+        if off + vlen > p.len() {
+            return Err(io::Error::new(io::ErrorKind::InvalidData, "env frame truncated"));
+        }
+        let val = String::from_utf8(p[off..off + vlen].to_vec())
+            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+        off += vlen;
+        vars.push((key, val));
+    }
+    Ok(Some(Frame::Env { vars }))
+}
+
+fn decode_session_info(payload: BytesMut) -> Result<Option<Frame>, io::Error> {
+    let p = &payload[..];
+    if p.len() < 4 {
+        return Err(io::Error::new(io::ErrorKind::InvalidData, "session info frame too short"));
+    }
+    let count = read_u32(p, 0) as usize;
+    let mut off = 4;
+    let mut sessions = Vec::with_capacity(count);
+    let read_str = |p: &[u8], off: &mut usize| -> Result<String, io::Error> {
+        if *off + 2 > p.len() {
+            return Err(io::Error::new(io::ErrorKind::InvalidData, "session info truncated"));
+        }
+        let len = read_u16(p, *off) as usize;
+        *off += 2;
+        if *off + len > p.len() {
+            return Err(io::Error::new(io::ErrorKind::InvalidData, "session info truncated"));
+        }
+        let s = String::from_utf8(p[*off..*off + len].to_vec())
+            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+        *off += len;
+        Ok(s)
+    };
+    for _ in 0..count {
+        let id = read_str(p, &mut off)?;
+        let name = read_str(p, &mut off)?;
+        let pty_path = read_str(p, &mut off)?;
+        // Fixed fields: shell_pid(4) + created_at(8) + attached(1) + last_heartbeat(8) = 21
+        if off + 21 > p.len() {
+            return Err(io::Error::new(io::ErrorKind::InvalidData, "session info truncated"));
+        }
+        let shell_pid = read_u32(p, off);
+        off += 4;
+        let created_at = read_u64(p, off);
+        off += 8;
+        let attached = p[off] != 0;
+        off += 1;
+        let last_heartbeat = read_u64(p, off);
+        off += 8;
+        sessions.push(SessionEntry {
+            id,
+            name,
+            pty_path,
+            shell_pid,
+            created_at,
+            attached,
+            last_heartbeat,
+        });
+    }
+    Ok(Some(Frame::SessionInfo { sessions }))
+}
+
 impl Decoder for FrameCodec {
     type Item = Frame;
     type Error = io::Error;
@@ -331,126 +518,118 @@ impl Decoder for FrameCodec {
         let payload = src.split_to(payload_len);
 
         match frame_type {
+            // Blob frames
             TYPE_DATA => Ok(Some(Frame::Data(payload.freeze()))),
+            TYPE_TUNNEL_DATA => Ok(Some(Frame::TunnelData(payload.freeze()))),
+
+            // Fixed-field frames (PayloadReader auto-tracks offsets)
             TYPE_RESIZE => {
                 expect_len(&payload, 4, "resize")?;
-                Ok(Some(Frame::Resize { cols: read_u16(&payload, 0), rows: read_u16(&payload, 2) }))
+                let mut r = PayloadReader::new(&payload);
+                Ok(Some(Frame::Resize { cols: r.u16(), rows: r.u16() }))
             }
             TYPE_EXIT => {
                 expect_len(&payload, 4, "exit")?;
-                Ok(Some(Frame::Exit { code: read_i32(&payload, 0) }))
+                Ok(Some(Frame::Exit { code: PayloadReader::new(&payload).i32() }))
             }
-            TYPE_DETACHED => Ok(Some(Frame::Detached)),
-            TYPE_PING => Ok(Some(Frame::Ping)),
-            TYPE_PONG => Ok(Some(Frame::Pong)),
-            TYPE_ENV => {
-                let p = &payload[..];
-                if p.len() < 4 {
-                    return Err(io::Error::new(io::ErrorKind::InvalidData, "env frame too short"));
-                }
-                let count = read_u32(p, 0) as usize;
-                let mut off = 4;
-                let mut vars = Vec::with_capacity(count);
-                for _ in 0..count {
-                    if off + 2 > p.len() {
-                        return Err(io::Error::new(
-                            io::ErrorKind::InvalidData,
-                            "env frame truncated",
-                        ));
-                    }
-                    let klen = read_u16(p, off) as usize;
-                    off += 2;
-                    if off + klen + 2 > p.len() {
-                        return Err(io::Error::new(
-                            io::ErrorKind::InvalidData,
-                            "env frame truncated",
-                        ));
-                    }
-                    let key = String::from_utf8(p[off..off + klen].to_vec())
-                        .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
-                    off += klen;
-                    let vlen = read_u16(p, off) as usize;
-                    off += 2;
-                    if off + vlen > p.len() {
-                        return Err(io::Error::new(
-                            io::ErrorKind::InvalidData,
-                            "env frame truncated",
-                        ));
-                    }
-                    let val = String::from_utf8(p[off..off + vlen].to_vec())
-                        .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
-                    off += vlen;
-                    vars.push((key, val));
-                }
-                Ok(Some(Frame::Env { vars }))
+            TYPE_HELLO => {
+                expect_len(&payload, 2, "hello")?;
+                Ok(Some(Frame::Hello { version: PayloadReader::new(&payload).u16() }))
             }
-            TYPE_AGENT_FORWARD => Ok(Some(Frame::AgentForward)),
+            TYPE_HELLO_ACK => {
+                expect_len(&payload, 2, "hello ack")?;
+                Ok(Some(Frame::HelloAck { version: PayloadReader::new(&payload).u16() }))
+            }
             TYPE_AGENT_OPEN => {
                 expect_len(&payload, 4, "agent open")?;
-                Ok(Some(Frame::AgentOpen { channel_id: read_u32(&payload, 0) }))
-            }
-            TYPE_AGENT_DATA => {
-                expect_min_len(&payload, 4, "agent data")?;
-                let channel_id = read_u32(&payload, 0);
-                let data = payload.freeze().slice(4..);
-                Ok(Some(Frame::AgentData { channel_id, data }))
+                Ok(Some(Frame::AgentOpen { channel_id: PayloadReader::new(&payload).u32() }))
             }
             TYPE_AGENT_CLOSE => {
                 expect_len(&payload, 4, "agent close")?;
-                Ok(Some(Frame::AgentClose { channel_id: read_u32(&payload, 0) }))
+                Ok(Some(Frame::AgentClose { channel_id: PayloadReader::new(&payload).u32() }))
             }
-            TYPE_OPEN_FORWARD => Ok(Some(Frame::OpenForward)),
-            TYPE_OPEN_URL => Ok(Some(Frame::OpenUrl { url: decode_string(payload)? })),
             TYPE_TUNNEL_LISTEN => {
                 expect_len(&payload, 2, "tunnel listen")?;
-                Ok(Some(Frame::TunnelListen { port: read_u16(&payload, 0) }))
+                Ok(Some(Frame::TunnelListen { port: PayloadReader::new(&payload).u16() }))
             }
-            TYPE_TUNNEL_OPEN => Ok(Some(Frame::TunnelOpen)),
-            TYPE_TUNNEL_DATA => Ok(Some(Frame::TunnelData(payload.freeze()))),
-            TYPE_TUNNEL_CLOSE => Ok(Some(Frame::TunnelClose)),
             TYPE_SEND_OFFER => {
                 expect_len(&payload, 12, "send offer")?;
-                Ok(Some(Frame::SendOffer {
-                    file_count: read_u32(&payload, 0),
-                    total_bytes: read_u64(&payload, 4),
-                }))
+                let mut r = PayloadReader::new(&payload);
+                Ok(Some(Frame::SendOffer { file_count: r.u32(), total_bytes: r.u64() }))
             }
-            TYPE_SEND_DONE => Ok(Some(Frame::SendDone)),
-            TYPE_SEND_CANCEL => Ok(Some(Frame::SendCancel { reason: decode_string(payload)? })),
             TYPE_PORT_FORWARD_LISTEN => {
                 expect_len(&payload, 8, "port forward listen")?;
+                let mut r = PayloadReader::new(&payload);
                 Ok(Some(Frame::PortForwardListen {
-                    forward_id: read_u32(&payload, 0),
-                    listen_port: read_u16(&payload, 4),
-                    target_port: read_u16(&payload, 6),
+                    forward_id: r.u32(),
+                    listen_port: r.u16(),
+                    target_port: r.u16(),
                 }))
             }
             TYPE_PORT_FORWARD_READY => {
                 expect_len(&payload, 4, "port forward ready")?;
-                Ok(Some(Frame::PortForwardReady { forward_id: read_u32(&payload, 0) }))
+                Ok(Some(Frame::PortForwardReady { forward_id: PayloadReader::new(&payload).u32() }))
             }
             TYPE_PORT_FORWARD_OPEN => {
                 expect_len(&payload, 10, "port forward open")?;
+                let mut r = PayloadReader::new(&payload);
                 Ok(Some(Frame::PortForwardOpen {
-                    forward_id: read_u32(&payload, 0),
-                    channel_id: read_u32(&payload, 4),
-                    target_port: read_u16(&payload, 8),
+                    forward_id: r.u32(),
+                    channel_id: r.u32(),
+                    target_port: r.u16(),
                 }))
-            }
-            TYPE_PORT_FORWARD_DATA => {
-                expect_min_len(&payload, 4, "port forward data")?;
-                let channel_id = read_u32(&payload, 0);
-                let data = payload.freeze().slice(4..);
-                Ok(Some(Frame::PortForwardData { channel_id, data }))
             }
             TYPE_PORT_FORWARD_CLOSE => {
                 expect_len(&payload, 4, "port forward close")?;
-                Ok(Some(Frame::PortForwardClose { channel_id: read_u32(&payload, 0) }))
+                Ok(Some(Frame::PortForwardClose { channel_id: PayloadReader::new(&payload).u32() }))
             }
             TYPE_PORT_FORWARD_STOP => {
                 expect_len(&payload, 4, "port forward stop")?;
-                Ok(Some(Frame::PortForwardStop { forward_id: read_u32(&payload, 0) }))
+                Ok(Some(Frame::PortForwardStop { forward_id: PayloadReader::new(&payload).u32() }))
             }
+
+            // Prefix + blob frames (fixed header, trailing bytes)
+            TYPE_AGENT_DATA => {
+                expect_min_len(&payload, 4, "agent data")?;
+                let mut r = PayloadReader::new(&payload);
+                let channel_id = r.u32();
+                let off = r.offset();
+                Ok(Some(Frame::AgentData { channel_id, data: payload.freeze().slice(off..) }))
+            }
+            TYPE_PORT_FORWARD_DATA => {
+                expect_min_len(&payload, 4, "port forward data")?;
+                let mut r = PayloadReader::new(&payload);
+                let channel_id = r.u32();
+                let off = r.offset();
+                Ok(Some(Frame::PortForwardData { channel_id, data: payload.freeze().slice(off..) }))
+            }
+
+            // Empty frames
+            TYPE_DETACHED => Ok(Some(Frame::Detached)),
+            TYPE_PING => Ok(Some(Frame::Ping)),
+            TYPE_PONG => Ok(Some(Frame::Pong)),
+            TYPE_AGENT_FORWARD => Ok(Some(Frame::AgentForward)),
+            TYPE_OPEN_FORWARD => Ok(Some(Frame::OpenForward)),
+            TYPE_TUNNEL_OPEN => Ok(Some(Frame::TunnelOpen)),
+            TYPE_TUNNEL_CLOSE => Ok(Some(Frame::TunnelClose)),
+            TYPE_SEND_DONE => Ok(Some(Frame::SendDone)),
+            TYPE_LIST_SESSIONS => Ok(Some(Frame::ListSessions)),
+            TYPE_KILL_SERVER => Ok(Some(Frame::KillServer)),
+            TYPE_OK => Ok(Some(Frame::Ok)),
+
+            // String frames
+            TYPE_OPEN_URL => Ok(Some(Frame::OpenUrl { url: decode_string(payload)? })),
+            TYPE_SEND_CANCEL => Ok(Some(Frame::SendCancel { reason: decode_string(payload)? })),
+            TYPE_NEW_SESSION => Ok(Some(Frame::NewSession { name: decode_string(payload)? })),
+            TYPE_ATTACH => Ok(Some(Frame::Attach { session: decode_string(payload)? })),
+            TYPE_TAIL => Ok(Some(Frame::Tail { session: decode_string(payload)? })),
+            TYPE_KILL_SESSION => Ok(Some(Frame::KillSession { session: decode_string(payload)? })),
+            TYPE_SESSION_CREATED => Ok(Some(Frame::SessionCreated { id: decode_string(payload)? })),
+            TYPE_ERROR => Ok(Some(Frame::Error { message: decode_string(payload)? })),
+
+            // Custom frames
+            TYPE_ENV => decode_env(payload),
+            TYPE_SESSION_INFO => decode_session_info(payload),
             TYPE_SEND_FILE => {
                 expect_min_len(&payload, 1, "send file")?;
                 let role = payload[payload.len() - 1];
@@ -458,85 +637,7 @@ impl Decoder for FrameCodec {
                     .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
                 Ok(Some(Frame::SendFile { session, role }))
             }
-            TYPE_HELLO => {
-                expect_len(&payload, 2, "hello")?;
-                Ok(Some(Frame::Hello { version: read_u16(&payload, 0) }))
-            }
-            TYPE_HELLO_ACK => {
-                expect_len(&payload, 2, "hello ack")?;
-                Ok(Some(Frame::HelloAck { version: read_u16(&payload, 0) }))
-            }
-            TYPE_NEW_SESSION => Ok(Some(Frame::NewSession { name: decode_string(payload)? })),
-            TYPE_ATTACH => Ok(Some(Frame::Attach { session: decode_string(payload)? })),
-            TYPE_TAIL => Ok(Some(Frame::Tail { session: decode_string(payload)? })),
-            TYPE_LIST_SESSIONS => Ok(Some(Frame::ListSessions)),
-            TYPE_KILL_SESSION => Ok(Some(Frame::KillSession { session: decode_string(payload)? })),
-            TYPE_KILL_SERVER => Ok(Some(Frame::KillServer)),
-            TYPE_SESSION_CREATED => Ok(Some(Frame::SessionCreated { id: decode_string(payload)? })),
-            TYPE_SESSION_INFO => {
-                let p = &payload[..];
-                if p.len() < 4 {
-                    return Err(io::Error::new(
-                        io::ErrorKind::InvalidData,
-                        "session info frame too short",
-                    ));
-                }
-                let count = read_u32(p, 0) as usize;
-                let mut off = 4;
-                let mut sessions = Vec::with_capacity(count);
-                for _ in 0..count {
-                    let read_str = |p: &[u8], off: &mut usize| -> Result<String, io::Error> {
-                        if *off + 2 > p.len() {
-                            return Err(io::Error::new(
-                                io::ErrorKind::InvalidData,
-                                "session info truncated",
-                            ));
-                        }
-                        let len = read_u16(p, *off) as usize;
-                        *off += 2;
-                        if *off + len > p.len() {
-                            return Err(io::Error::new(
-                                io::ErrorKind::InvalidData,
-                                "session info truncated",
-                            ));
-                        }
-                        let s = String::from_utf8(p[*off..*off + len].to_vec())
-                            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
-                        *off += len;
-                        Ok(s)
-                    };
-                    let id = read_str(p, &mut off)?;
-                    let name = read_str(p, &mut off)?;
-                    let pty_path = read_str(p, &mut off)?;
-                    // Fixed fields: shell_pid(4) + created_at(8) + attached(1) + last_heartbeat(8) = 21
-                    if off + 21 > p.len() {
-                        return Err(io::Error::new(
-                            io::ErrorKind::InvalidData,
-                            "session info truncated",
-                        ));
-                    }
-                    let shell_pid = read_u32(p, off);
-                    off += 4;
-                    let created_at = read_u64(p, off);
-                    off += 8;
-                    let attached = p[off] != 0;
-                    off += 1;
-                    let last_heartbeat = read_u64(p, off);
-                    off += 8;
-                    sessions.push(SessionEntry {
-                        id,
-                        name,
-                        pty_path,
-                        shell_pid,
-                        created_at,
-                        attached,
-                        last_heartbeat,
-                    });
-                }
-                Ok(Some(Frame::SessionInfo { sessions }))
-            }
-            TYPE_OK => Ok(Some(Frame::Ok)),
-            TYPE_ERROR => Ok(Some(Frame::Error { message: decode_string(payload)? })),
+
             _ => Err(io::Error::new(
                 io::ErrorKind::InvalidData,
                 format!("unknown frame type: 0x{frame_type:02x}"),
@@ -550,163 +651,93 @@ impl Encoder<Frame> for FrameCodec {
 
     fn encode(&mut self, frame: Frame, dst: &mut BytesMut) -> Result<(), io::Error> {
         match frame {
-            Frame::Data(data) => {
-                dst.put_u8(TYPE_DATA);
-                dst.put_u32(data.len() as u32);
-                dst.extend_from_slice(&data);
-            }
+            // Blob frames
+            Frame::Data(data) => encode_blob(dst, TYPE_DATA, &data),
+            Frame::TunnelData(data) => encode_blob(dst, TYPE_TUNNEL_DATA, &data),
+
+            // Fixed-field frames (encode_fields! auto-computes payload length)
             Frame::Resize { cols, rows } => {
-                dst.put_u8(TYPE_RESIZE);
-                dst.put_u32(4);
-                dst.put_u16(cols);
-                dst.put_u16(rows);
+                encode_fields!(dst, TYPE_RESIZE, cols => put_u16, rows => put_u16);
             }
             Frame::Exit { code } => {
-                dst.put_u8(TYPE_EXIT);
-                dst.put_u32(4);
-                dst.put_i32(code);
+                encode_fields!(dst, TYPE_EXIT, code => put_i32);
             }
+            Frame::Hello { version } => {
+                encode_fields!(dst, TYPE_HELLO, version => put_u16);
+            }
+            Frame::HelloAck { version } => {
+                encode_fields!(dst, TYPE_HELLO_ACK, version => put_u16);
+            }
+            Frame::AgentOpen { channel_id } => {
+                encode_fields!(dst, TYPE_AGENT_OPEN, channel_id => put_u32);
+            }
+            Frame::AgentClose { channel_id } => {
+                encode_fields!(dst, TYPE_AGENT_CLOSE, channel_id => put_u32);
+            }
+            Frame::TunnelListen { port } => {
+                encode_fields!(dst, TYPE_TUNNEL_LISTEN, port => put_u16);
+            }
+            Frame::SendOffer { file_count, total_bytes } => {
+                encode_fields!(dst, TYPE_SEND_OFFER, file_count => put_u32, total_bytes => put_u64);
+            }
+            Frame::PortForwardListen { forward_id, listen_port, target_port } => {
+                encode_fields!(dst, TYPE_PORT_FORWARD_LISTEN,
+                    forward_id => put_u32, listen_port => put_u16, target_port => put_u16);
+            }
+            Frame::PortForwardReady { forward_id } => {
+                encode_fields!(dst, TYPE_PORT_FORWARD_READY, forward_id => put_u32);
+            }
+            Frame::PortForwardOpen { forward_id, channel_id, target_port } => {
+                encode_fields!(dst, TYPE_PORT_FORWARD_OPEN,
+                    forward_id => put_u32, channel_id => put_u32, target_port => put_u16);
+            }
+            Frame::PortForwardClose { channel_id } => {
+                encode_fields!(dst, TYPE_PORT_FORWARD_CLOSE, channel_id => put_u32);
+            }
+            Frame::PortForwardStop { forward_id } => {
+                encode_fields!(dst, TYPE_PORT_FORWARD_STOP, forward_id => put_u32);
+            }
+
+            // Prefix + blob frames
+            Frame::AgentData { channel_id, data } => {
+                encode_prefix_blob(dst, TYPE_AGENT_DATA, channel_id, &data);
+            }
+            Frame::PortForwardData { channel_id, data } => {
+                encode_prefix_blob(dst, TYPE_PORT_FORWARD_DATA, channel_id, &data);
+            }
+
+            // Empty frames
             Frame::Detached => encode_empty(dst, TYPE_DETACHED),
             Frame::Ping => encode_empty(dst, TYPE_PING),
             Frame::Pong => encode_empty(dst, TYPE_PONG),
-            Frame::Env { vars } => {
-                // Binary: [count: u32] [key_len: u16][key][val_len: u16][val] ...
-                let body_len: usize =
-                    4 + vars.iter().map(|(k, v)| 2 + k.len() + 2 + v.len()).sum::<usize>();
-                dst.put_u8(TYPE_ENV);
-                dst.put_u32(body_len as u32);
-                dst.put_u32(vars.len() as u32);
-                for (k, v) in &vars {
-                    dst.put_u16(k.len() as u16);
-                    dst.extend_from_slice(k.as_bytes());
-                    dst.put_u16(v.len() as u16);
-                    dst.extend_from_slice(v.as_bytes());
-                }
-            }
             Frame::AgentForward => encode_empty(dst, TYPE_AGENT_FORWARD),
-            Frame::AgentOpen { channel_id } => {
-                dst.put_u8(TYPE_AGENT_OPEN);
-                dst.put_u32(4);
-                dst.put_u32(channel_id);
-            }
-            Frame::AgentData { channel_id, data } => {
-                dst.put_u8(TYPE_AGENT_DATA);
-                dst.put_u32(4 + data.len() as u32);
-                dst.put_u32(channel_id);
-                dst.extend_from_slice(&data);
-            }
-            Frame::AgentClose { channel_id } => {
-                dst.put_u8(TYPE_AGENT_CLOSE);
-                dst.put_u32(4);
-                dst.put_u32(channel_id);
-            }
             Frame::OpenForward => encode_empty(dst, TYPE_OPEN_FORWARD),
-            Frame::OpenUrl { url } => encode_str(dst, TYPE_OPEN_URL, &url),
-            Frame::TunnelListen { port } => {
-                dst.put_u8(TYPE_TUNNEL_LISTEN);
-                dst.put_u32(2);
-                dst.put_u16(port);
-            }
             Frame::TunnelOpen => encode_empty(dst, TYPE_TUNNEL_OPEN),
-            Frame::TunnelData(data) => {
-                dst.put_u8(TYPE_TUNNEL_DATA);
-                dst.put_u32(data.len() as u32);
-                dst.extend_from_slice(&data);
-            }
             Frame::TunnelClose => encode_empty(dst, TYPE_TUNNEL_CLOSE),
-            Frame::SendOffer { file_count, total_bytes } => {
-                dst.put_u8(TYPE_SEND_OFFER);
-                dst.put_u32(12); // u32 + u64
-                dst.put_u32(file_count);
-                dst.put_u64(total_bytes);
-            }
             Frame::SendDone => encode_empty(dst, TYPE_SEND_DONE),
+            Frame::ListSessions => encode_empty(dst, TYPE_LIST_SESSIONS),
+            Frame::KillServer => encode_empty(dst, TYPE_KILL_SERVER),
+            Frame::Ok => encode_empty(dst, TYPE_OK),
+
+            // String frames
+            Frame::OpenUrl { url } => encode_str(dst, TYPE_OPEN_URL, &url),
             Frame::SendCancel { reason } => encode_str(dst, TYPE_SEND_CANCEL, &reason),
-            Frame::PortForwardListen { forward_id, listen_port, target_port } => {
-                dst.put_u8(TYPE_PORT_FORWARD_LISTEN);
-                dst.put_u32(8); // u32 + u16 + u16
-                dst.put_u32(forward_id);
-                dst.put_u16(listen_port);
-                dst.put_u16(target_port);
-            }
-            Frame::PortForwardReady { forward_id } => {
-                dst.put_u8(TYPE_PORT_FORWARD_READY);
-                dst.put_u32(4);
-                dst.put_u32(forward_id);
-            }
-            Frame::PortForwardOpen { forward_id, channel_id, target_port } => {
-                dst.put_u8(TYPE_PORT_FORWARD_OPEN);
-                dst.put_u32(10); // u32 + u32 + u16
-                dst.put_u32(forward_id);
-                dst.put_u32(channel_id);
-                dst.put_u16(target_port);
-            }
-            Frame::PortForwardData { channel_id, data } => {
-                dst.put_u8(TYPE_PORT_FORWARD_DATA);
-                dst.put_u32(4 + data.len() as u32);
-                dst.put_u32(channel_id);
-                dst.extend_from_slice(&data);
-            }
-            Frame::PortForwardClose { channel_id } => {
-                dst.put_u8(TYPE_PORT_FORWARD_CLOSE);
-                dst.put_u32(4);
-                dst.put_u32(channel_id);
-            }
-            Frame::PortForwardStop { forward_id } => {
-                dst.put_u8(TYPE_PORT_FORWARD_STOP);
-                dst.put_u32(4);
-                dst.put_u32(forward_id);
-            }
-            Frame::SendFile { session, role } => {
-                let slen = session.len();
-                dst.put_u8(TYPE_SEND_FILE);
-                dst.put_u32((slen + 1) as u32); // session bytes + 1 byte role
-                dst.extend_from_slice(session.as_bytes());
-                dst.put_u8(role);
-            }
-            Frame::Hello { version } => {
-                dst.put_u8(TYPE_HELLO);
-                dst.put_u32(2);
-                dst.put_u16(version);
-            }
-            Frame::HelloAck { version } => {
-                dst.put_u8(TYPE_HELLO_ACK);
-                dst.put_u32(2);
-                dst.put_u16(version);
-            }
             Frame::NewSession { name } => encode_str(dst, TYPE_NEW_SESSION, &name),
             Frame::Attach { session } => encode_str(dst, TYPE_ATTACH, &session),
             Frame::Tail { session } => encode_str(dst, TYPE_TAIL, &session),
-            Frame::ListSessions => encode_empty(dst, TYPE_LIST_SESSIONS),
             Frame::KillSession { session } => encode_str(dst, TYPE_KILL_SESSION, &session),
-            Frame::KillServer => encode_empty(dst, TYPE_KILL_SERVER),
             Frame::SessionCreated { id } => encode_str(dst, TYPE_SESSION_CREATED, &id),
-            Frame::SessionInfo { sessions } => {
-                // Binary: [count: u32] per entry: [id_len: u16][id][name_len: u16][name]
-                //   [pty_len: u16][pty_path][shell_pid: u32][created_at: u64]
-                //   [attached: u8][last_heartbeat: u64]
-                let body_len: usize = 4 + sessions
-                    .iter()
-                    .map(|e| 2 + e.id.len() + 2 + e.name.len() + 2 + e.pty_path.len() + 21)
-                    .sum::<usize>();
-                dst.put_u8(TYPE_SESSION_INFO);
-                dst.put_u32(body_len as u32);
-                dst.put_u32(sessions.len() as u32);
-                for e in &sessions {
-                    dst.put_u16(e.id.len() as u16);
-                    dst.extend_from_slice(e.id.as_bytes());
-                    dst.put_u16(e.name.len() as u16);
-                    dst.extend_from_slice(e.name.as_bytes());
-                    dst.put_u16(e.pty_path.len() as u16);
-                    dst.extend_from_slice(e.pty_path.as_bytes());
-                    dst.put_u32(e.shell_pid);
-                    dst.put_u64(e.created_at);
-                    dst.put_u8(if e.attached { 1 } else { 0 });
-                    dst.put_u64(e.last_heartbeat);
-                }
-            }
-            Frame::Ok => encode_empty(dst, TYPE_OK),
             Frame::Error { message } => encode_str(dst, TYPE_ERROR, &message),
+
+            // Custom frames
+            Frame::Env { vars } => encode_env(dst, &vars),
+            Frame::SessionInfo { sessions } => encode_session_info(dst, &sessions),
+            Frame::SendFile { session, role } => {
+                dst.put_u8(TYPE_SEND_FILE);
+                dst.put_u32((session.len() + 1) as u32);
+                dst.extend_from_slice(session.as_bytes());
+                dst.put_u8(role);
+            }
         }
         Ok(())
     }
