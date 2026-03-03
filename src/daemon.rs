@@ -45,13 +45,15 @@ struct SessionState {
 /// Prefers $GRITTY_SOCKET_DIR, then $XDG_RUNTIME_DIR/gritty, falls back to /tmp/gritty-$UID.
 pub fn socket_dir() -> PathBuf {
     if let Ok(dir) = std::env::var("GRITTY_SOCKET_DIR") {
-        PathBuf::from(dir)
-    } else if let Ok(xdg) = std::env::var("XDG_RUNTIME_DIR") {
-        PathBuf::from(xdg).join("gritty")
-    } else {
-        let uid = unsafe { libc::getuid() };
-        PathBuf::from(format!("/tmp/gritty-{uid}"))
+        return PathBuf::from(dir);
     }
+    if let Some(proj) = directories::ProjectDirs::from("", "", "gritty") {
+        if let Some(runtime) = proj.runtime_dir() {
+            return runtime.to_path_buf();
+        }
+    }
+    let uid = unsafe { libc::getuid() };
+    PathBuf::from(format!("/tmp/gritty-{uid}"))
 }
 
 /// Returns the daemon socket path.

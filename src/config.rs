@@ -82,11 +82,8 @@ pub struct HostConfig {
 
 /// Return the config file path: $XDG_CONFIG_HOME/gritty/config.toml
 pub fn config_path() -> PathBuf {
-    if let Ok(xdg) = std::env::var("XDG_CONFIG_HOME") {
-        return PathBuf::from(xdg).join("gritty").join("config.toml");
-    }
-    if let Ok(home) = std::env::var("HOME") {
-        return PathBuf::from(home).join(".config").join("gritty").join("config.toml");
+    if let Some(proj) = directories::ProjectDirs::from("", "", "gritty") {
+        return proj.config_dir().join("config.toml");
     }
     PathBuf::from(".config").join("gritty").join("config.toml")
 }

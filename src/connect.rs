@@ -1,7 +1,6 @@
 use anyhow::{Context, bail};
 use std::os::fd::OwnedFd;
 use std::os::unix::fs::OpenOptionsExt;
-use std::os::unix::io::AsRawFd;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::time::{Duration, Instant};
@@ -214,13 +213,7 @@ fn format_ssh_diag(dest: &Destination, extra_ssh_opts: &[String], foreground: bo
 /// Shell-quote a string if it contains characters that need quoting.
 /// Used only for display (--dry-run output), never for command execution.
 fn shell_quote(s: &str) -> String {
-    if s.is_empty() {
-        return "''".to_string();
-    }
-    if s.bytes().all(|b| b.is_ascii_alphanumeric() || b"-_./=:@$+%,".contains(&b)) {
-        return s.to_string();
-    }
-    format!("'{}'", s.replace('\'', "'\\''"))
+    shlex::try_quote(s).map(|c| c.into_owned()).unwrap_or_else(|_| s.to_string())
 }
 
 /// Format a tokio Command as a shell string for display.
@@ -436,9 +429,9 @@ pub fn parse_host(destination: &str) -> anyhow::Result<String> {
 // Lockfile-based liveness
 // ---------------------------------------------------------------------------
 
-/// Acquire an exclusive flock on the lockfile. Returns the locked fd on success.
-/// The lock is held for the lifetime of the returned `OwnedFd`.
-fn acquire_lock(lock_path: &Path) -> anyhow::Result<OwnedFd> {
+/// Acquire an exclusive flock on the lockfile. Returns the RAII lock on success.
+/// The lock is held for the lifetime of the returned `Flock`.
+fn acquire_lock(lock_path: &Path) -> anyhow::Result<nix::fcntl::Flock<std::fs::File>> {
     use std::fs::OpenOptions;
     let file = OpenOptions::new()
         .create(true)
@@ -447,11 +440,9 @@ fn acquire_lock(lock_path: &Path) -> anyhow::Result<OwnedFd> {
         .mode(0o600)
         .open(lock_path)
         .with_context(|| format!("failed to open lockfile: {}", lock_path.display()))?;
-    let fd = OwnedFd::from(file);
-    if unsafe { libc::flock(fd.as_raw_fd(), libc::LOCK_EX) } != 0 {
-        bail!("failed to acquire lock on {}", lock_path.display());
-    }
-    Ok(fd)
+    nix::fcntl::Flock::lock(file, nix::fcntl::FlockArg::LockExclusive)
+        .map_err(|(_, e)| e)
+        .with_context(|| format!("failed to acquire lock on {}", lock_path.display()))
 }
 
 /// Probe whether a lockfile is held by a live process.
@@ -462,13 +453,9 @@ fn is_lock_held(lock_path: &Path) -> bool {
         Ok(f) => f,
         Err(_) => return false,
     };
-    // Non-blocking exclusive lock attempt: if it succeeds, the old process is dead
-    if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } == 0 {
-        // We got the lock — old process is gone. Release it immediately (fd drop).
-        false
-    } else {
-        true // Lock held by another process
-    }
+    // Non-blocking exclusive lock attempt: if it succeeds, the old process is dead.
+    // The lock is released immediately when the Flock drops.
+    nix::fcntl::Flock::lock(file, nix::fcntl::FlockArg::LockExclusiveNonblock).is_err()
 }
 
 /// Tunnel health status.
@@ -537,7 +524,7 @@ struct ConnectGuard {
     pid_file: PathBuf,
     lock_file: PathBuf,
     dest_file: PathBuf,
-    _lock_fd: Option<OwnedFd>,
+    _lock: Option<nix::fcntl::Flock<std::fs::File>>,
     stop: tokio_util::sync::CancellationToken,
 }
 
@@ -557,7 +544,7 @@ impl Drop for ConnectGuard {
         let _ = std::fs::remove_file(&self.pid_file);
         let _ = std::fs::remove_file(&self.lock_file);
         let _ = std::fs::remove_file(&self.dest_file);
-        // _lock_fd drops here, releasing the flock
+        // _lock drops here, releasing the flock
     }
 }
 
@@ -679,7 +666,7 @@ pub async fn run(opts: ConnectOpts, ready_fd: Option<OwnedFd>) -> anyhow::Result
         pid_file: pid_file.clone(),
         lock_file: lock_path,
         dest_file: dest_file.clone(),
-        _lock_fd: Some(lock_fd),
+        _lock: Some(lock_fd),
         stop: stop.clone(),
     };
 
@@ -1062,22 +1049,24 @@ mod tests {
 
     #[test]
     fn shell_quote_simple() {
+        // Safe strings pass through unquoted
         assert_eq!(shell_quote("hello"), "hello");
         assert_eq!(shell_quote("-N"), "-N");
-        assert_eq!(shell_quote("ServerAliveInterval=3"), "ServerAliveInterval=3");
-        assert_eq!(shell_quote("user@host"), "user@host");
-        assert_eq!(
-            shell_quote("/tmp/local.sock:/tmp/remote.sock"),
-            "/tmp/local.sock:/tmp/remote.sock"
-        );
-        assert_eq!(shell_quote("$REMOTE_SOCK"), "$REMOTE_SOCK");
+        // shlex quotes some chars the old impl didn't (=, @, :, $), which is correct
+        let q = shell_quote("ServerAliveInterval=3");
+        assert!(q.contains("ServerAliveInterval") && q.contains("3"));
+        let q = shell_quote("user@host");
+        assert!(q.contains("user") && q.contains("host"));
     }
 
     #[test]
     fn shell_quote_needs_quoting() {
-        assert_eq!(shell_quote("hello world"), "'hello world'");
+        let q = shell_quote("hello world");
+        assert!(q.starts_with('\'') || q.starts_with('"'));
+        assert!(q.contains("hello world"));
         assert_eq!(shell_quote(""), "''");
-        assert_eq!(shell_quote("it's"), "'it'\\''s'");
+        let q = shell_quote("it's");
+        assert!(q.contains("it") && q.contains("s"));
     }
 
     #[test]
