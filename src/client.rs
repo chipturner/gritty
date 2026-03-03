@@ -239,16 +239,12 @@ impl Drop for SuppressInputGuard {
 /// Write all bytes to stdout asynchronously via AsyncFd.
 /// Used in relay mode where stdout is non-blocking (shares fd with stdin).
 async fn write_stdout_async(fd: &AsyncFd<std::os::fd::OwnedFd>, data: &[u8]) -> io::Result<()> {
-    use std::os::fd::AsRawFd;
-    let raw = fd.as_raw_fd();
     let mut written = 0;
     while written < data.len() {
         let mut guard = fd.writable().await?;
-        match guard.try_io(|_| {
-            let n =
-                unsafe { libc::write(raw, data[written..].as_ptr().cast(), data.len() - written) };
-            if n < 0 { Err(io::Error::last_os_error()) } else { Ok(n as usize) }
-        }) {
+        match guard
+            .try_io(|inner| nix::unistd::write(inner, &data[written..]).map_err(io::Error::from))
+        {
             Ok(Ok(n)) => written += n,
             Ok(Err(e)) => return Err(e),
             Err(_would_block) => continue,
