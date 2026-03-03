@@ -132,6 +132,59 @@ fn shutdown(sessions: &mut HashMap<u32, SessionState>, ctl_path: &Path) {
     let _ = std::fs::remove_file(pid_file_path(ctl_path));
 }
 
+/// Perform Hello/HelloAck handshake and read control frame for a single connection.
+/// Spawned as a per-connection task so slow clients don't block the accept loop.
+async fn connection_handshake(
+    stream: UnixStream,
+    tx: mpsc::Sender<(Frame, Framed<UnixStream, FrameCodec>)>,
+) {
+    let mut framed = Framed::new(stream, FrameCodec);
+
+    // Read Hello handshake (5s timeout)
+    let hello = match tokio::time::timeout(Duration::from_secs(5), framed.next()).await {
+        Ok(Some(Ok(Frame::Hello { version }))) => version,
+        Ok(Some(Ok(_))) => {
+            let _ = timed_send(
+                &mut framed,
+                Frame::Error { message: "expected Hello handshake".to_string() },
+            )
+            .await;
+            return;
+        }
+        Ok(Some(Err(e))) => {
+            warn!("frame decode error: {e}");
+            return;
+        }
+        Ok(None) => return,
+        Err(_) => {
+            warn!("control connection timed out (hello)");
+            return;
+        }
+    };
+
+    // Send HelloAck with negotiated version
+    let negotiated = hello.min(PROTOCOL_VERSION);
+    if timed_send(&mut framed, Frame::HelloAck { version: negotiated }).await.is_err() {
+        return;
+    }
+
+    // Read control frame (5s timeout)
+    let frame = match tokio::time::timeout(Duration::from_secs(5), framed.next()).await {
+        Ok(Some(Ok(f))) => f,
+        Ok(Some(Err(e))) => {
+            warn!("frame decode error: {e}");
+            return;
+        }
+        Ok(None) => return,
+        Err(_) => {
+            warn!("control connection timed out");
+            return;
+        }
+    };
+
+    let _ = tx.send((frame, framed)).await;
+}
+
 /// Run the daemon, listening on its socket.
 ///
 /// If `ready_fd` is provided, a single byte is written to it after the socket
@@ -170,240 +223,224 @@ pub async fn run(ctl_path: &Path, ready_fd: Option<OwnedFd>) -> anyhow::Result<(
     let mut sigterm = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
     let mut sigint = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::interrupt())?;
 
+    // Channel for handshake results -- spawned tasks send completed handshakes here
+    let (conn_tx, mut conn_rx) = mpsc::channel::<(Frame, Framed<UnixStream, FrameCodec>)>(64);
+
     loop {
         reap_sessions(&mut sessions);
 
-        let stream = tokio::select! {
+        let should_break = tokio::select! {
             result = listener.accept() => {
                 let (stream, _addr) = result?;
-                stream
+                if let Err(e) = crate::security::verify_peer_uid(&stream) {
+                    warn!("{e}");
+                } else {
+                    let tx = conn_tx.clone();
+                    tokio::spawn(connection_handshake(stream, tx));
+                }
+                false
+            }
+            Some((frame, framed)) = conn_rx.recv() => {
+                dispatch_control(
+                    frame, framed, &mut sessions, &mut next_id, ctl_path,
+                ).await
             }
             _ = sigterm.recv() => {
                 info!("SIGTERM received, shutting down");
                 shutdown(&mut sessions, ctl_path);
-                break;
+                true
             }
             _ = sigint.recv() => {
                 info!("SIGINT received, shutting down");
                 shutdown(&mut sessions, ctl_path);
-                break;
+                true
             }
         };
 
-        if let Err(e) = crate::security::verify_peer_uid(&stream) {
-            warn!("{e}");
-            continue;
-        }
-        let mut framed = Framed::new(stream, FrameCodec);
-
-        // Read Hello handshake (5s timeout)
-        let hello = match tokio::time::timeout(Duration::from_secs(5), framed.next()).await {
-            Ok(Some(Ok(Frame::Hello { version }))) => version,
-            Ok(Some(Ok(_))) => {
-                let _ = timed_send(
-                    &mut framed,
-                    Frame::Error { message: "expected Hello handshake".to_string() },
-                )
-                .await;
-                continue;
-            }
-            Ok(Some(Err(e))) => {
-                warn!("frame decode error: {e}");
-                continue;
-            }
-            Ok(None) => continue,
-            Err(_) => {
-                warn!("control connection timed out (hello)");
-                continue;
-            }
-        };
-
-        // Send HelloAck with negotiated version
-        let negotiated = hello.min(PROTOCOL_VERSION);
-        if timed_send(&mut framed, Frame::HelloAck { version: negotiated }).await.is_err() {
-            continue;
-        }
-
-        // Read control frame (5s timeout)
-        let frame = match tokio::time::timeout(Duration::from_secs(5), framed.next()).await {
-            Ok(Some(Ok(f))) => f,
-            Ok(Some(Err(e))) => {
-                warn!("frame decode error: {e}");
-                continue;
-            }
-            Ok(None) => continue,
-            Err(_) => {
-                warn!("control connection timed out");
-                continue;
-            }
-        };
-
-        match frame {
-            Frame::NewSession { name } => {
-                // Reject names containing control characters (prevents wire
-                // format corruption in tab/newline-delimited SessionInfo)
-                let name_opt = if name.is_empty() { None } else { Some(name) };
-                if let Some(ref n) = name_opt {
-                    if n.bytes().any(|b| b.is_ascii_control()) {
-                        let _ = timed_send(
-                            &mut framed,
-                            Frame::Error {
-                                message: "session name must not contain control characters"
-                                    .to_string(),
-                            },
-                        )
-                        .await;
-                        continue;
-                    }
-                    let dup = sessions.values().any(|s| s.name.as_deref() == Some(n));
-                    if dup {
-                        let _ = timed_send(
-                            &mut framed,
-                            Frame::Error { message: format!("session name already exists: {n}") },
-                        )
-                        .await;
-                        continue;
-                    }
-                }
-
-                let id = next_id;
-                next_id += 1;
-
-                let (client_tx, client_rx) = mpsc::unbounded_channel();
-                let metadata = Arc::new(OnceLock::new());
-                let meta_clone = Arc::clone(&metadata);
-                let sock_dir = ctl_path.parent().expect("ctl_path must have a parent");
-                let agent_socket_path = sock_dir.join(format!("agent-{id}.sock"));
-                let svc_socket_path = sock_dir.join(format!("svc-{id}.sock"));
-                let handle = tokio::spawn(async move {
-                    server::run(client_rx, meta_clone, agent_socket_path, svc_socket_path).await
-                });
-
-                sessions.insert(
-                    id,
-                    SessionState {
-                        handle,
-                        metadata,
-                        client_tx: client_tx.clone(),
-                        name: name_opt.clone(),
-                    },
-                );
-
-                info!(id, name = ?name_opt, "session created");
-
-                if timed_send(&mut framed, Frame::SessionCreated { id: id.to_string() })
-                    .await
-                    .is_err()
-                {
-                    continue;
-                }
-
-                // Hand off connection to session for auto-attach
-                let _ = client_tx.send(ClientConn::Active(framed));
-            }
-            Frame::Attach { session } => {
-                reap_sessions(&mut sessions);
-                if let Some(id) = resolve_session(&sessions, &session) {
-                    let state = &sessions[&id];
-                    if state.client_tx.is_closed() {
-                        sessions.remove(&id);
-                        let _ = timed_send(
-                            &mut framed,
-                            Frame::Error { message: format!("no such session: {session}") },
-                        )
-                        .await;
-                    } else if timed_send(&mut framed, Frame::Ok).await.is_ok() {
-                        let _ = state.client_tx.send(ClientConn::Active(framed));
-                    }
-                } else {
-                    let _ = timed_send(
-                        &mut framed,
-                        Frame::Error { message: format!("no such session: {session}") },
-                    )
-                    .await;
-                }
-            }
-            Frame::Tail { session } => {
-                reap_sessions(&mut sessions);
-                if let Some(id) = resolve_session(&sessions, &session) {
-                    let state = &sessions[&id];
-                    if state.client_tx.is_closed() {
-                        sessions.remove(&id);
-                        let _ = timed_send(
-                            &mut framed,
-                            Frame::Error { message: format!("no such session: {session}") },
-                        )
-                        .await;
-                    } else if timed_send(&mut framed, Frame::Ok).await.is_ok() {
-                        let _ = state.client_tx.send(ClientConn::Tail(framed));
-                    }
-                } else {
-                    let _ = timed_send(
-                        &mut framed,
-                        Frame::Error { message: format!("no such session: {session}") },
-                    )
-                    .await;
-                }
-            }
-            Frame::ListSessions => {
-                reap_sessions(&mut sessions);
-                let entries = build_session_entries(&sessions);
-                let _ = timed_send(&mut framed, Frame::SessionInfo { sessions: entries }).await;
-            }
-            Frame::KillSession { session } => {
-                reap_sessions(&mut sessions);
-                if let Some(id) = resolve_session(&sessions, &session) {
-                    let state = sessions.remove(&id).unwrap();
-                    state.handle.abort();
-                    info!(id, "session killed");
-                    let _ = timed_send(&mut framed, Frame::Ok).await;
-                } else {
-                    let _ = timed_send(
-                        &mut framed,
-                        Frame::Error { message: format!("no such session: {session}") },
-                    )
-                    .await;
-                }
-            }
-            Frame::SendFile { session, .. } => {
-                reap_sessions(&mut sessions);
-                if let Some(id) = resolve_session(&sessions, &session) {
-                    let state = &sessions[&id];
-                    if state.client_tx.is_closed() {
-                        sessions.remove(&id);
-                        let _ = timed_send(
-                            &mut framed,
-                            Frame::Error { message: format!("no such session: {session}") },
-                        )
-                        .await;
-                    } else if timed_send(&mut framed, Frame::Ok).await.is_ok() {
-                        let stream = framed.into_inner();
-                        let _ = state.client_tx.send(ClientConn::Send(stream));
-                    }
-                } else {
-                    let _ = timed_send(
-                        &mut framed,
-                        Frame::Error { message: format!("no such session: {session}") },
-                    )
-                    .await;
-                }
-            }
-            Frame::KillServer => {
-                info!("kill-server received, shutting down");
-                shutdown(&mut sessions, ctl_path);
-                let _ = timed_send(&mut framed, Frame::Ok).await;
-                break;
-            }
-            other => {
-                error!(?other, "unexpected frame on control socket");
-                let _ = timed_send(
-                    &mut framed,
-                    Frame::Error { message: "unexpected frame type".to_string() },
-                )
-                .await;
-            }
+        if should_break {
+            break;
         }
     }
 
     Ok(())
+}
+
+/// Dispatch a single control frame. Takes ownership of the framed connection
+/// so it can be handed off to session tasks when needed. Returns `true` for
+/// KillServer (daemon should exit).
+async fn dispatch_control(
+    frame: Frame,
+    mut framed: Framed<UnixStream, FrameCodec>,
+    sessions: &mut HashMap<u32, SessionState>,
+    next_id: &mut u32,
+    ctl_path: &Path,
+) -> bool {
+    match frame {
+        Frame::NewSession { name } => {
+            // Reject names containing control characters
+            let name_opt = if name.is_empty() { None } else { Some(name) };
+            if let Some(ref n) = name_opt {
+                if n.bytes().any(|b| b.is_ascii_control()) {
+                    let _ = timed_send(
+                        &mut framed,
+                        Frame::Error {
+                            message: "session name must not contain control characters".to_string(),
+                        },
+                    )
+                    .await;
+                    return false;
+                }
+                let dup = sessions.values().any(|s| s.name.as_deref() == Some(n));
+                if dup {
+                    let _ = timed_send(
+                        &mut framed,
+                        Frame::Error { message: format!("session name already exists: {n}") },
+                    )
+                    .await;
+                    return false;
+                }
+            }
+
+            let id = *next_id;
+            *next_id += 1;
+
+            let (client_tx, client_rx) = mpsc::unbounded_channel();
+            let metadata = Arc::new(OnceLock::new());
+            let meta_clone = Arc::clone(&metadata);
+            let sock_dir = ctl_path.parent().expect("ctl_path must have a parent");
+            let agent_socket_path = sock_dir.join(format!("agent-{id}.sock"));
+            let svc_socket_path = sock_dir.join(format!("svc-{id}.sock"));
+            let handle = tokio::spawn(async move {
+                server::run(client_rx, meta_clone, agent_socket_path, svc_socket_path).await
+            });
+
+            sessions.insert(
+                id,
+                SessionState {
+                    handle,
+                    metadata,
+                    client_tx: client_tx.clone(),
+                    name: name_opt.clone(),
+                },
+            );
+
+            info!(id, name = ?name_opt, "session created");
+
+            if timed_send(&mut framed, Frame::SessionCreated { id: id.to_string() }).await.is_err()
+            {
+                return false;
+            }
+
+            // Hand off connection to session for auto-attach
+            let _ = client_tx.send(ClientConn::Active(framed));
+            false
+        }
+        Frame::Attach { session } => {
+            reap_sessions(sessions);
+            if let Some(id) = resolve_session(sessions, &session) {
+                let state = &sessions[&id];
+                if state.client_tx.is_closed() {
+                    sessions.remove(&id);
+                    let _ = timed_send(
+                        &mut framed,
+                        Frame::Error { message: format!("no such session: {session}") },
+                    )
+                    .await;
+                } else if timed_send(&mut framed, Frame::Ok).await.is_ok() {
+                    let _ = state.client_tx.send(ClientConn::Active(framed));
+                }
+            } else {
+                let _ = timed_send(
+                    &mut framed,
+                    Frame::Error { message: format!("no such session: {session}") },
+                )
+                .await;
+            }
+            false
+        }
+        Frame::Tail { session } => {
+            reap_sessions(sessions);
+            if let Some(id) = resolve_session(sessions, &session) {
+                let state = &sessions[&id];
+                if state.client_tx.is_closed() {
+                    sessions.remove(&id);
+                    let _ = timed_send(
+                        &mut framed,
+                        Frame::Error { message: format!("no such session: {session}") },
+                    )
+                    .await;
+                } else if timed_send(&mut framed, Frame::Ok).await.is_ok() {
+                    let _ = state.client_tx.send(ClientConn::Tail(framed));
+                }
+            } else {
+                let _ = timed_send(
+                    &mut framed,
+                    Frame::Error { message: format!("no such session: {session}") },
+                )
+                .await;
+            }
+            false
+        }
+        Frame::ListSessions => {
+            reap_sessions(sessions);
+            let entries = build_session_entries(sessions);
+            let _ = timed_send(&mut framed, Frame::SessionInfo { sessions: entries }).await;
+            false
+        }
+        Frame::KillSession { session } => {
+            reap_sessions(sessions);
+            if let Some(id) = resolve_session(sessions, &session) {
+                let state = sessions.remove(&id).unwrap();
+                state.handle.abort();
+                info!(id, "session killed");
+                let _ = timed_send(&mut framed, Frame::Ok).await;
+            } else {
+                let _ = timed_send(
+                    &mut framed,
+                    Frame::Error { message: format!("no such session: {session}") },
+                )
+                .await;
+            }
+            false
+        }
+        Frame::SendFile { session, .. } => {
+            reap_sessions(sessions);
+            if let Some(id) = resolve_session(sessions, &session) {
+                let state = &sessions[&id];
+                if state.client_tx.is_closed() {
+                    sessions.remove(&id);
+                    let _ = timed_send(
+                        &mut framed,
+                        Frame::Error { message: format!("no such session: {session}") },
+                    )
+                    .await;
+                } else if timed_send(&mut framed, Frame::Ok).await.is_ok() {
+                    let stream = framed.into_inner();
+                    let _ = state.client_tx.send(ClientConn::Send(stream));
+                }
+            } else {
+                let _ = timed_send(
+                    &mut framed,
+                    Frame::Error { message: format!("no such session: {session}") },
+                )
+                .await;
+            }
+            false
+        }
+        Frame::KillServer => {
+            info!("kill-server received, shutting down");
+            shutdown(sessions, ctl_path);
+            let _ = timed_send(&mut framed, Frame::Ok).await;
+            true
+        }
+        other => {
+            error!(?other, "unexpected frame on control socket");
+            let _ = timed_send(
+                &mut framed,
+                Frame::Error { message: "unexpected frame type".to_string() },
+            )
+            .await;
+            false
+        }
+    }
 }
