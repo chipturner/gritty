@@ -35,13 +35,17 @@ pub fn collect_env_vars() -> Vec<(String, String)> {
 ///
 /// Reader task reads from the stream and calls `on_data`/`on_close`.
 /// Writer task drains the returned sender and writes to the stream.
+/// Channel buffer size for `spawn_channel_relay` writer channels.
+/// At 8KB per read, 256 entries ≈ 2MB per channel.
+const CHANNEL_RELAY_BUFFER: usize = 256;
+
 pub fn spawn_channel_relay<R, W, F, G>(
     channel_id: u32,
     read_half: R,
     write_half: W,
     on_data: F,
     on_close: G,
-) -> tokio::sync::mpsc::UnboundedSender<bytes::Bytes>
+) -> tokio::sync::mpsc::Sender<bytes::Bytes>
 where
     R: tokio::io::AsyncRead + Unpin + Send + 'static,
     W: tokio::io::AsyncWrite + Unpin + Send + 'static,
@@ -50,7 +54,8 @@ where
 {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
-    let (writer_tx, mut writer_rx) = tokio::sync::mpsc::unbounded_channel::<bytes::Bytes>();
+    let (writer_tx, mut writer_rx) =
+        tokio::sync::mpsc::channel::<bytes::Bytes>(CHANNEL_RELAY_BUFFER);
 
     tokio::spawn(async move {
         let mut read_half = read_half;
@@ -174,7 +179,7 @@ mod tests {
 
         let writer_tx = spawn_channel_relay(7, read_half, write_half, |_, _| true, |_| {});
 
-        writer_tx.send(bytes::Bytes::from_static(b"hello")).unwrap();
+        writer_tx.try_send(bytes::Bytes::from_static(b"hello")).unwrap();
 
         let mut buf = vec![0u8; 32];
         let n =
@@ -199,7 +204,7 @@ mod tests {
         let writer_tx = spawn_channel_relay(7, read_half, write_half, |_, _| true, |_| {});
 
         // Send data then drop the sender (triggers half-close)
-        writer_tx.send(bytes::Bytes::from_static(b"request")).unwrap();
+        writer_tx.try_send(bytes::Bytes::from_static(b"request")).unwrap();
         drop(writer_tx);
 
         // Read the data

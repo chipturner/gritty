@@ -72,7 +72,7 @@ enum RelayExit {
 
 /// Events from agent connection tasks to the main relay loop.
 enum AgentEvent {
-    Accepted { channel_id: u32, writer_tx: mpsc::UnboundedSender<Bytes> },
+    Accepted { channel_id: u32, writer_tx: mpsc::Sender<Bytes> },
     Data { channel_id: u32, data: Bytes },
     Closed { channel_id: u32 },
 }
@@ -95,7 +95,7 @@ enum PortForwardEvent {
     /// Svc socket requested a port forward.
     Requested { stream: UnixStream, direction: u8, listen_port: u16, target_port: u16 },
     /// TCP connection accepted on a listening port.
-    Accepted { forward_id: u32, channel_id: u32, writer_tx: mpsc::UnboundedSender<Bytes> },
+    Accepted { forward_id: u32, channel_id: u32, writer_tx: mpsc::Sender<Bytes> },
     /// Background TCP connect completed (remote-fwd PortForwardOpen).
     Connected { forward_id: u32, channel_id: u32, stream: tokio::net::TcpStream },
     /// Background TCP connect failed.
@@ -113,7 +113,7 @@ struct PortForwardState {
     /// Handle for the TCP listener task (aborted on teardown).
     listener_handle: Option<tokio::task::JoinHandle<()>>,
     /// Active TCP relay channels.
-    channels: HashMap<u32, mpsc::UnboundedSender<Bytes>>,
+    channels: HashMap<u32, mpsc::Sender<Bytes>>,
     /// Handle for the svc stop watcher (aborted on teardown).
     stop_handle: Option<tokio::task::JoinHandle<()>>,
     target_port: u16,
@@ -122,7 +122,7 @@ struct PortForwardState {
 /// Grouped state for SSH agent forwarding within a session.
 struct AgentForwardState {
     enabled: bool,
-    channels: HashMap<u32, mpsc::UnboundedSender<Bytes>>,
+    channels: HashMap<u32, mpsc::Sender<Bytes>>,
     acceptor: Option<tokio::task::JoinHandle<()>>,
     next_channel_id: Arc<AtomicU32>,
     socket_path: PathBuf,
@@ -152,7 +152,7 @@ impl AgentForwardState {
 /// Grouped state for the OAuth callback reverse tunnel.
 struct TunnelRelayState {
     port: Option<u16>,
-    writer: Option<mpsc::UnboundedSender<Bytes>>,
+    writer: Option<mpsc::Sender<Bytes>>,
 }
 
 impl TunnelRelayState {
@@ -169,7 +169,7 @@ impl TunnelRelayState {
 /// Grouped state for TCP port forwarding (local and remote).
 struct PortForwardTable {
     forwards: HashMap<u32, PortForwardState>,
-    channels: HashMap<u32, (u32, mpsc::UnboundedSender<Bytes>)>,
+    channels: HashMap<u32, (u32, mpsc::Sender<Bytes>)>,
     pending_remote: HashMap<u32, UnixStream>,
     next_forward_id: u32,
     next_channel_id: Arc<AtomicU32>,
@@ -721,7 +721,7 @@ impl ServerRelay<'_> {
             }
             Some(Ok(Frame::AgentData { channel_id, data })) => {
                 if let Some(tx) = self.agent.channels.get(&channel_id) {
-                    let _ = tx.send(data);
+                    let _ = tx.try_send(data);
                 }
             }
             Some(Ok(Frame::AgentClose { channel_id })) => {
@@ -748,7 +748,7 @@ impl ServerRelay<'_> {
             }
             Some(Ok(Frame::TunnelData(data))) => {
                 if let Some(ref tx) = self.tunnel.writer {
-                    let _ = tx.send(data);
+                    let _ = tx.try_send(data);
                 }
             }
             Some(Ok(Frame::TunnelClose)) => {
@@ -787,7 +787,7 @@ impl ServerRelay<'_> {
             }
             Some(Ok(Frame::PortForwardData { channel_id, data })) => {
                 if let Some((_, tx)) = self.pf.channels.get(&channel_id) {
-                    let _ = tx.send(data);
+                    let _ = tx.try_send(data);
                 }
             }
             Some(Ok(Frame::PortForwardClose { channel_id })) => {
@@ -886,7 +886,8 @@ impl ServerRelay<'_> {
                 if let Some(port) = self.tunnel.port {
                     debug!(port, "tunnel connected to local port");
                     let (mut read_half, write_half) = stream.into_split();
-                    let (writer_tx, mut writer_rx) = mpsc::unbounded_channel::<Bytes>();
+                    let (writer_tx, mut writer_rx) =
+                        mpsc::channel::<Bytes>(crate::CHANNEL_RELAY_BUFFER);
                     self.tunnel.writer = Some(writer_tx);
 
                     // Writer task: channel -> TCP

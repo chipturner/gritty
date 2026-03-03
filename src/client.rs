@@ -296,14 +296,14 @@ enum AgentEvent {
 
 /// Events from the tunnel TCP listener/connection to the relay loop.
 enum ClientTunnelEvent {
-    Accepted(mpsc::UnboundedSender<Bytes>),
+    Accepted(mpsc::Sender<Bytes>),
     Data(Bytes),
     Closed,
 }
 
 /// Events from port forward TCP acceptors/connections on the client side.
 enum ClientPortForwardEvent {
-    Accepted { forward_id: u32, channel_id: u32, writer_tx: mpsc::UnboundedSender<Bytes> },
+    Accepted { forward_id: u32, channel_id: u32, writer_tx: mpsc::Sender<Bytes> },
     Data { channel_id: u32, data: Bytes },
     Closed { channel_id: u32 },
 }
@@ -316,7 +316,7 @@ struct ClientPortForwardState {
 
 /// Grouped state for agent channel management on the client side.
 struct ClientAgentState {
-    channels: HashMap<u32, mpsc::UnboundedSender<Bytes>>,
+    channels: HashMap<u32, mpsc::Sender<Bytes>>,
 }
 
 impl ClientAgentState {
@@ -332,7 +332,7 @@ impl ClientAgentState {
 /// Grouped state for the OAuth callback tunnel on the client side.
 struct ClientTunnelState {
     listener: Option<tokio::task::JoinHandle<()>>,
-    writer: Option<mpsc::UnboundedSender<Bytes>>,
+    writer: Option<mpsc::Sender<Bytes>>,
 }
 
 impl ClientTunnelState {
@@ -351,7 +351,7 @@ impl ClientTunnelState {
 /// Grouped state for TCP port forwarding on the client side.
 struct ClientPortForwardTable {
     forwards: HashMap<u32, ClientPortForwardState>,
-    channels: HashMap<u32, (u32, mpsc::UnboundedSender<Bytes>)>,
+    channels: HashMap<u32, (u32, mpsc::Sender<Bytes>)>,
     next_channel_id: std::sync::Arc<std::sync::atomic::AtomicU32>,
 }
 
@@ -480,7 +480,7 @@ impl ClientRelay<'_> {
             }
             Some(Ok(Frame::AgentData { channel_id, data })) => {
                 if let Some(tx) = self.agent.channels.get(&channel_id) {
-                    let _ = tx.send(data);
+                    let _ = tx.try_send(data);
                 }
             }
             Some(Ok(Frame::AgentClose { channel_id })) => {
@@ -517,7 +517,7 @@ impl ClientRelay<'_> {
                                         Ok(Ok((stream, _))) => {
                                             let (read_half, write_half) = stream.into_split();
                                             let (writer_tx, mut writer_rx) =
-                                                mpsc::unbounded_channel::<Bytes>();
+                                                mpsc::channel::<Bytes>(crate::CHANNEL_RELAY_BUFFER);
 
                                             // Writer task: channel -> TCP
                                             tokio::spawn(async move {
@@ -600,7 +600,7 @@ impl ClientRelay<'_> {
             }
             Some(Ok(Frame::TunnelData(data))) => {
                 if let Some(ref tx) = self.tunnel.writer {
-                    let _ = tx.send(data);
+                    let _ = tx.try_send(data);
                 }
             }
             Some(Ok(Frame::TunnelClose)) => {
@@ -709,7 +709,7 @@ impl ClientRelay<'_> {
             // Port forward: channel data from server
             Some(Ok(Frame::PortForwardData { channel_id, data })) => {
                 if let Some((_, tx)) = self.pf.channels.get(&channel_id) {
-                    let _ = tx.send(data);
+                    let _ = tx.try_send(data);
                 }
             }
             // Port forward: channel closed by server
