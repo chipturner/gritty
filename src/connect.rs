@@ -35,12 +35,34 @@ impl Destination {
             (None, s)
         };
 
-        let (host, port) = if let Some(colon) = remainder.rfind(':') {
+        // Handle bracketed IPv6: [::1] or [::1]:port
+        let (host, port) = if remainder.starts_with('[') {
+            if let Some(bracket) = remainder.find(']') {
+                let h = &remainder[1..bracket];
+                let after = &remainder[bracket + 1..];
+                let p = if let Some(rest) = after.strip_prefix(':') {
+                    Some(
+                        rest.parse::<u16>()
+                            .with_context(|| format!("invalid port in destination: {s}"))?,
+                    )
+                } else if after.is_empty() {
+                    None
+                } else {
+                    bail!("unexpected characters after bracketed host: {s}");
+                };
+                (h.to_string(), p)
+            } else {
+                bail!("unclosed bracket in destination: {s}");
+            }
+        } else if remainder.matches(':').count() > 1 {
+            // Multiple colons without brackets -- bare IPv6 address (no port)
+            (remainder.to_string(), None)
+        } else if let Some(colon) = remainder.rfind(':') {
             let h = &remainder[..colon];
-            let p = remainder[colon + 1..]
-                .parse::<u16>()
-                .with_context(|| format!("invalid port in destination: {s}"))?;
-            (h.to_string(), Some(p))
+            match remainder[colon + 1..].parse::<u16>() {
+                Ok(p) => (h.to_string(), Some(p)),
+                Err(_) => (remainder.to_string(), None),
+            }
         } else {
             (remainder.to_string(), None)
         };
@@ -893,6 +915,51 @@ mod tests {
     #[test]
     fn parse_destination_invalid_colon_only() {
         assert!(Destination::parse(":2222").is_err());
+    }
+
+    #[test]
+    fn parse_destination_ipv6_bracketed() {
+        let d = Destination::parse("[::1]").unwrap();
+        assert_eq!(d.user, None);
+        assert_eq!(d.host, "::1");
+        assert_eq!(d.port, None);
+    }
+
+    #[test]
+    fn parse_destination_ipv6_bracketed_port() {
+        let d = Destination::parse("[::1]:2222").unwrap();
+        assert_eq!(d.user, None);
+        assert_eq!(d.host, "::1");
+        assert_eq!(d.port, Some(2222));
+    }
+
+    #[test]
+    fn parse_destination_ipv6_user_bracketed_port() {
+        let d = Destination::parse("user@[fe80::1]:22").unwrap();
+        assert_eq!(d.user.as_deref(), Some("user"));
+        assert_eq!(d.host, "fe80::1");
+        assert_eq!(d.port, Some(22));
+    }
+
+    #[test]
+    fn parse_destination_bare_ipv6() {
+        let d = Destination::parse("::1").unwrap();
+        assert_eq!(d.user, None);
+        assert_eq!(d.host, "::1");
+        assert_eq!(d.port, None);
+    }
+
+    #[test]
+    fn parse_destination_bare_ipv6_with_scope() {
+        let d = Destination::parse("fe80::1").unwrap();
+        assert_eq!(d.user, None);
+        assert_eq!(d.host, "fe80::1");
+        assert_eq!(d.port, None);
+    }
+
+    #[test]
+    fn parse_destination_ipv6_unclosed_bracket() {
+        assert!(Destination::parse("[::1").is_err());
     }
 
     #[test]
