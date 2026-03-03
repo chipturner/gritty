@@ -231,6 +231,9 @@ fn sanitize_filename(name: &str) -> Option<String> {
     if basename.is_empty() || basename == ".." || basename == "." {
         return None;
     }
+    if basename.contains('\0') || basename.contains('\\') {
+        return None;
+    }
     Some(basename.to_string())
 }
 

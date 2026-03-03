@@ -110,7 +110,7 @@ impl ConfigFile {
         match toml::from_str(&content) {
             Ok(c) => c,
             Err(e) => {
-                tracing::warn!("malformed config at {}: {e}", path.display());
+                eprintln!("warning: malformed config at {}: {e}", path.display());
                 Self::default()
             }
         }

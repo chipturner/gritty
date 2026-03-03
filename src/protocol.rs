@@ -413,7 +413,7 @@ fn decode_env(payload: BytesMut) -> Result<Option<Frame>, io::Error> {
     }
     let count = read_u32(p, 0) as usize;
     let mut off = 4;
-    let mut vars = Vec::with_capacity(count);
+    let mut vars = Vec::with_capacity(count.min(1024));
     for _ in 0..count {
         if off + 2 > p.len() {
             return Err(io::Error::new(io::ErrorKind::InvalidData, "env frame truncated"));
@@ -446,7 +446,7 @@ fn decode_session_info(payload: BytesMut) -> Result<Option<Frame>, io::Error> {
     }
     let count = read_u32(p, 0) as usize;
     let mut off = 4;
-    let mut sessions = Vec::with_capacity(count);
+    let mut sessions = Vec::with_capacity(count.min(1024));
     let read_str = |p: &[u8], off: &mut usize| -> Result<String, io::Error> {
         if *off + 2 > p.len() {
             return Err(io::Error::new(io::ErrorKind::InvalidData, "session info truncated"));
