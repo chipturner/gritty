@@ -9,21 +9,28 @@ const MAX_WINSIZE: u16 = 10_000;
 /// Trusted system roots (`/`, `/tmp`, `/run`, `$XDG_RUNTIME_DIR`) are accepted without
 /// ownership checks. All other existing directories must be owned by the current user
 /// and must not be symlinks.
+///
+/// Uses create-then-validate instead of check-then-create to avoid TOCTOU races.
 pub fn secure_create_dir_all(path: &Path) -> io::Result<()> {
-    if path.exists() {
-        if is_trusted_root(path) {
-            return Ok(());
-        }
-        return validate_dir(path);
+    if is_trusted_root(path) {
+        return Ok(());
     }
 
     if let Some(parent) = path.parent() {
         secure_create_dir_all(parent)?;
     }
 
-    std::fs::create_dir(path)?;
-    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700))?;
-    Ok(())
+    // Try to create; if it already exists, validate ownership/type.
+    // The umask (0o077 set by daemon) ensures 0o700 mode on creation.
+    match std::fs::create_dir(path) {
+        Ok(()) => {
+            // Explicitly set permissions in case umask wasn't set (e.g. client-side calls).
+            std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700))?;
+            Ok(())
+        }
+        Err(e) if e.kind() == io::ErrorKind::AlreadyExists => validate_dir(path),
+        Err(e) => Err(e),
+    }
 }
 
 /// Bind a `UnixListener` with TOCTOU-safe stale socket handling and 0600 permissions.
