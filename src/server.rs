@@ -1584,6 +1584,9 @@ fn handle_send_event(
                 }
                 _ => {
                     if let TransferState::Active { relay_handle } = old {
+                        let _ = notify_tx.send(Frame::SendCancel {
+                            reason: "superseded by new sender".to_string(),
+                        });
                         relay_handle.abort();
                     }
                     info!(files = manifest.files.len(), "transfer: sender waiting for receiver");
@@ -1608,6 +1611,9 @@ fn handle_send_event(
                 }
                 _ => {
                     if let TransferState::Active { relay_handle } = old {
+                        let _ = notify_tx.send(Frame::SendCancel {
+                            reason: "superseded by new receiver".to_string(),
+                        });
                         relay_handle.abort();
                     }
                     info!("transfer: receiver waiting for sender");
