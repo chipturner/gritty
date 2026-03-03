@@ -1,0 +1,15 @@
+[test-groups.pty-tests]
+max-threads = 2
+
+[test-groups.serial]
+max-threads = 1
+
+[[profile.default.overrides]]
+filter = 'binary(e2e_test) | binary(daemon_test)'
+test-group = 'pty-tests'
+retries = 2
+
+[[profile.default.overrides]]
+filter = 'binary(socat_tunnel_test) | binary(socat_bridge_test) | binary(ssh_integration_test)'
+test-group = 'serial'
+retries = 2
