@@ -484,7 +484,7 @@ impl ClientRelay<'_> {
             }
             Some(Ok(Frame::AgentData { channel_id, data })) => {
                 if let Some(tx) = self.agent.channels.get(&channel_id) {
-                    let _ = tx.try_send(data);
+                    let _ = tx.send(data).await;
                 }
             }
             Some(Ok(Frame::AgentClose { channel_id })) => {
@@ -606,7 +606,7 @@ impl ClientRelay<'_> {
             }
             Some(Ok(Frame::TunnelData(data))) => {
                 if let Some(ref tx) = self.tunnel.writer {
-                    let _ = tx.try_send(data);
+                    let _ = tx.send(data).await;
                 }
             }
             Some(Ok(Frame::TunnelClose)) => {
@@ -715,7 +715,7 @@ impl ClientRelay<'_> {
             // Port forward: channel data from server
             Some(Ok(Frame::PortForwardData { channel_id, data })) => {
                 if let Some((_, tx)) = self.pf.channels.get(&channel_id) {
-                    let _ = tx.try_send(data);
+                    let _ = tx.send(data).await;
                 }
             }
             // Port forward: channel closed by server
