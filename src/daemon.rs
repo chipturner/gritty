@@ -204,11 +204,15 @@ pub async fn run(ctl_path: &Path, ready_fd: Option<OwnedFd>) -> anyhow::Result<(
     let listener = crate::security::bind_unix_listener(ctl_path)?;
     info!(path = %ctl_path.display(), "daemon listening");
 
-    // Signal readiness to parent (daemonize pipe)
+    // Signal readiness to parent (daemonize pipe): [0x01][pid: u32 LE]
     if let Some(fd) = ready_fd {
         use std::io::Write;
         let mut f = std::fs::File::from(fd);
-        let _ = f.write_all(&[1]);
+        let pid = std::process::id();
+        let mut buf = [0u8; 5];
+        buf[0] = 0x01;
+        buf[1..5].copy_from_slice(&pid.to_le_bytes());
+        let _ = f.write_all(&buf);
         // f drops here, closing the pipe
     }
 

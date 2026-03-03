@@ -741,10 +741,14 @@ pub async fn run(opts: ConnectOpts, ready_fd: Option<OwnedFd>) -> anyhow::Result
     Ok(0)
 }
 
-/// Write one readiness byte to the pipe fd (if present).
+/// Write readiness signal to the pipe fd: [0x01][pid: u32 LE].
 fn signal_ready(ready_fd: &Option<OwnedFd>) {
     if let Some(fd) = ready_fd {
-        let _ = nix::unistd::write(fd, b"\x01");
+        let pid = std::process::id();
+        let mut buf = [0u8; 5];
+        buf[0] = 0x01;
+        buf[1..5].copy_from_slice(&pid.to_le_bytes());
+        let _ = nix::unistd::write(fd, &buf);
     }
 }
 

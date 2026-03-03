@@ -251,16 +251,16 @@ fn open_log_file(path: &Path) -> Option<std::fs::File> {
 
 /// Fork into background, returning the write end of the readiness pipe.
 ///
-/// Parent: blocks reading the pipe. Gets a byte -> child is ready, runs `on_ready`, exits 0.
-/// Gets EOF -> child died (exits 1).
-/// Child: returns Ok(OwnedFd) for the write end of the pipe.
+/// Double-fork daemonize: parent -> session leader -> grandchild (daemon).
+///
+/// Parent: blocks reading the pipe. Gets `[0x01][pid: u32 LE]` -> daemon ready, runs
+/// `on_ready(pid)`, exits 0. Gets other data -> error message, exits 1. Gets EOF -> crashed.
+/// Session leader (middle child): calls setsid(), forks again, exits immediately.
+/// Grandchild (daemon): redirects stdio, chdir("/"), returns Ok(OwnedFd) for the pipe.
 ///
 /// If `output_path` is `Some`, stdout/stderr are redirected to that file (O_APPEND).
 /// Otherwise they go to `/dev/null`. stdin always goes to `/dev/null`.
-fn daemonize(
-    on_ready: impl FnOnce(nix::unistd::Pid),
-    output_path: Option<&Path>,
-) -> anyhow::Result<OwnedFd> {
+fn daemonize(on_ready: impl FnOnce(u32), output_path: Option<&Path>) -> anyhow::Result<OwnedFd> {
     use nix::unistd::{ForkResult, fork, pipe, setsid};
     let (read_fd, write_fd) = pipe()?;
 
@@ -270,18 +270,26 @@ fn daemonize(
             // Close write end
             drop(write_fd);
 
-            // Read from pipe: 0x01 = child ready, other data = error message, EOF = crashed
-            let mut buf = [0u8; 1];
+            // Reap the middle child (exits immediately after second fork)
+            let _ = nix::sys::wait::waitpid(child, None);
+
+            // Read from pipe: 0x01 + pid = daemon ready, other data = error, EOF = crashed
+            let mut first = [0u8; 1];
             let mut read_file = std::fs::File::from(read_fd);
             use std::io::Read;
-            match read_file.read(&mut buf) {
-                Ok(1) if buf[0] == 0x01 => {
-                    on_ready(child);
-                    std::process::exit(0);
+            match read_file.read(&mut first) {
+                Ok(1) if first[0] == 0x01 => {
+                    let mut pid_buf = [0u8; 4];
+                    if read_file.read_exact(&mut pid_buf).is_ok() {
+                        on_ready(u32::from_le_bytes(pid_buf));
+                        std::process::exit(0);
+                    }
+                    eprintln!("error: failed to start");
+                    std::process::exit(1);
                 }
                 Ok(1) => {
                     // Error message from child -- read the rest
-                    let mut msg = vec![buf[0]];
+                    let mut msg = vec![first[0]];
                     let _ = read_file.read_to_end(&mut msg);
                     eprintln!("{}", String::from_utf8_lossy(&msg).trim());
                     std::process::exit(1);
@@ -299,38 +307,51 @@ fn daemonize(
             // New session, detach from terminal
             setsid()?;
 
-            // stdin always to /dev/null
-            let devnull = nix::fcntl::open(
-                "/dev/null",
-                nix::fcntl::OFlag::O_RDWR,
-                nix::sys::stat::Mode::empty(),
-            )?;
-            unsafe {
-                libc::dup2(devnull.as_raw_fd(), 0);
-            }
+            // Second fork: session leader exits, grandchild can't acquire a tty
+            match unsafe { fork() }? {
+                ForkResult::Parent { .. } => {
+                    // Middle child (session leader): exit immediately.
+                    // write_fd is closed by the OS; grandchild's copy keeps the pipe alive.
+                    std::process::exit(0);
+                }
+                ForkResult::Child => {
+                    // Grandchild: not a session leader
+                    let _ = std::env::set_current_dir("/");
 
-            // stdout/stderr: to output file if provided, else /dev/null
-            let out_fd = match output_path {
-                Some(path) => nix::fcntl::open(
-                    path,
-                    nix::fcntl::OFlag::O_WRONLY
-                        | nix::fcntl::OFlag::O_CREAT
-                        | nix::fcntl::OFlag::O_APPEND,
-                    nix::sys::stat::Mode::from_bits_truncate(0o600),
-                )?,
-                None => nix::fcntl::open(
-                    "/dev/null",
-                    nix::fcntl::OFlag::O_RDWR,
-                    nix::sys::stat::Mode::empty(),
-                )?,
-            };
-            unsafe {
-                libc::dup2(out_fd.as_raw_fd(), 1);
-                libc::dup2(out_fd.as_raw_fd(), 2);
-            }
-            // devnull and out_fd drop here, closing the original fds (always >2 post-fork)
+                    // stdin always to /dev/null
+                    let devnull = nix::fcntl::open(
+                        "/dev/null",
+                        nix::fcntl::OFlag::O_RDWR,
+                        nix::sys::stat::Mode::empty(),
+                    )?;
+                    unsafe {
+                        libc::dup2(devnull.as_raw_fd(), 0);
+                    }
 
-            Ok(write_fd)
+                    // stdout/stderr: to output file if provided, else /dev/null
+                    let out_fd = match output_path {
+                        Some(path) => nix::fcntl::open(
+                            path,
+                            nix::fcntl::OFlag::O_WRONLY
+                                | nix::fcntl::OFlag::O_CREAT
+                                | nix::fcntl::OFlag::O_APPEND,
+                            nix::sys::stat::Mode::from_bits_truncate(0o600),
+                        )?,
+                        None => nix::fcntl::open(
+                            "/dev/null",
+                            nix::fcntl::OFlag::O_RDWR,
+                            nix::sys::stat::Mode::empty(),
+                        )?,
+                    };
+                    unsafe {
+                        libc::dup2(out_fd.as_raw_fd(), 1);
+                        libc::dup2(out_fd.as_raw_fd(), 2);
+                    }
+                    // devnull and out_fd drop here, closing the original fds (always >2 post-fork)
+
+                    Ok(write_fd)
+                }
+            }
         }
     }
 }
@@ -369,8 +390,7 @@ fn main() {
             let ready_fd = if foreground {
                 None
             } else {
-                match daemonize(|child| eprintln!("server started (pid {child})"), Some(&out_path))
-                {
+                match daemonize(|pid| eprintln!("server started (pid {pid})"), Some(&out_path)) {
                     Ok(fd) => Some(fd),
                     Err(e) => {
                         eprintln!("error: failed to daemonize: {e}");
@@ -436,7 +456,7 @@ fn main() {
                 let sock_display = local_sock.display().to_string();
                 let conn_name = connection_name.clone();
                 match daemonize(
-                    move |_child| {
+                    move |_pid| {
                         println!("{sock_display}");
                         eprintln!("tunnel started (name: {conn_name}). to use:");
                         eprintln!("  gritty new {conn_name}");
