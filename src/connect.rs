@@ -267,6 +267,7 @@ async fn spawn_tunnel(
 ) -> anyhow::Result<Child> {
     debug!("tunnel: {} -> {}:{}", local_sock.display(), dest.ssh_dest(), remote_sock,);
     let mut cmd = tunnel_command(dest, local_sock, remote_sock, extra_ssh_opts, foreground);
+    cmd.kill_on_drop(true);
     let child = cmd.spawn().context("failed to spawn ssh tunnel")?;
     debug!("ssh tunnel pid: {:?}", child.id());
     Ok(child)
