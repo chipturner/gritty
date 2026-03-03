@@ -13,6 +13,14 @@ use tokio::net::UnixStream;
 use tokio::signal::unix::{SignalKind, signal};
 use tokio::sync::mpsc;
 use tokio::time::Instant;
+
+/// Outcome from a client relay loop iteration.
+enum RelayExit {
+    /// Shell or server reported an exit code (or detach/signal).
+    Exit(i32),
+    /// Server disconnected -- caller should reconnect.
+    Disconnected,
+}
 use tokio_util::codec::Framed;
 use tracing::{debug, info};
 
@@ -426,7 +434,7 @@ impl ClientRelay<'_> {
         &mut self,
         framed: &mut Framed<UnixStream, FrameCodec>,
         frame: Option<Result<Frame, io::Error>>,
-    ) -> Result<ControlFlow<Option<i32>>, anyhow::Error> {
+    ) -> Result<ControlFlow<RelayExit>, anyhow::Error> {
         match frame {
             Some(Ok(Frame::Data(data))) => {
                 debug!(len = data.len(), "socket → stdout");
@@ -439,7 +447,7 @@ impl ClientRelay<'_> {
             }
             Some(Ok(Frame::Exit { code })) => {
                 debug!(code, "server sent exit");
-                return Ok(ControlFlow::Break(Some(code)));
+                return Ok(ControlFlow::Break(RelayExit::Exit(code)));
             }
             Some(Ok(Frame::Detached)) => {
                 info!("detached by another client");
@@ -447,7 +455,7 @@ impl ClientRelay<'_> {
                 self.tunnel.teardown();
                 self.pf.teardown();
                 write_stdout_async(self.async_stdout, status_msg("detached").as_bytes()).await?;
-                return Ok(ControlFlow::Break(Some(0)));
+                return Ok(ControlFlow::Break(RelayExit::Exit(0)));
             }
             Some(Ok(Frame::AgentOpen { channel_id })) => {
                 if let Some(sock_path) = self.agent_socket {
@@ -664,7 +672,7 @@ impl ClientRelay<'_> {
                             ClientPortForwardState { listener_handle: Some(handle), target_port },
                         );
                         if !timed_send(framed, Frame::PortForwardReady { forward_id }).await {
-                            return Ok(ControlFlow::Break(None));
+                            return Ok(ControlFlow::Break(RelayExit::Disconnected));
                         }
                     }
                     Err(e) => {
@@ -729,11 +737,11 @@ impl ClientRelay<'_> {
             Some(Ok(_)) => {} // ignore control/resize frames
             Some(Err(e)) => {
                 debug!("server connection error: {e}");
-                return Ok(ControlFlow::Break(None));
+                return Ok(ControlFlow::Break(RelayExit::Disconnected));
             }
             None => {
                 debug!("server disconnected");
-                return Ok(ControlFlow::Break(None));
+                return Ok(ControlFlow::Break(RelayExit::Disconnected));
             }
         }
         Ok(ControlFlow::Continue(()))
@@ -743,48 +751,48 @@ impl ClientRelay<'_> {
         &mut self,
         framed: &mut Framed<UnixStream, FrameCodec>,
         event: Option<AgentEvent>,
-    ) -> Option<i32> {
+    ) -> bool {
         match event {
             Some(AgentEvent::Data { channel_id, data }) => {
                 if self.agent.channels.contains_key(&channel_id)
                     && !timed_send(framed, Frame::AgentData { channel_id, data }).await
                 {
-                    return None;
+                    return false;
                 }
             }
             Some(AgentEvent::Closed { channel_id }) => {
                 if self.agent.channels.remove(&channel_id).is_some()
                     && !timed_send(framed, Frame::AgentClose { channel_id }).await
                 {
-                    return None;
+                    return false;
                 }
             }
             None => {} // no more agent tasks
         }
-        Some(0) // sentinel: keep going
+        true
     }
 
     async fn handle_tunnel_event(
         &mut self,
         framed: &mut Framed<UnixStream, FrameCodec>,
         event: Option<ClientTunnelEvent>,
-    ) -> Option<i32> {
+    ) -> bool {
         match event {
             Some(ClientTunnelEvent::Accepted(writer_tx)) => {
                 // Close previous connection's server side if any
                 if self.tunnel.writer.take().is_some()
                     && !timed_send(framed, Frame::TunnelClose).await
                 {
-                    return None;
+                    return false;
                 }
                 self.tunnel.writer = Some(writer_tx);
                 if !timed_send(framed, Frame::TunnelOpen).await {
-                    return None;
+                    return false;
                 }
             }
             Some(ClientTunnelEvent::Data(data)) => {
                 if !timed_send(framed, Frame::TunnelData(data)).await {
-                    return None;
+                    return false;
                 }
             }
             Some(ClientTunnelEvent::Closed) => {
@@ -793,19 +801,19 @@ impl ClientRelay<'_> {
                     handle.abort();
                 }
                 if !timed_send(framed, Frame::TunnelClose).await {
-                    return None;
+                    return false;
                 }
             }
             None => {}
         }
-        Some(0) // sentinel: keep going
+        true
     }
 
     async fn handle_pf_event(
         &mut self,
         framed: &mut Framed<UnixStream, FrameCodec>,
         event: Option<ClientPortForwardEvent>,
-    ) -> Option<i32> {
+    ) -> bool {
         match event {
             Some(ClientPortForwardEvent::Accepted { forward_id, channel_id, writer_tx }) => {
                 if let Some(fwd) = self.pf.forwards.get(&forward_id) {
@@ -817,7 +825,7 @@ impl ClientRelay<'_> {
                     )
                     .await
                     {
-                        return None;
+                        return false;
                     }
                 }
             }
@@ -825,24 +833,23 @@ impl ClientRelay<'_> {
                 if self.pf.channels.contains_key(&channel_id)
                     && !timed_send(framed, Frame::PortForwardData { channel_id, data }).await
                 {
-                    return None;
+                    return false;
                 }
             }
             Some(ClientPortForwardEvent::Closed { channel_id }) => {
                 if self.pf.channels.remove(&channel_id).is_some()
                     && !timed_send(framed, Frame::PortForwardClose { channel_id }).await
                 {
-                    return None;
+                    return false;
                 }
             }
             None => {}
         }
-        Some(0) // sentinel: keep going
+        true
     }
 }
 
 /// Relay between stdin/stdout and the framed socket.
-/// Returns `Some(code)` on clean shell exit or detach, `None` on server disconnect / heartbeat timeout.
 #[allow(clippy::too_many_arguments)]
 async fn relay(
     framed: &mut Framed<UnixStream, FrameCodec>,
@@ -857,7 +864,7 @@ async fn relay(
     oauth_redirect: bool,
     oauth_timeout: u64,
     session: &str,
-) -> anyhow::Result<Option<i32>> {
+) -> anyhow::Result<RelayExit> {
     let mut sigterm = signal(SignalKind::terminate())?;
     let mut sighup = signal(SignalKind::hangup())?;
 
@@ -902,7 +909,7 @@ async fn relay(
                 match guard.try_io(|inner| inner.get_ref().read(buf)) {
                     Ok(Ok(0)) => {
                         debug!("stdin EOF");
-                        return Ok(Some(0));
+                        return Ok(RelayExit::Exit(0));
                     }
                     Ok(Ok(n)) => {
                         debug!(len = n, "stdin → socket");
@@ -911,19 +918,19 @@ async fn relay(
                                 match action {
                                     EscapeAction::Data(data) => {
                                         if !timed_send(framed, Frame::Data(Bytes::from(data))).await {
-                                            return Ok(None);
+                                            return Ok(RelayExit::Disconnected);
                                         }
                                     }
                                     EscapeAction::Detach => {
                                         write_stdout_async(async_stdout, status_msg("detached").as_bytes()).await?;
-                                        return Ok(Some(0));
+                                        return Ok(RelayExit::Exit(0));
                                     }
                                     EscapeAction::Suspend => {
                                         suspend(raw_guard, nb_guard)?;
                                         // Re-sync terminal size after resume
                                         let (cols, rows) = get_terminal_size();
                                         if !timed_send(framed, Frame::Resize { cols, rows }).await {
-                                            return Ok(None);
+                                            return Ok(RelayExit::Disconnected);
                                         }
                                     }
                                     EscapeAction::Status => {
@@ -945,7 +952,7 @@ async fn relay(
                                 }
                             }
                         } else if !timed_send(framed, Frame::Data(Bytes::copy_from_slice(&buf[..n]))).await {
-                            return Ok(None);
+                            return Ok(RelayExit::Disconnected);
                         }
                     }
                     Ok(Err(e)) => return Err(e.into()),
@@ -960,20 +967,20 @@ async fn relay(
             }
 
             event = agent_event_rx.recv() => {
-                if relay.handle_agent_event(framed, event).await.is_none() {
-                    return Ok(None);
+                if !relay.handle_agent_event(framed, event).await {
+                    return Ok(RelayExit::Disconnected);
                 }
             }
 
             event = tunnel_event_rx.recv() => {
-                if relay.handle_tunnel_event(framed, event).await.is_none() {
-                    return Ok(None);
+                if !relay.handle_tunnel_event(framed, event).await {
+                    return Ok(RelayExit::Disconnected);
                 }
             }
 
             event = pf_event_rx.recv() => {
-                if relay.handle_pf_event(framed, event).await.is_none() {
-                    return Ok(None);
+                if !relay.handle_pf_event(framed, event).await {
+                    return Ok(RelayExit::Disconnected);
                 }
             }
 
@@ -981,29 +988,29 @@ async fn relay(
                 let (cols, rows) = get_terminal_size();
                 debug!(cols, rows, "SIGWINCH → resize");
                 if !timed_send(framed, Frame::Resize { cols, rows }).await {
-                    return Ok(None);
+                    return Ok(RelayExit::Disconnected);
                 }
             }
 
             _ = heartbeat_interval.tick() => {
                 if relay.last_pong.elapsed() > HEARTBEAT_TIMEOUT {
                     debug!("heartbeat timeout");
-                    return Ok(None);
+                    return Ok(RelayExit::Disconnected);
                 }
                 *relay.last_ping_sent = Instant::now();
                 if !timed_send(framed, Frame::Ping).await {
-                    return Ok(None);
+                    return Ok(RelayExit::Disconnected);
                 }
             }
 
             _ = sigterm.recv() => {
                 debug!("SIGTERM received, exiting");
-                return Ok(Some(1));
+                return Ok(RelayExit::Exit(1));
             }
 
             _ = sighup.recv() => {
                 debug!("SIGHUP received, exiting");
-                return Ok(Some(1));
+                return Ok(RelayExit::Exit(1));
             }
         }
     }
@@ -1070,11 +1077,11 @@ pub async fn run(
             )
             .await?
         } else {
-            None
+            RelayExit::Disconnected
         };
         match result {
-            Some(code) => return Ok(code),
-            None => {
+            RelayExit::Exit(code) => return Ok(code),
+            RelayExit::Disconnected => {
                 // Env vars only sent on first connection; clear for reconnect
                 current_env.clear();
                 // Disconnected — try to reconnect
