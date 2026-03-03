@@ -46,7 +46,7 @@ const HEADER_LEN: usize = 5; // type(1) + length(4)
 const MAX_FRAME_SIZE: usize = 1 << 20; // 1 MB
 
 /// Protocol version for handshake negotiation.
-pub const PROTOCOL_VERSION: u16 = 1;
+pub const PROTOCOL_VERSION: u16 = 2;
 
 /// Discriminator byte for the unified per-session service socket (`svc-{id}.sock`).
 /// Sent as the first byte on every connection to route to the correct handler.
@@ -344,18 +344,44 @@ impl Decoder for FrameCodec {
             TYPE_PING => Ok(Some(Frame::Ping)),
             TYPE_PONG => Ok(Some(Frame::Pong)),
             TYPE_ENV => {
-                let text = String::from_utf8(payload.to_vec())
-                    .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
-                let vars = if text.is_empty() {
-                    Vec::new()
-                } else {
-                    text.lines()
-                        .filter_map(|line| {
-                            let (k, v) = line.split_once('=')?;
-                            Some((k.to_string(), v.to_string()))
-                        })
-                        .collect()
-                };
+                let p = &payload[..];
+                if p.len() < 4 {
+                    return Err(io::Error::new(io::ErrorKind::InvalidData, "env frame too short"));
+                }
+                let count = read_u32(p, 0) as usize;
+                let mut off = 4;
+                let mut vars = Vec::with_capacity(count);
+                for _ in 0..count {
+                    if off + 2 > p.len() {
+                        return Err(io::Error::new(
+                            io::ErrorKind::InvalidData,
+                            "env frame truncated",
+                        ));
+                    }
+                    let klen = read_u16(p, off) as usize;
+                    off += 2;
+                    if off + klen + 2 > p.len() {
+                        return Err(io::Error::new(
+                            io::ErrorKind::InvalidData,
+                            "env frame truncated",
+                        ));
+                    }
+                    let key = String::from_utf8(p[off..off + klen].to_vec())
+                        .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+                    off += klen;
+                    let vlen = read_u16(p, off) as usize;
+                    off += 2;
+                    if off + vlen > p.len() {
+                        return Err(io::Error::new(
+                            io::ErrorKind::InvalidData,
+                            "env frame truncated",
+                        ));
+                    }
+                    let val = String::from_utf8(p[off..off + vlen].to_vec())
+                        .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+                    off += vlen;
+                    vars.push((key, val));
+                }
                 Ok(Some(Frame::Env { vars }))
             }
             TYPE_AGENT_FORWARD => Ok(Some(Frame::AgentForward)),
@@ -448,30 +474,65 @@ impl Decoder for FrameCodec {
             TYPE_KILL_SERVER => Ok(Some(Frame::KillServer)),
             TYPE_SESSION_CREATED => Ok(Some(Frame::SessionCreated { id: decode_string(payload)? })),
             TYPE_SESSION_INFO => {
-                let text = String::from_utf8(payload.to_vec())
-                    .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
-                let sessions = if text.is_empty() {
-                    Vec::new()
-                } else {
-                    text.lines()
-                        .filter_map(|line| {
-                            let parts: Vec<&str> = line.split('\t').collect();
-                            if parts.len() == 7 {
-                                Some(SessionEntry {
-                                    id: parts[0].to_string(),
-                                    name: parts[1].to_string(),
-                                    pty_path: parts[2].to_string(),
-                                    shell_pid: parts[3].parse().unwrap_or(0),
-                                    created_at: parts[4].parse().unwrap_or(0),
-                                    attached: parts[5] == "1",
-                                    last_heartbeat: parts[6].parse().unwrap_or(0),
-                                })
-                            } else {
-                                None
-                            }
-                        })
-                        .collect()
-                };
+                let p = &payload[..];
+                if p.len() < 4 {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "session info frame too short",
+                    ));
+                }
+                let count = read_u32(p, 0) as usize;
+                let mut off = 4;
+                let mut sessions = Vec::with_capacity(count);
+                for _ in 0..count {
+                    let read_str = |p: &[u8], off: &mut usize| -> Result<String, io::Error> {
+                        if *off + 2 > p.len() {
+                            return Err(io::Error::new(
+                                io::ErrorKind::InvalidData,
+                                "session info truncated",
+                            ));
+                        }
+                        let len = read_u16(p, *off) as usize;
+                        *off += 2;
+                        if *off + len > p.len() {
+                            return Err(io::Error::new(
+                                io::ErrorKind::InvalidData,
+                                "session info truncated",
+                            ));
+                        }
+                        let s = String::from_utf8(p[*off..*off + len].to_vec())
+                            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+                        *off += len;
+                        Ok(s)
+                    };
+                    let id = read_str(p, &mut off)?;
+                    let name = read_str(p, &mut off)?;
+                    let pty_path = read_str(p, &mut off)?;
+                    // Fixed fields: shell_pid(4) + created_at(8) + attached(1) + last_heartbeat(8) = 21
+                    if off + 21 > p.len() {
+                        return Err(io::Error::new(
+                            io::ErrorKind::InvalidData,
+                            "session info truncated",
+                        ));
+                    }
+                    let shell_pid = read_u32(p, off);
+                    off += 4;
+                    let created_at = read_u64(p, off);
+                    off += 8;
+                    let attached = p[off] != 0;
+                    off += 1;
+                    let last_heartbeat = read_u64(p, off);
+                    off += 8;
+                    sessions.push(SessionEntry {
+                        id,
+                        name,
+                        pty_path,
+                        shell_pid,
+                        created_at,
+                        attached,
+                        last_heartbeat,
+                    });
+                }
                 Ok(Some(Frame::SessionInfo { sessions }))
             }
             TYPE_OK => Ok(Some(Frame::Ok)),
@@ -509,20 +570,18 @@ impl Encoder<Frame> for FrameCodec {
             Frame::Ping => encode_empty(dst, TYPE_PING),
             Frame::Pong => encode_empty(dst, TYPE_PONG),
             Frame::Env { vars } => {
-                // Strip newlines from keys/values to prevent injection of extra
-                // key=value pairs via the newline-delimited wire format.
-                let text: String = vars
-                    .iter()
-                    .map(|(k, v)| {
-                        let k = k.replace('\n', "");
-                        let v = v.replace('\n', "");
-                        format!("{k}={v}")
-                    })
-                    .collect::<Vec<_>>()
-                    .join("\n");
+                // Binary: [count: u32] [key_len: u16][key][val_len: u16][val] ...
+                let body_len: usize =
+                    4 + vars.iter().map(|(k, v)| 2 + k.len() + 2 + v.len()).sum::<usize>();
                 dst.put_u8(TYPE_ENV);
-                dst.put_u32(text.len() as u32);
-                dst.extend_from_slice(text.as_bytes());
+                dst.put_u32(body_len as u32);
+                dst.put_u32(vars.len() as u32);
+                for (k, v) in &vars {
+                    dst.put_u16(k.len() as u16);
+                    dst.extend_from_slice(k.as_bytes());
+                    dst.put_u16(v.len() as u16);
+                    dst.extend_from_slice(v.as_bytes());
+                }
             }
             Frame::AgentForward => encode_empty(dst, TYPE_AGENT_FORWARD),
             Frame::AgentOpen { channel_id } => {
@@ -623,26 +682,28 @@ impl Encoder<Frame> for FrameCodec {
             Frame::KillServer => encode_empty(dst, TYPE_KILL_SERVER),
             Frame::SessionCreated { id } => encode_str(dst, TYPE_SESSION_CREATED, &id),
             Frame::SessionInfo { sessions } => {
-                let text: String = sessions
+                // Binary: [count: u32] per entry: [id_len: u16][id][name_len: u16][name]
+                //   [pty_len: u16][pty_path][shell_pid: u32][created_at: u64]
+                //   [attached: u8][last_heartbeat: u64]
+                let body_len: usize = 4 + sessions
                     .iter()
-                    .map(|e| {
-                        let safe_pty = e.pty_path.replace(['\t', '\n'], " ");
-                        format!(
-                            "{}\t{}\t{}\t{}\t{}\t{}\t{}",
-                            e.id,
-                            e.name,
-                            safe_pty,
-                            e.shell_pid,
-                            e.created_at,
-                            if e.attached { "1" } else { "0" },
-                            e.last_heartbeat
-                        )
-                    })
-                    .collect::<Vec<_>>()
-                    .join("\n");
+                    .map(|e| 2 + e.id.len() + 2 + e.name.len() + 2 + e.pty_path.len() + 21)
+                    .sum::<usize>();
                 dst.put_u8(TYPE_SESSION_INFO);
-                dst.put_u32(text.len() as u32);
-                dst.extend_from_slice(text.as_bytes());
+                dst.put_u32(body_len as u32);
+                dst.put_u32(sessions.len() as u32);
+                for e in &sessions {
+                    dst.put_u16(e.id.len() as u16);
+                    dst.extend_from_slice(e.id.as_bytes());
+                    dst.put_u16(e.name.len() as u16);
+                    dst.extend_from_slice(e.name.as_bytes());
+                    dst.put_u16(e.pty_path.len() as u16);
+                    dst.extend_from_slice(e.pty_path.as_bytes());
+                    dst.put_u32(e.shell_pid);
+                    dst.put_u64(e.created_at);
+                    dst.put_u8(if e.attached { 1 } else { 0 });
+                    dst.put_u64(e.last_heartbeat);
+                }
             }
             Frame::Ok => encode_empty(dst, TYPE_OK),
             Frame::Error { message } => encode_str(dst, TYPE_ERROR, &message),

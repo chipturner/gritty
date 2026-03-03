@@ -307,8 +307,8 @@ fn exit_wrong_payload_size() {
 }
 
 #[test]
-fn session_info_with_tabs_in_id() {
-    // Tabs in id would corrupt the tab-separated wire format
+fn session_info_preserves_tabs_in_id() {
+    // Binary encoding preserves arbitrary content -- tabs no longer corrupt the format
     let mut codec = FrameCodec;
     let mut buf = BytesMut::new();
     let original = Frame::SessionInfo {
@@ -324,14 +324,11 @@ fn session_info_with_tabs_in_id() {
     };
     codec.encode(original.clone(), &mut buf).unwrap();
     let decoded = codec.decode(&mut buf).unwrap().unwrap();
-    // The tab splits the field incorrectly — 8 fields instead of 7, so filter_map drops the line
+    assert_eq!(original, decoded);
     match decoded {
         Frame::SessionInfo { sessions } => {
-            assert_eq!(
-                sessions.len(),
-                0,
-                "tab in id corrupts wire format — entry should be dropped"
-            );
+            assert_eq!(sessions.len(), 1);
+            assert_eq!(sessions[0].id, "has\ttab");
         }
         other => panic!("expected SessionInfo, got {other:?}"),
     }
@@ -375,10 +372,8 @@ fn decode_consumes_only_one_frame() {
 }
 
 #[test]
-fn session_info_with_newline_in_name() {
-    // Newlines in names corrupt the line-separated wire format.
-    // Wire: "0\thas\nnewline\t/dev/pts/3\t1234\t1700000000\t1\t0"
-    // Splits into two lines, neither has 7 fields, so both are dropped.
+fn session_info_preserves_newline_in_name() {
+    // Binary encoding preserves arbitrary content -- newlines no longer corrupt the format
     let mut codec = FrameCodec;
     let mut buf = BytesMut::new();
     let original = Frame::SessionInfo {
@@ -392,15 +387,13 @@ fn session_info_with_newline_in_name() {
             last_heartbeat: 0,
         }],
     };
-    codec.encode(original, &mut buf).unwrap();
+    codec.encode(original.clone(), &mut buf).unwrap();
     let decoded = codec.decode(&mut buf).unwrap().unwrap();
+    assert_eq!(original, decoded);
     match decoded {
         Frame::SessionInfo { sessions } => {
-            assert_eq!(
-                sessions.len(),
-                0,
-                "newline in name corrupts wire format — entry should be dropped"
-            );
+            assert_eq!(sessions.len(), 1);
+            assert_eq!(sessions[0].name, "has\nnewline");
         }
         other => panic!("expected SessionInfo, got {other:?}"),
     }
@@ -458,41 +451,27 @@ fn roundtrip_env() {
 }
 
 #[test]
-fn env_newlines_stripped_in_encoder() {
+fn env_preserves_newlines_in_values() {
     let mut codec = FrameCodec;
     let mut buf = BytesMut::new();
-    // Value contains a newline that could inject LD_PRELOAD
+    // Binary encoding preserves arbitrary content -- newlines are no longer special
     let original = Frame::Env {
         vars: vec![("TERM".to_string(), "xterm\nLD_PRELOAD=/tmp/evil.so".to_string())],
     };
-    codec.encode(original, &mut buf).unwrap();
+    codec.encode(original.clone(), &mut buf).unwrap();
     let decoded = codec.decode(&mut buf).unwrap().unwrap();
-    match decoded {
-        Frame::Env { vars } => {
-            // Should decode as a single var with newline stripped
-            assert_eq!(vars.len(), 1);
-            assert_eq!(vars[0].0, "TERM");
-            assert_eq!(vars[0].1, "xtermLD_PRELOAD=/tmp/evil.so");
-        }
-        _ => panic!("expected Env frame"),
-    }
+    assert_eq!(original, decoded);
 }
 
 #[test]
-fn env_newlines_in_key_stripped() {
+fn env_preserves_newlines_in_keys() {
     let mut codec = FrameCodec;
     let mut buf = BytesMut::new();
+    // Binary encoding preserves arbitrary content in keys too
     let original = Frame::Env { vars: vec![("TE\nRM".to_string(), "xterm".to_string())] };
-    codec.encode(original, &mut buf).unwrap();
+    codec.encode(original.clone(), &mut buf).unwrap();
     let decoded = codec.decode(&mut buf).unwrap().unwrap();
-    match decoded {
-        Frame::Env { vars } => {
-            assert_eq!(vars.len(), 1);
-            assert_eq!(vars[0].0, "TERM");
-            assert_eq!(vars[0].1, "xterm");
-        }
-        _ => panic!("expected Env frame"),
-    }
+    assert_eq!(original, decoded);
 }
 
 #[test]
@@ -525,7 +504,7 @@ fn roundtrip_env_empty() {
     let mut buf = BytesMut::new();
     let original = Frame::Env { vars: vec![] };
     codec.encode(original.clone(), &mut buf).unwrap();
-    assert_eq!(buf.len(), 5); // type(1) + len(4), zero payload
+    assert_eq!(buf.len(), 9); // type(1) + len(4) + count(4)
     assert_eq!(buf[0], 0x07);
     let decoded = codec.decode(&mut buf).unwrap().unwrap();
     assert_eq!(original, decoded);
