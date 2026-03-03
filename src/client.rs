@@ -497,7 +497,9 @@ impl ClientRelay<'_> {
             Some(Ok(Frame::OpenUrl { url })) => {
                 if url.starts_with("http://") || url.starts_with("https://") {
                     debug!("opening URL locally: {url}");
-                    let _ = opener::open(&url);
+                    tokio::task::spawn_blocking(move || {
+                        let _ = opener::open(&url);
+                    });
                 } else {
                     debug!("rejected non-http(s) URL: {url}");
                 }
