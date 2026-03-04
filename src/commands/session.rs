@@ -33,6 +33,9 @@ pub(crate) async fn new_session(
             if detach {
                 return Ok(());
             }
+            if !settings.no_escape {
+                eprintln!("[~? for help]");
+            }
             let mut env_vars = gritty::collect_env_vars();
             if settings.forward_open {
                 env_vars.push(("BROWSER".into(), "gritty open".into()));
@@ -88,6 +91,9 @@ pub(crate) async fn attach(
     match Frame::expect_from(framed.next().await).map_err(AttachError::Other)? {
         Frame::Ok => {
             eprintln!("[attached]");
+            if !settings.no_escape {
+                eprintln!("[~? for help]");
+            }
             let code = gritty::client::run(
                 target,
                 framed,
