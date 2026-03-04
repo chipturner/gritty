@@ -44,7 +44,7 @@ async fn setup_session() -> (
     let agent_path = unique_agent_socket_path();
     let svc_path = unique_svc_socket_path();
     let handle = tokio::spawn(async move {
-        gritty::server::run(client_rx, meta_clone, agent_path, svc_path, 0, None).await
+        gritty::server::run(client_rx, meta_clone, agent_path, svc_path, 0, None, None).await
     });
 
     let (server_stream, client_stream) = UnixStream::pair().unwrap();
@@ -72,7 +72,7 @@ async fn setup_session_with_svc_path() -> (
     let svc_path = unique_svc_socket_path();
     let svc_path_clone = svc_path.clone();
     let handle = tokio::spawn(async move {
-        gritty::server::run(client_rx, meta_clone, agent_path, svc_path, 0, None).await
+        gritty::server::run(client_rx, meta_clone, agent_path, svc_path, 0, None, None).await
     });
 
     let (server_stream, client_stream) = UnixStream::pair().unwrap();
@@ -100,7 +100,7 @@ async fn setup_session_with_env(
     let agent_path = unique_agent_socket_path();
     let svc_path = unique_svc_socket_path();
     let handle = tokio::spawn(async move {
-        gritty::server::run(client_rx, meta_clone, agent_path, svc_path, 0, None).await
+        gritty::server::run(client_rx, meta_clone, agent_path, svc_path, 0, None, None).await
     });
 
     let (server_stream, client_stream) = UnixStream::pair().unwrap();
@@ -366,7 +366,10 @@ async fn control_frame_on_session_is_ignored() {
     // Send various control frames that make no sense on a session connection
     framed.send(Frame::ListSessions).await.unwrap();
     framed.send(Frame::KillServer).await.unwrap();
-    framed.send(Frame::NewSession { name: "bogus".to_string() }).await.unwrap();
+    framed
+        .send(Frame::NewSession { name: "bogus".to_string(), command: String::new() })
+        .await
+        .unwrap();
 
     tokio::time::sleep(Duration::from_millis(200)).await;
 
@@ -744,7 +747,7 @@ async fn setup_session_with_agent_path() -> (
     let agent_path_clone = agent_path.clone();
     let svc_path = unique_svc_socket_path();
     let handle = tokio::spawn(async move {
-        gritty::server::run(client_rx, meta_clone, agent_path_clone, svc_path, 0, None).await
+        gritty::server::run(client_rx, meta_clone, agent_path_clone, svc_path, 0, None, None).await
     });
 
     let (server_stream, client_stream) = UnixStream::pair().unwrap();

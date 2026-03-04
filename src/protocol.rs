@@ -200,6 +200,7 @@ pub enum Frame {
     },
     NewSession {
         name: String,
+        command: String,
     },
     Attach {
         session: String,
@@ -639,7 +640,26 @@ impl Decoder for FrameCodec {
             // String frames
             TYPE_OPEN_URL => Ok(Some(Frame::OpenUrl { url: decode_string(payload)? })),
             TYPE_SEND_CANCEL => Ok(Some(Frame::SendCancel { reason: decode_string(payload)? })),
-            TYPE_NEW_SESSION => Ok(Some(Frame::NewSession { name: decode_string(payload)? })),
+            TYPE_NEW_SESSION => {
+                if payload.len() < 2 {
+                    return Ok(Some(Frame::NewSession {
+                        name: String::new(),
+                        command: String::new(),
+                    }));
+                }
+                let name_len = read_u16(&payload, 0) as usize;
+                if 2 + name_len > payload.len() {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "new session frame truncated",
+                    ));
+                }
+                let name = String::from_utf8(payload[2..2 + name_len].to_vec())
+                    .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+                let command = String::from_utf8(payload[2 + name_len..].to_vec())
+                    .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+                Ok(Some(Frame::NewSession { name, command }))
+            }
             TYPE_ATTACH => Ok(Some(Frame::Attach { session: decode_string(payload)? })),
             TYPE_TAIL => Ok(Some(Frame::Tail { session: decode_string(payload)? })),
             TYPE_KILL_SESSION => Ok(Some(Frame::KillSession { session: decode_string(payload)? })),
@@ -747,7 +767,16 @@ impl Encoder<Frame> for FrameCodec {
             // String frames
             Frame::OpenUrl { url } => encode_str(dst, TYPE_OPEN_URL, &url),
             Frame::SendCancel { reason } => encode_str(dst, TYPE_SEND_CANCEL, &reason),
-            Frame::NewSession { name } => encode_str(dst, TYPE_NEW_SESSION, &name),
+            Frame::NewSession { name, command } => {
+                let name_bytes = name.as_bytes();
+                let cmd_bytes = command.as_bytes();
+                let payload_len = 2 + name_bytes.len() + cmd_bytes.len();
+                dst.put_u8(TYPE_NEW_SESSION);
+                dst.put_u32(payload_len as u32);
+                dst.put_u16(name_bytes.len() as u16);
+                dst.extend_from_slice(name_bytes);
+                dst.extend_from_slice(cmd_bytes);
+            }
             Frame::Attach { session } => encode_str(dst, TYPE_ATTACH, &session),
             Frame::Tail { session } => encode_str(dst, TYPE_TAIL, &session),
             Frame::KillSession { session } => encode_str(dst, TYPE_KILL_SESSION, &session),

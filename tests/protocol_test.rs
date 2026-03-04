@@ -88,7 +88,7 @@ fn decode_invalid_type_returns_error() {
 fn roundtrip_new_session() {
     let mut codec = FrameCodec;
     let mut buf = BytesMut::new();
-    let original = Frame::NewSession { name: "myproject".to_string() };
+    let original = Frame::NewSession { name: "myproject".to_string(), command: String::new() };
     codec.encode(original.clone(), &mut buf).unwrap();
     let decoded = codec.decode(&mut buf).unwrap().unwrap();
     assert_eq!(original, decoded);
@@ -98,7 +98,30 @@ fn roundtrip_new_session() {
 fn roundtrip_new_session_empty_name() {
     let mut codec = FrameCodec;
     let mut buf = BytesMut::new();
-    let original = Frame::NewSession { name: String::new() };
+    let original = Frame::NewSession { name: String::new(), command: String::new() };
+    codec.encode(original.clone(), &mut buf).unwrap();
+    let decoded = codec.decode(&mut buf).unwrap().unwrap();
+    assert_eq!(original, decoded);
+}
+
+#[test]
+fn roundtrip_new_session_with_command() {
+    let mut codec = FrameCodec;
+    let mut buf = BytesMut::new();
+    let original = Frame::NewSession {
+        name: "worker".to_string(),
+        command: "echo hello && sleep 999".to_string(),
+    };
+    codec.encode(original.clone(), &mut buf).unwrap();
+    let decoded = codec.decode(&mut buf).unwrap().unwrap();
+    assert_eq!(original, decoded);
+}
+
+#[test]
+fn roundtrip_new_session_command_only() {
+    let mut codec = FrameCodec;
+    let mut buf = BytesMut::new();
+    let original = Frame::NewSession { name: String::new(), command: "make build".to_string() };
     codec.encode(original.clone(), &mut buf).unwrap();
     let decoded = codec.decode(&mut buf).unwrap().unwrap();
     assert_eq!(original, decoded);

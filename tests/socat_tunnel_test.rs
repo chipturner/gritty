@@ -173,7 +173,10 @@ async fn tunnel_death_session_persists() {
         .expect("stream ended")
         .expect("decode error");
     assert!(matches!(ack, Frame::HelloAck { .. }));
-    framed.send(Frame::NewSession { name: "persist-test".to_string() }).await.unwrap();
+    framed
+        .send(Frame::NewSession { name: "persist-test".to_string(), command: String::new() })
+        .await
+        .unwrap();
     let resp = timeout(Duration::from_secs(5), framed.next())
         .await
         .expect("timed out")

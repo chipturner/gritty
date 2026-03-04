@@ -141,7 +141,10 @@ async fn control_request(proxy_path: &Path, frame: Frame) -> Frame {
 /// Create a named session through the proxy. Returns (session_id, attached framed connection).
 async fn create_session(proxy_path: &Path, name: &str) -> (String, Framed<UnixStream, FrameCodec>) {
     let mut framed = connect_and_handshake(proxy_path).await;
-    framed.send(Frame::NewSession { name: name.to_string() }).await.unwrap();
+    framed
+        .send(Frame::NewSession { name: name.to_string(), command: String::new() })
+        .await
+        .unwrap();
     let resp = timeout(Duration::from_secs(5), framed.next())
         .await
         .expect("timed out")

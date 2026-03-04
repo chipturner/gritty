@@ -282,9 +282,10 @@ async fn dispatch_control(
     ctl_path: &Path,
 ) -> bool {
     match frame {
-        Frame::NewSession { name } => {
+        Frame::NewSession { name, command } => {
             // Reject names containing control characters
             let name_opt = if name.is_empty() { None } else { Some(name) };
+            let command_opt = if command.is_empty() { None } else { Some(command) };
             if let Some(ref n) = name_opt {
                 if n.bytes().any(|b| b.is_ascii_control()) {
                     let _ = timed_send(
@@ -327,6 +328,7 @@ async fn dispatch_control(
             let agent_socket_path = sock_dir.join(format!("agent-{id}.sock"));
             let svc_socket_path = sock_dir.join(format!("svc-{id}.sock"));
             let name_for_server = name_opt.clone();
+            let cmd_for_server = command_opt;
             let handle = tokio::spawn(async move {
                 server::run(
                     client_rx,
@@ -335,6 +337,7 @@ async fn dispatch_control(
                     svc_socket_path,
                     id,
                     name_for_server,
+                    cmd_for_server,
                 )
                 .await
             });

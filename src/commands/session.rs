@@ -5,6 +5,8 @@ use super::{AttachError, AutoStart};
 
 pub(crate) async fn new_session(
     name: Option<String>,
+    command: Option<String>,
+    detach: bool,
     settings: gritty::config::SessionSettings,
     ctl_path: PathBuf,
     auto_start_mode: AutoStart,
@@ -15,17 +17,21 @@ pub(crate) async fn new_session(
     use tokio_util::codec::Framed;
 
     let session_name = name.clone().unwrap_or_default();
+    let session_command = command.unwrap_or_default();
 
     let stream = super::util::connect_or_start(&ctl_path, &auto_start_mode, wait).await?;
     let mut framed = Framed::new(stream, FrameCodec);
     gritty::handshake(&mut framed).await?;
-    framed.send(Frame::NewSession { name: session_name }).await?;
+    framed.send(Frame::NewSession { name: session_name, command: session_command }).await?;
 
     match Frame::expect_from(framed.next().await)? {
         Frame::SessionCreated { id } => {
             match &name {
                 Some(n) => eprintln!("session created: {n} (id {id})"),
                 None => eprintln!("session created: id {id}"),
+            }
+            if detach {
+                return Ok(());
             }
             let mut env_vars = gritty::collect_env_vars();
             if settings.forward_open {

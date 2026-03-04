@@ -1108,6 +1108,7 @@ pub async fn run(
     svc_socket_path: PathBuf,
     session_id: u32,
     session_name: Option<String>,
+    command: Option<String>,
 ) -> anyhow::Result<()> {
     // Allocate PTY (once, before accept loop)
     let pty = openpty(None, None)?;
@@ -1219,11 +1220,15 @@ pub async fn run(
             _ => Vec::new(),
         };
 
-    // Spawn login shell on slave PTY
+    // Spawn shell (or custom command) on slave PTY
     let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/sh".to_string());
     let home = std::env::var("HOME").ok();
     let mut cmd = Command::new(&shell);
-    cmd.arg("-l");
+    if let Some(ref user_cmd) = command {
+        cmd.arg("-c").arg(user_cmd);
+    } else {
+        cmd.arg("-l");
+    }
     if let Some(ref dir) = home {
         cmd.current_dir(dir);
     }

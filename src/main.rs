@@ -36,6 +36,14 @@ enum Command {
         /// Target host, with optional session name (host or host:name)
         target: Option<String>,
 
+        /// Command to run instead of login shell
+        #[arg(short = 'c', long)]
+        command: Option<String>,
+
+        /// Create session but don't attach (for background jobs)
+        #[arg(short = 'd', long)]
+        detach: bool,
+
         /// Don't send Ctrl-L to redraw after the shell starts
         #[arg(long)]
         no_redraw: bool,
@@ -528,6 +536,8 @@ async fn run(cli: Cli, config: gritty::config::ConfigFile) -> anyhow::Result<()>
         Command::Server { .. } | Command::Connect { .. } => unreachable!(),
         Command::NewSession {
             target,
+            command,
+            detach,
             no_redraw,
             no_escape,
             forward_agent,
@@ -559,7 +569,7 @@ async fn run(cli: Cli, config: gritty::config::ConfigFile) -> anyhow::Result<()>
                 oauth_redirect: if no_oauth_redirect { false } else { resolved.oauth_redirect },
                 oauth_timeout: oauth_timeout.unwrap_or(resolved.oauth_timeout),
             };
-            new_session(session, settings, ctl_path, auto_start_mode, wait).await
+            new_session(session, command, detach, settings, ctl_path, auto_start_mode, wait).await
         }
         Command::Tail { target } => {
             let (host, session) = match &target {
@@ -617,7 +627,8 @@ async fn run(cli: Cli, config: gritty::config::ConfigFile) -> anyhow::Result<()>
                         (None, Some(h)) => AutoStart::Tunnel(h.to_string()),
                         (None, None) => anyhow::bail!("specify a host or use --ctl-socket"),
                     };
-                    new_session(None, settings, ctl_path, auto_start_mode, false).await?;
+                    new_session(None, None, false, settings, ctl_path, auto_start_mode, false)
+                        .await?;
                     unreachable!()
                 }
                 None => {
@@ -634,7 +645,16 @@ async fn run(cli: Cli, config: gritty::config::ConfigFile) -> anyhow::Result<()>
                         (None, Some(h)) => AutoStart::Tunnel(h.to_string()),
                         (None, None) => anyhow::bail!("specify a host or use --ctl-socket"),
                     };
-                    new_session(Some(session), settings, ctl_path, auto_start_mode, false).await?;
+                    new_session(
+                        Some(session),
+                        None,
+                        false,
+                        settings,
+                        ctl_path,
+                        auto_start_mode,
+                        false,
+                    )
+                    .await?;
                     unreachable!()
                 }
                 Err(AttachError::NoSuchSession) => {

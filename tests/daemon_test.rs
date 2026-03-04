@@ -61,7 +61,11 @@ async fn drain_data(framed: &mut Framed<UnixStream, FrameCodec>, wait: Duration)
 
 /// Create a session via NewSession, return the session id.
 async fn create_session(ctl_path: &std::path::Path, name: &str) -> String {
-    let resp = control_request(ctl_path, Frame::NewSession { name: name.to_string() }).await;
+    let resp = control_request(
+        ctl_path,
+        Frame::NewSession { name: name.to_string(), command: String::new() },
+    )
+    .await;
     match resp {
         Frame::SessionCreated { id } => id,
         other => panic!("expected SessionCreated, got {other:?}"),
@@ -140,7 +144,11 @@ async fn daemon_rejects_duplicate_name() {
     let id = create_session(&ctl_path, "dupname").await;
 
     // Try to create session with same name again
-    let resp = control_request(&ctl_path, Frame::NewSession { name: "dupname".to_string() }).await;
+    let resp = control_request(
+        &ctl_path,
+        Frame::NewSession { name: "dupname".to_string(), command: String::new() },
+    )
+    .await;
     assert!(matches!(resp, Frame::Error { .. }), "expected Error for duplicate name, got {resp:?}");
 
     kill_cleanup(&ctl_path, &id).await;
@@ -154,8 +162,11 @@ async fn daemon_rejects_name_with_tab() {
     let _daemon = tokio::spawn(async move { gritty::daemon::run(&ctl, None).await });
     wait_for_daemon(&ctl_path).await;
 
-    let resp =
-        control_request(&ctl_path, Frame::NewSession { name: "bad\tname".to_string() }).await;
+    let resp = control_request(
+        &ctl_path,
+        Frame::NewSession { name: "bad\tname".to_string(), command: String::new() },
+    )
+    .await;
     assert!(matches!(resp, Frame::Error { .. }), "expected Error for name with tab, got {resp:?}");
 
     control_request(&ctl_path, Frame::KillServer).await;
@@ -169,8 +180,11 @@ async fn daemon_rejects_name_with_newline() {
     let _daemon = tokio::spawn(async move { gritty::daemon::run(&ctl, None).await });
     wait_for_daemon(&ctl_path).await;
 
-    let resp =
-        control_request(&ctl_path, Frame::NewSession { name: "bad\nname".to_string() }).await;
+    let resp = control_request(
+        &ctl_path,
+        Frame::NewSession { name: "bad\nname".to_string(), command: String::new() },
+    )
+    .await;
     assert!(
         matches!(resp, Frame::Error { .. }),
         "expected Error for name with newline, got {resp:?}"
@@ -472,7 +486,11 @@ async fn list_before_session_ready() {
     wait_for_daemon(&ctl_path).await;
 
     // Create session via NewSession (don't wait the usual 200ms from helper)
-    let resp = control_request(&ctl_path, Frame::NewSession { name: "early".to_string() }).await;
+    let resp = control_request(
+        &ctl_path,
+        Frame::NewSession { name: "early".to_string(), command: String::new() },
+    )
+    .await;
     let id = match resp {
         Frame::SessionCreated { id } => id,
         other => panic!("expected SessionCreated, got {other:?}"),
@@ -916,7 +934,11 @@ async fn daemon_rejects_purely_numeric_name() {
     let _daemon = tokio::spawn(async move { gritty::daemon::run(&ctl, None).await });
     wait_for_daemon(&ctl_path).await;
 
-    let resp = control_request(&ctl_path, Frame::NewSession { name: "42".to_string() }).await;
+    let resp = control_request(
+        &ctl_path,
+        Frame::NewSession { name: "42".to_string(), command: String::new() },
+    )
+    .await;
     match resp {
         Frame::Error { message } => {
             assert!(
