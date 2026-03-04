@@ -1168,6 +1168,7 @@ pub async fn run(
                 // Env vars only sent on first connection; clear for reconnect
                 current_env.clear();
                 // Disconnected — try to reconnect
+                let reconnect_started = Instant::now();
                 write_stdout_async(&async_stdout, status_msg("reconnecting...").as_bytes()).await?;
 
                 loop {
@@ -1186,6 +1187,15 @@ pub async fn run(
                             continue;
                         }
                     }
+
+                    // Update elapsed time on each retry
+                    let elapsed = reconnect_started.elapsed().as_secs();
+                    write_stdout_async(
+                        &async_stdout,
+                        format!("\r{}", status_msg(&format!("reconnecting... {elapsed}s")))
+                            .as_bytes(),
+                    )
+                    .await?;
 
                     let stream = match UnixStream::connect(ctl_path).await {
                         Ok(s) => s,
@@ -1318,9 +1328,12 @@ pub async fn tail(
         match result {
             Some(code) => break code,
             None => {
+                let reconnect_started = Instant::now();
                 eprintln!("\x1b[2;33m[reconnecting...]\x1b[0m");
                 loop {
                     tokio::time::sleep(Duration::from_secs(1)).await;
+                    let elapsed = reconnect_started.elapsed().as_secs();
+                    eprint!("\r\x1b[2;33m[reconnecting... {elapsed}s]\x1b[0m");
 
                     let stream = match UnixStream::connect(ctl_path).await {
                         Ok(s) => s,
