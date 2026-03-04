@@ -185,7 +185,9 @@ async fn remote_exec(
         let stderr = stderr.trim();
         debug!("ssh failed (status {}): {stderr}", output.status);
         if stderr.contains("command not found") || stderr.contains("No such file") {
-            bail!("gritty not found on remote host (is it in PATH?)");
+            bail!(
+                "gritty not found on remote host -- install it there with: cargo install gritty-cli"
+            );
         }
         let diag = format_ssh_diag(dest, extra_ssh_opts, foreground);
         if stderr.is_empty() {
