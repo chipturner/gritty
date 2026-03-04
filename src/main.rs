@@ -128,6 +128,13 @@ enum Command {
         /// Target host
         target: Option<String>,
     },
+    /// Rename a session
+    Rename {
+        /// Target host and session (host:session)
+        target: Option<String>,
+        /// New name for the session
+        new_name: String,
+    },
     /// Send files to a paired receiver
     Send {
         /// Session to use (host:session); auto-detected if omitted
@@ -690,6 +697,24 @@ async fn run(cli: Cli, config: gritty::config::ConfigFile) -> anyhow::Result<()>
                 }
             };
             kill_session(session, ctl_path).await
+        }
+        Command::Rename { target, new_name } => {
+            let (host, session) = match &target {
+                Some(t) => {
+                    let (h, s) = parse_target(t);
+                    (Some(h), s)
+                }
+                None => (None, None),
+            };
+            let ctl_path = resolve_ctl_path(cli.ctl_socket, host.as_deref())?;
+            let session = match session {
+                Some(s) => s,
+                None => {
+                    suggest_session("rename", host.as_deref().unwrap_or("host"), &ctl_path).await?;
+                    unreachable!()
+                }
+            };
+            rename_session(session, new_name, ctl_path).await
         }
         Command::KillServer { target } => {
             let host = target.as_deref().map(|t| parse_target(t).0);

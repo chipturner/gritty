@@ -135,6 +135,28 @@ pub(crate) async fn tail_session(target: String, ctl_path: PathBuf) -> anyhow::R
     }
 }
 
+pub(crate) async fn rename_session(
+    target: String,
+    new_name: String,
+    ctl_path: PathBuf,
+) -> anyhow::Result<()> {
+    use gritty::protocol::Frame;
+
+    match server_request(
+        &ctl_path,
+        Frame::RenameSession { session: target.clone(), new_name: new_name.clone() },
+    )
+    .await?
+    {
+        Frame::Ok => {
+            eprintln!("session renamed: {target} -> {new_name}");
+            Ok(())
+        }
+        Frame::Error { message } => anyhow::bail!("{message}"),
+        other => anyhow::bail!("unexpected response from server: {other:?}"),
+    }
+}
+
 pub(crate) async fn kill_session(target: String, ctl_path: PathBuf) -> anyhow::Result<()> {
     use gritty::protocol::Frame;
 

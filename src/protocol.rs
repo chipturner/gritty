@@ -41,6 +41,7 @@ const TYPE_PORT_FORWARD_OPEN: u8 = 0x1E;
 const TYPE_PORT_FORWARD_DATA: u8 = 0x1F;
 const TYPE_PORT_FORWARD_CLOSE: u8 = 0x26;
 const TYPE_PORT_FORWARD_STOP: u8 = 0x27;
+const TYPE_RENAME_SESSION: u8 = 0x28;
 
 const HEADER_LEN: usize = 5; // type(1) + length(4)
 const MAX_FRAME_SIZE: usize = 1 << 20; // 1 MB
@@ -215,6 +216,10 @@ pub enum Frame {
         session: String,
     },
     KillServer,
+    RenameSession {
+        session: String,
+        new_name: String,
+    },
     // Control responses
     SessionCreated {
         id: String,
@@ -682,6 +687,26 @@ impl Decoder for FrameCodec {
             TYPE_ATTACH => Ok(Some(Frame::Attach { session: decode_string(payload)? })),
             TYPE_TAIL => Ok(Some(Frame::Tail { session: decode_string(payload)? })),
             TYPE_KILL_SESSION => Ok(Some(Frame::KillSession { session: decode_string(payload)? })),
+            TYPE_RENAME_SESSION => {
+                if payload.len() < 2 {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "rename session frame too short",
+                    ));
+                }
+                let session_len = read_u16(&payload, 0) as usize;
+                if 2 + session_len > payload.len() {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "rename session frame truncated",
+                    ));
+                }
+                let session = String::from_utf8(payload[2..2 + session_len].to_vec())
+                    .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+                let new_name = String::from_utf8(payload[2 + session_len..].to_vec())
+                    .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+                Ok(Some(Frame::RenameSession { session, new_name }))
+            }
             TYPE_SESSION_CREATED => Ok(Some(Frame::SessionCreated { id: decode_string(payload)? })),
             TYPE_ERROR => Ok(Some(Frame::Error { message: decode_string(payload)? })),
 
@@ -799,6 +824,16 @@ impl Encoder<Frame> for FrameCodec {
             Frame::Attach { session } => encode_str(dst, TYPE_ATTACH, &session),
             Frame::Tail { session } => encode_str(dst, TYPE_TAIL, &session),
             Frame::KillSession { session } => encode_str(dst, TYPE_KILL_SESSION, &session),
+            Frame::RenameSession { session, new_name } => {
+                let session_bytes = session.as_bytes();
+                let name_bytes = new_name.as_bytes();
+                let payload_len = 2 + session_bytes.len() + name_bytes.len();
+                dst.put_u8(TYPE_RENAME_SESSION);
+                dst.put_u32(payload_len as u32);
+                dst.put_u16(session_bytes.len() as u16);
+                dst.extend_from_slice(session_bytes);
+                dst.extend_from_slice(name_bytes);
+            }
             Frame::SessionCreated { id } => encode_str(dst, TYPE_SESSION_CREATED, &id),
             Frame::Error { message } => encode_str(dst, TYPE_ERROR, &message),
 

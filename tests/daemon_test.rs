@@ -953,3 +953,91 @@ async fn daemon_rejects_purely_numeric_name() {
     let id = create_session(&ctl_path, "session2").await;
     kill_cleanup(&ctl_path, &id).await;
 }
+
+#[tokio::test]
+async fn rename_session_success() {
+    let (_tmp, ctl_path) = test_ctl();
+
+    let ctl = ctl_path.clone();
+    let _daemon = tokio::spawn(async move { gritty::daemon::run(&ctl, None).await });
+    wait_for_daemon(&ctl_path).await;
+
+    let id = create_session(&ctl_path, "oldname").await;
+
+    let resp = control_request(
+        &ctl_path,
+        Frame::RenameSession { session: "oldname".to_string(), new_name: "newname".to_string() },
+    )
+    .await;
+    assert_eq!(resp, Frame::Ok);
+
+    // Verify the session is now findable by new name
+    let resp = control_request(&ctl_path, Frame::ListSessions).await;
+    match resp {
+        Frame::SessionInfo { sessions } => {
+            assert_eq!(sessions.len(), 1);
+            assert_eq!(sessions[0].name, "newname");
+        }
+        other => panic!("expected SessionInfo, got {other:?}"),
+    }
+
+    kill_cleanup(&ctl_path, &id).await;
+}
+
+#[tokio::test]
+async fn rename_session_to_taken_name() {
+    let (_tmp, ctl_path) = test_ctl();
+
+    let ctl = ctl_path.clone();
+    let _daemon = tokio::spawn(async move { gritty::daemon::run(&ctl, None).await });
+    wait_for_daemon(&ctl_path).await;
+
+    let id_a = create_session(&ctl_path, "alice").await;
+    let id_b = create_session(&ctl_path, "bob").await;
+
+    let resp = control_request(
+        &ctl_path,
+        Frame::RenameSession { session: "alice".to_string(), new_name: "bob".to_string() },
+    )
+    .await;
+    match resp {
+        Frame::Error { message } => {
+            assert!(
+                message.contains("already exists"),
+                "error should mention duplicate, got: {message}"
+            );
+        }
+        other => panic!("expected Error for duplicate name, got {other:?}"),
+    }
+
+    kill_cleanup(&ctl_path, &id_a).await;
+    kill_cleanup(&ctl_path, &id_b).await;
+}
+
+#[tokio::test]
+async fn rename_session_to_numeric_name() {
+    let (_tmp, ctl_path) = test_ctl();
+
+    let ctl = ctl_path.clone();
+    let _daemon = tokio::spawn(async move { gritty::daemon::run(&ctl, None).await });
+    wait_for_daemon(&ctl_path).await;
+
+    let id = create_session(&ctl_path, "myname").await;
+
+    let resp = control_request(
+        &ctl_path,
+        Frame::RenameSession { session: "myname".to_string(), new_name: "42".to_string() },
+    )
+    .await;
+    match resp {
+        Frame::Error { message } => {
+            assert!(
+                message.contains("purely numeric"),
+                "error should mention numeric, got: {message}"
+            );
+        }
+        other => panic!("expected Error for numeric rename, got {other:?}"),
+    }
+
+    kill_cleanup(&ctl_path, &id).await;
+}

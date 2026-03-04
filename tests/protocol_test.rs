@@ -128,6 +128,28 @@ fn roundtrip_new_session_command_only() {
 }
 
 #[test]
+fn roundtrip_rename_session() {
+    let mut codec = FrameCodec;
+    let mut buf = BytesMut::new();
+    let original =
+        Frame::RenameSession { session: "0".to_string(), new_name: "myproject".to_string() };
+    codec.encode(original.clone(), &mut buf).unwrap();
+    let decoded = codec.decode(&mut buf).unwrap().unwrap();
+    assert_eq!(original, decoded);
+}
+
+#[test]
+fn roundtrip_rename_session_by_name() {
+    let mut codec = FrameCodec;
+    let mut buf = BytesMut::new();
+    let original =
+        Frame::RenameSession { session: "oldname".to_string(), new_name: "newname".to_string() };
+    codec.encode(original.clone(), &mut buf).unwrap();
+    let decoded = codec.decode(&mut buf).unwrap().unwrap();
+    assert_eq!(original, decoded);
+}
+
+#[test]
 fn roundtrip_attach() {
     let mut codec = FrameCodec;
     let mut buf = BytesMut::new();

@@ -484,6 +484,53 @@ async fn dispatch_control(
             }
             false
         }
+        Frame::RenameSession { session, new_name } => {
+            reap_sessions(sessions);
+            if let Some(id) = resolve_session(sessions, &session) {
+                if new_name.is_empty() {
+                    let _ = timed_send(
+                        &mut framed,
+                        Frame::Error { message: "new name must not be empty".to_string() },
+                    )
+                    .await;
+                } else if new_name.bytes().any(|b| b.is_ascii_control()) {
+                    let _ = timed_send(
+                        &mut framed,
+                        Frame::Error {
+                            message: "session name must not contain control characters".to_string(),
+                        },
+                    )
+                    .await;
+                } else if new_name.parse::<u32>().is_ok() {
+                    let _ = timed_send(
+                        &mut framed,
+                        Frame::Error {
+                            message: "session name must not be purely numeric (ambiguous with session IDs)".to_string(),
+                        },
+                    )
+                    .await;
+                } else if sessions.values().any(|s| s.name.as_deref() == Some(&new_name)) {
+                    let _ = timed_send(
+                        &mut framed,
+                        Frame::Error {
+                            message: format!("session name already exists: {new_name}"),
+                        },
+                    )
+                    .await;
+                } else {
+                    sessions.get_mut(&id).unwrap().name = Some(new_name.clone());
+                    info!(id, new_name, "session renamed");
+                    let _ = timed_send(&mut framed, Frame::Ok).await;
+                }
+            } else {
+                let _ = timed_send(
+                    &mut framed,
+                    Frame::Error { message: format!("no such session: {session}") },
+                )
+                .await;
+            }
+            false
+        }
         Frame::KillServer => {
             info!("kill-server received, shutting down");
             shutdown(sessions, ctl_path);
