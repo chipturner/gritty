@@ -102,6 +102,18 @@ fn is_trusted_root(path: &Path) -> bool {
 fn validate_dir(path: &Path) -> io::Result<()> {
     let meta = std::fs::symlink_metadata(path)?;
 
+    // Root-owned entries are system-managed (e.g. /var -> /private/var on macOS).
+    // Just verify the path resolves to a directory.
+    if meta.uid() == 0 {
+        if !path.is_dir() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!("{} does not resolve to a directory", path.display()),
+            ));
+        }
+        return Ok(());
+    }
+
     if meta.file_type().is_symlink() {
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
