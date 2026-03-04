@@ -696,9 +696,14 @@ pub async fn run(opts: ConnectOpts, ready_fd: Option<OwnedFd>) -> anyhow::Result
             } else {
                 None
             };
+            let fg_hint = if opts.foreground {
+                String::new()
+            } else {
+                format!("\n  if SSH needs a password or host key accept, use: gritty connect --foreground {}", opts.destination)
+            };
             match msg {
-                Some(err) => bail!("ssh tunnel failed: {err}\n  to diagnose: {diag}"),
-                None => bail!("ssh tunnel exited ({status})\n  to diagnose: {diag}"),
+                Some(err) => bail!("ssh tunnel failed: {err}\n  to diagnose: {diag}{fg_hint}"),
+                None => bail!("ssh tunnel exited ({status})\n  to diagnose: {diag}{fg_hint}"),
             }
         }
     }
