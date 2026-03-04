@@ -473,6 +473,13 @@ fn main() {
             let out_path = socket_dir.join(format!("connect-{connection_name}.out"));
             let log_path = socket_dir.join(format!("connect-{connection_name}.log"));
 
+            if !foreground && !dry_run {
+                if let Err(e) = gritty::connect::preflight_ssh(&destination, &ssh_options) {
+                    eprintln!("error: {e}");
+                    std::process::exit(1);
+                }
+            }
+
             let ready_fd = if foreground || dry_run {
                 None
             } else {

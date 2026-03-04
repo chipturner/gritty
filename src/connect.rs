@@ -433,6 +433,34 @@ pub fn parse_host(destination: &str) -> anyhow::Result<String> {
     Ok(Destination::parse(destination)?.host)
 }
 
+/// Synchronous SSH connectivity check -- call before daemonizing to catch
+/// host-key prompts and password prompts while the terminal is still attached.
+pub fn preflight_ssh(dest_str: &str, ssh_options: &[String]) -> anyhow::Result<()> {
+    let dest = Destination::parse(dest_str)?;
+    let mut cmd = std::process::Command::new("ssh");
+    cmd.args(dest.port_args());
+    for opt in ssh_options {
+        cmd.arg("-o");
+        cmd.arg(opt);
+    }
+    cmd.args(["-o", "BatchMode=yes", "-o", "ConnectTimeout=5"]);
+    cmd.arg(dest.ssh_dest());
+    cmd.arg("true");
+    cmd.stdin(std::process::Stdio::null());
+    cmd.stdout(std::process::Stdio::null());
+    cmd.stderr(std::process::Stdio::null());
+    let status = cmd.status().context("failed to run ssh")?;
+    if !status.success() {
+        bail!(
+            "SSH cannot connect non-interactively to {}\n  \
+             if SSH needs a password or host key accept, use: gritty connect --foreground {}",
+            dest.ssh_dest(),
+            dest_str
+        );
+    }
+    Ok(())
+}
+
 // ---------------------------------------------------------------------------
 // Lockfile-based liveness
 // ---------------------------------------------------------------------------
