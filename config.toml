@@ -12,6 +12,9 @@
 # no-redraw = false
 # oauth-redirect = true
 # oauth-timeout = 180
+# heartbeat-interval = 5
+# heartbeat-timeout = 15
+# ring-buffer-size = 1048576
 
 # Connect-specific global defaults.
 [defaults.connect]

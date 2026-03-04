@@ -44,7 +44,8 @@ async fn setup_session() -> (
     let agent_path = unique_agent_socket_path();
     let svc_path = unique_svc_socket_path();
     let handle = tokio::spawn(async move {
-        gritty::server::run(client_rx, meta_clone, agent_path, svc_path, 0, None, None).await
+        gritty::server::run(client_rx, meta_clone, agent_path, svc_path, 0, None, None, 1 << 20)
+            .await
     });
 
     let (server_stream, client_stream) = UnixStream::pair().unwrap();
@@ -72,7 +73,8 @@ async fn setup_session_with_svc_path() -> (
     let svc_path = unique_svc_socket_path();
     let svc_path_clone = svc_path.clone();
     let handle = tokio::spawn(async move {
-        gritty::server::run(client_rx, meta_clone, agent_path, svc_path, 0, None, None).await
+        gritty::server::run(client_rx, meta_clone, agent_path, svc_path, 0, None, None, 1 << 20)
+            .await
     });
 
     let (server_stream, client_stream) = UnixStream::pair().unwrap();
@@ -100,7 +102,8 @@ async fn setup_session_with_env(
     let agent_path = unique_agent_socket_path();
     let svc_path = unique_svc_socket_path();
     let handle = tokio::spawn(async move {
-        gritty::server::run(client_rx, meta_clone, agent_path, svc_path, 0, None, None).await
+        gritty::server::run(client_rx, meta_clone, agent_path, svc_path, 0, None, None, 1 << 20)
+            .await
     });
 
     let (server_stream, client_stream) = UnixStream::pair().unwrap();
@@ -747,7 +750,17 @@ async fn setup_session_with_agent_path() -> (
     let agent_path_clone = agent_path.clone();
     let svc_path = unique_svc_socket_path();
     let handle = tokio::spawn(async move {
-        gritty::server::run(client_rx, meta_clone, agent_path_clone, svc_path, 0, None, None).await
+        gritty::server::run(
+            client_rx,
+            meta_clone,
+            agent_path_clone,
+            svc_path,
+            0,
+            None,
+            None,
+            1 << 20,
+        )
+        .await
     });
 
     let (server_stream, client_stream) = UnixStream::pair().unwrap();

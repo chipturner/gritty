@@ -15,6 +15,9 @@ pub struct SessionSettings {
     pub no_redraw: bool,
     pub oauth_redirect: bool,
     pub oauth_timeout: u64,
+    pub heartbeat_interval: u64,
+    pub heartbeat_timeout: u64,
+    pub ring_buffer_size: u64,
 }
 
 impl Default for SessionSettings {
@@ -26,6 +29,9 @@ impl Default for SessionSettings {
             no_redraw: false,
             oauth_redirect: true,
             oauth_timeout: 180,
+            heartbeat_interval: 5,
+            heartbeat_timeout: 15,
+            ring_buffer_size: 1 << 20, // 1 MB
         }
     }
 }
@@ -56,6 +62,9 @@ pub struct Defaults {
     pub no_redraw: Option<bool>,
     pub oauth_redirect: Option<bool>,
     pub oauth_timeout: Option<u64>,
+    pub heartbeat_interval: Option<u64>,
+    pub heartbeat_timeout: Option<u64>,
+    pub ring_buffer_size: Option<u64>,
     pub connect: Option<ConnectDefaults>,
 }
 
@@ -77,6 +86,9 @@ pub struct HostConfig {
     pub no_redraw: Option<bool>,
     pub oauth_redirect: Option<bool>,
     pub oauth_timeout: Option<u64>,
+    pub heartbeat_interval: Option<u64>,
+    pub heartbeat_timeout: Option<u64>,
+    pub ring_buffer_size: Option<u64>,
     pub connect: Option<ConnectDefaults>,
 }
 
@@ -125,6 +137,18 @@ impl ConfigFile {
             no_redraw: pick(h.and_then(|h| h.no_redraw), d.no_redraw),
             oauth_redirect: h.and_then(|h| h.oauth_redirect).or(d.oauth_redirect).unwrap_or(true),
             oauth_timeout: h.and_then(|h| h.oauth_timeout).or(d.oauth_timeout).unwrap_or(180),
+            heartbeat_interval: h
+                .and_then(|h| h.heartbeat_interval)
+                .or(d.heartbeat_interval)
+                .unwrap_or(5),
+            heartbeat_timeout: h
+                .and_then(|h| h.heartbeat_timeout)
+                .or(d.heartbeat_timeout)
+                .unwrap_or(15),
+            ring_buffer_size: h
+                .and_then(|h| h.ring_buffer_size)
+                .or(d.ring_buffer_size)
+                .unwrap_or(1 << 20),
         }
     }
 

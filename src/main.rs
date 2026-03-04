@@ -575,6 +575,9 @@ async fn run(cli: Cli, config: gritty::config::ConfigFile) -> anyhow::Result<()>
                 forward_open: forward_open || resolved.forward_open,
                 oauth_redirect: if no_oauth_redirect { false } else { resolved.oauth_redirect },
                 oauth_timeout: oauth_timeout.unwrap_or(resolved.oauth_timeout),
+                heartbeat_interval: resolved.heartbeat_interval,
+                heartbeat_timeout: resolved.heartbeat_timeout,
+                ring_buffer_size: resolved.ring_buffer_size,
             };
             new_session(session, command, detach, settings, ctl_path, auto_start_mode, wait).await
         }
@@ -623,6 +626,9 @@ async fn run(cli: Cli, config: gritty::config::ConfigFile) -> anyhow::Result<()>
                 forward_open: forward_open || resolved.forward_open,
                 oauth_redirect: if no_oauth_redirect { false } else { resolved.oauth_redirect },
                 oauth_timeout: oauth_timeout.unwrap_or(resolved.oauth_timeout),
+                heartbeat_interval: resolved.heartbeat_interval,
+                heartbeat_timeout: resolved.heartbeat_timeout,
+                ring_buffer_size: resolved.ring_buffer_size,
             };
             let session = match session {
                 Some(s) => s,

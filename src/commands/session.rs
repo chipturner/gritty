@@ -48,6 +48,8 @@ pub(crate) async fn new_session(
                 settings.forward_open,
                 settings.oauth_redirect,
                 settings.oauth_timeout,
+                settings.heartbeat_interval,
+                settings.heartbeat_timeout,
             )
             .await?;
             std::process::exit(code);
@@ -97,6 +99,8 @@ pub(crate) async fn attach(
                 settings.forward_open,
                 settings.oauth_redirect,
                 settings.oauth_timeout,
+                settings.heartbeat_interval,
+                settings.heartbeat_timeout,
             )
             .await
             .map_err(AttachError::Other)?;

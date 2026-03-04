@@ -1101,6 +1101,7 @@ impl ServerRelay<'_> {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 pub async fn run(
     mut client_rx: mpsc::UnboundedReceiver<ClientConn>,
     metadata_slot: Arc<OnceLock<SessionMetadata>>,
@@ -1109,6 +1110,7 @@ pub async fn run(
     session_id: u32,
     session_name: Option<String>,
     command: Option<String>,
+    ring_buffer_cap: usize,
 ) -> anyhow::Result<()> {
     // Allocate PTY (once, before accept loop)
     let pty = openpty(None, None)?;
@@ -1138,7 +1140,6 @@ pub async fn run(
     let mut ring_buf: VecDeque<Bytes> = VecDeque::new();
     let mut ring_buf_size: usize = 0;
     let mut ring_buf_dropped: usize = 0;
-    const RING_BUF_CAP: usize = 1 << 20; // 1 MB
 
     // Agent forwarding state
     let mut agent = AgentForwardState::new(agent_socket_path);
@@ -1335,7 +1336,7 @@ pub async fn run(
                                 }
                                 ring_buf_size += chunk.len();
                                 ring_buf.push_back(chunk);
-                                while ring_buf_size > RING_BUF_CAP {
+                                while ring_buf_size > ring_buffer_cap {
                                     if let Some(old) = ring_buf.pop_front() {
                                         ring_buf_size -= old.len();
                                         ring_buf_dropped += old.len();

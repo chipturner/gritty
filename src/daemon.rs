@@ -262,6 +262,8 @@ pub async fn run(ctl_path: &Path, ready_fd: Option<OwnedFd>) -> anyhow::Result<(
     let mut sessions: HashMap<u32, SessionState> = HashMap::new();
     let mut next_id: u32 = 0;
     let mut last_attached: Option<u32> = None;
+    let ring_buffer_cap =
+        crate::config::ConfigFile::load().resolve_session(None).ring_buffer_size as usize;
 
     // Signal handlers
     let mut sigterm = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
@@ -287,6 +289,7 @@ pub async fn run(ctl_path: &Path, ready_fd: Option<OwnedFd>) -> anyhow::Result<(
             Some((frame, framed)) = conn_rx.recv() => {
                 dispatch_control(
                     frame, framed, &mut sessions, &mut next_id, ctl_path, &mut last_attached,
+                    ring_buffer_cap,
                 ).await
             }
             _ = sigterm.recv() => {
@@ -319,6 +322,7 @@ async fn dispatch_control(
     next_id: &mut u32,
     ctl_path: &Path,
     last_attached: &mut Option<u32>,
+    ring_buffer_cap: usize,
 ) -> bool {
     match frame {
         Frame::NewSession { name, command } => {
@@ -377,6 +381,7 @@ async fn dispatch_control(
                     id,
                     name_for_server,
                     cmd_for_server,
+                    ring_buffer_cap,
                 )
                 .await
             });

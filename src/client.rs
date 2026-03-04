@@ -300,8 +300,8 @@ async fn timed_send(framed: &mut Framed<UnixStream, FrameCodec>, frame: Frame) -
     }
 }
 
-const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(5);
-const HEARTBEAT_TIMEOUT: Duration = Duration::from_secs(15);
+const DEFAULT_HEARTBEAT_INTERVAL: Duration = Duration::from_secs(5);
+const DEFAULT_HEARTBEAT_TIMEOUT: Duration = Duration::from_secs(15);
 
 /// Events from local agent connection tasks to the relay loop.
 enum AgentEvent {
@@ -882,11 +882,13 @@ async fn relay(
     oauth_redirect: bool,
     oauth_timeout: u64,
     session: &str,
+    hb_interval: Duration,
+    hb_timeout: Duration,
 ) -> anyhow::Result<RelayExit> {
     let mut sigterm = signal(SignalKind::terminate())?;
     let mut sighup = signal(SignalKind::hangup())?;
 
-    let mut heartbeat_interval = tokio::time::interval(HEARTBEAT_INTERVAL);
+    let mut heartbeat_interval = tokio::time::interval(hb_interval);
     heartbeat_interval.reset(); // first tick is immediate otherwise; delay it
     let mut last_pong = Instant::now();
     let mut last_ping_sent = Instant::now();
@@ -1076,7 +1078,7 @@ async fn relay(
             }
 
             _ = heartbeat_interval.tick() => {
-                if relay.last_pong.elapsed() > HEARTBEAT_TIMEOUT {
+                if relay.last_pong.elapsed() > hb_timeout {
                     debug!("heartbeat timeout");
                     return Ok(RelayExit::Disconnected);
                 }
@@ -1111,6 +1113,8 @@ pub async fn run(
     forward_open: bool,
     oauth_redirect: bool,
     oauth_timeout: u64,
+    heartbeat_interval: u64,
+    heartbeat_timeout: u64,
 ) -> anyhow::Result<i32> {
     let stdin = io::stdin();
     let stdin_fd = stdin.as_fd();
@@ -1157,6 +1161,8 @@ pub async fn run(
                 oauth_redirect,
                 oauth_timeout,
                 session,
+                Duration::from_secs(heartbeat_interval),
+                Duration::from_secs(heartbeat_timeout),
             )
             .await?
         } else {
@@ -1270,7 +1276,7 @@ pub async fn tail(
         }
     });
 
-    let mut heartbeat_interval = tokio::time::interval(HEARTBEAT_INTERVAL);
+    let mut heartbeat_interval = tokio::time::interval(DEFAULT_HEARTBEAT_INTERVAL);
     heartbeat_interval.reset();
     let mut last_pong = Instant::now();
     let mut sigint = signal(SignalKind::interrupt())?;
@@ -1305,7 +1311,7 @@ pub async fn tail(
                     }
                 }
                 _ = heartbeat_interval.tick() => {
-                    if last_pong.elapsed() > HEARTBEAT_TIMEOUT {
+                    if last_pong.elapsed() > DEFAULT_HEARTBEAT_TIMEOUT {
                         debug!("tail heartbeat timeout");
                         break 'relay None;
                     }
