@@ -175,6 +175,8 @@ After a newline (or at session start), `~` enters escape mode:
 | Sequence | Action |
 |----------|--------|
 | `~.` | Detach from session (clean exit, no auto-reconnect) |
+| `~R` | Force reconnect |
+| `~#` | Session status and RTT |
 | `~^Z` | Suspend the client (SIGTSTP) |
 | `~?` | Print help |
 | `~~` | Send a literal `~` |
