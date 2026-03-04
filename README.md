@@ -222,6 +222,16 @@ gritty completions zsh > ~/.zfunc/_gritty
 gritty completions fish > ~/.config/fish/completions/gritty.fish
 ```
 
+## Troubleshooting
+
+**"gritty not found on remote host"** -- gritty must be installed on the remote host too. Run `cargo install gritty-cli` there, or ensure it's in `$HOME/bin`, `$HOME/.local/bin`, `$HOME/.cargo/bin`, or another standard path.
+
+**First connect hangs or fails** -- if SSH needs a password or host key confirmation, the background process can't prompt you. Use `gritty connect --foreground <dest>` the first time to handle the interactive prompt, then use the normal backgrounding flow afterwards.
+
+**"[reconnecting...]" forever** -- the SSH tunnel is down and not coming back. Check `gritty tunnels` for tunnel status. If the tunnel shows as stale, `gritty disconnect <name>` to clean it up and `gritty connect <dest>` to re-establish. Check `gritty info` for log file paths if you need to dig deeper.
+
+**Protocol version mismatch after upgrade** -- if you upgrade gritty on one side but not the other, the version handshake negotiates down to the older protocol. This usually works, but if you see unexpected errors, upgrade both sides to the same version. `gritty protocol-version` shows the local version; `gritty info` shows tunnel status.
+
 ## Design
 
 gritty contains zero networking code. Sessions live on Unix domain sockets; for remote access, you forward the socket over SSH -- the same SSH that already handles your keys, `.ssh/config`, bastion hosts, and MFA. No ports to open, no firewall rules, no TLS certificates, no authentication system to trust beyond the one you already use.
