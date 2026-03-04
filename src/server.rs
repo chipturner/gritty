@@ -10,6 +10,7 @@ use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, OnceLock};
+use std::time::Duration;
 use tokio::io::AsyncReadExt;
 use tokio::io::unix::AsyncFd;
 use tokio::net::{UnixListener, UnixStream};
@@ -84,10 +85,10 @@ enum OpenEvent {
 
 /// Events from tunnel TCP connection tasks to the main relay loop.
 enum TunnelEvent {
-    Connected(tokio::net::TcpStream),
-    ConnectFailed,
-    Data(Bytes),
-    Closed,
+    Connected { channel_id: u32, stream: tokio::net::TcpStream },
+    ConnectFailed { channel_id: u32 },
+    Data { channel_id: u32, data: Bytes },
+    Closed { channel_id: u32 },
 }
 
 /// Events from port forward TCP acceptors and connections to the main relay loop.
@@ -149,20 +150,23 @@ impl AgentForwardState {
     }
 }
 
-/// Grouped state for the OAuth callback reverse tunnel.
+/// Grouped state for the OAuth callback reverse tunnel (multi-channel).
 struct TunnelRelayState {
     port: Option<u16>,
-    writer: Option<mpsc::Sender<Bytes>>,
+    channels: HashMap<u32, mpsc::Sender<Bytes>>,
+    idle_deadline: Option<tokio::time::Instant>,
+    idle_timeout: Duration,
 }
 
 impl TunnelRelayState {
-    fn new() -> Self {
-        Self { port: None, writer: None }
+    fn new(idle_timeout: Duration) -> Self {
+        Self { port: None, channels: HashMap::new(), idle_deadline: None, idle_timeout }
     }
 
     fn teardown(&mut self) {
-        self.writer = None;
+        self.channels.clear();
         self.port = None;
+        self.idle_deadline = None;
     }
 }
 
@@ -734,29 +738,33 @@ impl ServerRelay<'_> {
                 debug!("open forwarding enabled by client");
                 *self.open_forward_enabled = true;
             }
-            Some(Ok(Frame::TunnelOpen)) => {
+            Some(Ok(Frame::TunnelOpen { channel_id })) => {
                 if let Some(port) = self.tunnel.port {
+                    self.tunnel.idle_deadline = None;
                     let tx = self.tunnel_event_tx.clone();
                     tokio::spawn(async move {
                         match tokio::net::TcpStream::connect(("127.0.0.1", port)).await {
                             Ok(stream) => {
-                                let _ = tx.send(TunnelEvent::Connected(stream));
+                                let _ = tx.send(TunnelEvent::Connected { channel_id, stream });
                             }
                             Err(_) => {
-                                let _ = tx.send(TunnelEvent::ConnectFailed);
+                                let _ = tx.send(TunnelEvent::ConnectFailed { channel_id });
                             }
                         }
                     });
                 }
             }
-            Some(Ok(Frame::TunnelData(data))) => {
-                if let Some(ref tx) = self.tunnel.writer {
+            Some(Ok(Frame::TunnelData { channel_id, data })) => {
+                if let Some(tx) = self.tunnel.channels.get(&channel_id) {
                     let _ = tx.send(data).await;
                 }
             }
-            Some(Ok(Frame::TunnelClose)) => {
-                self.tunnel.writer = None;
-                self.tunnel.port = None;
+            Some(Ok(Frame::TunnelClose { channel_id })) => {
+                self.tunnel.channels.remove(&channel_id);
+                if self.tunnel.channels.is_empty() && self.tunnel.port.is_some() {
+                    self.tunnel.idle_deadline =
+                        Some(tokio::time::Instant::now() + self.tunnel.idle_timeout);
+                }
             }
             Some(Ok(Frame::PortForwardReady { forward_id })) => {
                 if let Some(mut svc_stream) = self.pf.pending_remote.remove(&forward_id) {
@@ -885,13 +893,14 @@ impl ServerRelay<'_> {
         event: Option<TunnelEvent>,
     ) {
         match event {
-            Some(TunnelEvent::Connected(stream)) => {
-                if let Some(port) = self.tunnel.port {
-                    debug!(port, "tunnel connected to local port");
+            Some(TunnelEvent::Connected { channel_id, stream }) => {
+                if self.tunnel.port.is_some() {
+                    debug!(channel_id, "tunnel channel connected");
+                    self.tunnel.idle_deadline = None;
                     let (mut read_half, write_half) = stream.into_split();
                     let (writer_tx, mut writer_rx) =
                         mpsc::channel::<Bytes>(crate::CHANNEL_RELAY_BUFFER);
-                    self.tunnel.writer = Some(writer_tx);
+                    self.tunnel.channels.insert(channel_id, writer_tx);
 
                     // Writer task: channel -> TCP
                     tokio::spawn(async move {
@@ -911,12 +920,12 @@ impl ServerRelay<'_> {
                         loop {
                             match read_half.read(&mut buf).await {
                                 Ok(0) | Err(_) => {
-                                    let _ = tx.send(TunnelEvent::Closed);
+                                    let _ = tx.send(TunnelEvent::Closed { channel_id });
                                     break;
                                 }
                                 Ok(n) => {
                                     let data = Bytes::copy_from_slice(&buf[..n]);
-                                    if tx.send(TunnelEvent::Data(data)).is_err() {
+                                    if tx.send(TunnelEvent::Data { channel_id, data }).is_err() {
                                         break;
                                     }
                                 }
@@ -925,17 +934,19 @@ impl ServerRelay<'_> {
                     });
                 }
             }
-            Some(TunnelEvent::ConnectFailed) => {
-                let _ = framed.send(Frame::TunnelClose).await;
-                self.tunnel.port = None;
+            Some(TunnelEvent::ConnectFailed { channel_id }) => {
+                let _ = framed.send(Frame::TunnelClose { channel_id }).await;
             }
-            Some(TunnelEvent::Data(data)) => {
-                let _ = framed.send(Frame::TunnelData(data)).await;
+            Some(TunnelEvent::Data { channel_id, data }) => {
+                let _ = framed.send(Frame::TunnelData { channel_id, data }).await;
             }
-            Some(TunnelEvent::Closed) => {
-                let _ = framed.send(Frame::TunnelClose).await;
-                self.tunnel.writer = None;
-                self.tunnel.port = None;
+            Some(TunnelEvent::Closed { channel_id }) => {
+                self.tunnel.channels.remove(&channel_id);
+                let _ = framed.send(Frame::TunnelClose { channel_id }).await;
+                if self.tunnel.channels.is_empty() && self.tunnel.port.is_some() {
+                    self.tunnel.idle_deadline =
+                        Some(tokio::time::Instant::now() + self.tunnel.idle_timeout);
+                }
             }
             None => {}
         }
@@ -1095,6 +1106,8 @@ pub async fn run(
     metadata_slot: Arc<OnceLock<SessionMetadata>>,
     agent_socket_path: PathBuf,
     svc_socket_path: PathBuf,
+    session_id: u32,
+    session_name: Option<String>,
 ) -> anyhow::Result<()> {
     // Allocate PTY (once, before accept loop)
     let pty = openpty(None, None)?;
@@ -1135,7 +1148,7 @@ pub async fn run(
 
     // Tunnel state (reverse TCP tunnel for OAuth callbacks)
     let (tunnel_event_tx, mut tunnel_event_rx) = mpsc::unbounded_channel::<TunnelEvent>();
-    let mut tunnel = TunnelRelayState::new();
+    let mut tunnel = TunnelRelayState::new(Duration::from_secs(5));
 
     // Broadcast channel for tail clients
     let (tail_tx, _) = broadcast::channel::<TailEvent>(256);
@@ -1233,6 +1246,11 @@ pub async fn run(
     cmd.env("SSH_AUTH_SOCK", &agent.socket_path);
     // Set GRITTY_SOCK so `gritty open`/`gritty send`/`gritty receive` find the service socket
     cmd.env("GRITTY_SOCK", &svc_socket_path);
+    // Session context env vars
+    cmd.env("GRITTY_SESSION", session_id.to_string());
+    if let Some(ref name) = session_name {
+        cmd.env("GRITTY_SESSION_NAME", name);
+    }
     let mut managed = ManagedChild::new(unsafe {
         cmd.pre_exec(move || {
             nix::unistd::setsid().map_err(io::Error::other)?;
@@ -1432,7 +1450,31 @@ pub async fn run(
                                 relay.tunnel.teardown();
                                 relay.pf.teardown();
                                 *relay.open_forward_enabled = false;
+                                // Inform the new client about the takeover
+                                let was_attached = relay.metadata_slot.get()
+                                    .map(|m| m.attached.load(Ordering::Relaxed))
+                                    .unwrap_or(false);
                                 framed = new_framed;
+                                if was_attached {
+                                    let hb_age = relay.metadata_slot.get()
+                                        .and_then(|m| {
+                                            let hb = m.last_heartbeat.load(Ordering::Relaxed);
+                                            if hb == 0 { return None; }
+                                            let now = std::time::SystemTime::now()
+                                                .duration_since(std::time::UNIX_EPOCH)
+                                                .unwrap_or_default()
+                                                .as_secs();
+                                            Some(now.saturating_sub(hb))
+                                        });
+                                    let hb_str = match hb_age {
+                                        Some(s) => format!("{s}s ago"),
+                                        None => "n/a".to_string(),
+                                    };
+                                    let msg = format!(
+                                        "\r\n\x1b[2;33m[gritty: took over session (was active, heartbeat {hb_str})]\x1b[0m\r\n"
+                                    );
+                                    let _ = framed.send(Frame::Data(Bytes::from(msg))).await;
+                                }
                             }
                             Some(ClientConn::Tail(f)) => {
                                 info!("tail client connected while active");
@@ -1455,6 +1497,18 @@ pub async fn run(
 
                     event = tunnel_event_rx.recv() => {
                         relay.handle_tunnel_event(&mut framed, event).await;
+                    }
+
+                    _ = async {
+                        match relay.tunnel.idle_deadline {
+                            Some(deadline) => tokio::time::sleep_until(deadline).await,
+                            None => std::future::pending().await,
+                        }
+                    } => {
+                        if relay.tunnel.channels.is_empty() {
+                            debug!("tunnel idle timeout, tearing down");
+                            relay.tunnel.teardown();
+                        }
                     }
 
                     event = send_event_rx.recv() => {

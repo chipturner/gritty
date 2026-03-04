@@ -163,13 +163,20 @@ async fn send_file_handshake(
     Ok(stream)
 }
 
-/// Connect to service sockets for transfer. Returns one or more streams.
+/// A stream tagged with the session it belongs to.
+struct TaggedStream {
+    stream: tokio::net::UnixStream,
+    /// Human-readable session label (e.g. "local:work").
+    label: Option<String>,
+}
+
+/// Connect to service sockets for transfer. Returns one or more tagged streams.
 /// In-session or explicit --session returns one; auto-detect returns all.
 async fn connect_send_sockets(
     ctl_socket: Option<PathBuf>,
     session_flag: Option<String>,
     role: u8,
-) -> anyhow::Result<Vec<tokio::net::UnixStream>> {
+) -> anyhow::Result<Vec<TaggedStream>> {
     // In-session: GRITTY_SOCK is set
     if let Ok(sock_path) = std::env::var("GRITTY_SOCK") {
         if session_flag.is_some() {
@@ -180,7 +187,7 @@ async fn connect_send_sockets(
         })?;
         use tokio::io::AsyncWriteExt;
         stream.write_all(&[role]).await?;
-        return Ok(vec![stream]);
+        return Ok(vec![TaggedStream { stream, label: None }]);
     }
 
     // Explicit --session flag
@@ -190,7 +197,8 @@ async fn connect_send_sockets(
             .ok_or_else(|| anyhow::anyhow!("--session requires host:session (e.g. local:0)"))?;
         let ctl_path = resolve_ctl_path(ctl_socket, Some(&host))?;
         let stream = send_file_handshake(&ctl_path, &session, role).await?;
-        return Ok(vec![stream]);
+        let label = format!("{host}:{session}");
+        return Ok(vec![TaggedStream { stream, label: Some(label) }]);
     }
 
     // Auto-detect: connect to ALL sessions
@@ -198,7 +206,15 @@ async fn connect_send_sockets(
     let mut streams = Vec::new();
     for s in &sessions {
         if let Ok(stream) = send_file_handshake(&s.ctl_path, &s.session_id, role).await {
-            streams.push(stream);
+            // Derive host from ctl_path (connect-*.sock -> host, ctl.sock -> local)
+            let host = s
+                .ctl_path
+                .file_name()
+                .and_then(|f| f.to_str())
+                .and_then(|f| f.strip_prefix("connect-").and_then(|r| r.strip_suffix(".sock")))
+                .unwrap_or("local");
+            let label = format!("{host}:{}", s.session_id);
+            streams.push(TaggedStream { stream, label: Some(label) });
         }
     }
     if streams.is_empty() {
@@ -208,17 +224,15 @@ async fn connect_send_sockets(
 }
 
 /// Wait for the first stream to become readable, return it (drop the rest).
-async fn select_first_ready(
-    streams: Vec<tokio::net::UnixStream>,
-) -> anyhow::Result<tokio::net::UnixStream> {
+async fn select_first_ready(streams: Vec<TaggedStream>) -> anyhow::Result<TaggedStream> {
     use futures_util::future::select_all;
 
     let futs: Vec<_> = streams
         .into_iter()
-        .map(|stream| {
+        .map(|ts| {
             Box::pin(async move {
-                stream.readable().await?;
-                Ok::<_, std::io::Error>(stream)
+                ts.stream.readable().await?;
+                Ok::<_, std::io::Error>(ts)
             })
         })
         .collect();
@@ -308,29 +322,33 @@ pub(crate) async fn send_command(
         anyhow::bail!("no files to send");
     }
 
-    let mut streams =
+    let mut tagged =
         connect_send_sockets(ctl_socket, session, gritty::protocol::SvcRequest::Send.to_byte())
             .await?;
 
     // Write manifest on all streams
     if let Some(ref data) = stdin_data {
         let stdin_entries = vec![("stdin".to_string(), data.len() as u64, PathBuf::new())];
-        for stream in &mut streams {
-            write_send_manifest(stream, &stdin_entries).await?;
+        for ts in &mut tagged {
+            write_send_manifest(&mut ts.stream, &stdin_entries).await?;
         }
     } else {
-        for stream in &mut streams {
-            write_send_manifest(stream, &entries).await?;
+        for ts in &mut tagged {
+            write_send_manifest(&mut ts.stream, &entries).await?;
         }
     }
 
     // Wait for go signal -- first stream to get paired wins
     eprintln!("\x1b[2mwaiting for receiver...\x1b[0m");
-    let mut stream = if streams.len() == 1 {
-        streams.into_iter().next().unwrap()
+    let ts = if tagged.len() == 1 {
+        tagged.into_iter().next().unwrap()
     } else {
-        select_first_ready(streams).await?
+        select_first_ready(tagged).await?
     };
+    if let Some(ref label) = ts.label {
+        eprintln!("paired with session {label}");
+    }
+    let mut stream = ts.stream;
 
     let mut go = [0u8; 1];
     stream.read_exact(&mut go).await.map_err(|_| anyhow::anyhow!("no receiver connected"))?;
@@ -386,24 +404,28 @@ pub(crate) async fn receive_command(
         anyhow::bail!("{}: not a directory", dest_dir.display());
     }
 
-    let mut streams =
+    let mut tagged =
         connect_send_sockets(ctl_socket, session, gritty::protocol::SvcRequest::Receive.to_byte())
             .await?;
 
     // Write dest dir on all streams
     let dest_str = dest_dir.to_string_lossy();
-    for stream in &mut streams {
-        stream.write_all(dest_str.as_bytes()).await?;
-        stream.write_all(b"\n").await?;
+    for ts in &mut tagged {
+        ts.stream.write_all(dest_str.as_bytes()).await?;
+        ts.stream.write_all(b"\n").await?;
     }
 
     // Wait for file data -- first stream to get paired wins
     eprintln!("\x1b[2mwaiting for sender...\x1b[0m");
-    let mut stream = if streams.len() == 1 {
-        streams.into_iter().next().unwrap()
+    let ts = if tagged.len() == 1 {
+        tagged.into_iter().next().unwrap()
     } else {
-        select_first_ready(streams).await?
+        select_first_ready(tagged).await?
     };
+    if let Some(ref label) = ts.label {
+        eprintln!("paired with session {label}");
+    }
+    let mut stream = ts.stream;
 
     // Read: file_count (u32 BE)
     let mut buf4 = [0u8; 4];

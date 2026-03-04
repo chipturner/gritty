@@ -46,7 +46,7 @@ const HEADER_LEN: usize = 5; // type(1) + length(4)
 const MAX_FRAME_SIZE: usize = 1 << 20; // 1 MB
 
 /// Protocol version for handshake negotiation.
-pub const PROTOCOL_VERSION: u16 = 2;
+pub const PROTOCOL_VERSION: u16 = 3;
 
 /// Discriminator byte for the unified per-session service socket (`svc-{id}.sock`).
 /// Sent as the first byte on every connection to route to the correct handler.
@@ -131,12 +131,19 @@ pub enum Frame {
     TunnelListen {
         port: u16,
     },
-    /// Client signals the tunnel connection has been accepted (client → server).
-    TunnelOpen,
+    /// Client signals a tunnel connection has been accepted (client → server).
+    TunnelOpen {
+        channel_id: u32,
+    },
     /// Tunnel data relay (bidirectional).
-    TunnelData(Bytes),
+    TunnelData {
+        channel_id: u32,
+        data: Bytes,
+    },
     /// Tunnel connection closed (bidirectional).
-    TunnelClose,
+    TunnelClose {
+        channel_id: u32,
+    },
     /// Server notifies attached client that a file transfer started (server → client).
     SendOffer {
         file_count: u32,
@@ -520,7 +527,6 @@ impl Decoder for FrameCodec {
         match frame_type {
             // Blob frames
             TYPE_DATA => Ok(Some(Frame::Data(payload.freeze()))),
-            TYPE_TUNNEL_DATA => Ok(Some(Frame::TunnelData(payload.freeze()))),
 
             // Fixed-field frames (PayloadReader auto-tracks offsets)
             TYPE_RESIZE => {
@@ -551,6 +557,14 @@ impl Decoder for FrameCodec {
             TYPE_TUNNEL_LISTEN => {
                 expect_len(&payload, 2, "tunnel listen")?;
                 Ok(Some(Frame::TunnelListen { port: PayloadReader::new(&payload).u16() }))
+            }
+            TYPE_TUNNEL_OPEN => {
+                expect_len(&payload, 4, "tunnel open")?;
+                Ok(Some(Frame::TunnelOpen { channel_id: PayloadReader::new(&payload).u32() }))
+            }
+            TYPE_TUNNEL_CLOSE => {
+                expect_len(&payload, 4, "tunnel close")?;
+                Ok(Some(Frame::TunnelClose { channel_id: PayloadReader::new(&payload).u32() }))
             }
             TYPE_SEND_OFFER => {
                 expect_len(&payload, 12, "send offer")?;
@@ -596,6 +610,13 @@ impl Decoder for FrameCodec {
                 let off = r.offset();
                 Ok(Some(Frame::AgentData { channel_id, data: payload.freeze().slice(off..) }))
             }
+            TYPE_TUNNEL_DATA => {
+                expect_min_len(&payload, 4, "tunnel data")?;
+                let mut r = PayloadReader::new(&payload);
+                let channel_id = r.u32();
+                let off = r.offset();
+                Ok(Some(Frame::TunnelData { channel_id, data: payload.freeze().slice(off..) }))
+            }
             TYPE_PORT_FORWARD_DATA => {
                 expect_min_len(&payload, 4, "port forward data")?;
                 let mut r = PayloadReader::new(&payload);
@@ -610,8 +631,6 @@ impl Decoder for FrameCodec {
             TYPE_PONG => Ok(Some(Frame::Pong)),
             TYPE_AGENT_FORWARD => Ok(Some(Frame::AgentForward)),
             TYPE_OPEN_FORWARD => Ok(Some(Frame::OpenForward)),
-            TYPE_TUNNEL_OPEN => Ok(Some(Frame::TunnelOpen)),
-            TYPE_TUNNEL_CLOSE => Ok(Some(Frame::TunnelClose)),
             TYPE_SEND_DONE => Ok(Some(Frame::SendDone)),
             TYPE_LIST_SESSIONS => Ok(Some(Frame::ListSessions)),
             TYPE_KILL_SERVER => Ok(Some(Frame::KillServer)),
@@ -653,7 +672,6 @@ impl Encoder<Frame> for FrameCodec {
         match frame {
             // Blob frames
             Frame::Data(data) => encode_blob(dst, TYPE_DATA, &data),
-            Frame::TunnelData(data) => encode_blob(dst, TYPE_TUNNEL_DATA, &data),
 
             // Fixed-field frames (encode_fields! auto-computes payload length)
             Frame::Resize { cols, rows } => {
@@ -676,6 +694,12 @@ impl Encoder<Frame> for FrameCodec {
             }
             Frame::TunnelListen { port } => {
                 encode_fields!(dst, TYPE_TUNNEL_LISTEN, port => put_u16);
+            }
+            Frame::TunnelOpen { channel_id } => {
+                encode_fields!(dst, TYPE_TUNNEL_OPEN, channel_id => put_u32);
+            }
+            Frame::TunnelClose { channel_id } => {
+                encode_fields!(dst, TYPE_TUNNEL_CLOSE, channel_id => put_u32);
             }
             Frame::SendOffer { file_count, total_bytes } => {
                 encode_fields!(dst, TYPE_SEND_OFFER, file_count => put_u32, total_bytes => put_u64);
@@ -702,6 +726,9 @@ impl Encoder<Frame> for FrameCodec {
             Frame::AgentData { channel_id, data } => {
                 encode_prefix_blob(dst, TYPE_AGENT_DATA, channel_id, &data);
             }
+            Frame::TunnelData { channel_id, data } => {
+                encode_prefix_blob(dst, TYPE_TUNNEL_DATA, channel_id, &data);
+            }
             Frame::PortForwardData { channel_id, data } => {
                 encode_prefix_blob(dst, TYPE_PORT_FORWARD_DATA, channel_id, &data);
             }
@@ -712,8 +739,6 @@ impl Encoder<Frame> for FrameCodec {
             Frame::Pong => encode_empty(dst, TYPE_PONG),
             Frame::AgentForward => encode_empty(dst, TYPE_AGENT_FORWARD),
             Frame::OpenForward => encode_empty(dst, TYPE_OPEN_FORWARD),
-            Frame::TunnelOpen => encode_empty(dst, TYPE_TUNNEL_OPEN),
-            Frame::TunnelClose => encode_empty(dst, TYPE_TUNNEL_CLOSE),
             Frame::SendDone => encode_empty(dst, TYPE_SEND_DONE),
             Frame::ListSessions => encode_empty(dst, TYPE_LIST_SESSIONS),
             Frame::KillServer => encode_empty(dst, TYPE_KILL_SERVER),

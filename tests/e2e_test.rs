@@ -44,7 +44,7 @@ async fn setup_session() -> (
     let agent_path = unique_agent_socket_path();
     let svc_path = unique_svc_socket_path();
     let handle = tokio::spawn(async move {
-        gritty::server::run(client_rx, meta_clone, agent_path, svc_path).await
+        gritty::server::run(client_rx, meta_clone, agent_path, svc_path, 0, None).await
     });
 
     let (server_stream, client_stream) = UnixStream::pair().unwrap();
@@ -72,7 +72,7 @@ async fn setup_session_with_svc_path() -> (
     let svc_path = unique_svc_socket_path();
     let svc_path_clone = svc_path.clone();
     let handle = tokio::spawn(async move {
-        gritty::server::run(client_rx, meta_clone, agent_path, svc_path).await
+        gritty::server::run(client_rx, meta_clone, agent_path, svc_path, 0, None).await
     });
 
     let (server_stream, client_stream) = UnixStream::pair().unwrap();
@@ -100,7 +100,7 @@ async fn setup_session_with_env(
     let agent_path = unique_agent_socket_path();
     let svc_path = unique_svc_socket_path();
     let handle = tokio::spawn(async move {
-        gritty::server::run(client_rx, meta_clone, agent_path, svc_path).await
+        gritty::server::run(client_rx, meta_clone, agent_path, svc_path, 0, None).await
     });
 
     let (server_stream, client_stream) = UnixStream::pair().unwrap();
@@ -744,7 +744,7 @@ async fn setup_session_with_agent_path() -> (
     let agent_path_clone = agent_path.clone();
     let svc_path = unique_svc_socket_path();
     let handle = tokio::spawn(async move {
-        gritty::server::run(client_rx, meta_clone, agent_path_clone, svc_path).await
+        gritty::server::run(client_rx, meta_clone, agent_path_clone, svc_path, 0, None).await
     });
 
     let (server_stream, client_stream) = UnixStream::pair().unwrap();
@@ -1163,8 +1163,8 @@ async fn tunnel_forwarding_roundtrip() {
     }
     assert!(got_tunnel_listen, "should have received TunnelListen before OpenUrl");
 
-    // Send TunnelOpen (simulating client accepted a connection)
-    framed.send(Frame::TunnelOpen).await.unwrap();
+    // Send TunnelOpen with channel_id (simulating client accepted a connection)
+    framed.send(Frame::TunnelOpen { channel_id: 0 }).await.unwrap();
     tokio::time::sleep(Duration::from_millis(100)).await;
 
     // Accept connection on the callback listener (simulating the remote program)
@@ -1172,7 +1172,10 @@ async fn tunnel_forwarding_roundtrip() {
 
     // Send data from client -> server -> callback program
     let request = b"GET /callback?code=abc123 HTTP/1.1\r\n\r\n";
-    framed.send(Frame::TunnelData(Bytes::from_static(request))).await.unwrap();
+    framed
+        .send(Frame::TunnelData { channel_id: 0, data: Bytes::from_static(request) })
+        .await
+        .unwrap();
 
     // Read it from the callback connection
     let mut buf = vec![0u8; 4096];
@@ -1186,7 +1189,7 @@ async fn tunnel_forwarding_roundtrip() {
     // Read TunnelData back from the server
     loop {
         match timeout(Duration::from_secs(3), framed.next()).await {
-            Ok(Some(Ok(Frame::TunnelData(data)))) => {
+            Ok(Some(Ok(Frame::TunnelData { data, .. }))) => {
                 assert_eq!(&data[..], response);
                 break;
             }
@@ -1199,8 +1202,8 @@ async fn tunnel_forwarding_roundtrip() {
     drop(callback_conn);
     loop {
         match timeout(Duration::from_secs(3), framed.next()).await {
-            Ok(Some(Ok(Frame::TunnelClose))) => break,
-            Ok(Some(Ok(Frame::Data(_) | Frame::TunnelData(_)))) => continue,
+            Ok(Some(Ok(Frame::TunnelClose { .. }))) => break,
+            Ok(Some(Ok(Frame::Data(_) | Frame::TunnelData { .. }))) => continue,
             other => panic!("expected TunnelClose, got: {other:?}"),
         }
     }

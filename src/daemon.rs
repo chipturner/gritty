@@ -296,6 +296,16 @@ async fn dispatch_control(
                     .await;
                     return false;
                 }
+                if n.parse::<u32>().is_ok() {
+                    let _ = timed_send(
+                        &mut framed,
+                        Frame::Error {
+                            message: "session name must not be purely numeric (ambiguous with session IDs)".to_string(),
+                        },
+                    )
+                    .await;
+                    return false;
+                }
                 let dup = sessions.values().any(|s| s.name.as_deref() == Some(n));
                 if dup {
                     let _ = timed_send(
@@ -316,8 +326,17 @@ async fn dispatch_control(
             let sock_dir = ctl_path.parent().expect("ctl_path must have a parent");
             let agent_socket_path = sock_dir.join(format!("agent-{id}.sock"));
             let svc_socket_path = sock_dir.join(format!("svc-{id}.sock"));
+            let name_for_server = name_opt.clone();
             let handle = tokio::spawn(async move {
-                server::run(client_rx, meta_clone, agent_socket_path, svc_socket_path).await
+                server::run(
+                    client_rx,
+                    meta_clone,
+                    agent_socket_path,
+                    svc_socket_path,
+                    id,
+                    name_for_server,
+                )
+                .await
             });
 
             sessions.insert(

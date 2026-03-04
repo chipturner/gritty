@@ -281,6 +281,7 @@ async fn wait_for_socket(path: &Path, timeout: Duration) -> anyhow::Result<()> {
 }
 
 /// Background task: monitor SSH child, respawn on transient failure.
+/// Uses exponential backoff (1s..60s) and never gives up on transient errors.
 async fn tunnel_monitor(
     mut child: Child,
     dest: Destination,
@@ -289,9 +290,14 @@ async fn tunnel_monitor(
     extra_ssh_opts: Vec<String>,
     stop: tokio_util::sync::CancellationToken,
 ) {
-    let mut exit_times: Vec<Instant> = Vec::new();
+    let mut backoff = Duration::from_secs(1);
+    const MAX_BACKOFF: Duration = Duration::from_secs(60);
+    /// If the tunnel stays alive for this long, reset the backoff.
+    const HEALTHY_THRESHOLD: Duration = Duration::from_secs(30);
 
     loop {
+        let spawned_at = Instant::now();
+
         tokio::select! {
             _ = stop.cancelled() => {
                 let _ = child.kill().await;
@@ -323,20 +329,19 @@ async fn tunnel_monitor(
                     return;
                 }
 
-                // Rate limit: 5 exits in 10s = give up
-                let now = Instant::now();
-                exit_times.push(now);
-                exit_times.retain(|t| now.duration_since(*t) < Duration::from_secs(10));
-                if exit_times.len() >= 5 {
-                    warn!("ssh tunnel failing too fast (5 exits in 10s), giving up");
-                    return;
+                // Reset backoff if the tunnel was alive long enough
+                if spawned_at.elapsed() >= HEALTHY_THRESHOLD {
+                    backoff = Duration::from_secs(1);
                 }
 
-                tokio::time::sleep(Duration::from_secs(1)).await;
+                info!("ssh tunnel died, retrying in {}s", backoff.as_secs());
 
-                if stop.is_cancelled() {
-                    return;
+                tokio::select! {
+                    _ = tokio::time::sleep(backoff) => {}
+                    _ = stop.cancelled() => return,
                 }
+
+                backoff = (backoff * 2).min(MAX_BACKOFF);
 
                 match spawn_tunnel(&dest, &local_sock, &remote_sock, &extra_ssh_opts, false).await {
                     Ok(new_child) => {
@@ -345,7 +350,9 @@ async fn tunnel_monitor(
                     }
                     Err(e) => {
                         warn!("failed to respawn ssh tunnel: {e}");
-                        return;
+                        // Even spawn failure is retried -- the tunnel process
+                        // might just not be available momentarily.
+                        continue;
                     }
                 }
             }

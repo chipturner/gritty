@@ -907,3 +907,27 @@ async fn daemon_rejects_non_hello_first_frame() {
         "daemon should still work after rejecting bad client, got {resp:?}"
     );
 }
+
+#[tokio::test]
+async fn daemon_rejects_purely_numeric_name() {
+    let (_tmp, ctl_path) = test_ctl();
+
+    let ctl = ctl_path.clone();
+    let _daemon = tokio::spawn(async move { gritty::daemon::run(&ctl, None).await });
+    wait_for_daemon(&ctl_path).await;
+
+    let resp = control_request(&ctl_path, Frame::NewSession { name: "42".to_string() }).await;
+    match resp {
+        Frame::Error { message } => {
+            assert!(
+                message.contains("purely numeric"),
+                "error should mention purely numeric, got: {message}"
+            );
+        }
+        other => panic!("expected Error for numeric name, got {other:?}"),
+    }
+
+    // Non-numeric names with digits should still be allowed
+    let id = create_session(&ctl_path, "session2").await;
+    kill_cleanup(&ctl_path, &id).await;
+}

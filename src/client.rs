@@ -7,6 +7,8 @@ use std::io::{self, Read, Write};
 use std::ops::ControlFlow;
 use std::os::fd::{AsFd, AsRawFd, BorrowedFd};
 use std::path::Path;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicU32, Ordering};
 use std::time::Duration;
 use tokio::io::unix::AsyncFd;
 use tokio::net::UnixStream;
@@ -28,6 +30,7 @@ use tracing::{debug, info};
 
 const ESCAPE_HELP: &[u8] = b"\r\nSupported escape sequences:\r\n\
     ~.  - detach from session\r\n\
+    ~R  - force reconnect\r\n\
     ~^Z - suspend client\r\n\
     ~#  - session status and RTT\r\n\
     ~?  - this message\r\n\
@@ -45,6 +48,7 @@ enum EscapeState {
 enum EscapeAction {
     Data(Vec<u8>),
     Detach,
+    Reconnect,
     Suspend,
     Status,
     Help,
@@ -93,6 +97,13 @@ impl EscapeProcessor {
                                 actions.push(EscapeAction::Data(std::mem::take(&mut data_buf)));
                             }
                             actions.push(EscapeAction::Detach);
+                            return actions; // Stop processing
+                        }
+                        b'R' => {
+                            if !data_buf.is_empty() {
+                                actions.push(EscapeAction::Data(std::mem::take(&mut data_buf)));
+                            }
+                            actions.push(EscapeAction::Reconnect);
                             return actions; // Stop processing
                         }
                         0x1a => {
@@ -300,9 +311,9 @@ enum AgentEvent {
 
 /// Events from the tunnel TCP listener/connection to the relay loop.
 enum ClientTunnelEvent {
-    Accepted(mpsc::Sender<Bytes>),
-    Data(Bytes),
-    Closed,
+    Accepted { channel_id: u32, writer_tx: mpsc::Sender<Bytes> },
+    Data { channel_id: u32, data: Bytes },
+    Closed { channel_id: u32 },
 }
 
 /// Events from port forward TCP acceptors/connections on the client side.
@@ -333,19 +344,24 @@ impl ClientAgentState {
     }
 }
 
-/// Grouped state for the OAuth callback tunnel on the client side.
+/// Grouped state for the OAuth callback tunnel on the client side (multi-channel).
 struct ClientTunnelState {
     listener: Option<tokio::task::JoinHandle<()>>,
-    writer: Option<mpsc::Sender<Bytes>>,
+    channels: HashMap<u32, mpsc::Sender<Bytes>>,
+    next_channel_id: Arc<AtomicU32>,
 }
 
 impl ClientTunnelState {
     fn new() -> Self {
-        Self { listener: None, writer: None }
+        Self {
+            listener: None,
+            channels: HashMap::new(),
+            next_channel_id: Arc::new(AtomicU32::new(0)),
+        }
     }
 
     fn teardown(&mut self) {
-        drop(self.writer.take());
+        self.channels.clear();
         if let Some(handle) = self.listener.take() {
             handle.abort();
         }
@@ -423,6 +439,8 @@ struct ClientRelay<'a> {
     last_pong: &'a mut Instant,
     last_ping_sent: &'a mut Instant,
     last_rtt: &'a mut Option<Duration>,
+    connected_at: Instant,
+    bytes_relayed: &'a mut u64,
 }
 
 impl ClientRelay<'_> {
@@ -434,6 +452,7 @@ impl ClientRelay<'_> {
         match frame {
             Some(Ok(Frame::Data(data))) => {
                 debug!(len = data.len(), "socket → stdout");
+                *self.bytes_relayed += data.len() as u64;
                 write_stdout_async(self.async_stdout, &data).await?;
             }
             Some(Ok(Frame::Pong)) => {
@@ -503,7 +522,7 @@ impl ClientRelay<'_> {
             Some(Ok(Frame::TunnelListen { port })) => {
                 if !self.oauth_redirect {
                     debug!(port, "tunnel: oauth-redirect disabled, declining");
-                    let _ = timed_send(framed, Frame::TunnelClose).await;
+                    let _ = timed_send(framed, Frame::TunnelClose { channel_id: 0 }).await;
                 } else {
                     // Bind synchronously to guarantee port is ready before OpenUrl
                     match std::net::TcpListener::bind(("127.0.0.1", port)) {
@@ -513,6 +532,7 @@ impl ClientRelay<'_> {
                             let listener = tokio::net::TcpListener::from_std(std_listener).unwrap();
                             let tx = self.tunnel_event_tx.clone();
                             let timeout = self.oauth_timeout;
+                            let next_id = Arc::clone(&self.tunnel.next_channel_id);
                             self.tunnel.listener = Some(tokio::spawn(async move {
                                 let deadline =
                                     tokio::time::Instant::now() + Duration::from_secs(timeout);
@@ -521,6 +541,8 @@ impl ClientRelay<'_> {
                                         tokio::time::timeout_at(deadline, listener.accept()).await;
                                     match accept {
                                         Ok(Ok((stream, _))) => {
+                                            let channel_id =
+                                                next_id.fetch_add(1, Ordering::Relaxed);
                                             let (read_half, write_half) = stream.into_split();
                                             let (writer_tx, mut writer_rx) =
                                                 mpsc::channel::<Bytes>(crate::CHANNEL_RELAY_BUFFER);
@@ -536,7 +558,10 @@ impl ClientRelay<'_> {
                                                 }
                                             });
 
-                                            let _ = tx.send(ClientTunnelEvent::Accepted(writer_tx));
+                                            let _ = tx.send(ClientTunnelEvent::Accepted {
+                                                channel_id,
+                                                writer_tx,
+                                            });
 
                                             // Reader task: TCP -> events (spawned so we
                                             // can keep accepting new connections)
@@ -548,13 +573,21 @@ impl ClientRelay<'_> {
                                                 loop {
                                                     match read_half.read(&mut buf).await {
                                                         Ok(0) | Err(_) => {
+                                                            let _ = reader_tx.send(
+                                                                ClientTunnelEvent::Closed {
+                                                                    channel_id,
+                                                                },
+                                                            );
                                                             break;
                                                         }
                                                         Ok(n) => {
                                                             let data =
                                                                 Bytes::copy_from_slice(&buf[..n]);
                                                             if reader_tx
-                                                                .send(ClientTunnelEvent::Data(data))
+                                                                .send(ClientTunnelEvent::Data {
+                                                                    channel_id,
+                                                                    data,
+                                                                })
                                                                 .is_err()
                                                             {
                                                                 break;
@@ -566,7 +599,6 @@ impl ClientRelay<'_> {
                                         }
                                         _ => {
                                             debug!(port, "tunnel: accept timed out or failed");
-                                            let _ = tx.send(ClientTunnelEvent::Closed);
                                             break;
                                         }
                                     }
@@ -575,7 +607,7 @@ impl ClientRelay<'_> {
                         }
                         Err(e) => {
                             debug!(port, "tunnel: bind failed: {e}");
-                            let _ = timed_send(framed, Frame::TunnelClose).await;
+                            let _ = timed_send(framed, Frame::TunnelClose { channel_id: 0 }).await;
                         }
                     }
                 }
@@ -604,16 +636,13 @@ impl ClientRelay<'_> {
                 )
                 .await?;
             }
-            Some(Ok(Frame::TunnelData(data))) => {
-                if let Some(ref tx) = self.tunnel.writer {
+            Some(Ok(Frame::TunnelData { channel_id, data })) => {
+                if let Some(tx) = self.tunnel.channels.get(&channel_id) {
                     let _ = tx.send(data).await;
                 }
             }
-            Some(Ok(Frame::TunnelClose)) => {
-                self.tunnel.writer = None;
-                if let Some(handle) = self.tunnel.listener.take() {
-                    handle.abort();
-                }
+            Some(Ok(Frame::TunnelClose { channel_id })) => {
+                self.tunnel.channels.remove(&channel_id);
             }
             // Port forward: server asks client to bind a port (remote-fwd)
             Some(Ok(Frame::PortForwardListen { forward_id, listen_port, target_port })) => {
@@ -776,29 +805,20 @@ impl ClientRelay<'_> {
         event: Option<ClientTunnelEvent>,
     ) -> bool {
         match event {
-            Some(ClientTunnelEvent::Accepted(writer_tx)) => {
-                // Close previous connection's server side if any
-                if self.tunnel.writer.take().is_some()
-                    && !timed_send(framed, Frame::TunnelClose).await
-                {
-                    return false;
-                }
-                self.tunnel.writer = Some(writer_tx);
-                if !timed_send(framed, Frame::TunnelOpen).await {
+            Some(ClientTunnelEvent::Accepted { channel_id, writer_tx }) => {
+                self.tunnel.channels.insert(channel_id, writer_tx);
+                if !timed_send(framed, Frame::TunnelOpen { channel_id }).await {
                     return false;
                 }
             }
-            Some(ClientTunnelEvent::Data(data)) => {
-                if !timed_send(framed, Frame::TunnelData(data)).await {
+            Some(ClientTunnelEvent::Data { channel_id, data }) => {
+                if !timed_send(framed, Frame::TunnelData { channel_id, data }).await {
                     return false;
                 }
             }
-            Some(ClientTunnelEvent::Closed) => {
-                self.tunnel.writer = None;
-                if let Some(handle) = self.tunnel.listener.take() {
-                    handle.abort();
-                }
-                if !timed_send(framed, Frame::TunnelClose).await {
+            Some(ClientTunnelEvent::Closed { channel_id }) => {
+                self.tunnel.channels.remove(&channel_id);
+                if !timed_send(framed, Frame::TunnelClose { channel_id }).await {
                     return false;
                 }
             }
@@ -884,6 +904,7 @@ async fn relay(
     let (pf_event_tx, mut pf_event_rx) = mpsc::unbounded_channel::<ClientPortForwardEvent>();
     let mut pf = ClientPortForwardTable::new();
 
+    let mut bytes_relayed = 0u64;
     let mut relay = ClientRelay {
         async_stdout,
         agent: &mut agent,
@@ -898,6 +919,8 @@ async fn relay(
         last_pong: &mut last_pong,
         last_ping_sent: &mut last_ping_sent,
         last_rtt: &mut last_rtt,
+        connected_at: Instant::now(),
+        bytes_relayed: &mut bytes_relayed,
     };
 
     loop {
@@ -923,6 +946,10 @@ async fn relay(
                                         write_stdout_async(async_stdout, status_msg("detached").as_bytes()).await?;
                                         return Ok(RelayExit::Exit(0));
                                     }
+                                    EscapeAction::Reconnect => {
+                                        write_stdout_async(async_stdout, status_msg("force reconnect").as_bytes()).await?;
+                                        return Ok(RelayExit::Disconnected);
+                                    }
                                     EscapeAction::Suspend => {
                                         suspend(raw_guard, nb_guard)?;
                                         // Re-sync terminal size after resume
@@ -936,12 +963,70 @@ async fn relay(
                                             Some(d) => format!("{:.1}ms", d.as_secs_f64() * 1000.0),
                                             None => "n/a".to_string(),
                                         };
+                                        let uptime = relay.connected_at.elapsed();
+                                        let uptime_str = if uptime.as_secs() >= 3600 {
+                                            format!(
+                                                "{}h {}m {}s",
+                                                uptime.as_secs() / 3600,
+                                                (uptime.as_secs() % 3600) / 60,
+                                                uptime.as_secs() % 60,
+                                            )
+                                        } else if uptime.as_secs() >= 60 {
+                                            format!(
+                                                "{}m {}s",
+                                                uptime.as_secs() / 60,
+                                                uptime.as_secs() % 60,
+                                            )
+                                        } else {
+                                            format!("{}s", uptime.as_secs())
+                                        };
+                                        let bytes_str = format_size(*relay.bytes_relayed);
+                                        let agent_info = if relay.agent_socket.is_some() {
+                                            format!(
+                                                "on ({} channels)",
+                                                relay.agent.channels.len()
+                                            )
+                                        } else {
+                                            "off".to_string()
+                                        };
+                                        let open_str = if relay.oauth_redirect { "on" } else { "off" };
+                                        let mut pf_lines = Vec::new();
+                                        for (&fwd_id, fwd) in &relay.pf.forwards {
+                                            let ch_count = relay.pf.channels.values()
+                                                .filter(|(fid, _)| *fid == fwd_id)
+                                                .count();
+                                            pf_lines.push(format!(
+                                                "    :{} ({} connections)",
+                                                fwd.target_port,
+                                                ch_count,
+                                            ));
+                                        }
+                                        let tunnel_str = if !relay.tunnel.channels.is_empty() {
+                                            format!("active ({} channels)", relay.tunnel.channels.len())
+                                        } else if relay.tunnel.listener.is_some() {
+                                            "listening".to_string()
+                                        } else {
+                                            "idle".to_string()
+                                        };
+                                        let mut status = format!(
+                                            "\r\n\x1b[2;33m[gritty status]\r\n\
+                                             \x1b[0m\x1b[2m  session: {session}\r\n\
+                                             \x1b[0m\x1b[2m  rtt: {rtt_str}\r\n\
+                                             \x1b[0m\x1b[2m  connected: {uptime_str}\r\n\
+                                             \x1b[0m\x1b[2m  bytes relayed: {bytes_str}\r\n\
+                                             \x1b[0m\x1b[2m  agent forwarding: {agent_info}\r\n\
+                                             \x1b[0m\x1b[2m  open forwarding: {open_str}\r\n\
+                                             \x1b[0m\x1b[2m  oauth tunnel: {tunnel_str}\r\n",
+                                        );
+                                        for line in &pf_lines {
+                                            status.push_str(&format!(
+                                                "\x1b[0m\x1b[2m  port forward{line}\r\n"
+                                            ));
+                                        }
+                                        status.push_str("\x1b[0m");
                                         write_stdout_async(
                                             async_stdout,
-                                            status_msg(&format!(
-                                                "session: {session}, rtt: {rtt_str}"
-                                            ))
-                                            .as_bytes(),
+                                            status.as_bytes(),
                                         ).await?;
                                     }
                                     EscapeAction::Help => {
@@ -1331,6 +1416,20 @@ mod tests {
         let mut ep = EscapeProcessor { state: EscapeState::Normal };
         let actions = ep.process(b"\n~#");
         assert_eq!(actions, vec![EscapeAction::Data(b"\n".to_vec()), EscapeAction::Status,]);
+    }
+
+    #[test]
+    fn tilde_reconnect() {
+        let mut ep = EscapeProcessor { state: EscapeState::Normal };
+        let actions = ep.process(b"\n~R");
+        assert_eq!(actions, vec![EscapeAction::Data(b"\n".to_vec()), EscapeAction::Reconnect,]);
+    }
+
+    #[test]
+    fn tilde_reconnect_stops_processing() {
+        let mut ep = EscapeProcessor { state: EscapeState::Normal };
+        let actions = ep.process(b"\n~Rremaining");
+        assert_eq!(actions, vec![EscapeAction::Data(b"\n".to_vec()), EscapeAction::Reconnect,]);
     }
 
     #[test]

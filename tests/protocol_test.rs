@@ -709,18 +709,19 @@ fn roundtrip_tunnel_listen() {
 fn roundtrip_tunnel_open() {
     let mut codec = FrameCodec;
     let mut buf = BytesMut::new();
-    codec.encode(Frame::TunnelOpen, &mut buf).unwrap();
-    assert_eq!(buf.len(), 5); // type(1) + len(4), zero payload
+    let original = Frame::TunnelOpen { channel_id: 42 };
+    codec.encode(original.clone(), &mut buf).unwrap();
+    assert_eq!(buf.len(), 9); // type(1) + len(4) + channel_id(4)
     assert_eq!(buf[0], 0x0F);
     let decoded = codec.decode(&mut buf).unwrap().unwrap();
-    assert_eq!(Frame::TunnelOpen, decoded);
+    assert_eq!(original, decoded);
 }
 
 #[test]
 fn roundtrip_tunnel_data() {
     let mut codec = FrameCodec;
     let mut buf = BytesMut::new();
-    let original = Frame::TunnelData(Bytes::from("tunnel-payload"));
+    let original = Frame::TunnelData { channel_id: 7, data: Bytes::from("tunnel-payload") };
     codec.encode(original.clone(), &mut buf).unwrap();
     assert_eq!(buf[0], 0x17);
     let decoded = codec.decode(&mut buf).unwrap().unwrap();
@@ -731,9 +732,9 @@ fn roundtrip_tunnel_data() {
 fn roundtrip_tunnel_data_empty() {
     let mut codec = FrameCodec;
     let mut buf = BytesMut::new();
-    let original = Frame::TunnelData(Bytes::new());
+    let original = Frame::TunnelData { channel_id: 0, data: Bytes::new() };
     codec.encode(original.clone(), &mut buf).unwrap();
-    assert_eq!(buf.len(), 5); // type(1) + len(4), zero payload
+    assert_eq!(buf.len(), 9); // type(1) + len(4) + channel_id(4)
     let decoded = codec.decode(&mut buf).unwrap().unwrap();
     assert_eq!(original, decoded);
 }
@@ -742,11 +743,12 @@ fn roundtrip_tunnel_data_empty() {
 fn roundtrip_tunnel_close() {
     let mut codec = FrameCodec;
     let mut buf = BytesMut::new();
-    codec.encode(Frame::TunnelClose, &mut buf).unwrap();
-    assert_eq!(buf.len(), 5); // type(1) + len(4), zero payload
+    let original = Frame::TunnelClose { channel_id: 99 };
+    codec.encode(original.clone(), &mut buf).unwrap();
+    assert_eq!(buf.len(), 9); // type(1) + len(4) + channel_id(4)
     assert_eq!(buf[0], 0x18);
     let decoded = codec.decode(&mut buf).unwrap().unwrap();
-    assert_eq!(Frame::TunnelClose, decoded);
+    assert_eq!(original, decoded);
 }
 
 #[test]
