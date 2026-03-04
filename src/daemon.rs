@@ -77,8 +77,16 @@ fn reap_sessions(sessions: &mut HashMap<u32, SessionState>) {
     });
 }
 
-/// Resolve a session identifier (name or id string) to a session id.
-fn resolve_session(sessions: &HashMap<u32, SessionState>, target: &str) -> Option<u32> {
+/// Resolve a session identifier (name, id string, or "-" for last attached) to a session id.
+fn resolve_session(
+    sessions: &HashMap<u32, SessionState>,
+    target: &str,
+    last_attached: Option<u32>,
+) -> Option<u32> {
+    // "-" means last attached session
+    if target == "-" {
+        return last_attached.filter(|id| sessions.contains_key(id));
+    }
     // Try name match first
     for (&id, state) in sessions {
         if state.name.as_deref() == Some(target) {
@@ -253,6 +261,7 @@ pub async fn run(ctl_path: &Path, ready_fd: Option<OwnedFd>) -> anyhow::Result<(
 
     let mut sessions: HashMap<u32, SessionState> = HashMap::new();
     let mut next_id: u32 = 0;
+    let mut last_attached: Option<u32> = None;
 
     // Signal handlers
     let mut sigterm = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
@@ -277,7 +286,7 @@ pub async fn run(ctl_path: &Path, ready_fd: Option<OwnedFd>) -> anyhow::Result<(
             }
             Some((frame, framed)) = conn_rx.recv() => {
                 dispatch_control(
-                    frame, framed, &mut sessions, &mut next_id, ctl_path,
+                    frame, framed, &mut sessions, &mut next_id, ctl_path, &mut last_attached,
                 ).await
             }
             _ = sigterm.recv() => {
@@ -309,6 +318,7 @@ async fn dispatch_control(
     sessions: &mut HashMap<u32, SessionState>,
     next_id: &mut u32,
     ctl_path: &Path,
+    last_attached: &mut Option<u32>,
 ) -> bool {
     match frame {
         Frame::NewSession { name, command } => {
@@ -389,12 +399,13 @@ async fn dispatch_control(
             }
 
             // Hand off connection to session for auto-attach
+            *last_attached = Some(id);
             let _ = client_tx.send(ClientConn::Active(framed));
             false
         }
         Frame::Attach { session } => {
             reap_sessions(sessions);
-            if let Some(id) = resolve_session(sessions, &session) {
+            if let Some(id) = resolve_session(sessions, &session, *last_attached) {
                 let state = &sessions[&id];
                 if state.client_tx.is_closed() {
                     sessions.remove(&id);
@@ -404,6 +415,7 @@ async fn dispatch_control(
                     )
                     .await;
                 } else if timed_send(&mut framed, Frame::Ok).await.is_ok() {
+                    *last_attached = Some(id);
                     let _ = state.client_tx.send(ClientConn::Active(framed));
                 }
             } else {
@@ -417,7 +429,7 @@ async fn dispatch_control(
         }
         Frame::Tail { session } => {
             reap_sessions(sessions);
-            if let Some(id) = resolve_session(sessions, &session) {
+            if let Some(id) = resolve_session(sessions, &session, *last_attached) {
                 let state = &sessions[&id];
                 if state.client_tx.is_closed() {
                     sessions.remove(&id);
@@ -446,7 +458,7 @@ async fn dispatch_control(
         }
         Frame::KillSession { session } => {
             reap_sessions(sessions);
-            if let Some(id) = resolve_session(sessions, &session) {
+            if let Some(id) = resolve_session(sessions, &session, *last_attached) {
                 let state = sessions.remove(&id).unwrap();
                 state.handle.abort();
                 info!(id, "session killed");
@@ -462,7 +474,7 @@ async fn dispatch_control(
         }
         Frame::SendFile { session, .. } => {
             reap_sessions(sessions);
-            if let Some(id) = resolve_session(sessions, &session) {
+            if let Some(id) = resolve_session(sessions, &session, *last_attached) {
                 let state = &sessions[&id];
                 if state.client_tx.is_closed() {
                     sessions.remove(&id);
@@ -486,7 +498,7 @@ async fn dispatch_control(
         }
         Frame::RenameSession { session, new_name } => {
             reap_sessions(sessions);
-            if let Some(id) = resolve_session(sessions, &session) {
+            if let Some(id) = resolve_session(sessions, &session, *last_attached) {
                 if new_name.is_empty() {
                     let _ = timed_send(
                         &mut framed,

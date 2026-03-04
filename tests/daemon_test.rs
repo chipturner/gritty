@@ -1041,3 +1041,50 @@ async fn rename_session_to_numeric_name() {
 
     kill_cleanup(&ctl_path, &id).await;
 }
+
+#[tokio::test]
+async fn attach_dash_resolves_to_last_session() {
+    let (_tmp, ctl_path) = test_ctl();
+
+    let ctl = ctl_path.clone();
+    let _daemon = tokio::spawn(async move { gritty::daemon::run(&ctl, None).await });
+    wait_for_daemon(&ctl_path).await;
+
+    // create_session auto-attaches, so last_attached is set to each session
+    let id_a = create_session(&ctl_path, "alpha").await;
+    let _id_b = create_session(&ctl_path, "beta").await;
+    // After creating beta, last_attached = beta's id
+
+    // Explicitly attach to alpha (updates last_attached to alpha)
+    let resp = control_request(&ctl_path, Frame::Attach { session: id_a.clone() }).await;
+    assert_eq!(resp, Frame::Ok);
+    tokio::time::sleep(Duration::from_millis(100)).await;
+
+    // Now "-" should resolve to alpha (last explicitly attached)
+    let resp = control_request(&ctl_path, Frame::Attach { session: "-".to_string() }).await;
+    assert_eq!(resp, Frame::Ok, "attach - should resolve to last attached session (alpha)");
+
+    kill_cleanup(&ctl_path, &id_a).await;
+    kill_cleanup(&ctl_path, &_id_b).await;
+}
+
+#[tokio::test]
+async fn attach_dash_no_previous_session() {
+    let (_tmp, ctl_path) = test_ctl();
+
+    let ctl = ctl_path.clone();
+    let _daemon = tokio::spawn(async move { gritty::daemon::run(&ctl, None).await });
+    wait_for_daemon(&ctl_path).await;
+
+    // No sessions created at all, "-" should fail
+    let resp = control_request(&ctl_path, Frame::Attach { session: "-".to_string() }).await;
+    match resp {
+        Frame::Error { message } => {
+            assert!(
+                message.contains("no such session"),
+                "expected no-such-session error, got: {message}"
+            );
+        }
+        other => panic!("expected Error for attach -, got {other:?}"),
+    }
+}
