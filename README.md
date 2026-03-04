@@ -99,7 +99,7 @@ For local sessions (useful for testing): `gritty new local:scratch`
 | `gritty config-edit` | | Open config in `$VISUAL`/`$EDITOR` (creates from template if missing) |
 | `gritty completions <shell>` | | Generate shell completions (bash, zsh, fish, elvish, powershell) |
 
-`<host>` is a connection name from `gritty connect`, or `local` for the local server. Session is specified after a colon: `host:session`. Auto-starts server/tunnel on `new`; `attach` waits for an existing server. `send`/`receive` auto-detect the session across all active daemons; use `--session host:session` to target a specific one.
+The `<host>` in `host:session` is a **connection name**, not an SSH destination. It's the name assigned by `gritty connect` -- by default the hostname, overridable with `-n`. `local` is the reserved name for the local server. For example, `gritty connect user@mybox.example.com -n devbox` creates connection name `devbox`, so you'd use `gritty new devbox:work`. Auto-starts server/tunnel on `new`; `attach` waits for an existing server. `send`/`receive` auto-detect the session across all active daemons; use `--session host:session` to target a specific one.
 
 **Global options:**
 - `-v` / `--verbose`: enable debug logging
