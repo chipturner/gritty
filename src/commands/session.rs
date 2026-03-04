@@ -205,12 +205,20 @@ pub(crate) async fn list_sessions(ctl_path: PathBuf) -> anyhow::Result<()> {
                                 status,
                             )
                         };
-                        vec![s.id.clone(), name, pty, pid, created, status]
+                        vec![
+                            s.id.clone(),
+                            name,
+                            s.foreground_cmd.clone(),
+                            pty,
+                            pid,
+                            created,
+                            status,
+                        ]
                     })
                     .collect();
 
                 gritty::table::print_table(
-                    &["ID", "Name", "PTY", "PID", "Created", "Status"],
+                    &["ID", "Name", "Cmd", "PTY", "PID", "Created", "Status"],
                     &rows,
                 );
             }
@@ -300,21 +308,33 @@ pub(crate) async fn list_all_sessions() -> anyhow::Result<()> {
                         status,
                     )
                 };
-                vec![host.clone(), s.id.clone(), name, pty, pid, created, status]
+                vec![
+                    host.clone(),
+                    s.id.clone(),
+                    name,
+                    s.foreground_cmd.clone(),
+                    pty,
+                    pid,
+                    created,
+                    status,
+                ]
             })
         })
         .collect();
 
     if multi_host {
         gritty::table::print_table(
-            &["Host", "ID", "Name", "PTY", "PID", "Created", "Status"],
+            &["Host", "ID", "Name", "Cmd", "PTY", "PID", "Created", "Status"],
             &rows,
         );
     } else {
         let host = &rows[0][0];
         println!("Host: {host}");
         let trimmed: Vec<Vec<String>> = rows.iter().map(|r| r[1..].to_vec()).collect();
-        gritty::table::print_table(&["ID", "Name", "PTY", "PID", "Created", "Status"], &trimmed);
+        gritty::table::print_table(
+            &["ID", "Name", "Cmd", "PTY", "PID", "Created", "Status"],
+            &trimmed,
+        );
     }
     Ok(())
 }

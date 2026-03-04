@@ -84,6 +84,7 @@ pub struct SessionEntry {
     pub created_at: u64,
     pub attached: bool,
     pub last_heartbeat: u64,
+    pub foreground_cmd: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -281,7 +282,16 @@ fn encode_env(dst: &mut BytesMut, vars: &[(String, String)]) {
 fn encode_session_info(dst: &mut BytesMut, sessions: &[SessionEntry]) {
     let body_len: usize = 4 + sessions
         .iter()
-        .map(|e| 2 + e.id.len() + 2 + e.name.len() + 2 + e.pty_path.len() + 21)
+        .map(|e| {
+            2 + e.id.len()
+                + 2
+                + e.name.len()
+                + 2
+                + e.pty_path.len()
+                + 21
+                + 2
+                + e.foreground_cmd.len()
+        })
         .sum::<usize>();
     dst.put_u8(TYPE_SESSION_INFO);
     dst.put_u32(body_len as u32);
@@ -297,6 +307,8 @@ fn encode_session_info(dst: &mut BytesMut, sessions: &[SessionEntry]) {
         dst.put_u64(e.created_at);
         dst.put_u8(if e.attached { 1 } else { 0 });
         dst.put_u64(e.last_heartbeat);
+        dst.put_u16(e.foreground_cmd.len() as u16);
+        dst.extend_from_slice(e.foreground_cmd.as_bytes());
     }
 }
 
@@ -485,6 +497,12 @@ fn decode_session_info(payload: BytesMut) -> Result<Option<Frame>, io::Error> {
         off += 1;
         let last_heartbeat = read_u64(p, off);
         off += 8;
+        // Optional field: foreground_cmd (backwards compat -- empty if absent)
+        let foreground_cmd = if off + 2 <= p.len() {
+            read_str(p, &mut off).unwrap_or_default()
+        } else {
+            String::new()
+        };
         sessions.push(SessionEntry {
             id,
             name,
@@ -493,6 +511,7 @@ fn decode_session_info(payload: BytesMut) -> Result<Option<Frame>, io::Error> {
             created_at,
             attached,
             last_heartbeat,
+            foreground_cmd,
         });
     }
     Ok(Some(Frame::SessionInfo { sessions }))

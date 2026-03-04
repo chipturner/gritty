@@ -175,6 +175,7 @@ fn roundtrip_session_info() {
             SessionEntry {
                 id: "0".to_string(),
                 name: "project-a".to_string(),
+                foreground_cmd: "vim".to_string(),
                 pty_path: "/dev/pts/3".to_string(),
                 shell_pid: 1234,
                 created_at: 1700000000,
@@ -184,6 +185,7 @@ fn roundtrip_session_info() {
             SessionEntry {
                 id: "1".to_string(),
                 name: String::new(),
+                foreground_cmd: String::new(),
                 pty_path: "/dev/pts/5".to_string(),
                 shell_pid: 5678,
                 created_at: 1700000100,
@@ -338,6 +340,7 @@ fn session_info_preserves_tabs_in_id() {
         sessions: vec![SessionEntry {
             id: "has\ttab".to_string(),
             name: "test".to_string(),
+            foreground_cmd: String::new(),
             pty_path: "/dev/pts/3".to_string(),
             shell_pid: 1234,
             created_at: 1700000000,
@@ -403,6 +406,7 @@ fn session_info_preserves_newline_in_name() {
         sessions: vec![SessionEntry {
             id: "0".to_string(),
             name: "has\nnewline".to_string(),
+            foreground_cmd: String::new(),
             pty_path: "/dev/pts/3".to_string(),
             shell_pid: 1234,
             created_at: 1700000000,

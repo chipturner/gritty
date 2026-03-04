@@ -94,6 +94,33 @@ fn resolve_session(sessions: &HashMap<u32, SessionState>, target: &str) -> Optio
     None
 }
 
+/// Read the foreground process command name for a shell pid via /proc.
+/// Returns "-" on any failure (non-Linux, permission denied, etc.).
+fn foreground_process(shell_pid: u32) -> String {
+    // Read /proc/{shell_pid}/stat to get tpgid (field 8, 1-indexed)
+    let stat = match std::fs::read_to_string(format!("/proc/{shell_pid}/stat")) {
+        Ok(s) => s,
+        Err(_) => return "-".to_string(),
+    };
+    // Fields are space-separated, but field 2 (comm) is in parens and may contain spaces.
+    // Find the closing paren, then parse fields after it.
+    let after_comm = match stat.rfind(')') {
+        Some(pos) => &stat[pos + 2..], // skip ") "
+        None => return "-".to_string(),
+    };
+    // Fields after comm: state(3) ppid(4) pgrp(5) session(6) tty_nr(7) tpgid(8)
+    // That's index 5 in the remaining space-separated fields (0-indexed)
+    let fields: Vec<&str> = after_comm.split_whitespace().collect();
+    let tpgid = match fields.get(5).and_then(|s| s.parse::<u32>().ok()) {
+        Some(t) if t > 0 => t,
+        _ => return "-".to_string(),
+    };
+    // Read /proc/{tpgid}/comm
+    std::fs::read_to_string(format!("/proc/{tpgid}/comm"))
+        .map(|s| s.trim().to_string())
+        .unwrap_or_else(|_| "-".to_string())
+}
+
 fn build_session_entries(sessions: &HashMap<u32, SessionState>) -> Vec<SessionEntry> {
     let mut entries: Vec<_> = sessions
         .iter()
@@ -107,6 +134,7 @@ fn build_session_entries(sessions: &HashMap<u32, SessionState>) -> Vec<SessionEn
                     created_at: meta.created_at,
                     attached: meta.attached.load(Ordering::Relaxed),
                     last_heartbeat: meta.last_heartbeat.load(Ordering::Relaxed),
+                    foreground_cmd: foreground_process(meta.shell_pid),
                 }
             } else {
                 SessionEntry {
@@ -117,6 +145,7 @@ fn build_session_entries(sessions: &HashMap<u32, SessionState>) -> Vec<SessionEn
                     created_at: 0,
                     attached: false,
                     last_heartbeat: 0,
+                    foreground_cmd: "-".to_string(),
                 }
             }
         })
