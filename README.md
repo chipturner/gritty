@@ -65,17 +65,12 @@ For local sessions (useful for testing): `gritty new local:scratch`
 ## Features
 
 - **Self-healing connections** -- heartbeat detection, automatic tunnel respawn, transparent reconnect
-- **Persistent sessions** -- shells survive disconnect, network failure, laptop sleep; reattach from any terminal or machine
+- **Persistent sessions** -- shells survive disconnect, network failure, laptop sleep; reattach from any terminal or machine; multiple named sessions
 - **SSH agent forwarding** (`-A`) -- `git push`, `ssh`, and other agent-dependent commands work remotely
 - **URL open forwarding** (`-O`) -- `$BROWSER` requests forwarded to your local machine, with automatic OAuth callback tunneling
-- **Port forwarding** -- `gritty local-forward` / `gritty remote-forward` for transient TCP forwards through the session; for persistent ports, configure SSH forwarding on the tunnel via `-o` or config
+- **Port forwarding** -- `gritty local-forward` / `gritty remote-forward` for transient TCP forwards through the session
 - **File transfer** -- `gritty send` / `gritty receive` through the session connection, with `--stdin`/`--stdout` pipe mode
-- **Read-only tail** -- `gritty tail` streams session output without detaching the active client
-- **Environment forwarding** -- TERM, LANG, COLORTERM propagated to the remote shell
-- **Single binary, zero config** -- optional TOML config for per-host defaults; no port allocation, no root required
-- **No network protocol** -- Unix domain sockets locally, SSH handles encryption and auth
-- **Multiple named sessions** -- create, list, attach, kill by name or ID
-- **SSH-style escape sequences** -- `~.` detach, `~^Z` suspend, `~?` help
+- **Single binary, no network protocol** -- Unix domain sockets locally, SSH handles encryption and auth; optional TOML config for per-host defaults
 
 ## Commands
 
