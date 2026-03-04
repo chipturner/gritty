@@ -1,35 +1,43 @@
 # gritty
 
-Persistent, self-healing terminal sessions that make remote hosts feel local.
+Persistent remote shells that bring your local tools with them.
 
-gritty gives you remote shell sessions that survive network changes, laptop sleep, and SSH disconnects -- then brings your local tools along for the ride. Your SSH agent works remotely. URLs open in your local browser. OAuth flows complete seamlessly. Ports forward through the session. Files transfer without scp. Close your laptop, change wifi, open it back up: you're exactly where you left off.
+> **Early stage.** Works on Linux and macOS. Available on [crates.io](https://crates.io/crates/gritty-cli). Expect rough edges -- patches welcome.
+
+```bash
+gritty new devbox:work -A -O        # connect, forward SSH agent + browser/OAuth
+
+# Inside the session -- your local tools just work:
+git push                            # uses your local SSH keys via -A
+gh auth login                       # OAuth opens in your local browser via -O
+gritty lf 8080                      # quick-check a remote web server locally
+gritty rf 5432                      # let the session reach local postgres
+```
+
+Close your laptop, change wifi, open it back up: you're exactly where you left off.
 
 It works by forwarding Unix domain sockets over SSH -- no custom protocol, no open ports, no certificates, no configuration. If you can `ssh` to a host, you can use gritty.
+
+### Install
+
+Install on **both your laptop and the remote host**:
 
 ```bash
 cargo install gritty-cli
 ```
 
-## Quick Start
+### Quick Start
 
-One command creates a session and connects -- auto-starting the SSH tunnel and remote server:
+For first-time setup, use `--foreground` so you can accept the host key and enter your password if needed:
 
 ```bash
-gritty new devbox:work              # create session, connect through SSH
+gritty connect --foreground devbox   # set up tunnel (Ctrl-C when done)
 ```
 
-That's it. The tunnel and remote server start automatically. The host must be resolvable by SSH (e.g., via `~/.ssh/config`). For `user@host` destinations, set up the tunnel first: `gritty connect user@devbox`.
-
-Now make it feel local:
+After that, one command creates a session and connects -- auto-starting the tunnel and remote server:
 
 ```bash
-gritty new devbox:work -A -O        # forward SSH agent + browser/OAuth
-
-# Inside the session:
-git push                            # uses your local SSH keys via -A
-gh auth login                       # OAuth opens in your local browser via -O
-gritty lf 8080                      # quick-check a remote web server locally
-gritty rf 5432                      # let the session reach local postgres
+gritty new devbox:work -A -O
 ```
 
 Transfer files through the session (run one side locally, one remotely):
@@ -50,14 +58,6 @@ Detach and reattach from anywhere:
 gritty attach devbox:work           # reattach from any terminal, any machine
 gritty ls devbox                    # list sessions
 gritty tunnels                      # list active tunnels
-```
-
-`gritty ls devbox` output:
-
-```
-ID  Name    PTY         PID    Created              Status
-0   work    /dev/pts/4  48291  2026-02-21 14:32:07  attached (heartbeat 3s ago)
-1   deploy  /dev/pts/5  48305  2026-02-21 14:33:41  detached
 ```
 
 For local sessions (useful for testing): `gritty new local:scratch`
