@@ -1111,6 +1111,7 @@ pub async fn run(
     session_name: Option<String>,
     command: Option<String>,
     ring_buffer_cap: usize,
+    oauth_tunnel_idle_timeout: u64,
 ) -> anyhow::Result<()> {
     // Allocate PTY (once, before accept loop)
     let pty = openpty(None, None)?;
@@ -1150,7 +1151,7 @@ pub async fn run(
 
     // Tunnel state (reverse TCP tunnel for OAuth callbacks)
     let (tunnel_event_tx, mut tunnel_event_rx) = mpsc::unbounded_channel::<TunnelEvent>();
-    let mut tunnel = TunnelRelayState::new(Duration::from_secs(5));
+    let mut tunnel = TunnelRelayState::new(Duration::from_secs(oauth_tunnel_idle_timeout));
 
     // Broadcast channel for tail clients
     let (tail_tx, _) = broadcast::channel::<TailEvent>(256);

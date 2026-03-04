@@ -648,7 +648,7 @@ pub async fn run(opts: ConnectOpts, ready_fd: Option<OwnedFd>) -> anyhow::Result
             }
             eprintln!("  to use:");
             eprintln!("    gritty new {connection_name}");
-            eprintln!("    gritty attach {connection_name} -t <name>");
+            eprintln!("    gritty attach {connection_name}:<session>");
             // Signal readiness to parent even for already-running case
             signal_ready(&ready_fd);
             return Ok(0);

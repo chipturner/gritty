@@ -81,6 +81,7 @@ For local sessions (useful for testing): `gritty new local:scratch`
 | `gritty tail <host:session>` | `t` | Read-only stream of session output |
 | `gritty list-sessions [host]` | `ls`, `list` | List sessions (no args = all daemons) |
 | `gritty kill-session <host:session>` | | Kill a session |
+| `gritty rename <host:session> <name>` | | Rename a session |
 | `gritty kill-server <host>` | | Kill the server and all sessions |
 | `gritty connect <destination>` | `c` | Set up SSH tunnel to remote host |
 | `gritty disconnect <name>` | `dc` | Tear down an SSH tunnel |
@@ -94,7 +95,7 @@ For local sessions (useful for testing): `gritty new local:scratch`
 | `gritty config-edit` | | Open config in `$VISUAL`/`$EDITOR` (creates from template if missing) |
 | `gritty completions <shell>` | | Generate shell completions (bash, zsh, fish, elvish, powershell) |
 
-The `<host>` in `host:session` is a **connection name**, not an SSH destination. It's the name assigned by `gritty connect` -- by default the hostname, overridable with `-n`. `local` is the reserved name for the local server. For example, `gritty connect user@mybox.example.com -n devbox` creates connection name `devbox`, so you'd use `gritty new devbox:work`. Auto-starts server/tunnel on `new`; `attach` waits for an existing server. `send`/`receive` auto-detect the session across all active daemons; use `--session host:session` to target a specific one.
+The `<host>` in `host:session` is a **connection name**, not an SSH destination. It's the name assigned by `gritty connect` -- by default the hostname, overridable with `-n`. `local` is the reserved name for the local server. For example, `gritty connect user@mybox.example.com -n devbox` creates connection name `devbox`, so you'd use `gritty new devbox:work`. The special session name `-` refers to the last-attached session (e.g. `gritty attach devbox:-`). Auto-starts server/tunnel on `new`; `attach` waits for an existing server. `send`/`receive` auto-detect the session across all active daemons; use `--session host:session` to target a specific one.
 
 **Global options:**
 - `-v` / `--verbose`: enable debug logging
@@ -103,6 +104,8 @@ The `<host>` in `host:session` is a **connection name**, not an SSH destination.
 **Session options** (`new`/`attach`):
 - `-A` / `--forward-agent`: forward your local SSH agent
 - `-O` / `--forward-open`: forward URL opens to local machine
+- `-c <cmd>` / `--command` (`new` only): run a command instead of a login shell
+- `-d` / `--detach` (`new` only): create session without attaching (background jobs)
 - `--no-redraw`: don't send Ctrl-L after connecting
 - `--no-escape`: disable escape sequence processing
 - `--no-oauth-redirect`: disable OAuth callback tunneling (part of `-O`)
@@ -120,6 +123,8 @@ The `<host>` in `host:session` is a **connection name**, not an SSH destination.
 - `--session host:session`: target a specific session
 - `--stdin` (`send`): read data from stdin instead of files
 - `--stdout` (`receive`): write data to stdout instead of files
+- `-r` / `--recursive` (`send`): send directories recursively
+- `--timeout <seconds>`: deadline for pairing with a receiver/sender
 
 **Port forwarding:** port spec is `PORT` (same on both ends) or `LISTEN:TARGET`. Runs inside a session (`GRITTY_SOCK` required). Ctrl-C stops the forward. These are transient, on-demand forwards -- great for quick checks during development. For always-on port forwarding, configure it on the SSH tunnel instead: `gritty connect devbox -o "LocalForward=8080 localhost:8080"` or add it to `ssh-options` in your config file.
 
@@ -161,6 +166,10 @@ gritty works out of the box with no config file. Optionally, set persistent defa
 # no-redraw = false
 # oauth-redirect = true
 # oauth-timeout = 180
+# heartbeat-interval = 5
+# heartbeat-timeout = 15
+# ring-buffer-size = 1048576
+# oauth-tunnel-idle-timeout = 5
 
 # Connect-specific global defaults.
 [defaults.connect]

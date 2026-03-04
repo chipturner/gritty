@@ -18,6 +18,7 @@ pub struct SessionSettings {
     pub heartbeat_interval: u64,
     pub heartbeat_timeout: u64,
     pub ring_buffer_size: u64,
+    pub oauth_tunnel_idle_timeout: u64,
 }
 
 impl Default for SessionSettings {
@@ -32,6 +33,7 @@ impl Default for SessionSettings {
             heartbeat_interval: 5,
             heartbeat_timeout: 15,
             ring_buffer_size: 1 << 20, // 1 MB
+            oauth_tunnel_idle_timeout: 5,
         }
     }
 }
@@ -65,6 +67,7 @@ pub struct Defaults {
     pub heartbeat_interval: Option<u64>,
     pub heartbeat_timeout: Option<u64>,
     pub ring_buffer_size: Option<u64>,
+    pub oauth_tunnel_idle_timeout: Option<u64>,
     pub connect: Option<ConnectDefaults>,
 }
 
@@ -89,6 +92,7 @@ pub struct HostConfig {
     pub heartbeat_interval: Option<u64>,
     pub heartbeat_timeout: Option<u64>,
     pub ring_buffer_size: Option<u64>,
+    pub oauth_tunnel_idle_timeout: Option<u64>,
     pub connect: Option<ConnectDefaults>,
 }
 
@@ -149,6 +153,10 @@ impl ConfigFile {
                 .and_then(|h| h.ring_buffer_size)
                 .or(d.ring_buffer_size)
                 .unwrap_or(1 << 20),
+            oauth_tunnel_idle_timeout: h
+                .and_then(|h| h.oauth_tunnel_idle_timeout)
+                .or(d.oauth_tunnel_idle_timeout)
+                .unwrap_or(5),
         }
     }
 
@@ -387,6 +395,23 @@ mod tests {
         let s = cfg.resolve_session(Some("devbox"));
         assert!(!s.oauth_redirect); // from host
         assert_eq!(s.oauth_timeout, 90); // from defaults
+    }
+
+    #[test]
+    fn oauth_tunnel_idle_timeout_configurable() {
+        let cfg: ConfigFile = toml::from_str(
+            r#"
+            [defaults]
+            oauth-tunnel-idle-timeout = 10
+
+            [host.devbox]
+            oauth-tunnel-idle-timeout = 30
+            "#,
+        )
+        .unwrap();
+        assert_eq!(cfg.resolve_session(None).oauth_tunnel_idle_timeout, 10);
+        assert_eq!(cfg.resolve_session(Some("devbox")).oauth_tunnel_idle_timeout, 30);
+        assert_eq!(cfg.resolve_session(Some("unknown")).oauth_tunnel_idle_timeout, 10);
     }
 
     #[test]

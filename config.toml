@@ -15,6 +15,7 @@
 # heartbeat-interval = 5
 # heartbeat-timeout = 15
 # ring-buffer-size = 1048576
+# oauth-tunnel-idle-timeout = 5
 
 # Connect-specific global defaults.
 [defaults.connect]

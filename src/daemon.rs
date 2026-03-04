@@ -262,8 +262,9 @@ pub async fn run(ctl_path: &Path, ready_fd: Option<OwnedFd>) -> anyhow::Result<(
     let mut sessions: HashMap<u32, SessionState> = HashMap::new();
     let mut next_id: u32 = 0;
     let mut last_attached: Option<u32> = None;
-    let ring_buffer_cap =
-        crate::config::ConfigFile::load().resolve_session(None).ring_buffer_size as usize;
+    let session_config = crate::config::ConfigFile::load().resolve_session(None);
+    let ring_buffer_cap = session_config.ring_buffer_size as usize;
+    let oauth_tunnel_idle_timeout = session_config.oauth_tunnel_idle_timeout;
 
     // Signal handlers
     let mut sigterm = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
@@ -289,7 +290,7 @@ pub async fn run(ctl_path: &Path, ready_fd: Option<OwnedFd>) -> anyhow::Result<(
             Some((frame, framed)) = conn_rx.recv() => {
                 dispatch_control(
                     frame, framed, &mut sessions, &mut next_id, ctl_path, &mut last_attached,
-                    ring_buffer_cap,
+                    ring_buffer_cap, oauth_tunnel_idle_timeout,
                 ).await
             }
             _ = sigterm.recv() => {
@@ -315,6 +316,7 @@ pub async fn run(ctl_path: &Path, ready_fd: Option<OwnedFd>) -> anyhow::Result<(
 /// Dispatch a single control frame. Takes ownership of the framed connection
 /// so it can be handed off to session tasks when needed. Returns `true` for
 /// KillServer (daemon should exit).
+#[allow(clippy::too_many_arguments)]
 async fn dispatch_control(
     frame: Frame,
     mut framed: Framed<UnixStream, FrameCodec>,
@@ -323,6 +325,7 @@ async fn dispatch_control(
     ctl_path: &Path,
     last_attached: &mut Option<u32>,
     ring_buffer_cap: usize,
+    oauth_tunnel_idle_timeout: u64,
 ) -> bool {
     match frame {
         Frame::NewSession { name, command } => {
@@ -382,6 +385,7 @@ async fn dispatch_control(
                     name_for_server,
                     cmd_for_server,
                     ring_buffer_cap,
+                    oauth_tunnel_idle_timeout,
                 )
                 .await
             });

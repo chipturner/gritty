@@ -490,7 +490,7 @@ fn main() {
                         println!("{sock_display}");
                         eprintln!("tunnel started (name: {conn_name}). to use:");
                         eprintln!("  gritty new {conn_name}");
-                        eprintln!("  gritty attach {conn_name} -t <name>");
+                        eprintln!("  gritty attach {conn_name}:<session>");
                     },
                     Some(&out_path),
                 ) {
@@ -593,6 +593,7 @@ async fn run(cli: Cli, config: gritty::config::ConfigFile) -> anyhow::Result<()>
                 heartbeat_interval: resolved.heartbeat_interval,
                 heartbeat_timeout: resolved.heartbeat_timeout,
                 ring_buffer_size: resolved.ring_buffer_size,
+                oauth_tunnel_idle_timeout: resolved.oauth_tunnel_idle_timeout,
             };
             new_session(session, command, detach, settings, ctl_path, auto_start_mode, wait).await
         }
@@ -644,6 +645,7 @@ async fn run(cli: Cli, config: gritty::config::ConfigFile) -> anyhow::Result<()>
                 heartbeat_interval: resolved.heartbeat_interval,
                 heartbeat_timeout: resolved.heartbeat_timeout,
                 ring_buffer_size: resolved.ring_buffer_size,
+                oauth_tunnel_idle_timeout: resolved.oauth_tunnel_idle_timeout,
             };
             let session = match session {
                 Some(s) => s,
