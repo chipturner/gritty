@@ -120,8 +120,7 @@ const TUNNEL_SSH_OPTS: &[&str] = &[
 
 /// PATH prefix prepended to remote commands so gritty is discoverable
 /// in non-interactive SSH shells.
-const REMOTE_PATH_PREFIX: &str =
-    "$HOME/bin:$HOME/.local/bin:$HOME/.cargo/bin:/usr/local/bin:/opt/homebrew/bin:$PATH";
+const REMOTE_PATH_PREFIX: &str = "$HOME/bin:$HOME/.local/bin:$HOME/.cargo/bin:$HOME/.nix-profile/bin:/usr/local/bin:/opt/homebrew/bin:/snap/bin:$PATH";
 
 /// Build the common SSH args that precede the destination in every invocation:
 /// port, user-supplied options, ConnectTimeout, and BatchMode (background only).
