@@ -276,6 +276,7 @@ pub(crate) async fn send_command(
     session: Option<String>,
     use_stdin: bool,
     recursive: bool,
+    timeout: Option<u64>,
     files: Vec<PathBuf>,
 ) -> anyhow::Result<()> {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -340,21 +341,31 @@ pub(crate) async fn send_command(
 
     // Wait for go signal -- first stream to get paired wins
     eprintln!("\x1b[2mwaiting for receiver...\x1b[0m");
-    let ts = if tagged.len() == 1 {
-        tagged.into_iter().next().unwrap()
-    } else {
-        select_first_ready(tagged).await?
-    };
-    if let Some(ref label) = ts.label {
-        eprintln!("paired with session {label}");
-    }
-    let mut stream = ts.stream;
+    let wait_for_pair = async {
+        let ts = if tagged.len() == 1 {
+            tagged.into_iter().next().unwrap()
+        } else {
+            select_first_ready(tagged).await?
+        };
+        if let Some(ref label) = ts.label {
+            eprintln!("paired with session {label}");
+        }
+        let mut stream = ts.stream;
 
-    let mut go = [0u8; 1];
-    stream.read_exact(&mut go).await.map_err(|_| anyhow::anyhow!("no receiver connected"))?;
-    if go[0] != 0x01 {
-        anyhow::bail!("unexpected signal from server: 0x{:02x}", go[0]);
-    }
+        let mut go = [0u8; 1];
+        stream.read_exact(&mut go).await.map_err(|_| anyhow::anyhow!("no receiver connected"))?;
+        if go[0] != 0x01 {
+            anyhow::bail!("unexpected signal from server: 0x{:02x}", go[0]);
+        }
+        Ok::<_, anyhow::Error>(stream)
+    };
+    let mut stream = if let Some(secs) = timeout {
+        tokio::time::timeout(std::time::Duration::from_secs(secs), wait_for_pair)
+            .await
+            .map_err(|_| anyhow::anyhow!("timed out waiting for receiver"))??
+    } else {
+        wait_for_pair.await?
+    };
 
     // Stream data
     if let Some(data) = stdin_data {
@@ -395,6 +406,7 @@ pub(crate) async fn receive_command(
     ctl_socket: Option<PathBuf>,
     session: Option<String>,
     use_stdout: bool,
+    timeout: Option<u64>,
     dir: Option<PathBuf>,
 ) -> anyhow::Result<()> {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -417,20 +429,30 @@ pub(crate) async fn receive_command(
 
     // Wait for file data -- first stream to get paired wins
     eprintln!("\x1b[2mwaiting for sender...\x1b[0m");
-    let ts = if tagged.len() == 1 {
-        tagged.into_iter().next().unwrap()
-    } else {
-        select_first_ready(tagged).await?
-    };
-    if let Some(ref label) = ts.label {
-        eprintln!("paired with session {label}");
-    }
-    let mut stream = ts.stream;
+    let wait_for_pair = async {
+        let ts = if tagged.len() == 1 {
+            tagged.into_iter().next().unwrap()
+        } else {
+            select_first_ready(tagged).await?
+        };
+        if let Some(ref label) = ts.label {
+            eprintln!("paired with session {label}");
+        }
+        let mut stream = ts.stream;
 
-    // Read: file_count (u32 BE)
-    let mut buf4 = [0u8; 4];
-    stream.read_exact(&mut buf4).await.map_err(|_| anyhow::anyhow!("no sender connected"))?;
-    let file_count = u32::from_be_bytes(buf4);
+        // Read: file_count (u32 BE)
+        let mut buf4 = [0u8; 4];
+        stream.read_exact(&mut buf4).await.map_err(|_| anyhow::anyhow!("no sender connected"))?;
+        let file_count = u32::from_be_bytes(buf4);
+        Ok::<_, anyhow::Error>((stream, file_count))
+    };
+    let (mut stream, file_count) = if let Some(secs) = timeout {
+        tokio::time::timeout(std::time::Duration::from_secs(secs), wait_for_pair)
+            .await
+            .map_err(|_| anyhow::anyhow!("timed out waiting for sender"))??
+    } else {
+        wait_for_pair.await?
+    };
 
     // Read per-file metadata and data
     let mut received = 0u32;

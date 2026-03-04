@@ -149,6 +149,10 @@ enum Command {
         #[arg(short = 'r', long)]
         recursive: bool,
 
+        /// Timeout in seconds waiting for a receiver
+        #[arg(long)]
+        timeout: Option<u64>,
+
         /// Files to send
         files: Vec<PathBuf>,
     },
@@ -161,6 +165,10 @@ enum Command {
         /// Write received data to stdout instead of files
         #[arg(long)]
         stdout: bool,
+
+        /// Timeout in seconds waiting for a sender
+        #[arg(long)]
+        timeout: Option<u64>,
 
         /// Destination directory (default: current directory)
         dir: Option<PathBuf>,
@@ -738,11 +746,11 @@ async fn run(cli: Cli, config: gritty::config::ConfigFile) -> anyhow::Result<()>
             println!("{}", ctl_path.display());
             Ok(())
         }
-        Command::Send { session, stdin, recursive, files } => {
-            send_command(cli.ctl_socket, session, stdin, recursive, files).await
+        Command::Send { session, stdin, recursive, timeout, files } => {
+            send_command(cli.ctl_socket, session, stdin, recursive, timeout, files).await
         }
-        Command::Receive { session, stdout, dir } => {
-            receive_command(cli.ctl_socket, session, stdout, dir).await
+        Command::Receive { session, stdout, timeout, dir } => {
+            receive_command(cli.ctl_socket, session, stdout, timeout, dir).await
         }
         Command::Open { url } => {
             open_url(&url);
