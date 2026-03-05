@@ -595,6 +595,7 @@ pub struct ConnectOpts {
     pub name: Option<String>,
     pub dry_run: bool,
     pub foreground: bool,
+    pub ignore_version_mismatch: bool,
 }
 
 pub async fn run(opts: ConnectOpts, ready_fd: Option<OwnedFd>) -> anyhow::Result<i32> {
@@ -684,10 +685,16 @@ pub async fn run(opts: ConnectOpts, ready_fd: Option<OwnedFd>) -> anyhow::Result
     // Check protocol version compatibility
     if let Some(rv) = remote_version {
         if rv != crate::protocol::PROTOCOL_VERSION {
-            warn!(
-                "remote protocol version ({rv}) differs from local ({})",
+            let msg = format!(
+                "remote protocol version ({rv}) differs from local ({}); \
+                 use --ignore-version-mismatch to connect anyway",
                 crate::protocol::PROTOCOL_VERSION
             );
+            if opts.ignore_version_mismatch {
+                warn!("{msg}");
+            } else {
+                bail!("{msg}");
+            }
         }
     }
 

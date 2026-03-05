@@ -218,6 +218,10 @@ enum Command {
         /// Run in the foreground instead of backgrounding
         #[arg(long, short = 'f')]
         foreground: bool,
+
+        /// Connect even if remote protocol version differs from local
+        #[arg(long)]
+        ignore_version_mismatch: bool,
     },
     /// Disconnect an SSH tunnel by connection name
     #[command(visible_alias = "dc")]
@@ -444,6 +448,7 @@ fn main() {
             ssh_options,
             dry_run,
             foreground,
+            ignore_version_mismatch,
         } => {
             // Compute connection name before fork so parent can print socket path
             let connection_name = match name.clone() {
@@ -528,6 +533,7 @@ fn main() {
                 name,
                 dry_run,
                 foreground,
+                ignore_version_mismatch,
             };
 
             let error_pipe = dup_ready_fd(&ready_fd);

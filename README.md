@@ -118,6 +118,7 @@ The `<host>` in `host:session` is a **connection name**, not an SSH destination.
 - `--no-server-start`: don't auto-start the remote server
 - `--dry-run`: print SSH commands instead of running them
 - `-f` / `--foreground`: run in the foreground instead of backgrounding
+- `--ignore-version-mismatch`: connect even if the remote protocol version differs from local
 
 **Send/receive options:**
 - `--session host:session`: target a specific session

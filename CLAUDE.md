@@ -110,6 +110,7 @@ Handshake: `0x16` Hello, `0x24` HelloAck. Relay: `0x01` Data, `0x02` Resize, `0x
 - **Fork before tokio** -- `daemonize()` MUST fork before creating the tokio runtime. `main()` is sync (no `#[tokio::main]`).
 
 ### Changing protocol/signatures
+- **`PROTOCOL_VERSION`** -- bump whenever frame types, encoding, or `SessionEntry` fields change. Version mismatch is a hard gate: daemon rejects clients, `connect` aborts tunnel setup.
 - **`Frame` enum** -- update: encoder, decoder, protocol tests, all `match frame` in server.rs, client.rs, daemon.rs, main.rs.
 - **`SessionInfo`** -- entry count `u32`. Changing `SessionEntry` fields requires updating both encoder and decoder in protocol.rs.
 - **`server::run()`** -- takes `(client_rx, metadata, agent_path, svc_path, session_id, session_name, command, ring_buffer_cap, oauth_tunnel_idle_timeout)`. Called by e2e tests + daemon; update both.

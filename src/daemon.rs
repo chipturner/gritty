@@ -201,9 +201,21 @@ async fn connection_handshake(
         }
     };
 
-    // Send HelloAck with negotiated version
-    let negotiated = hello.min(PROTOCOL_VERSION);
-    if timed_send(&mut framed, Frame::HelloAck { version: negotiated }).await.is_err() {
+    // Reject version mismatch
+    if hello != PROTOCOL_VERSION {
+        let _ = timed_send(
+            &mut framed,
+            Frame::Error {
+                message: format!(
+                    "protocol version mismatch: client={hello} server={PROTOCOL_VERSION}; \
+                     both sides must run the same version"
+                ),
+            },
+        )
+        .await;
+        return;
+    }
+    if timed_send(&mut framed, Frame::HelloAck { version: PROTOCOL_VERSION }).await.is_err() {
         return;
     }
 

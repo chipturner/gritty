@@ -110,6 +110,30 @@ async fn kill_cleanup(ctl_path: &std::path::Path, session: &str) {
 }
 
 #[tokio::test]
+async fn daemon_rejects_version_mismatch() {
+    let (_tmp, ctl_path) = test_ctl();
+
+    let ctl = ctl_path.clone();
+    let _daemon = tokio::spawn(async move { gritty::daemon::run(&ctl, None).await });
+    wait_for_daemon(&ctl_path).await;
+
+    let stream = UnixStream::connect(&ctl_path).await.unwrap();
+    let mut framed = Framed::new(stream, FrameCodec);
+    framed.send(Frame::Hello { version: PROTOCOL_VERSION + 1 }).await.unwrap();
+    let resp = timeout(Duration::from_secs(3), framed.next())
+        .await
+        .expect("timed out")
+        .expect("stream ended")
+        .expect("decode error");
+    match resp {
+        Frame::Error { message } => {
+            assert!(message.contains("protocol version mismatch"), "unexpected error: {message}");
+        }
+        other => panic!("expected Error, got {other:?}"),
+    }
+}
+
+#[tokio::test]
 async fn daemon_creates_and_lists_sessions() {
     let (_tmp, ctl_path) = test_ctl();
 
