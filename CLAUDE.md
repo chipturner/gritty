@@ -120,5 +120,13 @@ Handshake: `0x16` Hello, `0x24` HelloAck. Relay: `0x01` Data, `0x02` Resize, `0x
 - **Nextest**: e2e + daemon capped at 2 concurrent; socat/SSH serial; 2 retries for flaky tests. Per-process isolation.
 - **SSH/socat**: auto-detect availability, skip gracefully. `GRITTY_SSH_TEST=0` to force-skip.
 
+### Workflow
+- Run `just fmt` after making code changes.
+- Run `just check` (clippy + full test suite) before finishing work.
+- When changing code, update docs **in the same commit**. Files to check:
+  - **README.md** -- command table, flags, session env vars, config defaults, escape sequences
+  - **CLAUDE.md** -- module descriptions, wire format codes, `server::run()` signature, key patterns
+  - **ARCHITECTURE.md** -- high-level feature descriptions, diagrams
+
 ### Style
 - `main()` returns `()`. Errors via `eprintln!("error: ...")`. Never `-> anyhow::Result` on `main()`.
