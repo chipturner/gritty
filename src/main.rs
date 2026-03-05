@@ -230,7 +230,7 @@ enum Command {
     Tunnels,
     /// Show diagnostics (paths, server status, tunnels)
     Info,
-    /// Open config file in $EDITOR (creates from template if missing)
+    /// Open config file in $VISUAL/$EDITOR/vi (creates from template if missing)
     ConfigEdit,
     /// Print the protocol version number
     ProtocolVersion,

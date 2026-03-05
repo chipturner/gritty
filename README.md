@@ -79,7 +79,7 @@ For local sessions (useful for testing): `gritty new local:scratch`
 | `gritty new-session <host[:name]>` | `new` | Create a session and auto-attach |
 | `gritty attach <host:session>` | `a` | Attach to a session (`-c` creates if missing) |
 | `gritty tail <host:session>` | `t` | Read-only stream of session output |
-| `gritty list-sessions [host]` | `ls`, `list` | List sessions (no args = all daemons) |
+| `gritty list-sessions [host]` | `ls`, `list` | List sessions (no args = all daemons; foreground process shown on Linux only) |
 | `gritty kill-session <host:session>` | | Kill a session |
 | `gritty rename <host:session> <name>` | | Rename a session |
 | `gritty kill-server <host>` | | Kill the server and all sessions |
@@ -125,6 +125,8 @@ The `<host>` in `host:session` is a **connection name**, not an SSH destination.
 - `--stdout` (`receive`): write data to stdout instead of files
 - `-r` / `--recursive` (`send`): send directories recursively
 - `--timeout <seconds>`: deadline for pairing with a receiver/sender
+
+**Environment inside sessions:** `GRITTY_SOCK` (svc socket for `gritty open`/`send`/`receive`/port forwarding), `GRITTY_SESSION` (session ID), and `GRITTY_SESSION_NAME` (if named) are set in the shell environment. Useful for prompt customization or scripts that need to know which session they're in.
 
 **Port forwarding:** port spec is `PORT` (same on both ends) or `LISTEN:TARGET`. Runs inside a session (`GRITTY_SOCK` required). Ctrl-C stops the forward. These are transient, on-demand forwards -- great for quick checks during development. For always-on port forwarding, configure it on the SSH tunnel instead: `gritty connect devbox -o "LocalForward=8080 localhost:8080"` or add it to `ssh-options` in your config file.
 
