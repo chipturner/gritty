@@ -10,10 +10,13 @@ Persistent TTY sessions over Unix domain sockets. Single binary, tmux-like CLI. 
 
 | Command | Alias | Description |
 |---------|-------|-------------|
-| `server` | `s` | Start server (self-daemonizes, `-f` for foreground) |
 | `new-session <host[:name]>` | `new` | Create session and auto-attach |
 | `attach <host:session>` | `a` | Attach to session (detaches other clients) |
 | `tail <host:session>` | `t` | Read-only stream of session output |
+| `list-sessions [host]` | `ls` | List sessions (all daemons if no host) |
+| `kill-session <host:session>` | | Kill a session |
+| `rename <host:session> <new>` | | Rename a session |
+| `kill-server <host>` | | Kill server and all sessions |
 | `send <files...>` | | Send files to paired receiver |
 | `receive [dir]` | | Receive files from paired sender |
 | `open <url>` | | Open URL on local machine (inside `-O` sessions) |
@@ -22,10 +25,7 @@ Persistent TTY sessions over Unix domain sockets. Single binary, tmux-like CLI. 
 | `connect <dest>` | `c` | SSH tunnel to remote server |
 | `disconnect <name>` | `dc` | Tear down SSH tunnel |
 | `tunnels` | `tun` | List active SSH tunnels |
-| `list-sessions [host]` | `ls` | List sessions (all daemons if no host) |
-| `kill-session <host:session>` | | Kill a session |
-| `rename <host:session> <new>` | | Rename a session |
-| `kill-server <host>` | | Kill server and all sessions |
+| `server` | `s` | Start server (self-daemonizes, `-f` for foreground) |
 | `info` | | Show diagnostics |
 | `config-edit` | | Edit config file |
 | `completions <shell>` | | Generate shell completions |

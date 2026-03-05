@@ -83,15 +83,16 @@ For local sessions (useful for testing): `gritty new local:scratch`
 | `gritty kill-session <host:session>` | | Kill a session |
 | `gritty rename <host:session> <name>` | | Rename a session |
 | `gritty kill-server <host>` | | Kill the server and all sessions |
+| `gritty send [-r] [files...]` | | Send files/directories to a paired receiver |
+| `gritty receive [dir]` | | Receive files from a paired sender |
+| `gritty open <url>` | | Open a URL on the local machine (inside sessions) |
+| `gritty local-forward <port>` | `lf` | Forward a TCP port from session to client |
+| `gritty remote-forward <port>` | `rf` | Forward a TCP port from client to session |
 | `gritty connect <destination>` | `c` | Set up SSH tunnel to remote host |
 | `gritty disconnect <name>` | `dc` | Tear down an SSH tunnel |
 | `gritty tunnels` | `tun` | List active SSH tunnels |
-| `gritty send [-r] [files...]` | | Send files/directories to a paired receiver |
-| `gritty receive [dir]` | | Receive files from a paired sender |
-| `gritty local-forward <port>` | `lf` | Forward a TCP port from session to client |
-| `gritty remote-forward <port>` | `rf` | Forward a TCP port from client to session |
-| `gritty open <url>` | | Open a URL on the local machine (inside sessions) |
-| `gritty info` | | Show diagnostics (version, config, server status, tunnels) |
+| `gritty server` | `s` | Start server (usually auto-started; `-f` for foreground) |
+| `gritty info` | | Show diagnostics (paths, server status, tunnels) |
 | `gritty config-edit` | | Open config in `$VISUAL`/`$EDITOR` (creates from template if missing) |
 | `gritty completions <shell>` | | Generate shell completions (bash, zsh, fish, elvish, powershell) |
 
@@ -237,7 +238,7 @@ gritty completions fish > ~/.config/fish/completions/gritty.fish
 
 **"[reconnecting...]" forever** -- the SSH tunnel is down and not coming back. Check `gritty tunnels` for tunnel status. If the tunnel shows as stale, `gritty disconnect <name>` to clean it up and `gritty connect <dest>` to re-establish. Check `gritty info` for log file paths if you need to dig deeper.
 
-**Protocol version mismatch after upgrade** -- if you upgrade gritty on one side but not the other, the version handshake negotiates down to the older protocol. This usually works, but if you see unexpected errors, upgrade both sides to the same version. `gritty protocol-version` shows the local version; `gritty info` shows tunnel status.
+**Protocol version mismatch after upgrade** -- if you upgrade gritty on one side but not the other, connections will be rejected with a version mismatch error. Upgrade both sides to the same version. `gritty protocol-version` shows the local version. If you need to connect temporarily before upgrading, use `gritty connect --ignore-version-mismatch`.
 
 ## Design
 

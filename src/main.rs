@@ -23,13 +23,6 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Command {
-    /// Start the server (backgrounds by default, use --foreground to stay in foreground)
-    #[command(visible_alias = "s")]
-    Server {
-        /// Run in the foreground instead of daemonizing
-        #[arg(long, short = 'f')]
-        foreground: bool,
-    },
     /// Create a new persistent session (auto-attaches)
     #[command(visible_alias = "new")]
     NewSession {
@@ -131,7 +124,7 @@ enum Command {
     /// Rename a session
     Rename {
         /// Target host and session (host:session)
-        target: Option<String>,
+        target: String,
         /// New name for the session
         new_name: String,
     },
@@ -190,9 +183,6 @@ enum Command {
         /// Port spec: PORT or LISTEN_PORT:TARGET_PORT
         port: String,
     },
-    /// Print the default socket path
-    #[command(visible_alias = "socket")]
-    SocketPath,
     /// SSH tunnel to a remote host (backgrounds by default, prints socket path)
     #[command(visible_alias = "c")]
     Connect {
@@ -232,10 +222,20 @@ enum Command {
     /// List active SSH tunnels
     #[command(visible_alias = "tun")]
     Tunnels,
+    /// Start the server (backgrounds by default, use -f to stay in foreground)
+    #[command(visible_alias = "s")]
+    Server {
+        /// Run in the foreground instead of daemonizing
+        #[arg(long, short = 'f')]
+        foreground: bool,
+    },
     /// Show diagnostics (paths, server status, tunnels)
     Info,
     /// Open config file in $VISUAL/$EDITOR/vi (creates from template if missing)
     ConfigEdit,
+    /// Print the default socket path
+    #[command(visible_alias = "socket")]
+    SocketPath,
     /// Print the protocol version number
     ProtocolVersion,
     /// Generate shell completions
@@ -728,19 +728,13 @@ async fn run(cli: Cli, config: gritty::config::ConfigFile) -> anyhow::Result<()>
             kill_session(session, ctl_path).await
         }
         Command::Rename { target, new_name } => {
-            let (host, session) = match &target {
-                Some(t) => {
-                    let (h, s) = parse_target(t);
-                    (Some(h), s)
-                }
-                None => (None, None),
-            };
-            let ctl_path = resolve_ctl_path(cli.ctl_socket, host.as_deref())?;
+            let (host, session) = parse_target(&target);
+            let ctl_path = resolve_ctl_path(cli.ctl_socket, Some(&host))?;
             let session = match session {
                 Some(s) => s,
                 None => {
-                    suggest_session("rename", host.as_deref().unwrap_or("host"), &ctl_path).await?;
-                    unreachable!()
+                    eprintln!("error: specify session as host:session (e.g. local:mysession)");
+                    std::process::exit(1);
                 }
             };
             rename_session(session, new_name, ctl_path).await
