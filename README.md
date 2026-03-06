@@ -1,11 +1,12 @@
 # gritty
 
+[![Crates.io](https://img.shields.io/crates/v/gritty-cli)](https://crates.io/crates/gritty-cli)
+[![License: MIT OR Apache-2.0](https://img.shields.io/crates/l/gritty-cli)](LICENSE)
+
 Persistent remote shells that bring your local tools with them.
 
-> **Early stage.** Works on Linux and macOS. Available on [crates.io](https://crates.io/crates/gritty-cli). Expect rough edges -- patches welcome.
-
 ```bash
-gritty new devbox:work              # connect with agent + browser/OAuth forwarding
+gritty new devbox:work              # devbox = any host from ~/.ssh/config
 
 # Inside the session -- your local tools just work:
 git push                            # uses your local SSH keys (agent forwarded by default)
@@ -23,22 +24,18 @@ It works by forwarding Unix domain sockets over SSH -- no custom protocol, no op
 Install on **both your laptop and the remote host**:
 
 ```bash
-cargo install gritty-cli
+cargo install gritty-cli   # binary name: gritty
 ```
 
 ### Quick Start
 
-For first-time setup, use `--foreground` so you can accept the host key and enter your password if needed:
-
-```bash
-gritty connect --foreground devbox   # set up tunnel (Ctrl-C when done)
-```
-
-After that, one command creates a session and connects -- auto-starting the tunnel and remote server:
+Make sure you can `ssh devbox` first (to accept the host key / enter your password), then:
 
 ```bash
 gritty new devbox:work
 ```
+
+That's it. gritty auto-starts the SSH tunnel and remote server. Agent forwarding and URL/OAuth forwarding are on by default.
 
 Transfer files through the session (run one side locally, one remotely):
 
@@ -71,6 +68,18 @@ For local sessions (useful for testing): `gritty new local:scratch`
 - **Port forwarding** -- `gritty local-forward` / `gritty remote-forward` for transient TCP forwards through the session
 - **File transfer** -- `gritty send` / `gritty receive` through the session connection, with `--stdin`/`--stdout` pipe mode
 - **Single binary, no network protocol** -- Unix domain sockets locally, SSH handles encryption and auth; optional TOML config for per-host defaults
+
+### OAuth Just Works Remotely
+
+Running `gh auth login`, `gcloud auth login`, or `aws sso login` on a remote box normally fails -- the browser opens nowhere and the localhost callback has no route back.
+
+With gritty (forwarding is on by default):
+1. The auth URL opens in your **local** browser
+2. gritty detects the `redirect_uri=localhost:PORT` in the URL
+3. It auto-tunnels that port back to the remote process
+4. OAuth completes as if you were sitting at the remote machine
+
+No config. Works with anything that uses `$BROWSER`.
 
 ## Commands
 
@@ -231,7 +240,7 @@ gritty completions fish > ~/.config/fish/completions/gritty.fish
 
 **"gritty not found on remote host"** -- gritty must be installed on the remote host too. Run `cargo install gritty-cli` there, or ensure it's in `$HOME/bin`, `$HOME/.local/bin`, `$HOME/.cargo/bin`, or another standard path.
 
-**First connect hangs or fails** -- if SSH needs a password or host key confirmation, the background process can't prompt you. Use `gritty connect --foreground <dest>` the first time to handle the interactive prompt, then use the normal backgrounding flow afterwards.
+**First connect hangs or fails** -- gritty backgrounds the SSH tunnel, so it can't prompt for a password or host key. Make sure `ssh <destination>` works first, then use `gritty connect` or `gritty new`.
 
 **"[reconnecting...]" forever** -- the SSH tunnel is down and not coming back. Check `gritty tunnels` for tunnel status. If the tunnel shows as stale, `gritty disconnect <name>` to clean it up and `gritty connect <dest>` to re-establish. Check `gritty info` for log file paths if you need to dig deeper.
 
@@ -246,6 +255,10 @@ All communication -- control and session relay -- flows through a single server 
 Locally, the socket is `0600`, the directory is `0700`, and every `accept()` verifies the peer UID. The attack surface is small because there's very little to attack.
 
 See [ARCHITECTURE.md](ARCHITECTURE.md) for diagrams and detailed protocol description.
+
+## Status
+
+Early stage. Works on Linux and macOS. Expect rough edges -- patches welcome.
 
 ## License
 
