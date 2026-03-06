@@ -1,21 +1,25 @@
 # gritty
 
+[![CI](https://github.com/chipturner/gritty/actions/workflows/ci.yml/badge.svg)](https://github.com/chipturner/gritty/actions/workflows/ci.yml)
 [![Crates.io](https://img.shields.io/crates/v/gritty-cli)](https://crates.io/crates/gritty-cli)
 [![License: MIT OR Apache-2.0](https://img.shields.io/crates/l/gritty-cli)](LICENSE)
 
 Persistent remote shells that bring your local tools with them.
 
-```bash
-gritty new devbox:work              # devbox = any host from ~/.ssh/config
+### The problem
 
-# Inside the session -- your local tools just work:
-git push                            # uses your local SSH keys (agent forwarded by default)
-gh auth login                       # OAuth opens in your local browser (forwarded by default)
-gritty lf 8080                      # quick-check a remote web server locally
-gritty rf 5432                      # let the session reach local postgres
+You SSH into a devbox and run `gh auth login`. It prints a URL. You copy it, paste it into your laptop browser, complete the flow... and the callback goes to `localhost:38291` *on your laptop*, not the remote box. It hangs.
+
+Same story for `gcloud auth login`, `aws sso login`, anything OAuth.
+
+### With gritty
+
+```bash
+gritty new devbox:work
+gh auth login                       # browser opens locally, callback tunnels back. Done.
 ```
 
-Close your laptop, change wifi, open it back up: you're exactly where you left off.
+Close your laptop, change wifi, open it back up -- `gritty attach devbox:work` and you're exactly where you left off. Agent forwarding, URL forwarding, and OAuth tunneling all work out of the box.
 
 It works by forwarding Unix domain sockets over SSH -- no custom protocol, no open ports, no certificates, no configuration. If you can `ssh` to a host, you can use gritty.
 
@@ -71,29 +75,17 @@ gritty ls devbox                    # list sessions
 gritty tunnels                      # list active tunnels
 ```
 
-For local sessions (useful for testing): `gritty new local:scratch`
+Local-only sessions (`gritty new local:scratch`) are available for testing but aren't the typical workflow.
 
 ## Features
 
 - **Self-healing connections** -- heartbeat detection, automatic tunnel respawn, transparent reconnect
 - **Persistent sessions** -- shells survive disconnect, network failure, laptop sleep; reattach from any terminal or machine; multiple named sessions
-- **SSH agent forwarding** -- `git push`, `ssh`, and other agent-dependent commands work remotely (on by default)
+- **SSH agent forwarding** -- `git push`, `ssh`, and other agent-dependent commands work remotely using your local keys (on by default); survives reconnects without stale sockets
 - **URL open forwarding** -- `$BROWSER` requests forwarded to your local machine, with automatic OAuth callback tunneling (on by default)
-- **Port forwarding** -- `gritty local-forward` / `gritty remote-forward` for transient TCP forwards through the session
+- **Port forwarding** -- `gritty lf 8080` to quick-check a remote web server locally, `gritty rf 5432` to let the session reach local postgres
 - **File transfer** -- `gritty send` / `gritty receive` through the session connection, with `--stdin`/`--stdout` pipe mode
 - **Single binary, no network protocol** -- Unix domain sockets locally, SSH handles encryption and auth; optional TOML config for per-host defaults
-
-### OAuth Just Works Remotely
-
-Running `gh auth login`, `gcloud auth login`, or `aws sso login` on a remote box normally fails -- the browser opens nowhere and the localhost callback has no route back.
-
-With gritty (forwarding is on by default):
-1. The auth URL opens in your **local** browser
-2. gritty detects the `redirect_uri=localhost:PORT` in the URL
-3. It auto-tunnels that port back to the remote process
-4. OAuth completes as if you were sitting at the remote machine
-
-No config. Works with anything that uses `$BROWSER`.
 
 ## Commands
 
@@ -162,9 +154,9 @@ The `<host>` in `host:session` is a **connection name**, not an SSH destination.
 | Survives network change | yes | yes | yes | yes |
 | Survives client reboot | yes | no | no | yes |
 | Auto-reconnect | yes | yes | yes | autossh only |
-| SSH agent forwarding | yes | [no](https://github.com/mobile-shell/mosh/issues/120) | [no](https://github.com/MisterTea/EternalTerminal/issues/41) | [stale socket](https://werat.dev/blog/happy-ssh-agent-forwarding/) |
-| Browser / URL forwarding | yes | no | no | no |
-| OAuth callback tunneling | yes | no | no | no |
+| SSH agent forwarding | ✨ yes | [no](https://github.com/mobile-shell/mosh/issues/120) | [no](https://github.com/MisterTea/EternalTerminal/issues/41) | [stale socket](https://werat.dev/blog/happy-ssh-agent-forwarding/) |
+| Browser / URL forwarding | ✨ yes | no | no | no |
+| OAuth callback tunneling | ✨ yes | no | no | no |
 | Port forwarding | yes | no | yes | SSH -L/-R |
 | File transfer | yes | no | no | scp/rsync |
 | Predictive local echo | no | yes | no | no |
@@ -172,7 +164,7 @@ The `<host>` in `host:session` is a **connection name**, not an SSH destination.
 | No extra ports / firewall | yes | no (UDP) | no (TCP) | yes |
 | IP roaming (mobile) | reconnect | seamless | reconnect | reconnect |
 | Windows client | no | no | no | yes |
-| Maturity | early | mature | mature | mature |
+| Maturity | 0.9 (new) | mature | mature | mature |
 
 **Where gritty wins:** seamless local-tool integration. SSH agent forwarding that survives reconnects without stale sockets. Browser opens and OAuth flows that just work remotely. Port forwarding and file transfer multiplexed over the session -- no extra tunnels or tools. Stateless client -- reboot your laptop, `gritty attach` picks up where you left off.
 
@@ -252,7 +244,7 @@ gritty completions fish > ~/.config/fish/completions/gritty.fish
 
 ## Troubleshooting
 
-**"gritty not found on remote host"** -- gritty must be installed on the remote host too. Run `cargo install gritty-cli` there, or ensure it's in `$HOME/bin`, `$HOME/.local/bin`, `$HOME/.cargo/bin`, or another standard path.
+**"gritty not found on remote host"** -- gritty must be installed on the remote host too. Install it with `curl -sSfL https://raw.githubusercontent.com/chipturner/gritty/main/install.sh | sh` (or `cargo install gritty-cli`), and ensure it's in `$HOME/bin`, `$HOME/.local/bin`, `$HOME/.cargo/bin`, or another standard path.
 
 **First connect hangs or fails** -- gritty backgrounds the SSH tunnel, so it can't prompt for a password or host key. Make sure `ssh <destination>` works first, then use `gritty connect` or `gritty new`.
 
