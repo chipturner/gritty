@@ -42,5 +42,10 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 url = "2"
 
+[package.metadata.binstall]
+pkg-url = "{ repo }/releases/download/v{ version }/gritty-{ target }.tar.gz"
+bin-dir = "gritty"
+pkg-fmt = "tgz"
+
 [dev-dependencies]
 tempfile = "3"

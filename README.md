@@ -24,12 +24,13 @@ It works by forwarding Unix domain sockets over SSH -- no custom protocol, no op
 **Prebuilt binaries** (Linux x86_64/ARM64, macOS x86_64/ARM64):
 
 ```bash
-# Download from GitHub Releases:
-# https://github.com/chipturner/gritty/releases
+# Download the install script, review it, then run:
+curl -sSfL https://raw.githubusercontent.com/chipturner/gritty/main/install.sh -o install.sh
+less install.sh
+sh install.sh
 
-# Example for Linux x86_64:
-curl -sSL https://github.com/chipturner/gritty/releases/latest/download/gritty-x86_64-unknown-linux-gnu.tar.gz | tar xz
-sudo mv gritty /usr/local/bin/
+# Or via cargo-binstall:
+cargo binstall gritty-cli
 ```
 
 **From source:**
