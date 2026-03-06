@@ -21,11 +21,24 @@ It works by forwarding Unix domain sockets over SSH -- no custom protocol, no op
 
 ### Install
 
-Install on **both your laptop and the remote host**:
+**Prebuilt binaries** (Linux x86_64/ARM64, macOS x86_64/ARM64):
 
 ```bash
-cargo install gritty-cli   # binary name: gritty
+# Download from GitHub Releases:
+# https://github.com/chipturner/gritty/releases
+
+# Example for Linux x86_64:
+curl -sSL https://github.com/chipturner/gritty/releases/latest/download/gritty-x86_64-unknown-linux-gnu.tar.gz | tar xz
+sudo mv gritty /usr/local/bin/
 ```
+
+**From source:**
+
+```bash
+cargo install gritty-cli   # binary name: gritty, requires Rust 1.85+
+```
+
+Install on **both your laptop and the remote host**.
 
 ### Quick Start
 
