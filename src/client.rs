@@ -256,6 +256,9 @@ async fn write_stdout_async(fd: &AsyncFd<std::os::fd::OwnedFd>, data: &[u8]) -> 
         match guard
             .try_io(|inner| nix::unistd::write(inner, &data[written..]).map_err(io::Error::from))
         {
+            Ok(Ok(0)) => {
+                return Err(io::Error::new(io::ErrorKind::WriteZero, "stdout closed"));
+            }
             Ok(Ok(n)) => written += n,
             Ok(Err(e)) => return Err(e),
             Err(_would_block) => continue,
