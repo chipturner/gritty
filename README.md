@@ -5,11 +5,11 @@ Persistent remote shells that bring your local tools with them.
 > **Early stage.** Works on Linux and macOS. Available on [crates.io](https://crates.io/crates/gritty-cli). Expect rough edges -- patches welcome.
 
 ```bash
-gritty new devbox:work -A -O        # connect, forward SSH agent + browser/OAuth
+gritty new devbox:work              # connect with agent + browser/OAuth forwarding
 
 # Inside the session -- your local tools just work:
-git push                            # uses your local SSH keys via -A
-gh auth login                       # OAuth opens in your local browser via -O
+git push                            # uses your local SSH keys (agent forwarded by default)
+gh auth login                       # OAuth opens in your local browser (forwarded by default)
 gritty lf 8080                      # quick-check a remote web server locally
 gritty rf 5432                      # let the session reach local postgres
 ```
@@ -37,7 +37,7 @@ gritty connect --foreground devbox   # set up tunnel (Ctrl-C when done)
 After that, one command creates a session and connects -- auto-starting the tunnel and remote server:
 
 ```bash
-gritty new devbox:work -A -O
+gritty new devbox:work
 ```
 
 Transfer files through the session (run one side locally, one remotely):
@@ -66,8 +66,8 @@ For local sessions (useful for testing): `gritty new local:scratch`
 
 - **Self-healing connections** -- heartbeat detection, automatic tunnel respawn, transparent reconnect
 - **Persistent sessions** -- shells survive disconnect, network failure, laptop sleep; reattach from any terminal or machine; multiple named sessions
-- **SSH agent forwarding** (`-A`) -- `git push`, `ssh`, and other agent-dependent commands work remotely
-- **URL open forwarding** (`-O`) -- `$BROWSER` requests forwarded to your local machine, with automatic OAuth callback tunneling
+- **SSH agent forwarding** -- `git push`, `ssh`, and other agent-dependent commands work remotely (on by default)
+- **URL open forwarding** -- `$BROWSER` requests forwarded to your local machine, with automatic OAuth callback tunneling (on by default)
 - **Port forwarding** -- `gritty local-forward` / `gritty remote-forward` for transient TCP forwards through the session
 - **File transfer** -- `gritty send` / `gritty receive` through the session connection, with `--stdin`/`--stdout` pipe mode
 - **Single binary, no network protocol** -- Unix domain sockets locally, SSH handles encryption and auth; optional TOML config for per-host defaults
@@ -103,8 +103,8 @@ The `<host>` in `host:session` is a **connection name**, not an SSH destination.
 - `--ctl-socket <path>`: override the server socket path
 
 **Session options** (`new`/`attach`):
-- `-A` / `--forward-agent`: forward your local SSH agent
-- `-O` / `--forward-open`: forward URL opens to local machine
+- `-A` / `--forward-agent`: forward your local SSH agent (on by default; disable with `--no-forward-agent`)
+- `-O` / `--forward-open`: forward URL opens to local machine (on by default; disable with `--no-forward-open`)
 - `-c <cmd>` / `--command` (`new` only): run a command instead of a login shell
 - `-d` / `--detach` (`new` only): create session without attaching (background jobs)
 - `--no-redraw`: don't send Ctrl-L after connecting
@@ -164,8 +164,8 @@ gritty works out of the box with no config file. Optionally, set persistent defa
 ```toml
 # Global defaults for all sessions/connections.
 [defaults]
-# forward-agent = false
-# forward-open = false
+# forward-agent = true
+# forward-open = true
 # no-escape = false
 # no-redraw = false
 # oauth-redirect = true
@@ -182,15 +182,12 @@ gritty works out of the box with no config file. Optionally, set persistent defa
 
 # Per-host overrides, keyed by connection name.
 # Connection name = hostname from destination, or -n override.
-[host.devbox]
-forward-agent = true
-forward-open = true
-
 [host.devbox.connect]
 ssh-options = ["IdentityFile=~/.ssh/devbox_tunnel_key"]
 
 [host.prod]
-forward-open = true
+forward-agent = false
+forward-open = false
 no-escape = true
 
 [host.prod.connect]

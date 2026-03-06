@@ -19,7 +19,7 @@ Persistent TTY sessions over Unix domain sockets. Single binary, tmux-like CLI. 
 | `kill-server <host>` | | Kill server and all sessions |
 | `send <files...>` | | Send files to paired receiver |
 | `receive [dir]` | | Receive files from paired sender |
-| `open <url>` | | Open URL on local machine (inside `-O` sessions) |
+| `open <url>` | | Open URL on local machine (inside sessions with open forwarding) |
 | `local-forward <port>` | `lf` | Forward TCP port: session to client |
 | `remote-forward <port>` | `rf` | Forward TCP port: client to session |
 | `connect <dest>` | `c` | SSH tunnel to remote server |

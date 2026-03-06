@@ -6,8 +6,8 @@
 
 # Global defaults for all sessions and connections.
 [defaults]
-# forward-agent = false
-# forward-open = false
+# forward-agent = true
+# forward-open = true
 # no-escape = false
 # no-redraw = false
 # oauth-redirect = true
@@ -25,14 +25,12 @@
 # Per-host overrides, keyed by connection name.
 # Connection name = hostname from destination, or -n <name> override.
 #
-# [host.devbox]
-# forward-agent = true
-# forward-open = true
-#
 # [host.devbox.connect]
 # ssh-options = ["IdentityFile=~/.ssh/devbox_key"]
 #
 # [host.prod]
+# forward-agent = false
+# forward-open = false
 # no-escape = true
 #
 # [host.prod.connect]

@@ -53,6 +53,14 @@ enum Command {
         #[arg(short = 'O', long)]
         forward_open: bool,
 
+        /// Disable SSH agent forwarding
+        #[arg(long)]
+        no_forward_agent: bool,
+
+        /// Disable URL open forwarding
+        #[arg(long)]
+        no_forward_open: bool,
+
         /// Disable OAuth callback tunneling (part of --forward-open)
         #[arg(long)]
         no_oauth_redirect: bool,
@@ -90,6 +98,14 @@ enum Command {
         /// Forward URL open requests back to the local machine
         #[arg(short = 'O', long)]
         forward_open: bool,
+
+        /// Disable SSH agent forwarding
+        #[arg(long)]
+        no_forward_agent: bool,
+
+        /// Disable URL open forwarding
+        #[arg(long)]
+        no_forward_open: bool,
 
         /// Disable OAuth callback tunneling (part of --forward-open)
         #[arg(long)]
@@ -570,6 +586,8 @@ async fn run(cli: Cli, config: gritty::config::ConfigFile) -> anyhow::Result<()>
             no_escape,
             forward_agent,
             forward_open,
+            no_forward_agent,
+            no_forward_open,
             no_oauth_redirect,
             oauth_timeout,
             wait,
@@ -592,8 +610,16 @@ async fn run(cli: Cli, config: gritty::config::ConfigFile) -> anyhow::Result<()>
             let settings = gritty::config::SessionSettings {
                 no_redraw: no_redraw || resolved.no_redraw,
                 no_escape: no_escape || resolved.no_escape,
-                forward_agent: forward_agent || resolved.forward_agent,
-                forward_open: forward_open || resolved.forward_open,
+                forward_agent: if no_forward_agent {
+                    false
+                } else {
+                    forward_agent || resolved.forward_agent
+                },
+                forward_open: if no_forward_open {
+                    false
+                } else {
+                    forward_open || resolved.forward_open
+                },
                 oauth_redirect: if no_oauth_redirect { false } else { resolved.oauth_redirect },
                 oauth_timeout: oauth_timeout.unwrap_or(resolved.oauth_timeout),
                 heartbeat_interval: resolved.heartbeat_interval,
@@ -629,6 +655,8 @@ async fn run(cli: Cli, config: gritty::config::ConfigFile) -> anyhow::Result<()>
             no_escape,
             forward_agent,
             forward_open,
+            no_forward_agent,
+            no_forward_open,
             no_oauth_redirect,
             oauth_timeout,
         } => {
@@ -644,8 +672,16 @@ async fn run(cli: Cli, config: gritty::config::ConfigFile) -> anyhow::Result<()>
             let settings = gritty::config::SessionSettings {
                 no_redraw: no_redraw || resolved.no_redraw,
                 no_escape: no_escape || resolved.no_escape,
-                forward_agent: forward_agent || resolved.forward_agent,
-                forward_open: forward_open || resolved.forward_open,
+                forward_agent: if no_forward_agent {
+                    false
+                } else {
+                    forward_agent || resolved.forward_agent
+                },
+                forward_open: if no_forward_open {
+                    false
+                } else {
+                    forward_open || resolved.forward_open
+                },
                 oauth_redirect: if no_oauth_redirect { false } else { resolved.oauth_redirect },
                 oauth_timeout: oauth_timeout.unwrap_or(resolved.oauth_timeout),
                 heartbeat_interval: resolved.heartbeat_interval,

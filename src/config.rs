@@ -24,8 +24,8 @@ pub struct SessionSettings {
 impl Default for SessionSettings {
     fn default() -> Self {
         Self {
-            forward_agent: false,
-            forward_open: false,
+            forward_agent: true,
+            forward_open: true,
             no_escape: false,
             no_redraw: false,
             oauth_redirect: true,
@@ -135,8 +135,8 @@ impl ConfigFile {
         let h = host.and_then(|name| self.host.get(name));
 
         SessionSettings {
-            forward_agent: pick(h.and_then(|h| h.forward_agent), d.forward_agent),
-            forward_open: pick(h.and_then(|h| h.forward_open), d.forward_open),
+            forward_agent: h.and_then(|h| h.forward_agent).or(d.forward_agent).unwrap_or(true),
+            forward_open: h.and_then(|h| h.forward_open).or(d.forward_open).unwrap_or(true),
             no_escape: pick(h.and_then(|h| h.no_escape), d.no_escape),
             no_redraw: pick(h.and_then(|h| h.no_redraw), d.no_redraw),
             oauth_redirect: h.and_then(|h| h.oauth_redirect).or(d.oauth_redirect).unwrap_or(true),
@@ -252,7 +252,7 @@ mod tests {
         .unwrap();
         let s = cfg.resolve_session(Some("unknown"));
         assert!(s.forward_agent);
-        assert!(!s.forward_open);
+        assert!(s.forward_open);
     }
 
     #[test]
