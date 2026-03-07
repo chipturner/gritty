@@ -104,6 +104,7 @@ impl EscapeProcessor {
                                 actions.push(EscapeAction::Data(std::mem::take(&mut data_buf)));
                             }
                             actions.push(EscapeAction::Reconnect);
+                            self.state = EscapeState::Normal;
                             return actions; // Stop processing
                         }
                         0x1a => {
@@ -1184,10 +1185,11 @@ pub async fn run(
                     // Race sleep against stdin so Ctrl-C is instant
                     tokio::select! {
                         _ = tokio::time::sleep(Duration::from_secs(1)) => {}
-                        _ = async_stdin.readable() => {
+                        ready = async_stdin.readable() => {
+                            let mut guard = ready?;
                             let mut peek = [0u8; 1];
-                            match async_stdin.get_ref().read(&mut peek) {
-                                Ok(1) if peek[0] == 0x03 => {
+                            match guard.try_io(|inner| inner.get_ref().read(&mut peek)) {
+                                Ok(Ok(1)) if peek[0] == 0x03 => {
                                     write_stdout_async(&async_stdout, b"\r\n").await?;
                                     return Ok(1);
                                 }
