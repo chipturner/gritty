@@ -71,11 +71,11 @@ pub(crate) async fn connect_or_start(
         Ok(s) => return Ok(s),
         Err(_) => match auto_start_mode {
             AutoStart::Server => {
-                eprintln!("no server running, starting one...");
+                eprintln!("\x1b[2;33m\u{25b8} starting server...\x1b[0m");
                 auto_start(&["server"])?;
             }
             AutoStart::Tunnel(host) => {
-                eprintln!("no tunnel running for {host}, starting one...");
+                eprintln!("\x1b[2;33m\u{25b8} starting tunnel {host}...\x1b[0m");
                 auto_start(&["connect", host])?;
             }
             AutoStart::None if wait => {}
@@ -92,7 +92,7 @@ pub(crate) async fn connect_or_start(
             Ok(s) => return Ok(s),
             Err(_) => {
                 if wait {
-                    eprintln!("waiting for server ({})... ctrl-c to abort", ctl_path.display());
+                    eprintln!("\x1b[2;33m\u{25b8} waiting for server...\x1b[0m");
                 }
                 tokio::time::sleep(std::time::Duration::from_millis(500)).await;
             }
@@ -178,7 +178,7 @@ pub(crate) async fn port_forward_command(
     } else {
         format!("{listen_port}:{target_port}")
     };
-    eprintln!("{dir_str}-forward {port_str} active (ctrl-c to stop)");
+    eprintln!("\x1b[32m\u{25b8} {dir_str}-forward {port_str} active\x1b[0m");
 
     // Block until SIGINT or stream EOF
     let mut sigint = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::interrupt())?;

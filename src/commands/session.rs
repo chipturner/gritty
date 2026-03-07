@@ -27,14 +27,11 @@ pub(crate) async fn new_session(
     match Frame::expect_from(framed.next().await)? {
         Frame::SessionCreated { id } => {
             match &name {
-                Some(n) => eprintln!("session created: {n} (id {id})"),
-                None => eprintln!("session created: id {id}"),
+                Some(n) => eprintln!("\x1b[32m\u{25b8} session {n}\x1b[0m"),
+                None => eprintln!("\x1b[32m\u{25b8} session {id}\x1b[0m"),
             }
             if detach {
                 return Ok(());
-            }
-            if !settings.no_escape {
-                eprintln!("[~? for help]");
             }
             let mut env_vars = gritty::collect_env_vars();
             if settings.forward_open {
@@ -76,7 +73,7 @@ pub(crate) async fn attach(
         match UnixStream::connect(ctl_path).await {
             Ok(s) => break s,
             Err(_) => {
-                eprintln!("waiting for server ({})... ctrl-c to abort", ctl_path.display());
+                eprintln!("\x1b[2;33m\u{25b8} waiting for server...\x1b[0m");
                 tokio::time::sleep(std::time::Duration::from_secs(1)).await;
             }
         }
@@ -90,10 +87,7 @@ pub(crate) async fn attach(
 
     match Frame::expect_from(framed.next().await).map_err(AttachError::Other)? {
         Frame::Ok => {
-            eprintln!("[attached]");
-            if !settings.no_escape {
-                eprintln!("[~? for help]");
-            }
+            eprintln!("\x1b[32m\u{25b8} attached\x1b[0m");
             let code = gritty::client::run(
                 target,
                 framed,
@@ -137,7 +131,7 @@ pub(crate) async fn tail_session(target: String, ctl_path: PathBuf) -> anyhow::R
 
     match Frame::expect_from(framed.next().await)? {
         Frame::Ok => {
-            eprintln!("[tailing session {target}]");
+            eprintln!("\x1b[2;33m\u{25b8} tailing {target}\x1b[0m");
             gritty::client::tail(&target, framed, &ctl_path).await
         }
         Frame::Error { message } => anyhow::bail!("{message}"),
@@ -159,7 +153,7 @@ pub(crate) async fn rename_session(
     .await?
     {
         Frame::Ok => {
-            eprintln!("session renamed: {target} -> {new_name}");
+            eprintln!("\x1b[32m\u{25b8} renamed {target} -> {new_name}\x1b[0m");
             Ok(())
         }
         Frame::Error { message } => anyhow::bail!("{message}"),
@@ -172,7 +166,7 @@ pub(crate) async fn kill_session(target: String, ctl_path: PathBuf) -> anyhow::R
 
     match server_request(&ctl_path, Frame::KillSession { session: target.clone() }).await? {
         Frame::Ok => {
-            eprintln!("session killed: {target}");
+            eprintln!("\x1b[32m\u{25b8} session {target} killed\x1b[0m");
             Ok(())
         }
         Frame::Error { message } => anyhow::bail!("{message}"),
@@ -185,7 +179,7 @@ pub(crate) async fn kill_server(ctl_path: PathBuf) -> anyhow::Result<()> {
 
     match server_request(&ctl_path, Frame::KillServer).await? {
         Frame::Ok => {
-            eprintln!("server killed");
+            eprintln!("\x1b[32m\u{25b8} server killed\x1b[0m");
             Ok(())
         }
         Frame::Error { message } => anyhow::bail!("{message}"),

@@ -433,7 +433,10 @@ fn main() {
             let ready_fd = if foreground {
                 None
             } else {
-                match daemonize(|pid| eprintln!("server started (pid {pid})"), Some(&out_path)) {
+                match daemonize(
+                    |pid| eprintln!("\x1b[32m\u{25b8} server started (pid {pid})\x1b[0m"),
+                    Some(&out_path),
+                ) {
                     Ok(fd) => Some(fd),
                     Err(e) => {
                         eprintln!("error: failed to daemonize: {e}");
@@ -509,9 +512,7 @@ fn main() {
                 match daemonize(
                     move |_pid| {
                         println!("{sock_display}");
-                        eprintln!("tunnel started (name: {conn_name}). to use:");
-                        eprintln!("  gritty new {conn_name}");
-                        eprintln!("  gritty attach {conn_name}:<session>");
+                        eprintln!("\x1b[32m\u{25b8} tunnel {conn_name} started\x1b[0m");
                     },
                     Some(&out_path),
                 ) {

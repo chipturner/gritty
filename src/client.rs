@@ -274,15 +274,15 @@ pub fn format_size(bytes: u64) -> String {
 }
 
 fn status_msg(text: &str) -> String {
-    format!("\r\n\x1b[2;33m[{text}]\x1b[0m\r\n")
+    format!("\r\n\x1b[2;33m\u{25b8} {text}\x1b[0m\r\n")
 }
 
 fn success_msg(text: &str) -> String {
-    format!("\r\n\x1b[32m[{text}]\x1b[0m\r\n")
+    format!("\r\n\x1b[32m\u{25b8} {text}\x1b[0m\r\n")
 }
 
 fn error_msg(text: &str) -> String {
-    format!("\r\n\x1b[31m[{text}]\x1b[0m\r\n")
+    format!("\r\n\x1b[31m\u{25b8} {text}\x1b[0m\r\n")
 }
 
 fn get_terminal_size() -> (u16, u16) {
@@ -621,22 +621,18 @@ impl ClientRelay<'_> {
                 let s = if file_count == 1 { "" } else { "s" };
                 write_stdout_async(
                     self.async_stdout,
-                    status_msg(&format!("gritty: receiving {file_count} file{s} ({size_str})"))
-                        .as_bytes(),
+                    status_msg(&format!("receiving {file_count} file{s} ({size_str})")).as_bytes(),
                 )
                 .await?;
             }
             Some(Ok(Frame::SendDone)) => {
-                write_stdout_async(
-                    self.async_stdout,
-                    success_msg("gritty: transfer complete").as_bytes(),
-                )
-                .await?;
+                write_stdout_async(self.async_stdout, success_msg("transfer complete").as_bytes())
+                    .await?;
             }
             Some(Ok(Frame::SendCancel { reason })) => {
                 write_stdout_async(
                     self.async_stdout,
-                    error_msg(&format!("gritty: transfer cancelled: {reason}")).as_bytes(),
+                    error_msg(&format!("transfer cancelled: {reason}")).as_bytes(),
                 )
                 .await?;
             }
@@ -1175,11 +1171,13 @@ pub async fn run(
         match result {
             RelayExit::Exit(code) => return Ok(code),
             RelayExit::Disconnected => {
-                // Env vars only sent on first connection; clear for reconnect
                 current_env.clear();
-                // Disconnected — try to reconnect
                 let reconnect_started = Instant::now();
-                write_stdout_async(&async_stdout, status_msg("reconnecting...").as_bytes()).await?;
+                write_stdout_async(
+                    &async_stdout,
+                    b"\r\n\x1b[2;33m\xe2\x96\xb8 reconnecting...\x1b[0m",
+                )
+                .await?;
 
                 loop {
                     // Race sleep against stdin so Ctrl-C is instant
@@ -1199,11 +1197,10 @@ pub async fn run(
                         }
                     }
 
-                    // Update elapsed time on each retry
                     let elapsed = reconnect_started.elapsed().as_secs();
                     write_stdout_async(
                         &async_stdout,
-                        format!("\r{}", status_msg(&format!("reconnecting... {elapsed}s")))
+                        format!("\r\x1b[2;33m\u{25b8} reconnecting... {elapsed}s\x1b[0m\x1b[K")
                             .as_bytes(),
                     )
                     .await?;
@@ -1229,7 +1226,7 @@ pub async fn run(
                         Some(Ok(Frame::Ok)) => {
                             write_stdout_async(
                                 &async_stdout,
-                                success_msg("reconnected").as_bytes(),
+                                b"\r\x1b[32m\xe2\x96\xb8 reconnected\x1b[0m\x1b[K\r\n",
                             )
                             .await?;
                             framed = new_framed;
@@ -1239,7 +1236,10 @@ pub async fn run(
                         Some(Ok(Frame::Error { message })) => {
                             write_stdout_async(
                                 &async_stdout,
-                                error_msg(&format!("session gone: {message}")).as_bytes(),
+                                format!(
+                                    "\r\x1b[31m\u{25b8} session gone: {message}\x1b[0m\x1b[K\r\n"
+                                )
+                                .as_bytes(),
                             )
                             .await?;
                             return Ok(1);
@@ -1340,11 +1340,11 @@ pub async fn tail(
             Some(code) => break code,
             None => {
                 let reconnect_started = Instant::now();
-                eprintln!("\x1b[2;33m[reconnecting...]\x1b[0m");
+                eprint!("\x1b[2;33m\u{25b8} reconnecting...\x1b[0m");
                 loop {
                     tokio::time::sleep(Duration::from_secs(1)).await;
                     let elapsed = reconnect_started.elapsed().as_secs();
-                    eprint!("\r\x1b[2;33m[reconnecting... {elapsed}s]\x1b[0m");
+                    eprint!("\r\x1b[2;33m\u{25b8} reconnecting... {elapsed}s\x1b[0m\x1b[K");
 
                     let stream = match UnixStream::connect(ctl_path).await {
                         Ok(s) => s,
@@ -1362,14 +1362,14 @@ pub async fn tail(
 
                     match new_framed.next().await {
                         Some(Ok(Frame::Ok)) => {
-                            eprintln!("\x1b[32m[reconnected]\x1b[0m");
+                            eprintln!("\r\x1b[32m\u{25b8} reconnected\x1b[0m\x1b[K");
                             framed = new_framed;
                             heartbeat_interval.reset();
                             last_pong = Instant::now();
                             break;
                         }
                         Some(Ok(Frame::Error { message })) => {
-                            eprintln!("\x1b[31m[session gone: {message}]\x1b[0m");
+                            eprintln!("\r\x1b[31m\u{25b8} session gone: {message}\x1b[0m\x1b[K");
                             break 'outer 1;
                         }
                         _ => continue,

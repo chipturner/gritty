@@ -640,30 +640,27 @@ pub async fn run(opts: ConnectOpts, ready_fd: Option<OwnedFd>) -> anyhow::Result
         TunnelStatus::Healthy => {
             println!("{}", local_sock.display());
             let pid_hint = read_pid_hint(&connection_name);
-            eprint!("tunnel already running (name: {connection_name})");
-            if let Some(pid) = pid_hint {
-                eprintln!(" (pid {pid})");
-                eprintln!("  to stop: gritty disconnect {connection_name}");
-            } else {
-                eprintln!();
+            match pid_hint {
+                Some(pid) => eprintln!(
+                    "\x1b[32m\u{25b8} tunnel {connection_name} already running (pid {pid})\x1b[0m"
+                ),
+                None => {
+                    eprintln!("\x1b[32m\u{25b8} tunnel {connection_name} already running\x1b[0m")
+                }
             }
-            eprintln!("  to use:");
-            eprintln!("    gritty new {connection_name}");
-            eprintln!("    gritty attach {connection_name}:<session>");
-            // Signal readiness to parent even for already-running case
             signal_ready(&ready_fd);
             return Ok(0);
         }
         TunnelStatus::Reconnecting => {
             let pid_hint = read_pid_hint(&connection_name);
-            eprint!("tunnel exists but is reconnecting (name: {connection_name})");
-            if let Some(pid) = pid_hint {
-                eprintln!(" (pid {pid})");
-            } else {
-                eprintln!();
+            match pid_hint {
+                Some(pid) => eprintln!(
+                    "\x1b[2;33m\u{25b8} tunnel {connection_name} reconnecting (pid {pid})\x1b[0m"
+                ),
+                None => {
+                    eprintln!("\x1b[2;33m\u{25b8} tunnel {connection_name} reconnecting\x1b[0m")
+                }
             }
-            eprintln!("  wait for it, or: gritty disconnect {connection_name}");
-            // Signal readiness to parent so it doesn't hang
             signal_ready(&ready_fd);
             return Ok(0);
         }
@@ -796,7 +793,7 @@ pub async fn disconnect(name: &str) -> anyhow::Result<()> {
     match probe_tunnel_status(name) {
         TunnelStatus::Stale => {
             cleanup_stale_files(name);
-            eprintln!("tunnel already stopped: {name}");
+            eprintln!("\x1b[2;33m\u{25b8} tunnel {name} already stopped\x1b[0m");
             return Ok(());
         }
         TunnelStatus::Healthy | TunnelStatus::Reconnecting => {}
@@ -813,7 +810,7 @@ pub async fn disconnect(name: &str) -> anyhow::Result<()> {
     let lock_path = connect_lock_path(name);
     if !is_lock_held(&lock_path) {
         cleanup_stale_files(name);
-        eprintln!("tunnel already stopped: {name}");
+        eprintln!("\x1b[2;33m\u{25b8} tunnel {name} already stopped\x1b[0m");
         return Ok(());
     }
     unsafe {
@@ -826,7 +823,7 @@ pub async fn disconnect(name: &str) -> anyhow::Result<()> {
         tokio::time::sleep(Duration::from_millis(100)).await;
         if !is_lock_held(&lock_path) {
             cleanup_stale_files(name);
-            eprintln!("tunnel stopped: {name}");
+            eprintln!("\x1b[32m\u{25b8} tunnel {name} stopped\x1b[0m");
             return Ok(());
         }
         if Instant::now() >= deadline {
@@ -843,7 +840,7 @@ pub async fn disconnect(name: &str) -> anyhow::Result<()> {
     }
     tokio::time::sleep(Duration::from_millis(100)).await;
     cleanup_stale_files(name);
-    eprintln!("tunnel killed: {name}");
+    eprintln!("\x1b[32m\u{25b8} tunnel {name} killed\x1b[0m");
     Ok(())
 }
 

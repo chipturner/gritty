@@ -340,7 +340,7 @@ pub(crate) async fn send_command(
     }
 
     // Wait for go signal -- first stream to get paired wins
-    eprintln!("\x1b[2mwaiting for receiver...\x1b[0m");
+    eprintln!("\x1b[2;33m\u{25b8} waiting for receiver...\x1b[0m");
     let wait_for_pair = async {
         let ts = if tagged.len() == 1 {
             tagged.into_iter().next().unwrap()
@@ -348,7 +348,7 @@ pub(crate) async fn send_command(
             select_first_ready(tagged).await?
         };
         if let Some(ref label) = ts.label {
-            eprintln!("paired with session {label}");
+            eprintln!("\x1b[32m\u{25b8} paired with session {label}\x1b[0m");
         }
         let mut stream = ts.stream;
 
@@ -370,13 +370,13 @@ pub(crate) async fn send_command(
     // Stream data
     if let Some(data) = stdin_data {
         let total_str = gritty::client::format_size(data.len() as u64);
-        eprintln!("sending stdin ({total_str})");
+        eprintln!("\x1b[2;33m\u{25b8} sending stdin ({total_str})\x1b[0m");
         stream.write_all(&data).await?;
     } else {
         let total_bytes: u64 = entries.iter().map(|(_, s, _)| s).sum();
         let total_str = gritty::client::format_size(total_bytes);
         let s = if entries.len() == 1 { "" } else { "s" };
-        eprintln!("sending {} file{s} ({total_str})", entries.len());
+        eprintln!("\x1b[2;33m\u{25b8} sending {} file{s} ({total_str})\x1b[0m", entries.len());
 
         let mut buf = vec![0u8; 64 * 1024];
         for (name, size, path) in &entries {
@@ -398,7 +398,7 @@ pub(crate) async fn send_command(
         }
     }
 
-    eprintln!("\x1b[32mdone\x1b[0m");
+    eprintln!("\x1b[32m\u{25b8} done\x1b[0m");
     Ok(())
 }
 
@@ -428,7 +428,7 @@ pub(crate) async fn receive_command(
     }
 
     // Wait for file data -- first stream to get paired wins
-    eprintln!("\x1b[2mwaiting for sender...\x1b[0m");
+    eprintln!("\x1b[2;33m\u{25b8} waiting for sender...\x1b[0m");
     let wait_for_pair = async {
         let ts = if tagged.len() == 1 {
             tagged.into_iter().next().unwrap()
@@ -436,7 +436,7 @@ pub(crate) async fn receive_command(
             select_first_ready(tagged).await?
         };
         if let Some(ref label) = ts.label {
-            eprintln!("paired with session {label}");
+            eprintln!("\x1b[32m\u{25b8} paired with session {label}\x1b[0m");
         }
         let mut stream = ts.stream;
 
@@ -490,7 +490,7 @@ pub(crate) async fn receive_command(
         } else {
             let s = if file_count == 1 { "" } else { "s" };
             if received == 0 {
-                eprintln!("receiving {file_count} file{s}");
+                eprintln!("\x1b[2;33m\u{25b8} receiving {file_count} file{s}\x1b[0m");
             }
 
             // Write file data (create parent dirs for nested paths)
@@ -522,10 +522,10 @@ pub(crate) async fn receive_command(
 
     if !use_stdout {
         if received == 0 {
-            eprintln!("no files received");
+            eprintln!("\x1b[2;33m\u{25b8} no files received\x1b[0m");
         } else {
             let s = if received == 1 { "" } else { "s" };
-            eprintln!("\x1b[32mreceived {received} file{s}\x1b[0m");
+            eprintln!("\x1b[32m\u{25b8} received {received} file{s}\x1b[0m");
         }
     }
     Ok(())
