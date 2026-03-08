@@ -123,6 +123,7 @@ The `<host>` in `host:session` is a **connection name**, not an SSH destination.
 - `-O` / `--forward-open`: forward URL opens to local machine (on by default; disable with `--no-forward-open`)
 - `-c <cmd>` / `--command`: run a command instead of a login shell (when creating)
 - `-d` / `--detach`: create session without attaching (background jobs)
+- `--force`: take over an already-attached session without prompting
 - `--no-create`: attach only, error if session doesn't exist
 - `--no-redraw`: don't send Ctrl-L after connecting
 - `--no-escape`: disable escape sequence processing

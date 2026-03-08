@@ -9,6 +9,7 @@ pub(crate) async fn connect_session(
     command: Option<String>,
     detach: bool,
     no_create: bool,
+    force: bool,
     settings: gritty::config::SessionSettings,
     ctl_path: PathBuf,
     auto_start_mode: AutoStart,
@@ -19,6 +20,25 @@ pub(crate) async fn connect_session(
     use tokio_util::codec::Framed;
 
     let session_command = command.unwrap_or_default();
+
+    // If not forcing, check whether the target session is already attached
+    if !force {
+        if let Some(entry) = find_session(&name, &ctl_path).await? {
+            if entry.attached {
+                let host = host_from_ctl_path(&ctl_path);
+                eprintln!(
+                    "error: session {name} is already attached (heartbeat {}s ago)",
+                    std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .unwrap_or_default()
+                        .as_secs()
+                        .saturating_sub(entry.last_heartbeat)
+                );
+                eprintln!("  gritty connect {host}:{name} --force   to take over",);
+                std::process::exit(1);
+            }
+        }
+    }
 
     let stream = super::util::connect_or_start(&ctl_path, &auto_start_mode, wait).await?;
     let mut framed = Framed::new(stream, FrameCodec);
@@ -102,6 +122,39 @@ pub(crate) async fn connect_session(
         }
         Frame::Error { message } => anyhow::bail!("{message}"),
         other => anyhow::bail!("unexpected response from server: {other:?}"),
+    }
+}
+
+/// Query the daemon for a specific session by name, returning its entry if found.
+/// Returns Ok(None) if the server isn't running or the session doesn't exist.
+async fn find_session(
+    name: &str,
+    ctl_path: &Path,
+) -> anyhow::Result<Option<gritty::protocol::SessionEntry>> {
+    use gritty::protocol::Frame;
+
+    let resp = match server_request(&ctl_path.to_path_buf(), Frame::ListSessions).await {
+        Ok(r) => r,
+        Err(_) => return Ok(None),
+    };
+    let Frame::SessionInfo { sessions } = resp else {
+        return Ok(None);
+    };
+    Ok(sessions.into_iter().find(|s| {
+        let display = if s.name.is_empty() { &s.id } else { &s.name };
+        display == name
+    }))
+}
+
+/// Extract a display-friendly host name from a ctl socket path.
+fn host_from_ctl_path(ctl_path: &Path) -> String {
+    // Tunnel sockets: .../connect-<host>.sock -> host is <host>
+    // Local daemon: .../ctl.sock -> host is "local"
+    let file = ctl_path.file_stem().and_then(|s| s.to_str()).unwrap_or("local");
+    if let Some(host) = file.strip_prefix("connect-") {
+        host.to_string()
+    } else {
+        "local".to_string()
     }
 }
 

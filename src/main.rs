@@ -77,6 +77,10 @@ enum Command {
         /// Wait indefinitely for the server instead of giving up after retries
         #[arg(short = 'w', long)]
         wait: bool,
+
+        /// Take over an already-attached session without prompting
+        #[arg(long)]
+        force: bool,
     },
     /// Tail a session's output (read-only, like tail -f)
     #[command(display_order = 1, visible_alias = "t")]
@@ -570,6 +574,7 @@ async fn run(cli: Cli, config: gritty::config::ConfigFile) -> anyhow::Result<()>
             no_oauth_redirect,
             oauth_timeout,
             wait,
+            force,
         } => {
             let (host, session) = match &target {
                 Some(t) => {
@@ -612,6 +617,7 @@ async fn run(cli: Cli, config: gritty::config::ConfigFile) -> anyhow::Result<()>
                 command,
                 detach,
                 no_create,
+                force,
                 settings,
                 ctl_path,
                 auto_start_mode,
