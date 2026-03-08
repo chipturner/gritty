@@ -91,24 +91,26 @@ Local-only sessions (`gritty connect local:scratch`) are available for testing b
 
 | Command | Aliases | Description |
 |---------|---------|-------------|
-| `gritty connect <host[:name]>` | `c` | Smart session: attach if exists, create if not |
-| `gritty tail <host:session>` | `t` | Read-only stream of session output |
+| `gritty connect [host[:name]]` | `c` | Smart session: attach if exists, create if not |
+| `gritty tail [host:session]` | `t` | Read-only stream of session output |
 | `gritty list-sessions [host]` | `ls`, `list` | List sessions (no args = all daemons; foreground process shown on Linux only) |
-| `gritty kill-session <host:session>` | | Kill a session |
+| `gritty kill-session [host:session]` | | Kill a session |
 | `gritty rename <host:session> <name>` | | Rename a session |
-| `gritty kill-server <host>` | | Kill the server and all sessions |
+| `gritty kill-server [host]` | | Kill the server and all sessions |
 | `gritty send [-r] [files...]` | | Send files/directories to a paired receiver |
 | `gritty receive [dir]` | | Receive files from a paired sender |
-| `gritty open <url>` | | Open a URL on the local machine (inside sessions) |
+| `gritty open <url>` | | Open a URL on the local machine (for use inside gritty sessions) |
 | `gritty local-forward <port>` | `lf` | Forward a TCP port from session to client |
 | `gritty remote-forward <port>` | `rf` | Forward a TCP port from client to session |
-| `gritty tunnel-create <destination>` | | Set up SSH tunnel to remote host (plumbing) |
+| `gritty tunnel-create <destination>` | | Set up SSH tunnel to remote host |
 | `gritty tunnel-destroy <name>` | | Tear down an SSH tunnel |
 | `gritty tunnels` | `tun` | List active SSH tunnels |
-| `gritty server` | `s` | Start server (usually auto-started; `-f` for foreground) |
+| `gritty server` | `s` | Start the server (backgrounds by default; `-f` for foreground) |
 | `gritty info` | | Show diagnostics (paths, server status, tunnels) |
-| `gritty config-edit` | | Open config in `$VISUAL`/`$EDITOR` (creates from template if missing) |
+| `gritty config-edit` | | Open config in `$VISUAL`/`$EDITOR`/vi (creates from template if missing) |
 | `gritty completions <shell>` | | Generate shell completions (bash, zsh, fish, elvish, powershell) |
+| `gritty socket-path` | `socket` | Print the default socket path |
+| `gritty protocol-version` | | Print the protocol version number |
 
 The `<host>` in `host:session` is a **connection name**, not an SSH destination. It's the name assigned by `gritty tunnel-create` -- by default the hostname, overridable with `-n`. `local` is the reserved name for the local server. For example, `gritty tunnel-create user@mybox.example.com -n devbox` creates connection name `devbox`, so you'd use `gritty connect devbox:work`. If the session name is omitted, it defaults to `default`. The special session name `-` refers to the last-attached session (e.g. `gritty connect devbox:-`). `connect` auto-starts server/tunnel as needed. `send`/`receive` auto-detect the session across all active daemons; use `--session host:session` to target a specific one.
 
@@ -145,7 +147,7 @@ The `<host>` in `host:session` is a **connection name**, not an SSH destination.
 
 **Environment inside sessions:** `GRITTY_SOCK` (svc socket for `gritty open`/`send`/`receive`/port forwarding), `GRITTY_SESSION` (session ID), and `GRITTY_SESSION_NAME` (if named) are set in the shell environment. Useful for prompt customization or scripts that need to know which session they're in.
 
-**Port forwarding:** port spec is `PORT` (same on both ends) or `LISTEN:TARGET`. Runs inside a session (`GRITTY_SOCK` required). Ctrl-C stops the forward. These are transient, on-demand forwards -- great for quick checks during development. For always-on port forwarding, configure it on the SSH tunnel instead: `gritty tunnel-create devbox -o "LocalForward=8080 localhost:8080"` or add it to `ssh-options` in your config file.
+**Port forwarding:** port spec is `PORT` (same on both ends) or `LISTEN_PORT:TARGET_PORT`. Runs inside a session (`GRITTY_SOCK` required). Ctrl-C stops the forward. These are transient, on-demand forwards -- great for quick checks during development. For always-on port forwarding, configure it on the SSH tunnel instead: `gritty tunnel-create devbox -o "LocalForward=8080 localhost:8080"` or add it to `ssh-options` in your config file.
 
 ## Comparison
 

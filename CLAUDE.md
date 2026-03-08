@@ -10,24 +10,26 @@ Persistent TTY sessions over Unix domain sockets. Single binary, tmux-like CLI. 
 
 | Command | Alias | Description |
 |---------|-------|-------------|
-| `connect <host[:name]>` | `c` | Smart session: attach if exists, create if not |
-| `tail <host:session>` | `t` | Read-only stream of session output |
-| `list-sessions [host]` | `ls` | List sessions (all daemons if no host) |
-| `kill-session <host:session>` | | Kill a session |
-| `rename <host:session> <new>` | | Rename a session |
-| `kill-server <host>` | | Kill server and all sessions |
-| `send <files...>` | | Send files to paired receiver |
+| `connect [host[:name]]` | `c` | Smart session: attach if exists, create if not |
+| `tail [host:session]` | `t` | Read-only stream of session output |
+| `list-sessions [host]` | `ls`, `list` | List sessions (all daemons if no host) |
+| `kill-session [host:session]` | | Kill a session |
+| `rename <host:session> <name>` | | Rename a session |
+| `kill-server [host]` | | Kill the server and all sessions |
+| `send [files...]` | | Send files to paired receiver |
 | `receive [dir]` | | Receive files from paired sender |
-| `open <url>` | | Open URL on local machine (inside sessions with open forwarding) |
+| `open <url>` | | Open a URL on the local machine (for use inside gritty sessions) |
 | `local-forward <port>` | `lf` | Forward TCP port: session to client |
 | `remote-forward <port>` | `rf` | Forward TCP port: client to session |
-| `tunnel-create <dest>` | | SSH tunnel to remote server (plumbing) |
+| `tunnel-create <destination>` | | SSH tunnel to remote host |
 | `tunnel-destroy <name>` | | Tear down SSH tunnel |
 | `tunnels` | `tun` | List active SSH tunnels |
-| `server` | `s` | Start server (self-daemonizes, `-f` for foreground) |
+| `server` | `s` | Start the server (backgrounds by default, `-f` for foreground) |
 | `info` | | Show diagnostics |
-| `config-edit` | | Edit config file |
+| `config-edit` | | Open config in `$VISUAL`/`$EDITOR`/vi |
 | `completions <shell>` | | Generate shell completions |
+| `socket-path` | `socket` | Print the default socket path |
+| `protocol-version` | | Print the protocol version number |
 
 Sessions have auto-incrementing IDs with optional names (`host:name`). Numeric names rejected. `-` = last-attached session. `<host>` is `local` or a connection name from `tunnel-create`. Session name defaults to `default` if omitted. Global: `--ctl-socket <path>`, `-v`. See `--help` for per-command flags.
 

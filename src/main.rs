@@ -23,8 +23,9 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Command {
+    // -- Sessions --
     /// Smart session: attach if exists, create if not
-    #[command(visible_alias = "c")]
+    #[command(display_order = 0, visible_alias = "c")]
     Connect {
         /// Target host, with optional session name (host or host:name)
         target: Option<String>,
@@ -78,35 +79,40 @@ enum Command {
         wait: bool,
     },
     /// Tail a session's output (read-only, like tail -f)
-    #[command(visible_alias = "t")]
+    #[command(display_order = 1, visible_alias = "t")]
     Tail {
         /// Target host and session (host:session)
         target: Option<String>,
     },
     /// List active sessions
-    #[command(visible_alias = "ls", visible_alias = "list")]
+    #[command(display_order = 2, visible_alias = "ls", visible_alias = "list")]
     ListSessions {
         /// Target host
         target: Option<String>,
     },
     /// Kill a specific session
+    #[command(display_order = 3)]
     KillSession {
         /// Target host and session (host:session)
         target: Option<String>,
     },
     /// Kill the server and all sessions
+    #[command(display_order = 4)]
     KillServer {
         /// Target host
         target: Option<String>,
     },
     /// Rename a session
+    #[command(display_order = 5)]
     Rename {
         /// Target host and session (host:session)
         target: String,
         /// New name for the session
         new_name: String,
     },
+    // -- In-session tools --
     /// Send files to a paired receiver
+    #[command(display_order = 10)]
     Send {
         /// Session to use (host:session); auto-detected if omitted
         #[arg(long)]
@@ -128,6 +134,7 @@ enum Command {
         files: Vec<PathBuf>,
     },
     /// Receive files from a paired sender
+    #[command(display_order = 11)]
     Receive {
         /// Session to use (host:session); auto-detected if omitted
         #[arg(long)]
@@ -145,23 +152,26 @@ enum Command {
         dir: Option<PathBuf>,
     },
     /// Open a URL on the local machine (for use inside gritty sessions)
+    #[command(display_order = 12)]
     Open {
         /// URL to open
         url: String,
     },
     /// Forward a port from the session to the client (listen on session, connect on client)
-    #[command(visible_alias = "lf")]
+    #[command(display_order = 13, visible_alias = "lf")]
     LocalForward {
         /// Port spec: PORT or LISTEN_PORT:TARGET_PORT
         port: String,
     },
     /// Forward a port from the client to the session (listen on client, connect on session)
-    #[command(visible_alias = "rf")]
+    #[command(display_order = 14, visible_alias = "rf")]
     RemoteForward {
         /// Port spec: PORT or LISTEN_PORT:TARGET_PORT
         port: String,
     },
+    // -- Tunnels --
     /// Set up SSH tunnel to a remote host (backgrounds by default)
+    #[command(display_order = 20)]
     TunnelCreate {
         /// Remote destination ([user@]host[:port])
         destination: String,
@@ -191,34 +201,41 @@ enum Command {
         ignore_version_mismatch: bool,
     },
     /// Tear down an SSH tunnel by connection name
+    #[command(display_order = 21)]
     TunnelDestroy {
         /// Connection name (as shown in `gritty tunnels`)
         name: String,
     },
     /// List active SSH tunnels
-    #[command(visible_alias = "tun")]
+    #[command(display_order = 22, visible_alias = "tun")]
     Tunnels,
+    // -- Server & config --
     /// Start the server (backgrounds by default, use -f to stay in foreground)
-    #[command(visible_alias = "s")]
+    #[command(display_order = 30, visible_alias = "s")]
     Server {
         /// Run in the foreground instead of daemonizing
         #[arg(long, short = 'f')]
         foreground: bool,
     },
     /// Show diagnostics (paths, server status, tunnels)
+    #[command(display_order = 31)]
     Info,
     /// Open config file in $VISUAL/$EDITOR/vi (creates from template if missing)
+    #[command(display_order = 32)]
     ConfigEdit,
-    /// Print the default socket path
-    #[command(visible_alias = "socket")]
-    SocketPath,
-    /// Print the protocol version number
-    ProtocolVersion,
     /// Generate shell completions
+    #[command(display_order = 33)]
     Completions {
         /// Shell to generate completions for
         shell: clap_complete::Shell,
     },
+    // -- Internal/plumbing --
+    /// Print the default socket path
+    #[command(display_order = 40, visible_alias = "socket")]
+    SocketPath,
+    /// Print the protocol version number
+    #[command(display_order = 41)]
+    ProtocolVersion,
 }
 
 fn init_tracing(verbose: bool, log_path: Option<&Path>) {
