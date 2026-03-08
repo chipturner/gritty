@@ -10,8 +10,7 @@ Persistent TTY sessions over Unix domain sockets. Single binary, tmux-like CLI. 
 
 | Command | Alias | Description |
 |---------|-------|-------------|
-| `new-session <host[:name]>` | `new` | Create session and auto-attach |
-| `attach <host:session>` | `a` | Attach to session (detaches other clients) |
+| `connect <host[:name]>` | `c` | Smart session: attach if exists, create if not |
 | `tail <host:session>` | `t` | Read-only stream of session output |
 | `list-sessions [host]` | `ls` | List sessions (all daemons if no host) |
 | `kill-session <host:session>` | | Kill a session |
@@ -22,15 +21,15 @@ Persistent TTY sessions over Unix domain sockets. Single binary, tmux-like CLI. 
 | `open <url>` | | Open URL on local machine (inside sessions with open forwarding) |
 | `local-forward <port>` | `lf` | Forward TCP port: session to client |
 | `remote-forward <port>` | `rf` | Forward TCP port: client to session |
-| `connect <dest>` | `c` | SSH tunnel to remote server |
-| `disconnect <name>` | `dc` | Tear down SSH tunnel |
+| `tunnel-create <dest>` | | SSH tunnel to remote server (plumbing) |
+| `tunnel-destroy <name>` | | Tear down SSH tunnel |
 | `tunnels` | `tun` | List active SSH tunnels |
 | `server` | `s` | Start server (self-daemonizes, `-f` for foreground) |
 | `info` | | Show diagnostics |
 | `config-edit` | | Edit config file |
 | `completions <shell>` | | Generate shell completions |
 
-Sessions have auto-incrementing IDs with optional names (`host:name`). Numeric names rejected. `-` = last-attached session. `<host>` is `local` or a connection name from `connect`. Global: `--ctl-socket <path>`, `-v`. See `--help` for per-command flags.
+Sessions have auto-incrementing IDs with optional names (`host:name`). Numeric names rejected. `-` = last-attached session. `<host>` is `local` or a connection name from `tunnel-create`. Session name defaults to `default` if omitted. Global: `--ctl-socket <path>`, `-v`. See `--help` for per-command flags.
 
 ## Build & Test
 
@@ -53,8 +52,8 @@ just coverage-html                   # HTML coverage report
 
 ```bash
 cargo run -- server                   # start server (self-backgrounds, prints PID)
-cargo run -- new local:myproject      # create named session
-cargo run -- attach local:myproject   # attach by name
+cargo run -- connect local:myproject  # create or attach to named session
+cargo run -- connect local            # create or attach to "default" session
 cargo run -- ls local                 # list active sessions
 RUST_LOG=debug cargo run -- server -f # debug mode (foreground)
 just quicktest                        # manual 3-pane tmux test
@@ -94,7 +93,7 @@ Handshake: `0x16` Hello, `0x24` HelloAck. Relay: `0x01` Data, `0x02` Resize, `0x
 - **Lockfile-based liveness**: `flock()` on `connect-{name}.lock`. Non-blocking probe distinguishes live vs dead tunnels.
 - **Multi-channel forwarding**: Agent, tunnel, and port forwarding use `channel_id: u32` + `spawn_channel_relay<R, W>()`. State cleared on disconnect/takeover.
 - **Terminal guards**: `RawModeGuard` + `NonBlockGuard`. Drop order matters: `NonBlockGuard` must outlive `AsyncFd`.
-- **Auto-start**: `new-session` auto-starts server on failure (`local` runs `gritty server`, others run `gritty connect`). `attach` waits indefinitely instead. Other commands fail immediately.
+- **Auto-start**: `connect` auto-starts server on failure (`local` runs `gritty server`, others run `gritty tunnel-create`). Other commands fail immediately.
 - **Host routing**: `parse_target()` splits `host:session`. `resolve_ctl_path()`: `--ctl-socket` > `"local"` > connect socket. `"local"` reserved keyword.
 - **Escape sequences**: `~.` detach, `~R` reconnect, `~#` status, `~^Z` suspend, `~?` help, `~~` literal. 3-state machine (Normal/AfterNewline/AfterTilde). `--no-escape` disables.
 - **Security**: `umask(0o077)`, sockets 0600, dirs 0700, `SO_PEERCRED` on all accepts, payloads <= 1MB, resize 1..=10000.

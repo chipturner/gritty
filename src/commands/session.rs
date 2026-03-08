@@ -1,12 +1,14 @@
 use std::path::{Path, PathBuf};
 
+use super::AutoStart;
 use super::util::{format_age, format_timestamp, server_request};
-use super::{AttachError, AutoStart};
 
-pub(crate) async fn new_session(
-    name: Option<String>,
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn connect_session(
+    name: String,
     command: Option<String>,
     detach: bool,
+    no_create: bool,
     settings: gritty::config::SessionSettings,
     ctl_path: PathBuf,
     auto_start_mode: AutoStart,
@@ -16,20 +18,64 @@ pub(crate) async fn new_session(
     use gritty::protocol::{Frame, FrameCodec};
     use tokio_util::codec::Framed;
 
-    let session_name = name.clone().unwrap_or_default();
     let session_command = command.unwrap_or_default();
 
     let stream = super::util::connect_or_start(&ctl_path, &auto_start_mode, wait).await?;
     let mut framed = Framed::new(stream, FrameCodec);
     gritty::handshake(&mut framed).await?;
-    framed.send(Frame::NewSession { name: session_name, command: session_command }).await?;
+
+    // Try attach first
+    framed.send(Frame::Attach { session: name.clone() }).await?;
+
+    match Frame::expect_from(framed.next().await)? {
+        Frame::Ok => {
+            // Attached to existing session
+            if detach {
+                eprintln!("\x1b[32m\u{25b8} session {name} exists (not attaching, -d)\x1b[0m");
+                return Ok(());
+            }
+            eprintln!("\x1b[32m\u{25b8} attached {name}\x1b[0m");
+            let code = gritty::client::run(
+                &name,
+                framed,
+                !settings.no_redraw,
+                &ctl_path,
+                vec![],
+                settings.no_escape,
+                settings.forward_agent,
+                settings.forward_open,
+                settings.oauth_redirect,
+                settings.oauth_timeout,
+                settings.heartbeat_interval,
+                settings.heartbeat_timeout,
+            )
+            .await?;
+            std::process::exit(code);
+        }
+        Frame::Error { message } if message.starts_with("no such session:") => {
+            if no_create {
+                anyhow::bail!("no such session: {name}");
+            }
+            // Fall through to create
+        }
+        Frame::Error { message } => anyhow::bail!("{message}"),
+        other => anyhow::bail!("unexpected response from server: {other:?}"),
+    }
+
+    // Create new session -- need a fresh connection since the previous one
+    // was consumed by the failed attach
+    let stream = super::util::connect_or_start(&ctl_path, &auto_start_mode, wait).await?;
+    let mut framed = Framed::new(stream, FrameCodec);
+    gritty::handshake(&mut framed).await?;
+    framed.send(Frame::NewSession { name: name.clone(), command: session_command }).await?;
 
     match Frame::expect_from(framed.next().await)? {
         Frame::SessionCreated { id } => {
-            match &name {
-                Some(n) => eprintln!("\x1b[32m\u{25b8} session {n}\x1b[0m"),
-                None => eprintln!("\x1b[32m\u{25b8} session {id}\x1b[0m"),
-            }
+            eprintln!("\x1b[32m\u{25b8} session {name}\x1b[0m");
+
+            // Alert about other detached sessions
+            alert_detached_sessions(&name, &ctl_path).await;
+
             if detach {
                 return Ok(());
             }
@@ -59,61 +105,35 @@ pub(crate) async fn new_session(
     }
 }
 
-pub(crate) async fn attach(
-    target: &str,
-    settings: &gritty::config::SessionSettings,
-    ctl_path: &Path,
-) -> Result<i32, AttachError> {
-    use futures_util::{SinkExt, StreamExt};
-    use gritty::protocol::{Frame, FrameCodec};
-    use tokio::net::UnixStream;
-    use tokio_util::codec::Framed;
+/// After creating a new session, show a hint if there are other detached
+/// sessions the user might have forgotten about.
+async fn alert_detached_sessions(current_name: &str, ctl_path: &Path) {
+    use gritty::protocol::Frame;
 
-    let stream = loop {
-        match UnixStream::connect(ctl_path).await {
-            Ok(s) => break s,
-            Err(_) => {
-                eprintln!("\x1b[2;33m\u{25b8} waiting for server...\x1b[0m");
-                tokio::time::sleep(std::time::Duration::from_secs(1)).await;
-            }
-        }
+    let ctl_path_buf = ctl_path.to_path_buf();
+    let Ok(resp) = server_request(&ctl_path_buf, Frame::ListSessions).await else {
+        return;
     };
-    let mut framed = Framed::new(stream, FrameCodec);
-    gritty::handshake(&mut framed).await.map_err(AttachError::Other)?;
-    framed
-        .send(Frame::Attach { session: target.to_string() })
-        .await
-        .map_err(|e| AttachError::Other(e.into()))?;
-
-    match Frame::expect_from(framed.next().await).map_err(AttachError::Other)? {
-        Frame::Ok => {
-            eprintln!("\x1b[32m\u{25b8} attached\x1b[0m");
-            let code = gritty::client::run(
-                target,
-                framed,
-                !settings.no_redraw,
-                ctl_path,
-                vec![],
-                settings.no_escape,
-                settings.forward_agent,
-                settings.forward_open,
-                settings.oauth_redirect,
-                settings.oauth_timeout,
-                settings.heartbeat_interval,
-                settings.heartbeat_timeout,
-            )
-            .await
-            .map_err(AttachError::Other)?;
-            Ok(code)
-        }
-        Frame::Error { message } if message.starts_with("no such session:") => {
-            Err(AttachError::NoSuchSession)
-        }
-        Frame::Error { message } => Err(AttachError::Other(anyhow::anyhow!("{message}"))),
-        other => {
-            Err(AttachError::Other(anyhow::anyhow!("unexpected response from server: {other:?}")))
-        }
+    let Frame::SessionInfo { sessions } = resp else {
+        return;
+    };
+    let detached: Vec<_> = sessions
+        .iter()
+        .filter(|s| {
+            !s.attached && {
+                let display = if s.name.is_empty() { &s.id } else { &s.name };
+                display != current_name
+            }
+        })
+        .collect();
+    if detached.is_empty() {
+        return;
     }
+    let names: Vec<_> = detached
+        .iter()
+        .map(|s| if s.name.is_empty() { s.id.clone() } else { s.name.clone() })
+        .collect();
+    eprintln!("\x1b[2;33m\u{25b8} detached sessions: {}\x1b[0m", names.join(", "));
 }
 
 pub(crate) async fn tail_session(target: String, ctl_path: PathBuf) -> anyhow::Result<i32> {
@@ -366,8 +386,8 @@ pub(crate) async fn list_all_sessions() -> anyhow::Result<()> {
 }
 
 /// Print available sessions and exit with an error when a session-requiring
-/// command is invoked without the session part (e.g. `gritty attach local`
-/// instead of `gritty attach local:session`).
+/// command is invoked without the session part (e.g. `gritty tail local`
+/// instead of `gritty tail local:session`).
 pub(crate) async fn suggest_session(cmd: &str, host: &str, ctl_path: &Path) -> anyhow::Result<()> {
     use gritty::protocol::Frame;
 

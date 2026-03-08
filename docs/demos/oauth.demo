@@ -1,0 +1,30 @@
+# OAuth demo: gh auth login inside a gritty session
+#
+# Shows: browser opens locally, OAuth callback tunnels back, auth completes.
+#
+# Prerequisites:
+#   - Remote host "devbox" accessible via ssh
+#   - gh CLI installed on devbox
+#   - Logged out of gh on devbox (gh auth logout)
+#   - No existing gritty tunnel (gritty tunnel-destroy devbox)
+#
+# The browser flow requires manual completion. When recording,
+# asciinema's --idle-time-limit compresses the wait.
+
+type: gritty connect devbox:work
+wait/10: $
+sleep: 0.5
+
+type: gh auth login -w
+wait/10: Press Enter
+sleep: 1
+send: Enter
+
+# Complete the OAuth flow in your browser now.
+# The recording pauses here; idle-time-limit trims it.
+wait/180: Logged in
+sleep: 2
+
+# Prove it worked
+type: gh api user -q .login
+sleep: 3

@@ -23,9 +23,9 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Command {
-    /// Create a new persistent session (auto-attaches)
-    #[command(visible_alias = "new")]
-    NewSession {
+    /// Smart session: attach if exists, create if not
+    #[command(visible_alias = "c")]
+    Connect {
         /// Target host, with optional session name (host or host:name)
         target: Option<String>,
 
@@ -37,7 +37,11 @@ enum Command {
         #[arg(short = 'd', long)]
         detach: bool,
 
-        /// Don't send Ctrl-L to redraw after the shell starts
+        /// Attach only, error if session doesn't exist
+        #[arg(long)]
+        no_create: bool,
+
+        /// Don't send Ctrl-L to redraw after attaching
         #[arg(long)]
         no_redraw: bool,
 
@@ -72,48 +76,6 @@ enum Command {
         /// Wait indefinitely for the server instead of giving up after retries
         #[arg(short = 'w', long)]
         wait: bool,
-    },
-    /// Attach to an existing session (detaches other clients)
-    #[command(visible_alias = "a")]
-    Attach {
-        /// Target host and session (host:session)
-        target: Option<String>,
-
-        /// Create the session if it doesn't exist
-        #[arg(short = 'c', long)]
-        create: bool,
-
-        /// Don't send Ctrl-L to redraw after attaching
-        #[arg(long)]
-        no_redraw: bool,
-
-        /// Disable escape sequences (~. detach, ~? help, etc.)
-        #[arg(long)]
-        no_escape: bool,
-
-        /// Forward local SSH agent to the session
-        #[arg(short = 'A', long)]
-        forward_agent: bool,
-
-        /// Forward URL open requests back to the local machine
-        #[arg(short = 'O', long)]
-        forward_open: bool,
-
-        /// Disable SSH agent forwarding
-        #[arg(long)]
-        no_forward_agent: bool,
-
-        /// Disable URL open forwarding
-        #[arg(long)]
-        no_forward_open: bool,
-
-        /// Disable OAuth callback tunneling (part of --forward-open)
-        #[arg(long)]
-        no_oauth_redirect: bool,
-
-        /// Timeout in seconds for OAuth callback tunnel (default: 180)
-        #[arg(long)]
-        oauth_timeout: Option<u64>,
     },
     /// Tail a session's output (read-only, like tail -f)
     #[command(visible_alias = "t")]
@@ -199,9 +161,8 @@ enum Command {
         /// Port spec: PORT or LISTEN_PORT:TARGET_PORT
         port: String,
     },
-    /// SSH tunnel to a remote host (backgrounds by default, prints socket path)
-    #[command(visible_alias = "c")]
-    Connect {
+    /// Set up SSH tunnel to a remote host (backgrounds by default)
+    TunnelCreate {
         /// Remote destination ([user@]host[:port])
         destination: String,
 
@@ -229,9 +190,8 @@ enum Command {
         #[arg(long)]
         ignore_version_mismatch: bool,
     },
-    /// Disconnect an SSH tunnel by connection name
-    #[command(visible_alias = "dc")]
-    Disconnect {
+    /// Tear down an SSH tunnel by connection name
+    TunnelDestroy {
         /// Connection name (as shown in `gritty tunnels`)
         name: String,
     },
@@ -460,7 +420,7 @@ fn main() {
                 report_error(&error_pipe, &e);
             }
         }
-        Command::Connect {
+        Command::TunnelCreate {
             destination,
             name,
             no_server_start,
@@ -578,11 +538,12 @@ fn main() {
 
 async fn run(cli: Cli, config: gritty::config::ConfigFile) -> anyhow::Result<()> {
     match cli.command {
-        Command::Server { .. } | Command::Connect { .. } => unreachable!(),
-        Command::NewSession {
+        Command::Server { .. } | Command::TunnelCreate { .. } => unreachable!(),
+        Command::Connect {
             target,
             command,
             detach,
+            no_create,
             no_redraw,
             no_escape,
             forward_agent,
@@ -600,6 +561,7 @@ async fn run(cli: Cli, config: gritty::config::ConfigFile) -> anyhow::Result<()>
                 }
                 None => (None, None),
             };
+            let name = session.unwrap_or_else(|| "default".to_string());
             let auto_start_mode = match (&cli.ctl_socket, host.as_deref()) {
                 (Some(_), _) => AutoStart::None,
                 (None, Some("local")) => AutoStart::Server,
@@ -628,7 +590,17 @@ async fn run(cli: Cli, config: gritty::config::ConfigFile) -> anyhow::Result<()>
                 ring_buffer_size: resolved.ring_buffer_size,
                 oauth_tunnel_idle_timeout: resolved.oauth_tunnel_idle_timeout,
             };
-            new_session(session, command, detach, settings, ctl_path, auto_start_mode, wait).await
+            connect_session(
+                name,
+                command,
+                detach,
+                no_create,
+                settings,
+                ctl_path,
+                auto_start_mode,
+                wait,
+            )
+            .await
         }
         Command::Tail { target } => {
             let (host, session) = match &target {
@@ -648,93 +620,6 @@ async fn run(cli: Cli, config: gritty::config::ConfigFile) -> anyhow::Result<()>
             };
             let code = tail_session(session, ctl_path).await?;
             std::process::exit(code);
-        }
-        Command::Attach {
-            target,
-            create,
-            no_redraw,
-            no_escape,
-            forward_agent,
-            forward_open,
-            no_forward_agent,
-            no_forward_open,
-            no_oauth_redirect,
-            oauth_timeout,
-        } => {
-            let (host, session) = match &target {
-                Some(t) => {
-                    let (h, s) = parse_target(t);
-                    (Some(h), s)
-                }
-                None => (None, None),
-            };
-            let ctl_path = resolve_ctl_path(cli.ctl_socket.clone(), host.as_deref())?;
-            let resolved = config.resolve_session(host.as_deref());
-            let settings = gritty::config::SessionSettings {
-                no_redraw: no_redraw || resolved.no_redraw,
-                no_escape: no_escape || resolved.no_escape,
-                forward_agent: if no_forward_agent {
-                    false
-                } else {
-                    forward_agent || resolved.forward_agent
-                },
-                forward_open: if no_forward_open {
-                    false
-                } else {
-                    forward_open || resolved.forward_open
-                },
-                oauth_redirect: if no_oauth_redirect { false } else { resolved.oauth_redirect },
-                oauth_timeout: oauth_timeout.unwrap_or(resolved.oauth_timeout),
-                heartbeat_interval: resolved.heartbeat_interval,
-                heartbeat_timeout: resolved.heartbeat_timeout,
-                ring_buffer_size: resolved.ring_buffer_size,
-                oauth_tunnel_idle_timeout: resolved.oauth_tunnel_idle_timeout,
-            };
-            let session = match session {
-                Some(s) => s,
-                None if create => {
-                    // --create with no session name: create unnamed session
-                    let auto_start_mode = match (&cli.ctl_socket, host.as_deref()) {
-                        (Some(_), _) => AutoStart::None,
-                        (None, Some("local")) => AutoStart::Server,
-                        (None, Some(h)) => AutoStart::Tunnel(h.to_string()),
-                        (None, None) => anyhow::bail!("specify a host or use --ctl-socket"),
-                    };
-                    new_session(None, None, false, settings, ctl_path, auto_start_mode, false)
-                        .await?;
-                    unreachable!()
-                }
-                None => {
-                    suggest_session("attach", host.as_deref().unwrap_or("host"), &ctl_path).await?;
-                    unreachable!()
-                }
-            };
-            match attach(&session, &settings, &ctl_path).await {
-                Ok(code) => std::process::exit(code),
-                Err(AttachError::NoSuchSession) if create => {
-                    let auto_start_mode = match (&cli.ctl_socket, host.as_deref()) {
-                        (Some(_), _) => AutoStart::None,
-                        (None, Some("local")) => AutoStart::Server,
-                        (None, Some(h)) => AutoStart::Tunnel(h.to_string()),
-                        (None, None) => anyhow::bail!("specify a host or use --ctl-socket"),
-                    };
-                    new_session(
-                        Some(session),
-                        None,
-                        false,
-                        settings,
-                        ctl_path,
-                        auto_start_mode,
-                        false,
-                    )
-                    .await?;
-                    unreachable!()
-                }
-                Err(AttachError::NoSuchSession) => {
-                    anyhow::bail!("no such session: {session}")
-                }
-                Err(AttachError::Other(e)) => Err(e)?,
-            }
         }
         Command::ListSessions { target } => {
             if target.is_none() && cli.ctl_socket.is_none() {
@@ -810,7 +695,7 @@ async fn run(cli: Cli, config: gritty::config::ConfigFile) -> anyhow::Result<()>
             let (listen_port, target_port) = parse_port_spec(&port)?;
             port_forward_command(1, listen_port, target_port).await
         }
-        Command::Disconnect { name } => gritty::connect::disconnect(&name).await,
+        Command::TunnelDestroy { name } => gritty::connect::disconnect(&name).await,
         Command::Tunnels => {
             gritty::connect::list_tunnels();
             Ok(())

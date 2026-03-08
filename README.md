@@ -15,11 +15,11 @@ Same story for `gcloud auth login`, `aws sso login`, anything OAuth.
 ### With gritty
 
 ```bash
-gritty new devbox:work
+gritty connect devbox:work
 gh auth login                       # browser opens locally, callback tunnels back. Done.
 ```
 
-Close your laptop, change wifi, open it back up -- `gritty attach devbox:work` and you're exactly where you left off. Agent forwarding, URL forwarding, and OAuth tunneling all work out of the box.
+Close your laptop, change wifi, open it back up -- `gritty connect devbox:work` and you're exactly where you left off. Agent forwarding, URL forwarding, and OAuth tunneling all work out of the box.
 
 It works by forwarding Unix domain sockets over SSH -- no custom protocol, no open ports, no certificates, no configuration. If you can `ssh` to a host, you can use gritty.
 
@@ -50,10 +50,10 @@ Install on **both your laptop and the remote host**.
 Make sure you can `ssh devbox` first (to accept the host key / enter your password), then:
 
 ```bash
-gritty new devbox:work
+gritty connect devbox:work
 ```
 
-That's it. gritty auto-starts the SSH tunnel and remote server. Agent forwarding and URL/OAuth forwarding are on by default.
+That's it. gritty auto-starts the SSH tunnel and remote server. Agent forwarding and URL/OAuth forwarding are on by default. If the session already exists, `connect` reattaches to it.
 
 Transfer files through the session (run one side locally, one remotely):
 
@@ -70,17 +70,17 @@ Detach and reattach from anywhere:
 ```bash
 # Detach with ~. or just close your terminal
 
-gritty attach devbox:work           # reattach from any terminal, any machine
+gritty connect devbox:work          # reattach from any terminal, any machine
 gritty ls devbox                    # list sessions
 gritty tunnels                      # list active tunnels
 ```
 
-Local-only sessions (`gritty new local:scratch`) are available for testing but aren't the typical workflow.
+Local-only sessions (`gritty connect local:scratch`) are available for testing but aren't the typical workflow.
 
 ## Features
 
 - **Self-healing connections** -- heartbeat detection, automatic tunnel respawn, transparent reconnect
-- **Persistent sessions** -- shells survive disconnect, network failure, laptop sleep; reattach from any terminal or machine; multiple named sessions
+- **Persistent sessions** -- shells survive disconnect, network failure, laptop sleep; `connect` reattaches or creates; multiple named sessions
 - **SSH agent forwarding** -- `git push`, `ssh`, and other agent-dependent commands work remotely using your local keys (on by default); survives reconnects without stale sockets
 - **URL open forwarding** -- `$BROWSER` requests forwarded to your local machine, with automatic OAuth callback tunneling (on by default)
 - **Port forwarding** -- `gritty lf 8080` to quick-check a remote web server locally, `gritty rf 5432` to let the session reach local postgres
@@ -91,8 +91,7 @@ Local-only sessions (`gritty new local:scratch`) are available for testing but a
 
 | Command | Aliases | Description |
 |---------|---------|-------------|
-| `gritty new-session <host[:name]>` | `new` | Create a session and auto-attach |
-| `gritty attach <host:session>` | `a` | Attach to a session (`-c` creates if missing) |
+| `gritty connect <host[:name]>` | `c` | Smart session: attach if exists, create if not |
 | `gritty tail <host:session>` | `t` | Read-only stream of session output |
 | `gritty list-sessions [host]` | `ls`, `list` | List sessions (no args = all daemons; foreground process shown on Linux only) |
 | `gritty kill-session <host:session>` | | Kill a session |
@@ -103,32 +102,33 @@ Local-only sessions (`gritty new local:scratch`) are available for testing but a
 | `gritty open <url>` | | Open a URL on the local machine (inside sessions) |
 | `gritty local-forward <port>` | `lf` | Forward a TCP port from session to client |
 | `gritty remote-forward <port>` | `rf` | Forward a TCP port from client to session |
-| `gritty connect <destination>` | `c` | Set up SSH tunnel to remote host |
-| `gritty disconnect <name>` | `dc` | Tear down an SSH tunnel |
+| `gritty tunnel-create <destination>` | | Set up SSH tunnel to remote host (plumbing) |
+| `gritty tunnel-destroy <name>` | | Tear down an SSH tunnel |
 | `gritty tunnels` | `tun` | List active SSH tunnels |
 | `gritty server` | `s` | Start server (usually auto-started; `-f` for foreground) |
 | `gritty info` | | Show diagnostics (paths, server status, tunnels) |
 | `gritty config-edit` | | Open config in `$VISUAL`/`$EDITOR` (creates from template if missing) |
 | `gritty completions <shell>` | | Generate shell completions (bash, zsh, fish, elvish, powershell) |
 
-The `<host>` in `host:session` is a **connection name**, not an SSH destination. It's the name assigned by `gritty connect` -- by default the hostname, overridable with `-n`. `local` is the reserved name for the local server. For example, `gritty connect user@mybox.example.com -n devbox` creates connection name `devbox`, so you'd use `gritty new devbox:work`. The special session name `-` refers to the last-attached session (e.g. `gritty attach devbox:-`). Auto-starts server/tunnel on `new`; `attach` waits for an existing server. `send`/`receive` auto-detect the session across all active daemons; use `--session host:session` to target a specific one.
+The `<host>` in `host:session` is a **connection name**, not an SSH destination. It's the name assigned by `gritty tunnel-create` -- by default the hostname, overridable with `-n`. `local` is the reserved name for the local server. For example, `gritty tunnel-create user@mybox.example.com -n devbox` creates connection name `devbox`, so you'd use `gritty connect devbox:work`. If the session name is omitted, it defaults to `default`. The special session name `-` refers to the last-attached session (e.g. `gritty connect devbox:-`). `connect` auto-starts server/tunnel as needed. `send`/`receive` auto-detect the session across all active daemons; use `--session host:session` to target a specific one.
 
 **Global options:**
 - `-v` / `--verbose`: enable debug logging
 - `--ctl-socket <path>`: override the server socket path
 
-**Session options** (`new`/`attach`):
+**Session options** (`connect`):
 - `-A` / `--forward-agent`: forward your local SSH agent (on by default; disable with `--no-forward-agent`)
 - `-O` / `--forward-open`: forward URL opens to local machine (on by default; disable with `--no-forward-open`)
-- `-c <cmd>` / `--command` (`new` only): run a command instead of a login shell
-- `-d` / `--detach` (`new` only): create session without attaching (background jobs)
+- `-c <cmd>` / `--command`: run a command instead of a login shell (when creating)
+- `-d` / `--detach`: create session without attaching (background jobs)
+- `--no-create`: attach only, error if session doesn't exist
 - `--no-redraw`: don't send Ctrl-L after connecting
 - `--no-escape`: disable escape sequence processing
 - `--no-oauth-redirect`: disable OAuth callback tunneling (part of `-O`)
 - `--oauth-timeout <seconds>`: OAuth callback accept timeout (default: 180)
-- `-w` / `--wait` (`new` only): wait indefinitely for the server
+- `-w` / `--wait`: wait indefinitely for the server
 
-**Connect options:**
+**Tunnel options** (`tunnel-create`):
 - `-n <name>`: override connection name (defaults to hostname)
 - `-o <option>` / `--ssh-option`: extra SSH options (repeatable, e.g., `-o "ProxyJump=bastion"`)
 - `--no-server-start`: don't auto-start the remote server
@@ -145,7 +145,7 @@ The `<host>` in `host:session` is a **connection name**, not an SSH destination.
 
 **Environment inside sessions:** `GRITTY_SOCK` (svc socket for `gritty open`/`send`/`receive`/port forwarding), `GRITTY_SESSION` (session ID), and `GRITTY_SESSION_NAME` (if named) are set in the shell environment. Useful for prompt customization or scripts that need to know which session they're in.
 
-**Port forwarding:** port spec is `PORT` (same on both ends) or `LISTEN:TARGET`. Runs inside a session (`GRITTY_SOCK` required). Ctrl-C stops the forward. These are transient, on-demand forwards -- great for quick checks during development. For always-on port forwarding, configure it on the SSH tunnel instead: `gritty connect devbox -o "LocalForward=8080 localhost:8080"` or add it to `ssh-options` in your config file.
+**Port forwarding:** port spec is `PORT` (same on both ends) or `LISTEN:TARGET`. Runs inside a session (`GRITTY_SOCK` required). Ctrl-C stops the forward. These are transient, on-demand forwards -- great for quick checks during development. For always-on port forwarding, configure it on the SSH tunnel instead: `gritty tunnel-create devbox -o "LocalForward=8080 localhost:8080"` or add it to `ssh-options` in your config file.
 
 ## Comparison
 
@@ -166,7 +166,7 @@ The `<host>` in `host:session` is a **connection name**, not an SSH destination.
 | Windows client | no | no | no | yes |
 | Maturity | 0.9 (new) | mature | mature | mature |
 
-**Where gritty wins:** seamless local-tool integration. SSH agent forwarding that survives reconnects without stale sockets. Browser opens and OAuth flows that just work remotely. Port forwarding and file transfer multiplexed over the session -- no extra tunnels or tools. Stateless client -- reboot your laptop, `gritty attach` picks up where you left off.
+**Where gritty wins:** seamless local-tool integration. SSH agent forwarding that survives reconnects without stale sockets. Browser opens and OAuth flows that just work remotely. Port forwarding and file transfer multiplexed over the session -- no extra tunnels or tools. Stateless client -- reboot your laptop, `gritty connect` picks up where you left off.
 
 **Where gritty loses:** no predictive local echo (mosh is unbeatable on high-latency links), no scroll-back or window management (use tmux inside gritty), no Windows support, and it's early-stage software.
 
@@ -246,9 +246,9 @@ gritty completions fish > ~/.config/fish/completions/gritty.fish
 
 **"gritty not found on remote host"** -- gritty must be installed on the remote host too. Install it with `curl -sSfL https://raw.githubusercontent.com/chipturner/gritty/main/install.sh | sh` (or `cargo install gritty-cli`), and ensure it's in `$HOME/bin`, `$HOME/.local/bin`, `$HOME/.cargo/bin`, or another standard path.
 
-**First connect hangs or fails** -- gritty backgrounds the SSH tunnel, so it can't prompt for a password or host key. Make sure `ssh <destination>` works first, then use `gritty connect` or `gritty new`.
+**First connect hangs or fails** -- gritty backgrounds the SSH tunnel, so it can't prompt for a password or host key. Make sure `ssh <destination>` works first, then use `gritty connect`.
 
-**"[reconnecting...]" forever** -- the SSH tunnel is down and not coming back. Check `gritty tunnels` for tunnel status. If the tunnel shows as stale, `gritty disconnect <name>` to clean it up and `gritty connect <dest>` to re-establish. Check `gritty info` for log file paths if you need to dig deeper.
+**"[reconnecting...]" forever** -- the SSH tunnel is down and not coming back. Check `gritty tunnels` for tunnel status. If the tunnel shows as stale, `gritty tunnel-destroy <name>` to clean it up and `gritty tunnel-create <dest>` to re-establish. Check `gritty info` for log file paths if you need to dig deeper.
 
 **Protocol version mismatch after upgrade** -- if you upgrade gritty on one side but not the other, connections will be rejected with a version mismatch error. Upgrade both sides to the same version. `gritty protocol-version` shows the local version. If you need to connect temporarily before upgrading, use `gritty connect --ignore-version-mismatch`.
 

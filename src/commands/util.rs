@@ -76,7 +76,7 @@ pub(crate) async fn connect_or_start(
             }
             AutoStart::Tunnel(host) => {
                 eprintln!("\x1b[2;33m\u{25b8} starting tunnel {host}...\x1b[0m");
-                auto_start(&["connect", host])?;
+                auto_start(&["tunnel-create", host])?;
             }
             AutoStart::None if wait => {}
             AutoStart::None => {

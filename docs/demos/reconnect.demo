@@ -1,0 +1,54 @@
+# Reconnect demo: session survives disconnect, tmux layout preserved
+#
+# Shows: counter keeps running during disconnect, tmux layout survives intact.
+#
+# Prerequisites:
+#   - Remote host "devbox" accessible via ssh
+#   - python3 and tmux installed on devbox
+#   - No existing gritty tunnel (gritty tunnel-destroy devbox)
+
+type: gritty connect devbox:work
+wait/10: $
+sleep: 0.5
+
+# Start a counter -- the incrementing numbers make the disconnect visible
+type: python3 -c "import time; [print(i, flush=True) or time.sleep(1) for i in range(999)]"
+sleep: 5
+
+# Kill the SSH tunnel from outside the session
+run: gritty tunnel-destroy devbox
+wait: reconnecting
+sleep: 2
+
+# Re-establish tunnel; client auto-reconnects
+run: gritty tunnel-create devbox
+wait/15: connected
+sleep: 3
+
+# Counter resumed -- numbers kept incrementing during disconnect
+send: C-c
+sleep: 1
+
+# Now show that a full TUI survives too
+type: tmux
+sleep: 1
+
+# Split and run top in the bottom pane
+send: C-b '"'
+sleep: 0.5
+type: top
+sleep: 2
+
+# Back to top pane
+send: C-b Up
+sleep: 1
+
+# Disconnect again
+run: gritty tunnel-destroy devbox
+wait: reconnecting
+sleep: 2
+
+# Reconnect -- tmux layout fully intact, top still running
+run: gritty tunnel-create devbox
+wait/15: connected
+sleep: 3
