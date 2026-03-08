@@ -65,7 +65,7 @@ impl TestEnv {
 
     fn cleanup(&self, name: &str) {
         let _ = self.gritty(&["kill-server", name]);
-        let _ = self.gritty(&["disconnect", name]);
+        let _ = self.gritty(&["tunnel-destroy", name]);
         std::thread::sleep(Duration::from_millis(500));
     }
 
@@ -88,14 +88,14 @@ fn connect_and_list_tunnels() {
     let name = "ssh-test-list";
 
     // Connect
-    env.gritty_ok(&["connect", "localhost", "-n", name]);
+    env.gritty_ok(&["tunnel-create", "localhost", "-n", name]);
 
     // Verify in tunnels output
     let tunnels = env.gritty_ok(&["tunnels"]);
     assert!(tunnels.contains(name), "tunnel {name} not in: {tunnels}");
 
     // Disconnect
-    env.gritty_ok(&["disconnect", name]);
+    env.gritty_ok(&["tunnel-destroy", name]);
     std::thread::sleep(Duration::from_millis(500));
 
     // Verify gone
@@ -112,7 +112,7 @@ fn connect_list_sessions_empty() {
     let env = TestEnv::new();
     let name = "ssh-test-empty";
 
-    env.gritty_ok(&["connect", "localhost", "-n", name]);
+    env.gritty_ok(&["tunnel-create", "localhost", "-n", name]);
 
     // Server auto-started, ls should work but show no sessions
     let out = env.gritty_ok(&["ls", name]);
@@ -130,15 +130,15 @@ fn connect_disconnect_reconnect() {
     let name = "ssh-test-reconnect";
 
     // First connect (starts remote server)
-    env.gritty_ok(&["connect", "localhost", "-n", name]);
+    env.gritty_ok(&["tunnel-create", "localhost", "-n", name]);
     env.gritty_ok(&["ls", name]);
 
     // Disconnect
-    env.gritty_ok(&["disconnect", name]);
+    env.gritty_ok(&["tunnel-destroy", name]);
     std::thread::sleep(Duration::from_millis(500));
 
     // Reconnect (server persists from first connect)
-    env.gritty_ok(&["connect", "localhost", "-n", name]);
+    env.gritty_ok(&["tunnel-create", "localhost", "-n", name]);
     env.gritty_ok(&["ls", name]);
 
     env.cleanup(name);
@@ -151,14 +151,14 @@ fn connect_with_custom_name() {
     let env = TestEnv::new();
     let name = "mydev-test";
 
-    env.gritty_ok(&["connect", "localhost", "-n", name]);
+    env.gritty_ok(&["tunnel-create", "localhost", "-n", name]);
 
     let tunnels = env.gritty_ok(&["tunnels"]);
     assert!(tunnels.contains(name), "custom name {name} not in: {tunnels}");
 
     env.gritty_ok(&["ls", name]);
 
-    env.gritty_ok(&["disconnect", name]);
+    env.gritty_ok(&["tunnel-destroy", name]);
     std::thread::sleep(Duration::from_millis(500));
 
     let tunnels = env.gritty_ok(&["tunnels"]);
@@ -174,7 +174,7 @@ fn connect_info_shows_tunnel() {
     let env = TestEnv::new();
     let name = "ssh-test-info";
 
-    env.gritty_ok(&["connect", "localhost", "-n", name]);
+    env.gritty_ok(&["tunnel-create", "localhost", "-n", name]);
 
     let info = env.gritty_ok(&["info"]);
     assert!(info.contains(name), "info should mention tunnel {name}: {info}");
@@ -190,7 +190,7 @@ fn connect_foreground_mode() {
     let name = "ssh-test-fg";
 
     // Spawn foreground connect as a child process
-    let mut child = env.spawn_gritty(&["connect", "localhost", "-n", name, "--foreground"]);
+    let mut child = env.spawn_gritty(&["tunnel-create", "localhost", "-n", name, "--foreground"]);
 
     // Poll for the connect socket to appear
     let connect_sock = env.socket_dir.join(format!("connect-{name}.sock"));
