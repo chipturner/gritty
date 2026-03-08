@@ -70,7 +70,7 @@ Eight modules behind a lib crate (`src/lib.rs` hosts `collect_env_vars()`, `spaw
 - **`protocol`** -- `Frame` enum, `Encoder`/`Decoder`, wire `[type: u8][length: u32 BE][payload]`. `PROTOCOL_VERSION: u16`. `SessionEntry` for list metadata. `SvcRequest` enum for svc socket dispatch.
 - **`daemon`** -- Accept loop on `ctl.sock`. Handshake, control frame, route. `HashMap<u32, SessionState>`. Hands off `Framed<UnixStream>` to session tasks via `mpsc`.
 - **`server`** -- Per-session: PTY, client relay, ring buffer, forwarding (agent/URL/tunnel/port), file transfer, tail broadcast. Per-session sockets: `agent-{id}.sock` + `svc-{id}.sock`.
-- **`connect`** -- Self-backgrounding SSH tunnel. Monitor respawns on transient failure (backoff 1s to 60s, resets after 30s healthy). Per-tunnel files: `.sock`, `.pid`, `.lock`, `.dest`, `.log`, `.out`. `ConnectGuard` Drop cleans up.
+- **`connect`** (module, implements `tunnel-create` CLI) -- Self-backgrounding SSH tunnel. Monitor respawns on transient failure (backoff 1s to 60s, resets after 30s healthy). Per-tunnel files: `.sock`, `.pid`, `.lock`, `.dest`, `.log`, `.out`. `ConnectGuard` Drop cleans up.
 - **`table`** -- `print_table()` for tabular output.
 - **`client`** -- Raw mode, escape processor, heartbeat (5s ping / 15s timeout), auto-reconnect, forwarding relay. `tail()` is read-only variant.
 
@@ -109,7 +109,7 @@ Handshake: `0x16` Hello, `0x24` HelloAck. Relay: `0x01` Data, `0x02` Resize, `0x
 - **Fork before tokio** -- `daemonize()` MUST fork before creating the tokio runtime. `main()` is sync (no `#[tokio::main]`).
 
 ### Changing protocol/signatures
-- **`PROTOCOL_VERSION`** -- bump whenever frame types, encoding, or `SessionEntry` fields change. Version mismatch is a hard gate: daemon rejects clients, `connect` aborts tunnel setup.
+- **`PROTOCOL_VERSION`** -- bump whenever frame types, encoding, or `SessionEntry` fields change. Version mismatch is a hard gate: daemon rejects clients, `tunnel-create` aborts tunnel setup.
 - **`Frame` enum** -- update: encoder, decoder, protocol tests, all `match frame` in server.rs, client.rs, daemon.rs, main.rs.
 - **`SessionInfo`** -- entry count `u32`. Changing `SessionEntry` fields requires updating both encoder and decoder in protocol.rs.
 - **`server::run()`** -- takes `(client_rx, metadata, agent_path, svc_path, session_id, session_name, command, ring_buffer_cap, oauth_tunnel_idle_timeout)`. Called by e2e tests + daemon; update both.

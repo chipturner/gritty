@@ -47,7 +47,7 @@ pub(crate) async fn server_request(
 }
 
 /// Run the current binary with the given args. Both `gritty server` and
-/// `gritty connect <host>` self-daemonize and return after the socket is ready.
+/// `gritty tunnel-create <host>` self-daemonize and return after the socket is ready.
 pub(crate) fn auto_start(args: &[&str]) -> anyhow::Result<()> {
     let exe = std::env::current_exe().unwrap_or_else(|_| PathBuf::from("gritty"));
     let status = std::process::Command::new(&exe).args(args).status()?;

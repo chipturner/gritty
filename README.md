@@ -190,14 +190,14 @@ gritty works out of the box with no config file. Optionally, set persistent defa
 # ring-buffer-size = 1048576
 # oauth-tunnel-idle-timeout = 5
 
-# Connect-specific global defaults.
-[defaults.connect]
+# Tunnel-specific global defaults (for tunnel-create).
+[defaults.tunnel]
 # ssh-options = []
 # no-server-start = false
 
 # Per-host overrides, keyed by connection name.
 # Connection name = hostname from destination, or -n override.
-[host.devbox.connect]
+[host.devbox.tunnel]
 ssh-options = ["IdentityFile=~/.ssh/devbox_tunnel_key"]
 
 [host.prod]
@@ -205,7 +205,7 @@ forward-agent = false
 forward-open = false
 no-escape = true
 
-[host.prod.connect]
+[host.prod.tunnel]
 no-server-start = true
 ```
 
@@ -250,7 +250,7 @@ gritty completions fish > ~/.config/fish/completions/gritty.fish
 
 **"[reconnecting...]" forever** -- the SSH tunnel is down and not coming back. Check `gritty tunnels` for tunnel status. If the tunnel shows as stale, `gritty tunnel-destroy <name>` to clean it up and `gritty tunnel-create <dest>` to re-establish. Check `gritty info` for log file paths if you need to dig deeper.
 
-**Protocol version mismatch after upgrade** -- if you upgrade gritty on one side but not the other, connections will be rejected with a version mismatch error. Upgrade both sides to the same version. `gritty protocol-version` shows the local version. If you need to connect temporarily before upgrading, use `gritty connect --ignore-version-mismatch`.
+**Protocol version mismatch after upgrade** -- if you upgrade gritty on one side but not the other, connections will be rejected with a version mismatch error. Upgrade both sides to the same version. `gritty protocol-version` shows the local version. If you need to connect temporarily before upgrading, use `gritty tunnel-create --ignore-version-mismatch`.
 
 ## Design
 

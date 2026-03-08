@@ -4,7 +4,7 @@
 # All settings are optional. CLI flags always take priority.
 # Precedence: CLI flag > [host.<name>] > [defaults] > built-in default.
 
-# Global defaults for all sessions and connections.
+# Global defaults for all sessions and tunnels.
 [defaults]
 # forward-agent = true
 # forward-open = true
@@ -17,15 +17,15 @@
 # ring-buffer-size = 1048576
 # oauth-tunnel-idle-timeout = 5
 
-# Connect-specific global defaults.
-[defaults.connect]
+# Tunnel-specific global defaults (for tunnel-create).
+[defaults.tunnel]
 # ssh-options = []
 # no-server-start = false
 
 # Per-host overrides, keyed by connection name.
 # Connection name = hostname from destination, or -n <name> override.
 #
-# [host.devbox.connect]
+# [host.devbox.tunnel]
 # ssh-options = ["IdentityFile=~/.ssh/devbox_key"]
 #
 # [host.prod]
@@ -33,5 +33,5 @@
 # forward-open = false
 # no-escape = true
 #
-# [host.prod.connect]
+# [host.prod.tunnel]
 # no-server-start = true

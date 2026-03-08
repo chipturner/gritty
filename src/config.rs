@@ -38,9 +38,9 @@ impl Default for SessionSettings {
     }
 }
 
-/// Resolved connect settings after merging all config layers.
+/// Resolved tunnel settings after merging all config layers.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
-pub struct ConnectSettings {
+pub struct TunnelSettings {
     pub session: SessionSettings,
     pub ssh_options: Vec<String>,
     pub no_server_start: bool,
@@ -68,13 +68,13 @@ pub struct Defaults {
     pub heartbeat_timeout: Option<u64>,
     pub ring_buffer_size: Option<u64>,
     pub oauth_tunnel_idle_timeout: Option<u64>,
-    pub connect: Option<ConnectDefaults>,
+    pub tunnel: Option<TunnelDefaults>,
 }
 
-/// Connect-specific defaults nested under [defaults.connect].
+/// Tunnel-specific defaults nested under [defaults.tunnel].
 #[derive(Debug, Clone, Default, Deserialize)]
 #[serde(default, rename_all = "kebab-case")]
-pub struct ConnectDefaults {
+pub struct TunnelDefaults {
     pub ssh_options: Option<Vec<String>>,
     pub no_server_start: Option<bool>,
 }
@@ -93,7 +93,7 @@ pub struct HostConfig {
     pub heartbeat_timeout: Option<u64>,
     pub ring_buffer_size: Option<u64>,
     pub oauth_tunnel_idle_timeout: Option<u64>,
-    pub connect: Option<ConnectDefaults>,
+    pub tunnel: Option<TunnelDefaults>,
 }
 
 /// Return the config file path: $XDG_CONFIG_HOME/gritty/config.toml
@@ -160,12 +160,12 @@ impl ConfigFile {
         }
     }
 
-    /// Resolve connect settings for a given host.
-    pub fn resolve_connect(&self, host: &str) -> ConnectSettings {
+    /// Resolve tunnel settings for a given host.
+    pub fn resolve_tunnel(&self, host: &str) -> TunnelSettings {
         let d = &self.defaults;
-        let dc = d.connect.as_ref();
+        let dc = d.tunnel.as_ref();
         let h = self.host.get(host);
-        let hc = h.and_then(|h| h.connect.as_ref());
+        let hc = h.and_then(|h| h.tunnel.as_ref());
 
         // ssh-options: host-specific first, then defaults (SSH uses first-match)
         let mut ssh_options = Vec::new();
@@ -176,7 +176,7 @@ impl ConfigFile {
             ssh_options.extend(opts.iter().cloned());
         }
 
-        ConnectSettings {
+        TunnelSettings {
             session: self.resolve_session(Some(host)),
             ssh_options,
             no_server_start: pick(
@@ -275,47 +275,47 @@ mod tests {
     }
 
     #[test]
-    fn connect_settings_merge_ssh_options() {
+    fn tunnel_settings_merge_ssh_options() {
         let cfg: ConfigFile = toml::from_str(
             r#"
-            [defaults.connect]
+            [defaults.tunnel]
             ssh-options = ["Compression=yes"]
 
-            [host.devbox.connect]
+            [host.devbox.tunnel]
             ssh-options = ["IdentityFile=~/.ssh/key"]
             "#,
         )
         .unwrap();
-        let c = cfg.resolve_connect("devbox");
+        let c = cfg.resolve_tunnel("devbox");
         // Host-specific first, then defaults
         assert_eq!(c.ssh_options, vec!["IdentityFile=~/.ssh/key", "Compression=yes"]);
     }
 
     #[test]
-    fn connect_settings_no_host_ssh_options() {
+    fn tunnel_settings_no_host_ssh_options() {
         let cfg: ConfigFile = toml::from_str(
             r#"
-            [defaults.connect]
+            [defaults.tunnel]
             ssh-options = ["Compression=yes"]
             "#,
         )
         .unwrap();
-        let c = cfg.resolve_connect("unknown");
+        let c = cfg.resolve_tunnel("unknown");
         assert_eq!(c.ssh_options, vec!["Compression=yes"]);
     }
 
     #[test]
-    fn connect_no_server_start() {
+    fn tunnel_no_server_start() {
         let cfg: ConfigFile = toml::from_str(
             r#"
-            [host.prod.connect]
+            [host.prod.tunnel]
             no-server-start = true
             "#,
         )
         .unwrap();
-        let c = cfg.resolve_connect("prod");
+        let c = cfg.resolve_tunnel("prod");
         assert!(c.no_server_start);
-        assert!(!cfg.resolve_connect("devbox").no_server_start);
+        assert!(!cfg.resolve_tunnel("devbox").no_server_start);
     }
 
     #[test]
@@ -428,7 +428,7 @@ mod tests {
     }
 
     #[test]
-    fn connect_session_settings_resolved() {
+    fn tunnel_session_settings_resolved() {
         let cfg: ConfigFile = toml::from_str(
             r#"
             [defaults]
@@ -439,7 +439,7 @@ mod tests {
             "#,
         )
         .unwrap();
-        let c = cfg.resolve_connect("devbox");
+        let c = cfg.resolve_tunnel("devbox");
         assert!(c.session.forward_agent);
         assert!(c.session.forward_open);
     }

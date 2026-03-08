@@ -403,7 +403,7 @@ async fn ensure_remote_ready(
 
 /// Compute a deterministic local socket path based on the destination.
 ///
-/// Using the raw destination string means re-running `gritty connect user@host`
+/// Using the raw destination string means re-running `gritty tunnel-create user@host`
 /// produces the same socket path, so sessions that used `--ctl-socket` can
 /// auto-reconnect after a tunnel restart.
 fn local_socket_path(destination: &str) -> PathBuf {
@@ -453,7 +453,7 @@ pub fn preflight_ssh(dest_str: &str, ssh_options: &[String]) -> anyhow::Result<(
     if !status.success() {
         bail!(
             "SSH cannot connect non-interactively to {}\n  \
-             if SSH needs a password or host key accept, use: gritty connect --foreground {}",
+             if SSH needs a password or host key accept, use: gritty tunnel-create --foreground {}",
             dest.ssh_dest(),
             dest_str
         );
@@ -732,7 +732,7 @@ pub async fn run(opts: ConnectOpts, ready_fd: Option<OwnedFd>) -> anyhow::Result
             let fg_hint = if opts.foreground {
                 String::new()
             } else {
-                format!("\n  if SSH needs a password or host key accept, use: gritty connect --foreground {}", opts.destination)
+                format!("\n  if SSH needs a password or host key accept, use: gritty tunnel-create --foreground {}", opts.destination)
             };
             match msg {
                 Some(err) => bail!("ssh tunnel failed: {err}\n  to diagnose: {diag}{fg_hint}"),

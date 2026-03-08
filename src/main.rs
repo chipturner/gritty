@@ -497,7 +497,7 @@ fn main() {
                 }
             };
 
-            let resolved = config.resolve_connect(&connection_name);
+            let resolved = config.resolve_tunnel(&connection_name);
 
             let opts = gritty::connect::ConnectOpts {
                 destination,

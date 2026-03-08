@@ -65,13 +65,13 @@ stress count="10":
     echo "\n$pass passed, $fail failed out of {{ count }} runs"
     [[ $fail -eq 0 ]]
 
-# Run the binary (pass args, e.g. `just run new -t myproject`)
+# Run the binary (pass args, e.g. `just run connect local:myproject`)
 run *args:
     cargo run -- {{ args }}
 
 # Run a foreground debug session
 debug-session name="test":
-    RUST_LOG=debug cargo run -- new-session -t {{ name }} --foreground
+    RUST_LOG=debug cargo run -- server -f
 
 # Launch 3-pane tmux manual test (server + socat bridge + client)
 quicktest:
