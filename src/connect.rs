@@ -465,9 +465,10 @@ pub fn preflight_ssh(dest_str: &str, ssh_options: &[String]) -> anyhow::Result<(
 // Lockfile-based liveness
 // ---------------------------------------------------------------------------
 
-/// Acquire an exclusive flock on the lockfile. Returns the RAII lock on success.
-/// The lock is held for the lifetime of the returned `Flock`.
-fn acquire_lock(lock_path: &Path) -> anyhow::Result<nix::fcntl::Flock<std::fs::File>> {
+/// Try to acquire an exclusive flock (non-blocking). Returns Err if already held.
+fn try_acquire_lock(
+    lock_path: &Path,
+) -> Result<nix::fcntl::Flock<std::fs::File>, nix::errno::Errno> {
     use std::fs::OpenOptions;
     let file = OpenOptions::new()
         .create(true)
@@ -475,10 +476,8 @@ fn acquire_lock(lock_path: &Path) -> anyhow::Result<nix::fcntl::Flock<std::fs::F
         .write(true)
         .mode(0o600)
         .open(lock_path)
-        .with_context(|| format!("failed to open lockfile: {}", lock_path.display()))?;
-    nix::fcntl::Flock::lock(file, nix::fcntl::FlockArg::LockExclusive)
-        .map_err(|(_, e)| e)
-        .with_context(|| format!("failed to acquire lock on {}", lock_path.display()))
+        .map_err(|_| nix::errno::Errno::EIO)?;
+    nix::fcntl::Flock::lock(file, nix::fcntl::FlockArg::LockExclusiveNonblock).map_err(|(_, e)| e)
 }
 
 /// Probe whether a lockfile is held by a live process.
@@ -635,43 +634,43 @@ pub async fn run(opts: ConnectOpts, ready_fd: Option<OwnedFd>) -> anyhow::Result
         crate::security::secure_create_dir_all(parent)?;
     }
 
-    // 2. Check for existing tunnel via lockfile (authoritative)
-    match probe_tunnel_status(&connection_name) {
-        TunnelStatus::Healthy => {
-            println!("{}", local_sock.display());
-            let pid_hint = read_pid_hint(&connection_name);
-            match pid_hint {
-                Some(pid) => eprintln!(
-                    "\x1b[32m\u{25b8} tunnel {connection_name} already running (pid {pid})\x1b[0m"
-                ),
-                None => {
-                    eprintln!("\x1b[32m\u{25b8} tunnel {connection_name} already running\x1b[0m")
-                }
-            }
-            signal_ready(&ready_fd);
-            return Ok(0);
-        }
-        TunnelStatus::Reconnecting => {
-            let pid_hint = read_pid_hint(&connection_name);
-            match pid_hint {
-                Some(pid) => eprintln!(
-                    "\x1b[2;33m\u{25b8} tunnel {connection_name} reconnecting (pid {pid})\x1b[0m"
-                ),
-                None => {
-                    eprintln!("\x1b[2;33m\u{25b8} tunnel {connection_name} reconnecting\x1b[0m")
-                }
-            }
-            signal_ready(&ready_fd);
-            return Ok(0);
-        }
-        TunnelStatus::Stale => {
+    // 2. Try to acquire lockfile (non-blocking). If someone else holds it,
+    //    the tunnel is running or being created -- signal readiness and exit.
+    let lock_fd = match try_acquire_lock(&lock_path) {
+        Ok(lock) => {
+            // We got the lock -- any leftover files are stale (process died).
             debug!("cleaning stale tunnel files for {connection_name}");
             cleanup_stale_files(&connection_name);
+            lock
         }
-    }
-
-    // 3. Acquire lockfile (held for entire lifetime of this process)
-    let lock_fd = acquire_lock(&lock_path)?;
+        Err(_) => {
+            // Another process holds the lock -- tunnel is alive or starting.
+            let sock_exists = std::os::unix::net::UnixStream::connect(&local_sock).is_ok();
+            let pid_hint = read_pid_hint(&connection_name);
+            if sock_exists {
+                println!("{}", local_sock.display());
+                match pid_hint {
+                    Some(pid) => eprintln!(
+                        "\x1b[32m\u{25b8} tunnel {connection_name} already running (pid {pid})\x1b[0m"
+                    ),
+                    None => eprintln!(
+                        "\x1b[32m\u{25b8} tunnel {connection_name} already running\x1b[0m"
+                    ),
+                }
+            } else {
+                match pid_hint {
+                    Some(pid) => eprintln!(
+                        "\x1b[2;33m\u{25b8} tunnel {connection_name} starting (pid {pid})\x1b[0m"
+                    ),
+                    None => {
+                        eprintln!("\x1b[2;33m\u{25b8} tunnel {connection_name} starting\x1b[0m")
+                    }
+                }
+            }
+            signal_ready(&ready_fd);
+            return Ok(0);
+        }
+    };
 
     // 4. Ensure remote server is running and get socket path
     let (remote_sock, remote_version) =
@@ -1208,7 +1207,7 @@ mod tests {
         assert!(!is_lock_held(&lock_path));
 
         // Acquire the lock
-        let _fd = acquire_lock(&lock_path).unwrap();
+        let _fd = try_acquire_lock(&lock_path).unwrap();
 
         // Now it should be held
         assert!(is_lock_held(&lock_path));
