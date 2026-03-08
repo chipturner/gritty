@@ -526,7 +526,8 @@ fn read_pid_hint(name: &str) -> Option<u32> {
 fn cleanup_stale_files(name: &str) {
     let _ = std::fs::remove_file(local_socket_path(name));
     let _ = std::fs::remove_file(connect_pid_path(name));
-    let _ = std::fs::remove_file(connect_lock_path(name));
+    // Lock file is NOT removed here -- we already hold the flock on it.
+    // It's cleaned up by ConnectGuard::Drop when the tunnel exits.
     let _ = std::fs::remove_file(connect_dest_path(name));
 }
 
