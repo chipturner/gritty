@@ -5,11 +5,13 @@ use super::util::{format_age, format_timestamp, server_request};
 
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn connect_session(
-    name: String,
+    session: Option<String>,
     command: Option<String>,
     detach: bool,
     no_create: bool,
     force: bool,
+    pick: bool,
+    no_pick: bool,
     settings: gritty::config::SessionSettings,
     ctl_path: PathBuf,
     auto_start_mode: AutoStart,
@@ -19,6 +21,10 @@ pub(crate) async fn connect_session(
     use gritty::protocol::{Frame, FrameCodec};
     use tokio_util::codec::Framed;
 
+    let name = match session {
+        Some(name) => name,
+        None => pick_session(pick, no_pick, &ctl_path).await,
+    };
     let session_command = command.unwrap_or_default();
 
     // If not forcing, check whether the target session is already attached
@@ -122,6 +128,64 @@ pub(crate) async fn connect_session(
         }
         Frame::Error { message } => anyhow::bail!("{message}"),
         other => anyhow::bail!("unexpected response from server: {other:?}"),
+    }
+}
+
+/// Resolve session name when none was explicitly given.
+async fn pick_session(pick: bool, no_pick: bool, ctl_path: &Path) -> String {
+    use gritty::protocol::Frame;
+
+    if no_pick {
+        return "default".to_string();
+    }
+
+    let sessions = match server_request(&ctl_path.to_path_buf(), Frame::ListSessions).await {
+        Ok(Frame::SessionInfo { sessions }) => sessions,
+        _ => return "default".to_string(),
+    };
+
+    if sessions.is_empty() {
+        return "default".to_string();
+    }
+
+    let host = host_from_ctl_path(ctl_path);
+
+    if pick {
+        print_session_list(&host, &sessions);
+        std::process::exit(1);
+    }
+
+    let detached: Vec<_> = sessions.iter().filter(|s| !s.attached).collect();
+
+    // One session, detached: attach directly
+    if sessions.len() == 1 && detached.len() == 1 {
+        return session_display_name(&sessions[0]);
+    }
+
+    // Multiple sessions, exactly one detached: attach to the detached one
+    if detached.len() == 1 {
+        return session_display_name(detached[0]);
+    }
+
+    // Ambiguous (multiple detached) or all attached: print list and exit
+    print_session_list(&host, &sessions);
+    std::process::exit(1);
+}
+
+fn session_display_name(s: &gritty::protocol::SessionEntry) -> String {
+    if s.name.is_empty() { s.id.clone() } else { s.name.clone() }
+}
+
+fn print_session_list(host: &str, sessions: &[gritty::protocol::SessionEntry]) {
+    if sessions.len() == 1 {
+        eprintln!("error: session on {host} is already attached:");
+    } else {
+        eprintln!("error: multiple sessions on {host} -- specify one:");
+    }
+    for s in sessions {
+        let name = session_display_name(s);
+        let suffix = if s.attached { "     (attached)" } else { "" };
+        eprintln!("  gritty connect {host}:{name}{suffix}");
     }
 }
 
