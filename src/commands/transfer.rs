@@ -1,3 +1,4 @@
+use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 
 use super::util::{parse_target, resolve_ctl_path};
@@ -9,53 +10,6 @@ fn sanitize_basename(name: &str) -> anyhow::Result<String> {
         anyhow::bail!("invalid filename: {name}");
     }
     Ok(basename.to_string())
-}
-
-/// Sanitize a relative path for file transfer. Allows `/` separators for
-/// directory structure but rejects `..` components and absolute paths.
-fn sanitize_relpath(name: &str) -> anyhow::Result<String> {
-    if name.is_empty() {
-        anyhow::bail!("empty filename");
-    }
-    let path = Path::new(name);
-    if path.is_absolute() {
-        anyhow::bail!("absolute path rejected: {name}");
-    }
-    for component in path.components() {
-        match component {
-            std::path::Component::ParentDir => {
-                anyhow::bail!("path traversal rejected: {name}");
-            }
-            std::path::Component::Normal(_) => {}
-            _ => {
-                anyhow::bail!("invalid path component in: {name}");
-            }
-        }
-    }
-    Ok(name.to_string())
-}
-
-/// Recursively walk a directory, collecting `(relative_path, absolute_path)` pairs.
-/// Skips symlinks.
-fn walk_dir(base: &Path, dir: &Path) -> anyhow::Result<Vec<(String, PathBuf)>> {
-    let mut results = Vec::new();
-    for entry in std::fs::read_dir(dir).map_err(|e| anyhow::anyhow!("{}: {e}", dir.display()))? {
-        let entry = entry?;
-        let file_type = entry.file_type()?;
-        if file_type.is_symlink() {
-            continue;
-        }
-        let path = entry.path();
-        if file_type.is_dir() {
-            results.extend(walk_dir(base, &path)?);
-        } else if file_type.is_file() {
-            let rel = path
-                .strip_prefix(base)
-                .map_err(|_| anyhow::anyhow!("failed to compute relative path"))?;
-            results.push((rel.to_string_lossy().to_string(), path));
-        }
-    }
-    Ok(results)
 }
 
 struct DiscoveredSession {
@@ -243,16 +197,17 @@ async fn select_first_ready(streams: Vec<TaggedStream>) -> anyhow::Result<Tagged
 
 async fn write_send_manifest(
     stream: &mut tokio::net::UnixStream,
-    entries: &[(String, u64, PathBuf)],
+    entries: &[(String, u64, u32, PathBuf)],
 ) -> anyhow::Result<()> {
     use tokio::io::AsyncWriteExt;
     let file_count = entries.len() as u32;
     stream.write_all(&file_count.to_be_bytes()).await?;
-    for (name, size, _) in entries {
+    for (name, size, mode, _) in entries {
         let name_bytes = name.as_bytes();
         stream.write_all(&(name_bytes.len() as u16).to_be_bytes()).await?;
         stream.write_all(name_bytes).await?;
         stream.write_all(&size.to_be_bytes()).await?;
+        stream.write_all(&mode.to_be_bytes()).await?;
     }
     Ok(())
 }
@@ -275,11 +230,10 @@ pub(crate) async fn send_command(
     ctl_socket: Option<PathBuf>,
     session: Option<String>,
     use_stdin: bool,
-    recursive: bool,
     timeout: Option<u64>,
     files: Vec<PathBuf>,
 ) -> anyhow::Result<()> {
-    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt};
 
     if use_stdin && !files.is_empty() {
         anyhow::bail!("--stdin cannot be used with file arguments");
@@ -288,35 +242,33 @@ pub(crate) async fn send_command(
         anyhow::bail!("either provide files or use --stdin");
     }
 
-    // Read stdin data upfront if needed (wire protocol requires size)
-    let stdin_data = if use_stdin {
-        let mut data = Vec::new();
-        tokio::io::stdin().read_to_end(&mut data).await?;
-        Some(data)
+    // Spool stdin to a temp file so we know the size without buffering in RAM
+    let stdin_temp = if use_stdin {
+        let std_file = tempfile::tempfile()?;
+        let mut temp = tokio::fs::File::from_std(std_file);
+        let size = tokio::io::copy(&mut tokio::io::stdin(), &mut temp).await?;
+        temp.seek(std::io::SeekFrom::Start(0)).await?;
+        Some((temp, size))
     } else {
         None
     };
 
     // Validate files exist and collect metadata
-    let mut entries: Vec<(String, u64, PathBuf)> = Vec::with_capacity(files.len());
+    let mut entries: Vec<(String, u64, u32, PathBuf)> = Vec::with_capacity(files.len());
     for path in &files {
         let meta =
             std::fs::metadata(path).map_err(|e| anyhow::anyhow!("{}: {e}", path.display()))?;
         if meta.is_dir() {
-            if !recursive {
-                anyhow::bail!("{}: is a directory (use -r to send recursively)", path.display());
-            }
-            // Use the directory name as the prefix for relative paths
-            let base = path.parent().unwrap_or(Path::new("."));
-            for (rel, abs) in walk_dir(base, path)? {
-                let size = std::fs::metadata(&abs)?.len();
-                entries.push((rel, size, abs));
-            }
+            anyhow::bail!(
+                "{}: is a directory (use tar: tar czf - dir | gritty send --stdin)",
+                path.display()
+            );
         } else if meta.is_file() {
             let basename = sanitize_basename(&path.to_string_lossy())?;
-            entries.push((basename, meta.len(), path.clone()));
+            let mode = meta.permissions().mode();
+            entries.push((basename, meta.len(), mode, path.clone()));
         } else {
-            anyhow::bail!("{}: not a regular file or directory", path.display());
+            anyhow::bail!("{}: not a regular file", path.display());
         }
     }
     if !use_stdin && entries.is_empty() {
@@ -328,8 +280,8 @@ pub(crate) async fn send_command(
             .await?;
 
     // Write manifest on all streams
-    if let Some(ref data) = stdin_data {
-        let stdin_entries = vec![("stdin".to_string(), data.len() as u64, PathBuf::new())];
+    if let Some((_, size)) = &stdin_temp {
+        let stdin_entries = vec![("stdin".to_string(), *size, 0o644u32, PathBuf::new())];
         for ts in &mut tagged {
             write_send_manifest(&mut ts.stream, &stdin_entries).await?;
         }
@@ -368,18 +320,18 @@ pub(crate) async fn send_command(
     };
 
     // Stream data
-    if let Some(data) = stdin_data {
-        let total_str = gritty::client::format_size(data.len() as u64);
+    if let Some((mut temp, size)) = stdin_temp {
+        let total_str = gritty::client::format_size(size);
         eprintln!("\x1b[2;33m\u{25b8} sending stdin ({total_str})\x1b[0m");
-        stream.write_all(&data).await?;
+        tokio::io::copy(&mut temp, &mut stream).await?;
     } else {
-        let total_bytes: u64 = entries.iter().map(|(_, s, _)| s).sum();
+        let total_bytes: u64 = entries.iter().map(|(_, s, _, _)| s).sum();
         let total_str = gritty::client::format_size(total_bytes);
         let s = if entries.len() == 1 { "" } else { "s" };
         eprintln!("\x1b[2;33m\u{25b8} sending {} file{s} ({total_str})\x1b[0m", entries.len());
 
         let mut buf = vec![0u8; 64 * 1024];
-        for (name, size, path) in &entries {
+        for (name, size, _mode, path) in &entries {
             let mut file = tokio::fs::File::open(path).await?;
             let mut remaining = *size;
             let mut transferred = 0u64;
@@ -471,12 +423,15 @@ pub(crate) async fn receive_command(
         let mut name_buf = vec![0u8; name_len];
         stream.read_exact(&mut name_buf).await?;
         let name = String::from_utf8(name_buf)?;
-        let name = sanitize_relpath(&name)?;
+        let name = sanitize_basename(&name)?;
 
-        // Read file_size (u64 BE)
+        // Read file_size (u64 BE) and mode (u32 BE)
         let mut buf8 = [0u8; 8];
         stream.read_exact(&mut buf8).await?;
         let file_size = u64::from_be_bytes(buf8);
+        let mut buf4 = [0u8; 4];
+        stream.read_exact(&mut buf4).await?;
+        let mode = u32::from_be_bytes(buf4);
 
         if let Some(ref mut out) = stdout {
             // Write data to stdout
@@ -498,11 +453,12 @@ pub(crate) async fn receive_command(
             if let Some(parent) = file_path.parent() {
                 tokio::fs::create_dir_all(parent).await?;
             }
+            let recv_mode = if mode == 0 { 0o644 } else { mode & 0o7777 };
             let mut file = tokio::fs::OpenOptions::new()
                 .write(true)
                 .create(true)
                 .truncate(true)
-                .mode(0o600)
+                .mode(recv_mode)
                 .open(&file_path)
                 .await?;
             let mut remaining = file_size;
@@ -548,31 +504,5 @@ mod tests {
     #[test]
     fn sanitize_basename_rejects_dotdot() {
         assert!(sanitize_basename("..").is_err());
-    }
-
-    #[test]
-    fn sanitize_relpath_simple() {
-        assert_eq!(sanitize_relpath("foo.txt").unwrap(), "foo.txt");
-    }
-
-    #[test]
-    fn sanitize_relpath_nested() {
-        assert_eq!(sanitize_relpath("a/b/c.txt").unwrap(), "a/b/c.txt");
-    }
-
-    #[test]
-    fn sanitize_relpath_rejects_absolute() {
-        assert!(sanitize_relpath("/etc/passwd").is_err());
-    }
-
-    #[test]
-    fn sanitize_relpath_rejects_traversal() {
-        assert!(sanitize_relpath("../etc/passwd").is_err());
-        assert!(sanitize_relpath("a/../../etc").is_err());
-    }
-
-    #[test]
-    fn sanitize_relpath_rejects_empty() {
-        assert!(sanitize_relpath("").is_err());
     }
 }

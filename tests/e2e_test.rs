@@ -1326,6 +1326,7 @@ async fn send_files(svc_path: &std::path::Path, files: &[(&str, &[u8])]) {
         stream.write_all(&(name_bytes.len() as u16).to_be_bytes()).await.unwrap();
         stream.write_all(name_bytes).await.unwrap();
         stream.write_all(&(data.len() as u64).to_be_bytes()).await.unwrap();
+        stream.write_all(&0o644u32.to_be_bytes()).await.unwrap(); // mode
     }
 
     // Wait for go signal
@@ -1369,6 +1370,10 @@ async fn receive_files(svc_path: &std::path::Path) -> Vec<(String, Vec<u8>)> {
         let mut buf8 = [0u8; 8];
         stream.read_exact(&mut buf8).await.unwrap();
         let file_size = u64::from_be_bytes(buf8);
+
+        let mut buf4 = [0u8; 4];
+        stream.read_exact(&mut buf4).await.unwrap();
+        let _mode = u32::from_be_bytes(buf4);
 
         let mut data = vec![0u8; file_size as usize];
         stream.read_exact(&mut data).await.unwrap();
@@ -1539,6 +1544,7 @@ async fn send_cancel_on_sender_disconnect() {
         stream.write_all(&(name.len() as u16).to_be_bytes()).await.unwrap();
         stream.write_all(name).await.unwrap();
         stream.write_all(&(1024u64 * 1024).to_be_bytes()).await.unwrap();
+        stream.write_all(&0o644u32.to_be_bytes()).await.unwrap(); // mode
 
         // Wait for go signal
         let mut go = [0u8; 1];
@@ -1604,6 +1610,7 @@ async fn send_filename_sanitized() {
         stream.write_all(&(name.len() as u16).to_be_bytes()).await.unwrap();
         stream.write_all(name).await.unwrap();
         stream.write_all(&(file_data.len() as u64).to_be_bytes()).await.unwrap();
+        stream.write_all(&0o644u32.to_be_bytes()).await.unwrap(); // mode
         let mut go = [0u8; 1];
         stream.read_exact(&mut go).await.unwrap();
         stream.write_all(file_data).await.unwrap();
@@ -1700,6 +1707,7 @@ async fn stale_sender_does_not_poison_next_transfer() {
         stream.write_all(&(name.len() as u16).to_be_bytes()).await.unwrap();
         stream.write_all(name).await.unwrap();
         stream.write_all(&100u64.to_be_bytes()).await.unwrap();
+        stream.write_all(&0o644u32.to_be_bytes()).await.unwrap(); // mode
         // Drop stream -- server enters WaitingForReceiver with a dead sender
     }
 

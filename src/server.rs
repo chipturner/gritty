@@ -206,12 +206,12 @@ impl PortForwardTable {
 
 /// File manifest entry parsed from sender protocol.
 struct FileManifest {
-    files: Vec<(String, u64)>, // (basename, size)
+    files: Vec<(String, u64, u32)>, // (basename, size, mode)
 }
 
 impl FileManifest {
     fn total_bytes(&self) -> u64 {
-        self.files.iter().map(|(_, s)| s).sum()
+        self.files.iter().map(|(_, s, _)| s).sum()
     }
 }
 
@@ -401,7 +401,10 @@ async fn parse_sender_manifest(stream: &mut UnixStream) -> io::Result<FileManife
         let mut buf8 = [0u8; 8];
         stream.read_exact(&mut buf8).await?;
         let file_size = u64::from_be_bytes(buf8);
-        files.push((name, file_size));
+        let mut buf4m = [0u8; 4];
+        stream.read_exact(&mut buf4m).await?;
+        let mode = u32::from_be_bytes(buf4m);
+        files.push((name, file_size, mode));
     }
     Ok(FileManifest { files })
 }
@@ -564,13 +567,14 @@ fn spawn_transfer_relay(
 
         // For each file: write metadata to receiver, then relay file data
         let mut buf = vec![0u8; 64 * 1024];
-        for (name, size) in &manifest.files {
+        for (name, size, mode) in &manifest.files {
             // Write per-file header to receiver
             let name_bytes = name.as_bytes();
-            let mut hdr = Vec::with_capacity(2 + name_bytes.len() + 8);
+            let mut hdr = Vec::with_capacity(2 + name_bytes.len() + 8 + 4);
             hdr.extend_from_slice(&(name_bytes.len() as u16).to_be_bytes());
             hdr.extend_from_slice(name_bytes);
             hdr.extend_from_slice(&size.to_be_bytes());
+            hdr.extend_from_slice(&mode.to_be_bytes());
             if receiver.write_all(&hdr).await.is_err() {
                 let _ =
                     notify_tx.send(Frame::SendCancel { reason: "receiver disconnected".into() });

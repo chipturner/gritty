@@ -84,7 +84,7 @@ Local-only sessions (`gritty connect local:scratch`) are available for testing b
 - **SSH agent forwarding** -- `git push`, `ssh`, and other agent-dependent commands work remotely using your local keys (on by default); survives reconnects without stale sockets
 - **URL open forwarding** -- `$BROWSER` requests forwarded to your local machine, with automatic OAuth callback tunneling (on by default)
 - **Port forwarding** -- `gritty lf 8080` to quick-check a remote web server locally, `gritty rf 5432` to let the session reach local postgres
-- **File transfer** -- `gritty send` / `gritty receive` through the session connection, with `--stdin`/`--stdout` pipe mode
+- **File transfer** -- `gritty send` / `gritty receive` through the session connection, preserving permissions; pipe mode with `--stdin`/`--stdout` for composing with `tar` etc.
 - **Single binary, no network protocol** -- Unix domain sockets locally, SSH handles encryption and auth; optional TOML config for per-host defaults
 
 ## Commands
@@ -97,7 +97,7 @@ Local-only sessions (`gritty connect local:scratch`) are available for testing b
 | `gritty kill-session [host:session]` | | Kill a session |
 | `gritty rename <host:session> <name>` | | Rename a session |
 | `gritty kill-server [host]` | | Kill the server and all sessions |
-| `gritty send [-r] [files...]` | | Send files/directories to a paired receiver |
+| `gritty send [files...]` | | Send files to a paired receiver |
 | `gritty receive [dir]` | | Receive files from a paired sender |
 | `gritty open <url>` | | Open a URL on the local machine (for use inside gritty sessions) |
 | `gritty local-forward <port>` | `lf` | Forward a TCP port from session to client |
@@ -145,8 +145,16 @@ The `<host>` in `host:session` is a **connection name**, not an SSH destination.
 - `--session host:session`: target a specific session
 - `--stdin` (`send`): read data from stdin instead of files
 - `--stdout` (`receive`): write data to stdout instead of files
-- `-r` / `--recursive` (`send`): send directories recursively
 - `--timeout <seconds>`: deadline for pairing with a receiver/sender
+
+File permissions are preserved. For directories, use tar with pipe mode:
+
+```bash
+# sender (remote)
+tar czf - mydir | gritty send --stdin
+# receiver (local)
+gritty receive --stdout | tar xzf -
+```
 
 **Environment inside sessions:** `GRITTY_SOCK` (svc socket for `gritty open`/`send`/`receive`/port forwarding), `GRITTY_SESSION` (session ID), and `GRITTY_SESSION_NAME` (if named) are set in the shell environment. Useful for prompt customization or scripts that need to know which session they're in.
 

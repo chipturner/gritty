@@ -865,12 +865,13 @@ async fn file_transfer_single_file_through_daemon() {
     let mut receiver_stream = receiver.into_inner();
     receiver_stream.write_all(&[gritty::protocol::SvcRequest::Receive.to_byte()]).await.unwrap();
 
-    // Write sender manifest: file_count(4 bytes) + per-file(name_len(2) + name + size(8))
+    // Write sender manifest: file_count(4) + per-file(name_len(2) + name + size(8) + mode(4))
     let mut manifest = Vec::new();
     manifest.extend_from_slice(&1u32.to_be_bytes()); // file_count
     manifest.extend_from_slice(&(file_name.len() as u16).to_be_bytes()); // name_len
     manifest.extend_from_slice(file_name.as_bytes()); // name
     manifest.extend_from_slice(&(file_data.len() as u64).to_be_bytes()); // size
+    manifest.extend_from_slice(&0o644u32.to_be_bytes()); // mode
     sender_stream.write_all(&manifest).await.unwrap();
 
     // Write receiver dest dir
@@ -978,6 +979,7 @@ async fn file_transfer_receiver_first_through_daemon() {
     manifest.extend_from_slice(&(file_name.len() as u16).to_be_bytes());
     manifest.extend_from_slice(file_name.as_bytes());
     manifest.extend_from_slice(&(file_data.len() as u64).to_be_bytes());
+    manifest.extend_from_slice(&0o644u32.to_be_bytes()); // mode
     sender_stream.write_all(&manifest).await.unwrap();
 
     // Wait for go signal
@@ -1060,6 +1062,7 @@ async fn file_transfer_survives_tunnel_death() {
     manifest.extend_from_slice(&(file_name.len() as u16).to_be_bytes());
     manifest.extend_from_slice(file_name.as_bytes());
     manifest.extend_from_slice(&(file_data.len() as u64).to_be_bytes());
+    manifest.extend_from_slice(&0o644u32.to_be_bytes()); // mode
     sender_stream.write_all(&manifest).await.unwrap();
 
     // Dest dir

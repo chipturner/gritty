@@ -47,7 +47,7 @@ const HEADER_LEN: usize = 5; // type(1) + length(4)
 const MAX_FRAME_SIZE: usize = 1 << 20; // 1 MB
 
 /// Protocol version for handshake negotiation.
-pub const PROTOCOL_VERSION: u16 = 3;
+pub const PROTOCOL_VERSION: u16 = 4;
 
 /// Discriminator byte for the unified per-session service socket (`svc-{id}.sock`).
 /// Sent as the first byte on every connection to route to the correct handler.
