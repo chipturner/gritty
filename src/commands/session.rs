@@ -151,8 +151,7 @@ async fn pick_session(pick: bool, no_pick: bool, ctl_path: &Path) -> String {
     let host = host_from_ctl_path(ctl_path);
 
     if pick {
-        print_session_list(&host, &sessions);
-        std::process::exit(1);
+        return pick_or_list(&host, &sessions);
     }
 
     let detached: Vec<_> = sessions.iter().filter(|s| !s.attached).collect();
@@ -167,9 +166,8 @@ async fn pick_session(pick: bool, no_pick: bool, ctl_path: &Path) -> String {
         return session_display_name(detached[0]);
     }
 
-    // Ambiguous (multiple detached) or all attached: print list and exit
-    print_session_list(&host, &sessions);
-    std::process::exit(1);
+    // Ambiguous (multiple detached) or all attached: show picker
+    pick_or_list(&host, &sessions)
 }
 
 fn session_display_name(s: &gritty::protocol::SessionEntry) -> String {
@@ -189,11 +187,22 @@ fn print_session_list(host: &str, sessions: &[gritty::protocol::SessionEntry]) {
     }
 }
 
+/// Show picker (TUI if stderr is a TTY, static list otherwise).
+/// Returns selected name or exits on abort/non-TTY.
+fn pick_or_list(host: &str, sessions: &[gritty::protocol::SessionEntry]) -> String {
+    if std::io::IsTerminal::is_terminal(&std::io::stderr()) {
+        match tui_pick_session(host, sessions) {
+            Some(name) => name,
+            None => std::process::exit(1),
+        }
+    } else {
+        print_session_list(host, sessions);
+        std::process::exit(1);
+    }
+}
+
 /// Interactive session picker. Returns selected session name, or None on abort.
-fn tui_pick_session(
-    host: &str,
-    sessions: &[gritty::protocol::SessionEntry],
-) -> Option<String> {
+fn tui_pick_session(host: &str, sessions: &[gritty::protocol::SessionEntry]) -> Option<String> {
     use crossterm::{
         event::{self, Event, KeyCode, KeyEvent, KeyModifiers},
         terminal,
@@ -203,10 +212,7 @@ fn tui_pick_session(
     let mut stderr = std::io::stderr();
 
     // Find first detached session for initial cursor position
-    let initial = sessions
-        .iter()
-        .position(|s| !s.attached)
-        .unwrap_or(0);
+    let initial = sessions.iter().position(|s| !s.attached).unwrap_or(0);
     let mut cursor = initial;
 
     // Precompute column data
@@ -283,9 +289,7 @@ fn tui_pick_session(
         };
         match ev {
             Event::Key(KeyEvent { code: KeyCode::Up | KeyCode::Char('k'), .. }) => {
-                if cursor > 0 {
-                    cursor -= 1;
-                }
+                cursor = cursor.saturating_sub(1);
             }
             Event::Key(KeyEvent { code: KeyCode::Down | KeyCode::Char('j'), .. }) => {
                 if cursor + 1 < rows.len() {
