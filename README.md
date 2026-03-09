@@ -124,7 +124,7 @@ The `<host>` in `host:session` is a **connection name**, not an SSH destination.
 - `-c <cmd>` / `--command`: run a command instead of a login shell (when creating)
 - `-d` / `--detach`: create session without attaching (background jobs)
 - `--force`: take over an already-attached session without prompting
-- `--pick`: always show session list, even if unambiguous
+- `--pick`: always show session picker (interactive when in a terminal)
 - `--no-pick`: never show session list; always target `default`
 - `--no-create`: attach only, error if session doesn't exist
 - `--no-redraw`: don't send Ctrl-L after connecting
