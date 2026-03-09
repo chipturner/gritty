@@ -169,7 +169,7 @@ The `<host>` in `host:session` is a **connection name**, not an SSH destination.
 | No extra ports / firewall | yes | no (UDP) | no (TCP) | yes |
 | IP roaming (mobile) | reconnect | seamless | reconnect | reconnect |
 | Windows client | no | no | no | yes |
-| Maturity | 0.9 (new) | mature | mature | mature |
+| Maturity | 0.9.3 (new) | mature | mature | mature |
 
 **Where gritty wins:** seamless local-tool integration. SSH agent forwarding that survives reconnects without stale sockets. Browser opens and OAuth flows that just work remotely. Port forwarding and file transfer multiplexed over the session -- no extra tunnels or tools. Stateless client -- reboot your laptop, `gritty connect` picks up where you left off.
 

@@ -74,8 +74,8 @@ flowchart LR
         agent_sock["agent-N.sock<br/>(SSH_AUTH_SOCK)"]
         svc_sock["svc-N.sock<br/>(GRITTY_SOCK)"]
         S["gritty session"]
-        agent_sock <-->|"-A"| S
-        svc_sock -->|"-O / send / receive / lf / rf"| S
+        agent_sock <-->|"agent fwd"| S
+        svc_sock -->|"open / send / receive / lf / rf"| S
     end
 
     S <-->|"relayed over<br/>session connection"| C
@@ -91,9 +91,9 @@ flowchart LR
 
 Forwarding multiplexes over the existing session connection -- no extra tunnels.
 
-**SSH agent** (`-A`): the session creates `agent-N.sock` and sets `SSH_AUTH_SOCK`. When a remote process (e.g. `git push`) connects, the request is relayed to the client's local SSH agent and back.
+**SSH agent forwarding** (on by default; disable with `--no-forward-agent`): the session creates `agent-N.sock` and sets `SSH_AUTH_SOCK`. When a remote process (e.g. `git push`) connects, the request is relayed to the client's local SSH agent and back.
 
-**URL open** (`-O`): the session sets `GRITTY_SOCK` and `BROWSER=gritty open`. When `gritty open <url>` runs, the URL is relayed to the client which opens it locally. **OAuth callback tunneling:** if the URL contains a `redirect_uri` pointing to `localhost` or `127.0.0.1`, gritty automatically creates a multi-channel reverse TCP tunnel (with idle timeout) so the OAuth callback reaches the remote program -- this binds a TCP port on your local machine for the duration of the callback. This handles the common case where a CLI tool opens a browser for OAuth login and waits for the redirect on a local port. Disable with `--no-oauth-redirect`; adjust the accept timeout with `--oauth-timeout <seconds>` (default: 180). Note that `-O` is a trust grant -- it gives processes inside the remote session the ability to open URLs and bind TCP ports on your local machine. Only use it with sessions you control.
+**URL open forwarding** (on by default; disable with `--no-forward-open`): the session sets `GRITTY_SOCK` and `BROWSER=gritty open`. When `gritty open <url>` runs, the URL is relayed to the client which opens it locally. **OAuth callback tunneling:** if the URL contains a `redirect_uri` pointing to `localhost` or `127.0.0.1`, gritty automatically creates a multi-channel reverse TCP tunnel (with idle timeout) so the OAuth callback reaches the remote program -- this binds a TCP port on your local machine for the duration of the callback. This handles the common case where a CLI tool opens a browser for OAuth login and waits for the redirect on a local port. Disable with `--no-oauth-redirect`; adjust the accept timeout with `--oauth-timeout <seconds>` (default: 180). Note that URL open forwarding is a trust grant -- it gives processes inside the remote session the ability to open URLs and bind TCP ports on your local machine. Only use it with sessions you control.
 
 ## Single-Socket Protocol
 
