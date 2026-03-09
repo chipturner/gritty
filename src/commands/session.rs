@@ -189,6 +189,142 @@ fn print_session_list(host: &str, sessions: &[gritty::protocol::SessionEntry]) {
     }
 }
 
+/// Interactive session picker. Returns selected session name, or None on abort.
+fn tui_pick_session(
+    host: &str,
+    sessions: &[gritty::protocol::SessionEntry],
+) -> Option<String> {
+    use crossterm::{
+        event::{self, Event, KeyCode, KeyEvent, KeyModifiers},
+        terminal,
+    };
+    use std::io::Write;
+
+    let mut stderr = std::io::stderr();
+
+    // Find first detached session for initial cursor position
+    let initial = sessions
+        .iter()
+        .position(|s| !s.attached)
+        .unwrap_or(0);
+    let mut cursor = initial;
+
+    // Precompute column data
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+
+    struct Row {
+        name: String,
+        attached: bool,
+        age: String,
+        cmd: String,
+    }
+
+    let rows: Vec<Row> = sessions
+        .iter()
+        .map(|s| Row {
+            name: session_display_name(s),
+            attached: s.attached,
+            age: format_age(now, s.created_at),
+            cmd: s.foreground_cmd.clone(),
+        })
+        .collect();
+
+    let name_w = rows.iter().map(|r| r.name.len()).max().unwrap_or(0);
+    let tag_w = 10; // "(attached)" is 10 chars
+    let age_w = rows.iter().map(|r| r.age.len()).max().unwrap_or(0);
+    let total_lines = rows.len() + 1; // +1 for header
+
+    // Enter raw mode
+    let _ = terminal::enable_raw_mode();
+    let _ = write!(stderr, "\x1b[?25l"); // hide cursor
+
+    let render = |stderr: &mut std::io::Stderr, cursor: usize| {
+        // Header: cyan bold
+        let _ = write!(stderr, "\x1b[36;1mPick a session on {host}:\x1b[0m\r\n");
+        for (i, row) in rows.iter().enumerate() {
+            let marker = if i == cursor { "\x1b[32;1m\u{25b8}\x1b[0m" } else { " " };
+            let tag = if row.attached { "(attached)" } else { "" };
+
+            if i == cursor {
+                // Selected: green bold
+                let _ = write!(
+                    stderr,
+                    "{marker} \x1b[32;1m{:<name_w$}\x1b[0m  {:<tag_w$}  \x1b[32m{:<age_w$}\x1b[0m  \x1b[32m{}\x1b[0m\r\n",
+                    row.name, tag, row.age, row.cmd,
+                );
+            } else if row.attached {
+                // Attached: dimmed
+                let _ = write!(
+                    stderr,
+                    "{marker} \x1b[2m{:<name_w$}  {:<tag_w$}  {:<age_w$}  {}\x1b[0m\r\n",
+                    row.name, tag, row.age, row.cmd,
+                );
+            } else {
+                // Normal
+                let _ = write!(
+                    stderr,
+                    "{marker} {:<name_w$}  {:<tag_w$}  {:<age_w$}  {}\r\n",
+                    row.name, tag, row.age, row.cmd,
+                );
+            }
+        }
+        let _ = stderr.flush();
+    };
+
+    // Initial render
+    render(&mut stderr, cursor);
+
+    let result = loop {
+        let Ok(ev) = event::read() else {
+            break None;
+        };
+        match ev {
+            Event::Key(KeyEvent { code: KeyCode::Up | KeyCode::Char('k'), .. }) => {
+                if cursor > 0 {
+                    cursor -= 1;
+                }
+            }
+            Event::Key(KeyEvent { code: KeyCode::Down | KeyCode::Char('j'), .. }) => {
+                if cursor + 1 < rows.len() {
+                    cursor += 1;
+                }
+            }
+            Event::Key(KeyEvent { code: KeyCode::Enter, .. }) => {
+                break Some(rows[cursor].name.clone());
+            }
+            Event::Key(KeyEvent { code: KeyCode::Esc | KeyCode::Char('q'), .. }) => {
+                break None;
+            }
+            Event::Key(KeyEvent {
+                code: KeyCode::Char('c'),
+                modifiers: KeyModifiers::CONTROL,
+                ..
+            }) => {
+                break None;
+            }
+            _ => continue, // don't re-render for unknown events
+        }
+        // Move cursor up to re-render in place
+        let _ = write!(stderr, "\x1b[{}A", total_lines);
+        render(&mut stderr, cursor);
+    };
+
+    // Cleanup: erase picker lines, restore terminal
+    let _ = write!(stderr, "\x1b[{}A", total_lines); // move up
+    for _ in 0..total_lines {
+        let _ = write!(stderr, "\x1b[2K\r\n"); // clear each line
+    }
+    let _ = write!(stderr, "\x1b[{}A", total_lines); // move back up
+    let _ = write!(stderr, "\x1b[?25h"); // show cursor
+    let _ = stderr.flush();
+    let _ = terminal::disable_raw_mode();
+
+    result
+}
+
 /// Query the daemon for a specific session by name, returning its entry if found.
 /// Returns Ok(None) if the server isn't running or the session doesn't exist.
 async fn find_session(
