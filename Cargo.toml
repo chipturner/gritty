@@ -25,6 +25,7 @@ anyhow = "1"
 bytes = "1"
 clap = { version = "4", features = ["derive"] }
 clap_complete = "4"
+crossterm = { version = "0.28", default-features = false, features = ["events"] }
 directories = "6"
 futures-util = { version = "0.3", features = ["sink"] }
 humansize = "2"
