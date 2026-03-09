@@ -408,7 +408,7 @@ async fn send_init_frames(
     forward_open: bool,
     redraw: bool,
 ) -> bool {
-    if !env_vars.is_empty() && !timed_send(framed, Frame::Env { vars: env_vars.to_vec() }).await {
+    if !timed_send(framed, Frame::Env { vars: env_vars.to_vec() }).await {
         return false;
     }
     if forward_agent && agent_socket.is_some() && !timed_send(framed, Frame::AgentForward).await {
@@ -1175,7 +1175,7 @@ pub async fn run(
                 let reconnect_started = Instant::now();
                 write_stdout_async(
                     &async_stdout,
-                    b"\r\n\x1b[2;33m\xe2\x96\xb8 reconnecting...\x1b[0m",
+                    b"\r\n\x1b[2;33m\xe2\x96\xb8 reconnecting... (Ctrl-C to abort)\x1b[0m",
                 )
                 .await?;
 
@@ -1200,7 +1200,7 @@ pub async fn run(
                     let elapsed = reconnect_started.elapsed().as_secs();
                     write_stdout_async(
                         &async_stdout,
-                        format!("\r\x1b[2;33m\u{25b8} reconnecting... {elapsed}s\x1b[0m\x1b[K")
+                        format!("\r\x1b[2;33m\u{25b8} reconnecting... {elapsed}s (Ctrl-C to abort)\x1b[0m\x1b[K")
                             .as_bytes(),
                     )
                     .await?;
@@ -1340,11 +1340,13 @@ pub async fn tail(
             Some(code) => break code,
             None => {
                 let reconnect_started = Instant::now();
-                eprint!("\x1b[2;33m\u{25b8} reconnecting...\x1b[0m");
+                eprint!("\x1b[2;33m\u{25b8} reconnecting... (Ctrl-C to abort)\x1b[0m");
                 loop {
                     tokio::time::sleep(Duration::from_secs(1)).await;
                     let elapsed = reconnect_started.elapsed().as_secs();
-                    eprint!("\r\x1b[2;33m\u{25b8} reconnecting... {elapsed}s\x1b[0m\x1b[K");
+                    eprint!(
+                        "\r\x1b[2;33m\u{25b8} reconnecting... {elapsed}s (Ctrl-C to abort)\x1b[0m\x1b[K"
+                    );
 
                     let stream = match UnixStream::connect(ctl_path).await {
                         Ok(s) => s,

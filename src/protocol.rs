@@ -665,12 +665,6 @@ impl Decoder for FrameCodec {
             TYPE_OPEN_URL => Ok(Some(Frame::OpenUrl { url: decode_string(payload)? })),
             TYPE_SEND_CANCEL => Ok(Some(Frame::SendCancel { reason: decode_string(payload)? })),
             TYPE_NEW_SESSION => {
-                if payload.len() < 2 {
-                    return Ok(Some(Frame::NewSession {
-                        name: String::new(),
-                        command: String::new(),
-                    }));
-                }
                 let name_len = read_u16(&payload, 0) as usize;
                 if 2 + name_len > payload.len() {
                     return Err(io::Error::new(

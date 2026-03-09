@@ -56,7 +56,7 @@ pub struct ConfigFile {
 
 /// Global defaults section.
 #[derive(Debug, Clone, Default, Deserialize)]
-#[serde(default, rename_all = "kebab-case")]
+#[serde(default, deny_unknown_fields, rename_all = "kebab-case")]
 pub struct Defaults {
     pub forward_agent: Option<bool>,
     pub forward_open: Option<bool>,
@@ -73,7 +73,7 @@ pub struct Defaults {
 
 /// Tunnel-specific defaults nested under [defaults.tunnel].
 #[derive(Debug, Clone, Default, Deserialize)]
-#[serde(default, rename_all = "kebab-case")]
+#[serde(default, deny_unknown_fields, rename_all = "kebab-case")]
 pub struct TunnelDefaults {
     pub ssh_options: Option<Vec<String>>,
     pub no_server_start: Option<bool>,
@@ -81,7 +81,7 @@ pub struct TunnelDefaults {
 
 /// Per-host override section.
 #[derive(Debug, Clone, Default, Deserialize)]
-#[serde(default, rename_all = "kebab-case")]
+#[serde(default, deny_unknown_fields, rename_all = "kebab-case")]
 pub struct HostConfig {
     pub forward_agent: Option<bool>,
     pub forward_open: Option<bool>,
@@ -415,16 +415,15 @@ mod tests {
     }
 
     #[test]
-    fn unknown_keys_ignored() {
-        let cfg: ConfigFile = toml::from_str(
+    fn unknown_keys_rejected() {
+        let result: Result<ConfigFile, _> = toml::from_str(
             r#"
             [defaults]
             forward-agent = true
             some-future-setting = "ignored"
             "#,
-        )
-        .unwrap();
-        assert!(cfg.resolve_session(None).forward_agent);
+        );
+        assert!(result.is_err());
     }
 
     #[test]

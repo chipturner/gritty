@@ -251,7 +251,7 @@ fn extract_redirect_port(url_str: &str) -> Option<u16> {
         }
         let redirect = url::Url::parse(&value).ok()?;
         match redirect.host_str()? {
-            "localhost" | "127.0.0.1" => return redirect.port(),
+            "localhost" | "127.0.0.1" | "::1" => return redirect.port(),
             _ => {}
         }
     }

@@ -150,7 +150,7 @@ The `<host>` in `host:session` is a **connection name**, not an SSH destination.
 
 **Environment inside sessions:** `GRITTY_SOCK` (svc socket for `gritty open`/`send`/`receive`/port forwarding), `GRITTY_SESSION` (session ID), and `GRITTY_SESSION_NAME` (if named) are set in the shell environment. Useful for prompt customization or scripts that need to know which session they're in.
 
-**Port forwarding:** port spec is `PORT` (same on both ends) or `LISTEN_PORT:TARGET_PORT`. Runs inside a session (`GRITTY_SOCK` required). Ctrl-C stops the forward. These are transient, on-demand forwards -- great for quick checks during development. For always-on port forwarding, configure it on the SSH tunnel instead: `gritty tunnel-create devbox -o "LocalForward=8080 localhost:8080"` or add it to `ssh-options` in your config file.
+**Port forwarding:** port spec is `PORT` (same on both ends) or `LISTEN_PORT:TARGET_PORT`. Runs inside a session (`GRITTY_SOCK` required). Ctrl-C stops the forward. All forwarding binds to `127.0.0.1` only -- there is no bind-address option (unlike SSH's `-L`/`-R`). These are transient, on-demand forwards -- great for quick checks during development. For always-on port forwarding, configure it on the SSH tunnel instead: `gritty tunnel-create devbox -o "LocalForward=8080 localhost:8080"` or add it to `ssh-options` in your config file.
 
 ## Comparison
 
