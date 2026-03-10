@@ -6,8 +6,51 @@ use std::os::fd::{AsRawFd, OwnedFd};
 use std::path::{Path, PathBuf};
 use tracing_subscriber::EnvFilter;
 
+// help_template left-aligned so the string content has no spurious indentation
 #[derive(Parser)]
-#[command(name = "gritty", about = "Persistent TTY sessions over Unix domain sockets")]
+#[command(
+    name = "gritty",
+    about = "Persistent TTY sessions over Unix domain sockets",
+    help_template = "\
+{before-help}{about}
+
+{usage-heading} {usage}
+
+Sessions:
+  connect (c)            Attach or create a session
+  list-sessions (ls)     List active sessions
+  tail (t)               Read-only stream of session output
+  kill-session           Kill a session
+  rename                 Rename a session
+  kill-server            Kill the server and all sessions
+
+Tunnels:
+  tunnels (tun)          List active SSH tunnels
+  tunnel-create          Set up SSH tunnel to a remote host
+  tunnel-destroy         Tear down an SSH tunnel
+
+In-session (run inside a gritty session):
+  local-forward (lf)     Forward a port: session to client
+  remote-forward (rf)    Forward a port: client to session
+  send                   Send files to a paired receiver
+  receive                Receive files from a paired sender
+  open                   Open a URL on the local machine
+
+Configuration:
+  info                   Show diagnostics (paths, server, tunnels)
+  config-edit            Open config in $VISUAL/$EDITOR/vi
+
+Plumbing:
+  server (s)             Start the server
+  completions            Generate shell completions
+  socket-path            Print the default socket path
+  protocol-version       Print the protocol version
+
+Options:
+{options}
+See 'gritty help <command>' for details.
+{after-help}"
+)]
 struct Cli {
     /// Path to the server control socket (overrides default)
     #[arg(long, global = true)]
@@ -91,31 +134,31 @@ enum Command {
         no_pick: bool,
     },
     /// Tail a session's output (read-only, like tail -f)
-    #[command(display_order = 1, visible_alias = "t")]
+    #[command(display_order = 2, visible_alias = "t")]
     Tail {
         /// Target host and session (host:session)
         target: Option<String>,
     },
     /// List active sessions
-    #[command(display_order = 2, visible_alias = "ls", visible_alias = "list")]
+    #[command(display_order = 1, visible_alias = "ls", visible_alias = "list")]
     ListSessions {
         /// Target host
         target: Option<String>,
     },
-    /// Kill a specific session
+    /// Kill a session
     #[command(display_order = 3)]
     KillSession {
         /// Target host and session (host:session)
         target: Option<String>,
     },
     /// Kill the server and all sessions
-    #[command(display_order = 4)]
+    #[command(display_order = 5)]
     KillServer {
         /// Target host
         target: Option<String>,
     },
     /// Rename a session
-    #[command(display_order = 5)]
+    #[command(display_order = 4)]
     Rename {
         /// Target host and session (host:session)
         target: String,
@@ -124,7 +167,7 @@ enum Command {
     },
     // -- In-session tools --
     /// Send files to a paired receiver
-    #[command(display_order = 10)]
+    #[command(display_order = 32)]
     Send {
         /// Session to use (host:session); auto-detected if omitted
         #[arg(long)]
@@ -142,7 +185,7 @@ enum Command {
         files: Vec<PathBuf>,
     },
     /// Receive files from a paired sender
-    #[command(display_order = 11)]
+    #[command(display_order = 33)]
     Receive {
         /// Session to use (host:session); auto-detected if omitted
         #[arg(long)]
@@ -160,26 +203,26 @@ enum Command {
         dir: Option<PathBuf>,
     },
     /// Open a URL on the local machine (for use inside gritty sessions)
-    #[command(display_order = 12)]
+    #[command(display_order = 34)]
     Open {
         /// URL to open
         url: String,
     },
     /// Forward a port from the session to the client (listen on session, connect on client)
-    #[command(display_order = 13, visible_alias = "lf")]
+    #[command(display_order = 30, visible_alias = "lf")]
     LocalForward {
         /// Port spec: PORT or LISTEN_PORT:TARGET_PORT
         port: String,
     },
     /// Forward a port from the client to the session (listen on client, connect on session)
-    #[command(display_order = 14, visible_alias = "rf")]
+    #[command(display_order = 31, visible_alias = "rf")]
     RemoteForward {
         /// Port spec: PORT or LISTEN_PORT:TARGET_PORT
         port: String,
     },
     // -- Tunnels --
     /// Set up SSH tunnel to a remote host (backgrounds by default)
-    #[command(display_order = 20)]
+    #[command(display_order = 11)]
     TunnelCreate {
         /// Remote destination ([user@]host[:port])
         destination: String,
@@ -209,40 +252,40 @@ enum Command {
         ignore_version_mismatch: bool,
     },
     /// Tear down an SSH tunnel by connection name
-    #[command(display_order = 21)]
+    #[command(display_order = 12)]
     TunnelDestroy {
         /// Connection name (as shown in `gritty tunnels`)
         name: String,
     },
     /// List active SSH tunnels
-    #[command(display_order = 22, visible_alias = "tun")]
+    #[command(display_order = 10, visible_alias = "tun")]
     Tunnels,
     // -- Server & config --
     /// Start the server (backgrounds by default, use -f to stay in foreground)
-    #[command(display_order = 30, visible_alias = "s")]
+    #[command(display_order = 40, visible_alias = "s")]
     Server {
         /// Run in the foreground instead of daemonizing
         #[arg(long, short = 'f')]
         foreground: bool,
     },
     /// Show diagnostics (paths, server status, tunnels)
-    #[command(display_order = 31)]
+    #[command(display_order = 20)]
     Info,
     /// Open config file in $VISUAL/$EDITOR/vi (creates from template if missing)
-    #[command(display_order = 32)]
+    #[command(display_order = 21)]
     ConfigEdit,
     /// Generate shell completions
-    #[command(display_order = 33)]
+    #[command(display_order = 41)]
     Completions {
         /// Shell to generate completions for
         shell: clap_complete::Shell,
     },
     // -- Internal/plumbing --
     /// Print the default socket path
-    #[command(display_order = 40, visible_alias = "socket")]
+    #[command(display_order = 42, visible_alias = "socket")]
     SocketPath,
     /// Print the protocol version number
-    #[command(display_order = 41)]
+    #[command(display_order = 43)]
     ProtocolVersion,
 }
 

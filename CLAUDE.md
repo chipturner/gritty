@@ -11,22 +11,22 @@ Persistent TTY sessions over Unix domain sockets. Single binary, tmux-like CLI. 
 | Command | Alias | Description |
 |---------|-------|-------------|
 | `connect [host[:name]]` | `c` | Smart session: attach if exists, create if not |
+| `list-sessions [host]` | `ls`, `list` | List sessions (all servers if no host) |
 | `tail [host:session]` | `t` | Read-only stream of session output |
-| `list-sessions [host]` | `ls`, `list` | List sessions (all daemons if no host) |
 | `kill-session [host:session]` | | Kill a session |
 | `rename <host:session> <name>` | | Rename a session |
 | `kill-server [host]` | | Kill the server and all sessions |
-| `send [files...]` | | Send files to paired receiver |
-| `receive [dir]` | | Receive files from paired sender |
-| `open <url>` | | Open a URL on the local machine (for use inside gritty sessions) |
-| `local-forward <port>` | `lf` | Forward TCP port: session to client |
-| `remote-forward <port>` | `rf` | Forward TCP port: client to session |
+| `tunnels` | `tun` | List active SSH tunnels |
 | `tunnel-create <destination>` | | SSH tunnel to remote host |
 | `tunnel-destroy <name>` | | Tear down SSH tunnel |
-| `tunnels` | `tun` | List active SSH tunnels |
-| `server` | `s` | Start the server (backgrounds by default, `-f` for foreground) |
+| `local-forward <port>` | `lf` | Forward TCP port: session to client |
+| `remote-forward <port>` | `rf` | Forward TCP port: client to session |
+| `send [files...]` | | Send files to a paired receiver |
+| `receive [dir]` | | Receive files from a paired sender |
+| `open <url>` | | Open a URL on the local machine (for use inside gritty sessions) |
 | `info` | | Show diagnostics |
 | `config-edit` | | Open config in `$VISUAL`/`$EDITOR`/vi |
+| `server` | `s` | Start the server (backgrounds by default, `-f` for foreground) |
 | `completions <shell>` | | Generate shell completions |
 | `socket-path` | `socket` | Print the default socket path |
 | `protocol-version` | | Print the protocol version number |
