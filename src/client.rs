@@ -708,36 +708,32 @@ impl ClientRelay<'_> {
                     }
                 }
             }
-            // Port forward: new TCP connection from server side (local-fwd)
+            // Port forward: new TCP connection from server side
             Some(Ok(Frame::PortForwardOpen { forward_id, channel_id, target_port })) => {
-                if self.pf.forwards.contains_key(&forward_id) || forward_id == u32::MAX {
-                    // forward_id == u32::MAX is a "don't track" sentinel for local-fwd
-                    match tokio::net::TcpStream::connect(("127.0.0.1", target_port)).await {
-                        Ok(stream) => {
-                            let (read_half, write_half) = stream.into_split();
-                            let data_tx = self.pf_event_tx.clone();
-                            let close_tx = self.pf_event_tx.clone();
-                            let writer_tx = crate::spawn_channel_relay(
-                                channel_id,
-                                read_half,
-                                write_half,
-                                move |id, data| {
-                                    data_tx
-                                        .send(ClientPortForwardEvent::Data { channel_id: id, data })
-                                        .is_ok()
-                                },
-                                move |id| {
-                                    let _ = close_tx
-                                        .send(ClientPortForwardEvent::Closed { channel_id: id });
-                                },
-                            );
-                            self.pf.channels.insert(channel_id, (forward_id, writer_tx));
-                        }
-                        Err(e) => {
-                            debug!(channel_id, target_port, "pf connect failed: {e}");
-                            let _ =
-                                timed_send(framed, Frame::PortForwardClose { channel_id }).await;
-                        }
+                match tokio::net::TcpStream::connect(("127.0.0.1", target_port)).await {
+                    Ok(stream) => {
+                        let (read_half, write_half) = stream.into_split();
+                        let data_tx = self.pf_event_tx.clone();
+                        let close_tx = self.pf_event_tx.clone();
+                        let writer_tx = crate::spawn_channel_relay(
+                            channel_id,
+                            read_half,
+                            write_half,
+                            move |id, data| {
+                                data_tx
+                                    .send(ClientPortForwardEvent::Data { channel_id: id, data })
+                                    .is_ok()
+                            },
+                            move |id| {
+                                let _ = close_tx
+                                    .send(ClientPortForwardEvent::Closed { channel_id: id });
+                            },
+                        );
+                        self.pf.channels.insert(channel_id, (forward_id, writer_tx));
+                    }
+                    Err(e) => {
+                        debug!(channel_id, target_port, "pf connect failed: {e}");
+                        let _ = timed_send(framed, Frame::PortForwardClose { channel_id }).await;
                     }
                 }
             }

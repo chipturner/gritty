@@ -839,7 +839,7 @@ async fn file_transfer_single_file_through_daemon() {
 
     // Sender: connect, handshake, SendFile with role=2 (Send)
     let mut sender = connect_and_handshake(&env.proxy_path).await;
-    sender.send(Frame::SendFile { session: id.clone(), role: 2 }).await.unwrap();
+    sender.send(Frame::SendFile { session: id.clone() }).await.unwrap();
     let resp = timeout(Duration::from_secs(5), sender.next())
         .await
         .expect("timed out")
@@ -854,7 +854,7 @@ async fn file_transfer_single_file_through_daemon() {
     // Receiver: connect, handshake, SendFile with role=3 (Receive)
     let recv_dir = tempfile::tempdir().unwrap();
     let mut receiver = connect_and_handshake(&env.proxy_path).await;
-    receiver.send(Frame::SendFile { session: id.clone(), role: 3 }).await.unwrap();
+    receiver.send(Frame::SendFile { session: id.clone() }).await.unwrap();
     let resp = timeout(Duration::from_secs(5), receiver.next())
         .await
         .expect("timed out")
@@ -945,7 +945,7 @@ async fn file_transfer_receiver_first_through_daemon() {
 
     // Receiver connects first
     let mut receiver = connect_and_handshake(&env.proxy_path).await;
-    receiver.send(Frame::SendFile { session: id.clone(), role: 3 }).await.unwrap();
+    receiver.send(Frame::SendFile { session: id.clone() }).await.unwrap();
     let resp = timeout(Duration::from_secs(5), receiver.next())
         .await
         .expect("timed out")
@@ -964,7 +964,7 @@ async fn file_transfer_receiver_first_through_daemon() {
 
     // Then sender connects
     let mut sender = connect_and_handshake(&env.proxy_path).await;
-    sender.send(Frame::SendFile { session: id.clone(), role: 2 }).await.unwrap();
+    sender.send(Frame::SendFile { session: id.clone() }).await.unwrap();
     let resp = timeout(Duration::from_secs(5), sender.next())
         .await
         .expect("timed out")
@@ -1035,7 +1035,7 @@ async fn file_transfer_survives_tunnel_death() {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
     let mut sender = connect_and_handshake(&env.proxy_path).await;
-    sender.send(Frame::SendFile { session: id.clone(), role: 2 }).await.unwrap();
+    sender.send(Frame::SendFile { session: id.clone() }).await.unwrap();
     let resp = timeout(Duration::from_secs(5), sender.next())
         .await
         .expect("timed out")
@@ -1046,7 +1046,7 @@ async fn file_transfer_survives_tunnel_death() {
     sender_stream.write_all(&[gritty::protocol::SvcRequest::Send.to_byte()]).await.unwrap();
 
     let mut receiver = connect_and_handshake(&env.proxy_path).await;
-    receiver.send(Frame::SendFile { session: id.clone(), role: 3 }).await.unwrap();
+    receiver.send(Frame::SendFile { session: id.clone() }).await.unwrap();
     let resp = timeout(Duration::from_secs(5), receiver.next())
         .await
         .expect("timed out")

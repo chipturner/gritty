@@ -47,7 +47,7 @@ const HEADER_LEN: usize = 5; // type(1) + length(4)
 const MAX_FRAME_SIZE: usize = 1 << 20; // 1 MB
 
 /// Protocol version for handshake negotiation.
-pub const PROTOCOL_VERSION: u16 = 4;
+pub const PROTOCOL_VERSION: u16 = 5;
 
 /// Discriminator byte for the unified per-session service socket (`svc-{id}.sock`).
 /// Sent as the first byte on every connection to route to the correct handler.
@@ -198,7 +198,6 @@ pub enum Frame {
     /// Local-side file transfer routing (client → daemon).
     SendFile {
         session: String,
-        role: u8,
     },
     NewSession {
         name: String,
@@ -708,11 +707,9 @@ impl Decoder for FrameCodec {
             TYPE_ENV => decode_env(payload),
             TYPE_SESSION_INFO => decode_session_info(payload),
             TYPE_SEND_FILE => {
-                expect_min_len(&payload, 1, "send file")?;
-                let role = payload[payload.len() - 1];
-                let session = String::from_utf8(payload[..payload.len() - 1].to_vec())
+                let session = String::from_utf8(payload.to_vec())
                     .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
-                Ok(Some(Frame::SendFile { session, role }))
+                Ok(Some(Frame::SendFile { session }))
             }
 
             _ => Err(io::Error::new(
@@ -834,12 +831,7 @@ impl Encoder<Frame> for FrameCodec {
             // Custom frames
             Frame::Env { vars } => encode_env(dst, &vars),
             Frame::SessionInfo { sessions } => encode_session_info(dst, &sessions),
-            Frame::SendFile { session, role } => {
-                dst.put_u8(TYPE_SEND_FILE);
-                dst.put_u32((session.len() + 1) as u32);
-                dst.extend_from_slice(session.as_bytes());
-                dst.put_u8(role);
-            }
+            Frame::SendFile { session } => encode_str(dst, TYPE_SEND_FILE, &session),
         }
         Ok(())
     }

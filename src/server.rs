@@ -107,6 +107,8 @@ enum PortForwardEvent {
     Closed { channel_id: u32 },
     /// Svc socket dropped -- teardown forward.
     Stopped { forward_id: u32 },
+    /// Remote-forward: client didn't respond with PortForwardReady in time.
+    RemoteTimeout { forward_id: u32 },
 }
 
 /// Per-forward state tracked by the server.
@@ -1023,6 +1025,12 @@ impl ServerRelay<'_> {
                         })
                         .await;
                     self.pf.pending_remote.insert(fwd_id, stream);
+                    let timeout_tx = self.pf_event_tx.clone();
+                    tokio::spawn(async move {
+                        tokio::time::sleep(Duration::from_secs(5)).await;
+                        let _ =
+                            timeout_tx.send(PortForwardEvent::RemoteTimeout { forward_id: fwd_id });
+                    });
                     self.pf.forwards.insert(
                         fwd_id,
                         PortForwardState {
@@ -1097,6 +1105,16 @@ impl ServerRelay<'_> {
                     for ch_id in fwd.channels.keys() {
                         self.pf.channels.remove(ch_id);
                     }
+                    let _ = framed.send(Frame::PortForwardStop { forward_id }).await;
+                }
+            }
+            Some(PortForwardEvent::RemoteTimeout { forward_id }) => {
+                if let Some(mut svc_stream) = self.pf.pending_remote.remove(&forward_id) {
+                    use tokio::io::AsyncWriteExt;
+                    debug!(forward_id, "remote-forward: client did not respond in time");
+                    let _ = svc_stream.write_all(&[0x02]).await;
+                    let _ = svc_stream.write_all(b"timed out waiting for client").await;
+                    self.pf.forwards.remove(&forward_id);
                     let _ = framed.send(Frame::PortForwardStop { forward_id }).await;
                 }
             }

@@ -848,19 +848,9 @@ fn roundtrip_send_cancel_empty() {
 fn roundtrip_send_file() {
     let mut codec = FrameCodec;
     let mut buf = BytesMut::new();
-    let original = Frame::SendFile { session: "myproject".to_string(), role: b'S' };
+    let original = Frame::SendFile { session: "myproject".to_string() };
     codec.encode(original.clone(), &mut buf).unwrap();
     assert_eq!(buf[0], 0x25);
-    let decoded = codec.decode(&mut buf).unwrap().unwrap();
-    assert_eq!(original, decoded);
-}
-
-#[test]
-fn roundtrip_send_file_receiver() {
-    let mut codec = FrameCodec;
-    let mut buf = BytesMut::new();
-    let original = Frame::SendFile { session: "0".to_string(), role: b'R' };
-    codec.encode(original.clone(), &mut buf).unwrap();
     let decoded = codec.decode(&mut buf).unwrap().unwrap();
     assert_eq!(original, decoded);
 }
@@ -877,13 +867,13 @@ fn send_offer_wrong_payload_size() {
 }
 
 #[test]
-fn send_file_empty_payload() {
+fn send_file_empty_session() {
     let mut codec = FrameCodec;
     let mut buf = BytesMut::new();
     buf.put_u8(0x25); // TYPE_SEND_FILE
-    buf.put_u32(0); // empty
-    let err = codec.decode(&mut buf).unwrap_err();
-    assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
+    buf.put_u32(0); // empty session
+    let decoded = codec.decode(&mut buf).unwrap().unwrap();
+    assert_eq!(decoded, Frame::SendFile { session: String::new() });
 }
 
 #[test]

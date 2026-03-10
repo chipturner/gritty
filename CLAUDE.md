@@ -84,8 +84,6 @@ Handshake: `0x16` Hello, `0x24` HelloAck. Relay: `0x01` Data, `0x02` Resize, `0x
 
 `SvcRequest`: `OpenUrl=1`, `Send=2`, `Receive=3`, `PortForward=4` (1-byte discriminator).
 
-`PortForwardOpen`: `forward_id == u32::MAX` is a "don't track" sentinel used for local-forward connections (server-initiated, no matching client-side listener to track).
-
 File transfer manifest (svc socket, not Frame protocol): sender writes `[file_count: u32][per file: [name_len: u16][name: bytes][size: u64][mode: u32]]`. Server relays per-file headers `[name_len: u16][name: bytes][size: u64][mode: u32]` to receiver, then `size` bytes of data. Sentinel `[name_len: 0x0000]` ends transfer. `--stdin` spools to a temp file for size discovery.
 
 ## Key Patterns

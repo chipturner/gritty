@@ -89,6 +89,8 @@ async fn discover_all_sessions(
 }
 
 /// Connect to the daemon, handshake, send SendFile, extract raw stream.
+/// The `role` byte is written on the raw stream after framing is stripped,
+/// so the session's `handle_send_stream` can route to Send or Receive.
 async fn send_file_handshake(
     ctl_path: &Path,
     session: &str,
@@ -104,7 +106,7 @@ async fn send_file_handshake(
     })?;
     let mut framed = Framed::new(stream, FrameCodec);
     gritty::handshake(&mut framed).await?;
-    framed.send(Frame::SendFile { session: session.to_string(), role }).await?;
+    framed.send(Frame::SendFile { session: session.to_string() }).await?;
 
     match Frame::expect_from(framed.next().await)? {
         Frame::Ok => {}

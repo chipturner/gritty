@@ -493,7 +493,7 @@ async fn dispatch_control(
             }
             false
         }
-        Frame::SendFile { session, .. } => {
+        Frame::SendFile { session } => {
             reap_sessions(sessions);
             if let Some(id) = resolve_session(sessions, &session, *last_attached) {
                 let state = &sessions[&id];

@@ -6,10 +6,16 @@ use std::os::fd::{AsRawFd, OwnedFd};
 use std::path::{Path, PathBuf};
 use tracing_subscriber::EnvFilter;
 
+fn version_string() -> &'static str {
+    static VERSION: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    VERSION.get_or_init(|| format!("{} ({})", env!("CARGO_PKG_VERSION"), env!("GRITTY_GIT_HASH"),))
+}
+
 // help_template left-aligned so the string content has no spurious indentation
 #[derive(Parser)]
 #[command(
     name = "gritty",
+    version = version_string(),
     about = "Persistent TTY sessions over Unix domain sockets",
     help_template = "\
 {before-help}{about}
