@@ -241,7 +241,7 @@ fn tui_pick_session(host: &str, sessions: &[gritty::protocol::SessionEntry]) -> 
     let name_w = rows.iter().map(|r| r.name.len()).max().unwrap_or(0);
     let tag_w = 10; // "(attached)" is 10 chars
     let age_w = rows.iter().map(|r| r.age.len()).max().unwrap_or(0);
-    let total_lines = rows.len() + 1; // +1 for header
+    let total_lines = rows.len() + 2; // +1 header, +1 hint
 
     // Enter raw mode
     let _ = terminal::enable_raw_mode();
@@ -277,6 +277,10 @@ fn tui_pick_session(host: &str, sessions: &[gritty::protocol::SessionEntry]) -> 
                 );
             }
         }
+        let _ = write!(
+            stderr,
+            "\x1b[2m  \u{2191}/\u{2193} navigate  enter select  esc cancel\x1b[0m\r\n"
+        );
         let _ = stderr.flush();
     };
 
@@ -303,7 +307,7 @@ fn tui_pick_session(host: &str, sessions: &[gritty::protocol::SessionEntry]) -> 
                 break None;
             }
             Event::Key(KeyEvent {
-                code: KeyCode::Char('c'),
+                code: KeyCode::Char('c') | KeyCode::Char('g'),
                 modifiers: KeyModifiers::CONTROL,
                 ..
             }) => {

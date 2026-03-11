@@ -214,7 +214,12 @@ async fn write_send_manifest(
     Ok(())
 }
 
-fn print_progress(name: &str, transferred: u64, total: u64) {
+fn print_progress(name: &str, transferred: u64, total: u64, last_render: &mut std::time::Instant) {
+    let now = std::time::Instant::now();
+    if transferred < total && now.duration_since(*last_render).as_millis() < 50 {
+        return;
+    }
+    *last_render = now;
     let pct = if total == 0 { 100 } else { (transferred * 100 / total).min(100) };
     let bar_width = 20usize;
     let filled = (pct as usize * bar_width / 100).min(bar_width);
@@ -337,6 +342,7 @@ pub(crate) async fn send_command(
             let mut file = tokio::fs::File::open(path).await?;
             let mut remaining = *size;
             let mut transferred = 0u64;
+            let mut last_render = std::time::Instant::now();
             while remaining > 0 {
                 let to_read = (remaining as usize).min(buf.len());
                 let n = file.read(&mut buf[..to_read]).await?;
@@ -346,7 +352,7 @@ pub(crate) async fn send_command(
                 stream.write_all(&buf[..n]).await?;
                 remaining -= n as u64;
                 transferred += n as u64;
-                print_progress(name, transferred, *size);
+                print_progress(name, transferred, *size, &mut last_render);
             }
             eprintln!();
         }
@@ -465,13 +471,14 @@ pub(crate) async fn receive_command(
                 .await?;
             let mut remaining = file_size;
             let mut transferred = 0u64;
+            let mut last_render = std::time::Instant::now();
             while remaining > 0 {
                 let to_read = (remaining as usize).min(buf.len());
                 stream.read_exact(&mut buf[..to_read]).await?;
                 file.write_all(&buf[..to_read]).await?;
                 remaining -= to_read as u64;
                 transferred += to_read as u64;
-                print_progress(&name, transferred, file_size);
+                print_progress(&name, transferred, file_size, &mut last_render);
             }
             eprintln!();
         }
