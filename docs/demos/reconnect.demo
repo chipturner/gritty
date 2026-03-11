@@ -5,10 +5,9 @@
 # Prerequisites:
 #   - Remote host "devbox" accessible via ssh
 #   - python3 and tmux installed on devbox
-#   - No existing gritty tunnel (gritty tunnel-destroy devbox)
 
 type: gritty connect devbox:work
-wait/10: $
+wait/10: session work
 sleep: 0.5
 
 # Start a counter -- the incrementing numbers make the disconnect visible
@@ -22,19 +21,19 @@ sleep: 2
 
 # Re-establish tunnel; client auto-reconnects
 run: gritty tunnel-create devbox
-wait/15: connected
+wait/15: reconnected
 sleep: 3
 
 # Counter resumed -- numbers kept incrementing during disconnect
 send: C-c
 sleep: 1
 
-# Now show that a full TUI survives too
-type: tmux
+# Now show that a full TUI survives too (nested tmux inside gritty)
+type: tmux -f /dev/null
 sleep: 1
 
 # Split and run top in the bottom pane
-send: C-b '"'
+send: C-b "
 sleep: 0.5
 type: top
 sleep: 2
@@ -48,7 +47,7 @@ run: gritty tunnel-destroy devbox
 wait: reconnecting
 sleep: 2
 
-# Reconnect -- tmux layout fully intact, top still running
+# Reconnect -- tmux layout fully intact, top still running.
+# No wait for "reconnected" here: inner tmux redraws over it immediately.
 run: gritty tunnel-create devbox
-wait/15: connected
-sleep: 3
+sleep: 5

@@ -211,7 +211,9 @@ impl RawModeGuard {
         let original = termios::tcgetattr(fd)?;
         let mut raw = original.clone();
         termios::cfmakeraw(&mut raw);
-        termios::tcsetattr(fd, SetArg::TCSAFLUSH, &raw)?;
+        // TCSADRAIN (not TCSAFLUSH) so keystrokes typed during connection
+        // setup are preserved and forwarded to the session.
+        termios::tcsetattr(fd, SetArg::TCSADRAIN, &raw)?;
         Ok(Self { fd, original })
     }
 }
@@ -1185,6 +1187,10 @@ pub async fn run(
                             match guard.try_io(|inner| inner.get_ref().read(&mut peek)) {
                                 Ok(Ok(1)) if peek[0] == 0x03 => {
                                     write_stdout_async(&async_stdout, b"\r\n").await?;
+                                    return Ok(1);
+                                }
+                                Ok(Ok(0)) | Ok(Err(_)) => {
+                                    // stdin EOF or error -- terminal is gone
                                     return Ok(1);
                                 }
                                 _ => {}

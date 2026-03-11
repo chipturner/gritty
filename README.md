@@ -4,24 +4,17 @@
 [![Crates.io](https://img.shields.io/crates/v/gritty-cli)](https://crates.io/crates/gritty-cli)
 [![License: MIT OR Apache-2.0](https://img.shields.io/crates/l/gritty-cli)](LICENSE)
 
-Persistent remote shells that bring your local tools with them.
+Persistent remote shells that just work.
 
-### The problem
-
-You SSH into a devbox and run `gh auth login`. It prints a URL. You copy it, paste it into your laptop browser, complete the flow... and the callback goes to `localhost:38291` *on your laptop*, not the remote box. It hangs.
-
-Same story for `gcloud auth login`, `aws sso login`, anything OAuth.
-
-### With gritty
+Close your laptop, change wifi, reboot -- `gritty connect devbox:work` picks up exactly where you left off. Your SSH agent, browser opens, port forwards, and in-progress work all survive. No stale sockets, no `tmux attach`, no re-auth.
 
 ```bash
-gritty connect devbox:work
-gh auth login                       # browser opens locally, callback tunnels back. Done.
+gritty connect devbox:work          # creates or reattaches -- one command, always
 ```
 
-Close your laptop, change wifi, open it back up -- `gritty connect devbox:work` and you're exactly where you left off. Agent forwarding, URL forwarding, and OAuth tunneling all work out of the box.
+Sessions are persistent and self-healing. The tunnel respawns on failure, the client auto-reconnects, and buffered output bridges the gap so nothing is lost. Your local tools come with you: `git push` uses your local SSH keys, `gh auth login` opens your local browser and tunnels the OAuth callback, `gritty send`/`receive` moves files through the session without scp. It feels like a local shell that happens to be remote.
 
-It works by forwarding Unix domain sockets over SSH -- no custom protocol, no open ports, no certificates, no configuration. If you can `ssh` to a host, you can use gritty.
+gritty works by forwarding Unix domain sockets over SSH -- no custom protocol, no open ports, no certificates, no configuration. If you can `ssh` to a host, you can use gritty.
 
 ### Install
 

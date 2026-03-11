@@ -23,11 +23,29 @@ ROWS=30
 
 die() { echo "error: $*" >&2; exit 1; }
 
+# Extract gritty hosts referenced in a demo file (for cleanup).
+demo_hosts() {
+    grep -ohE 'gritty (connect|tunnel-create) [^ ]+' "$1" \
+        | awk '{print $NF}' | cut -d: -f1 | sort -u
+}
+
+cleanup() {
+    tmux kill-session -t "$TMUX_SESSION" 2>/dev/null || true
+    for host in $DEMO_HOSTS; do
+        gritty kill-server "$host" 2>/dev/null || true
+        gritty tunnel-destroy "$host" 2>/dev/null || true
+    done
+}
+
 type_text() {
     local text=$1 i char
     for ((i = 0; i < ${#text}; i++)); do
         char="${text:i:1}"
-        tmux send-keys -t "$TMUX_SESSION" -l -- "$char"
+        if [[ "$char" == ";" ]]; then
+            tmux send-keys -t "$TMUX_SESSION" '\;'
+        else
+            tmux send-keys -t "$TMUX_SESSION" -l -- "$char"
+        fi
         sleep "0.0$((RANDOM % 5 + 3))"
     done
 }
@@ -51,7 +69,7 @@ wait_for() {
 
 setup_session() {
     tmux kill-session -t "$TMUX_SESSION" 2>/dev/null || true
-    tmux new-session -d -s "$TMUX_SESSION" -x "$COLS" -y "$ROWS"
+    tmux -f /dev/null new-session -d -s "$TMUX_SESSION" -x "$COLS" -y "$ROWS"
     tmux set-option -t "$TMUX_SESSION" status off
     # Clean prompt, no history
     tmux send-keys -t "$TMUX_SESSION" \
@@ -103,8 +121,11 @@ cast_file="${2:-}"
 [[ -n "$demo_file" ]] || die "usage: $0 <script.demo> [output.cast]"
 [[ -f "$demo_file" ]] || die "not found: $demo_file"
 
+DEMO_HOSTS=$(demo_hosts "$demo_file")
+
+cleanup
 setup_session
-trap 'tmux kill-session -t "$TMUX_SESSION" 2>/dev/null || true' EXIT
+trap cleanup EXIT
 
 if [[ -n "$cast_file" ]]; then
     # Recording mode: drive in background, record in foreground.
