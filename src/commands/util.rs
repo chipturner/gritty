@@ -194,6 +194,8 @@ pub(crate) async fn port_forward_command(
 }
 
 pub(crate) fn open_url(url: &str) {
+    use std::io::{Read, Write};
+
     let sock_path = match std::env::var("GRITTY_SOCK") {
         Ok(p) => p,
         Err(_) => {
@@ -205,10 +207,24 @@ pub(crate) fn open_url(url: &str) {
     };
     match std::os::unix::net::UnixStream::connect(&sock_path) {
         Ok(mut stream) => {
-            use std::io::Write;
             let _ = stream.write_all(&[gritty::protocol::SvcRequest::OpenUrl.to_byte()]);
             let _ = stream.write_all(url.as_bytes());
             let _ = stream.write_all(b"\n");
+
+            // Read response byte: 0x01 = forwarded, 0x00 = no client
+            let _ = stream.set_read_timeout(Some(std::time::Duration::from_secs(2)));
+            let mut resp = [0u8; 1];
+            match stream.read_exact(&mut resp) {
+                Ok(()) if resp[0] == 0x00 => {
+                    eprintln!("error: no client is connected with --forward-open");
+                    std::process::exit(1);
+                }
+                Ok(()) => {} // 0x01 or other = success
+                Err(_) => {
+                    // Timeout or older server -- degrade gracefully
+                    eprintln!("warning: could not confirm URL was forwarded (server may be older)");
+                }
+            }
         }
         Err(e) => {
             eprintln!("error: could not connect to service socket ({sock_path}): {e}");

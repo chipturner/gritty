@@ -183,9 +183,13 @@ enum Command {
         #[arg(long)]
         stdin: bool,
 
-        /// Timeout in seconds waiting for a receiver
+        /// Timeout in seconds waiting for a receiver (default: 300)
+        #[arg(long, default_value_t = 300)]
+        timeout: u64,
+
+        /// Wait indefinitely for a receiver
         #[arg(long)]
-        timeout: Option<u64>,
+        no_timeout: bool,
 
         /// Files to send
         files: Vec<PathBuf>,
@@ -201,9 +205,13 @@ enum Command {
         #[arg(long)]
         stdout: bool,
 
-        /// Timeout in seconds waiting for a sender
+        /// Timeout in seconds waiting for a sender (default: 300)
+        #[arg(long, default_value_t = 300)]
+        timeout: u64,
+
+        /// Wait indefinitely for a sender
         #[arg(long)]
-        timeout: Option<u64>,
+        no_timeout: bool,
 
         /// Destination directory (default: current directory)
         dir: Option<PathBuf>,
@@ -757,10 +765,12 @@ async fn run(cli: Cli, config: gritty::config::ConfigFile) -> anyhow::Result<()>
             println!("{}", ctl_path.display());
             Ok(())
         }
-        Command::Send { session, stdin, timeout, files } => {
+        Command::Send { session, stdin, timeout, no_timeout, files } => {
+            let timeout = if no_timeout { None } else { Some(timeout) };
             send_command(cli.ctl_socket, session, stdin, timeout, files).await
         }
-        Command::Receive { session, stdout, timeout, dir } => {
+        Command::Receive { session, stdout, timeout, no_timeout, dir } => {
+            let timeout = if no_timeout { None } else { Some(timeout) };
             receive_command(cli.ctl_socket, session, stdout, timeout, dir).await
         }
         Command::Open { url } => {

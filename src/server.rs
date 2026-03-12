@@ -81,7 +81,7 @@ enum AgentEvent {
 
 /// Events from open socket acceptor to the main relay loop.
 enum OpenEvent {
-    Url(String),
+    Url { url: String, stream: UnixStream },
 }
 
 /// Events from tunnel TCP connection tasks to the main relay loop.
@@ -495,7 +495,7 @@ fn spawn_svc_acceptor(
                         let s = String::from_utf8_lossy(&buf[..total]);
                         let url = s.trim();
                         if !url.is_empty() {
-                            let _ = otx.send(OpenEvent::Url(url.to_string()));
+                            let _ = otx.send(OpenEvent::Url { url: url.to_string(), stream });
                         }
                     }
                     Some(crate::protocol::SvcRequest::Send) => {
@@ -886,7 +886,8 @@ impl ServerRelay<'_> {
         event: Option<OpenEvent>,
     ) {
         match event {
-            Some(OpenEvent::Url(url)) => {
+            Some(OpenEvent::Url { url, mut stream }) => {
+                use tokio::io::AsyncWriteExt;
                 if *self.open_forward_enabled {
                     if let Some(port) = extract_redirect_port(&url) {
                         if port_in_use(port) {
@@ -896,6 +897,9 @@ impl ServerRelay<'_> {
                         }
                     }
                     let _ = framed.send(Frame::OpenUrl { url }).await;
+                    let _ = stream.write_all(&[0x01]).await;
+                } else {
+                    let _ = stream.write_all(&[0x00]).await;
                 }
             }
             None => {
