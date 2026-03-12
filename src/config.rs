@@ -19,6 +19,13 @@ pub struct SessionSettings {
     pub heartbeat_timeout: u64,
     pub ring_buffer_size: u64,
     pub oauth_tunnel_idle_timeout: u64,
+    pub client_name: String,
+}
+
+fn default_client_name() -> String {
+    std::fs::read_to_string("/etc/hostname")
+        .map(|s| s.trim().to_string())
+        .unwrap_or_default()
 }
 
 impl Default for SessionSettings {
@@ -34,6 +41,7 @@ impl Default for SessionSettings {
             heartbeat_timeout: 15,
             ring_buffer_size: 1 << 20, // 1 MB
             oauth_tunnel_idle_timeout: 5,
+            client_name: default_client_name(),
         }
     }
 }
@@ -68,6 +76,7 @@ pub struct Defaults {
     pub heartbeat_timeout: Option<u64>,
     pub ring_buffer_size: Option<u64>,
     pub oauth_tunnel_idle_timeout: Option<u64>,
+    pub client_name: Option<String>,
     pub tunnel: Option<TunnelDefaults>,
 }
 
@@ -93,6 +102,7 @@ pub struct HostConfig {
     pub heartbeat_timeout: Option<u64>,
     pub ring_buffer_size: Option<u64>,
     pub oauth_tunnel_idle_timeout: Option<u64>,
+    pub client_name: Option<String>,
     pub tunnel: Option<TunnelDefaults>,
 }
 
@@ -157,6 +167,10 @@ impl ConfigFile {
                 .and_then(|h| h.oauth_tunnel_idle_timeout)
                 .or(d.oauth_tunnel_idle_timeout)
                 .unwrap_or(5),
+            client_name: h
+                .and_then(|h| h.client_name.clone())
+                .or_else(|| d.client_name.clone())
+                .unwrap_or_else(default_client_name),
         }
     }
 

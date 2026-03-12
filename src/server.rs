@@ -40,6 +40,7 @@ pub struct SessionMetadata {
     pub created_at: u64,
     pub attached: AtomicBool,
     pub last_heartbeat: AtomicU64,
+    pub client_name: std::sync::Mutex<String>,
 }
 
 /// Wraps a child process and its process group ID.
@@ -1256,7 +1257,12 @@ pub async fn run(
     if let Some(ref dir) = home {
         cmd.current_dir(dir);
     }
-    const ALLOWED_ENV_KEYS: &[&str] = &["TERM", "LANG", "COLORTERM"];
+    let client_name = env_vars
+        .iter()
+        .find(|(k, _)| k == "GRITTY_CLIENT")
+        .map(|(_, v)| v.clone())
+        .unwrap_or_default();
+    const ALLOWED_ENV_KEYS: &[&str] = &["TERM", "LANG", "COLORTERM", "GRITTY_CLIENT"];
     for (k, v) in &env_vars {
         if ALLOWED_ENV_KEYS.contains(&k.as_str()) {
             cmd.env(k, v);
@@ -1304,6 +1310,7 @@ pub async fn run(
         created_at,
         attached: AtomicBool::new(false),
         last_heartbeat: AtomicU64::new(0),
+        client_name: std::sync::Mutex::new(client_name),
     });
 
     // First client is already connected — enter relay directly

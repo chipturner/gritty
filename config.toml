@@ -16,6 +16,7 @@
 # heartbeat-timeout = 15
 # ring-buffer-size = 1048576
 # oauth-tunnel-idle-timeout = 5
+# client-name = "my-laptop"  # default: hostname
 
 # Tunnel-specific global defaults (for tunnel-create).
 [defaults.tunnel]

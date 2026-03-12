@@ -665,6 +665,7 @@ async fn run(cli: Cli, config: gritty::config::ConfigFile) -> anyhow::Result<()>
                 heartbeat_timeout: resolved.heartbeat_timeout,
                 ring_buffer_size: resolved.ring_buffer_size,
                 oauth_tunnel_idle_timeout: resolved.oauth_tunnel_idle_timeout,
+                client_name: resolved.client_name,
             };
             connect_session(
                 session,
