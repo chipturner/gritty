@@ -54,8 +54,8 @@ Transfer files through the session (run one side locally, one remotely):
 gritty send file1.txt file2.txt     # auto-detects which session to use
 gritty receive /tmp/dest
 
-command | gritty send --stdin        # pipe mode
-gritty receive --stdout | command
+command | gritty send -              # pipe mode
+gritty receive - | command
 ```
 
 Detach and reattach from anywhere:
@@ -77,7 +77,7 @@ Local-only sessions (`gritty connect local:scratch`) are available for testing b
 - **SSH agent forwarding** -- `git push`, `ssh`, and other agent-dependent commands work remotely using your local keys (on by default); survives reconnects without stale sockets
 - **URL open forwarding** -- `$BROWSER` requests forwarded to your local machine, with automatic OAuth callback tunneling (on by default)
 - **Port forwarding** -- `gritty lf 8080` to quick-check a remote web server locally, `gritty rf 5432` to let the session reach local postgres
-- **File transfer** -- `gritty send` / `gritty receive` through the session connection, preserving permissions; pipe mode with `--stdin`/`--stdout` for composing with `tar` etc.
+- **File transfer** -- `gritty send` / `gritty receive` through the session connection, preserving permissions; pipe mode with `-` for composing with `tar` etc.
 - **Single binary, no network protocol** -- Unix domain sockets locally, SSH handles encryption and auth; optional TOML config for per-host defaults
 
 ## Commands
@@ -93,6 +93,7 @@ Local-only sessions (`gritty connect local:scratch`) are available for testing b
 | `gritty tunnels` | `tun` | List active SSH tunnels |
 | `gritty tunnel-create <destination>` | | Set up SSH tunnel to remote host |
 | `gritty tunnel-destroy <name>` | | Tear down an SSH tunnel |
+| `gritty bootstrap <destination>` | | Install gritty on a remote host |
 | `gritty local-forward <port>` | `lf` | Forward a TCP port from session to client |
 | `gritty remote-forward <port>` | `rf` | Forward a TCP port from client to session |
 | `gritty send [files...]` | | Send files to a paired receiver |
@@ -136,17 +137,16 @@ The `<host>` in `host:session` is a **connection name**, not an SSH destination.
 
 **Send/receive options:**
 - `--session host:session`: target a specific session
-- `--stdin` (`send`): read data from stdin instead of files
-- `--stdout` (`receive`): write data to stdout instead of files
+- `-` (`send`): read data from stdin; (`receive`): write data to stdout
 - `--timeout <seconds>`: deadline for pairing with a receiver/sender
 
 File permissions are preserved. For directories, use tar with pipe mode:
 
 ```bash
 # sender (remote)
-tar czf - mydir | gritty send --stdin
+tar czf - mydir | gritty send -
 # receiver (local)
-gritty receive --stdout | tar xzf -
+gritty receive - | tar xzf -
 ```
 
 **Environment inside sessions:** `GRITTY_SOCK` (svc socket for `gritty open`/`send`/`receive`/port forwarding), `GRITTY_SESSION` (session ID), and `GRITTY_SESSION_NAME` (if named) are set in the shell environment. Useful for prompt customization or scripts that need to know which session they're in.

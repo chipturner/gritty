@@ -246,7 +246,7 @@ pub(crate) async fn send_command(
         anyhow::bail!("--stdin cannot be used with file arguments");
     }
     if !use_stdin && files.is_empty() {
-        anyhow::bail!("either provide files or use --stdin");
+        anyhow::bail!("provide files to send (use - for stdin)");
     }
 
     // Spool stdin to a temp file so we know the size without buffering in RAM
@@ -267,7 +267,7 @@ pub(crate) async fn send_command(
             std::fs::metadata(path).map_err(|e| anyhow::anyhow!("{}: {e}", path.display()))?;
         if meta.is_dir() {
             anyhow::bail!(
-                "{}: is a directory (use tar: tar czf - dir | gritty send --stdin)",
+                "{}: is a directory (use tar: tar czf - dir | gritty send -)",
                 path.display()
             );
         } else if meta.is_file() {

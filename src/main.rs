@@ -34,6 +34,7 @@ Tunnels:
   tunnels (tun)          List active SSH tunnels
   tunnel-create          Set up SSH tunnel to a remote host
   tunnel-destroy         Tear down an SSH tunnel
+  bootstrap              Install gritty on a remote host
 
 In-session (run inside a gritty session):
   local-forward (lf)     Forward a port: session to client
@@ -179,8 +180,8 @@ enum Command {
         #[arg(long)]
         session: Option<String>,
 
-        /// Read data from stdin instead of files
-        #[arg(long)]
+        /// Read data from stdin instead of files (use - as shorthand)
+        #[arg(long, hide = true)]
         stdin: bool,
 
         /// Timeout in seconds waiting for a receiver (default: 300)
@@ -191,7 +192,7 @@ enum Command {
         #[arg(long)]
         no_timeout: bool,
 
-        /// Files to send
+        /// Files to send (use - for stdin)
         files: Vec<PathBuf>,
     },
     /// Receive files from a paired sender
@@ -201,8 +202,8 @@ enum Command {
         #[arg(long)]
         session: Option<String>,
 
-        /// Write received data to stdout instead of files
-        #[arg(long)]
+        /// Write received data to stdout instead of files (use - as shorthand)
+        #[arg(long, hide = true)]
         stdout: bool,
 
         /// Timeout in seconds waiting for a sender (default: 300)
@@ -213,7 +214,7 @@ enum Command {
         #[arg(long)]
         no_timeout: bool,
 
-        /// Destination directory (default: current directory)
+        /// Destination directory (default: current directory, - for stdout)
         dir: Option<PathBuf>,
     },
     /// Open a URL on the local machine (for use inside gritty sessions)
@@ -270,6 +271,20 @@ enum Command {
     TunnelDestroy {
         /// Connection name (as shown in `gritty tunnels`)
         name: String,
+    },
+    /// Install gritty on a remote host (copies local binary via scp)
+    #[command(display_order = 13)]
+    Bootstrap {
+        /// Remote destination ([user@]host[:port])
+        destination: String,
+
+        /// Remote install directory (default: ~/.local/bin)
+        #[arg(long, default_value = "~/.local/bin")]
+        install_dir: String,
+
+        /// Extra SSH options (can be repeated)
+        #[arg(long = "ssh-option", short = 'o')]
+        ssh_options: Vec<String>,
     },
     /// List active SSH tunnels
     #[command(display_order = 10, visible_alias = "tun")]
@@ -780,13 +795,19 @@ async fn run(cli: Cli, config: gritty::config::ConfigFile) -> anyhow::Result<()>
             println!("{}", ctl_path.display());
             Ok(())
         }
-        Command::Send { session, stdin, timeout, no_timeout, files } => {
+        Command::Send { session, stdin, timeout, no_timeout, mut files } => {
+            let use_stdin = stdin || files.iter().any(|f| f.as_os_str() == "-");
+            if use_stdin {
+                files.retain(|f| f.as_os_str() != "-");
+            }
             let timeout = if no_timeout { None } else { Some(timeout) };
-            send_command(cli.ctl_socket, session, stdin, timeout, files).await
+            send_command(cli.ctl_socket, session, use_stdin, timeout, files).await
         }
         Command::Receive { session, stdout, timeout, no_timeout, dir } => {
+            let use_stdout = stdout || dir.as_deref().is_some_and(|d| d.as_os_str() == "-");
+            let dir = if use_stdout { None } else { dir };
             let timeout = if no_timeout { None } else { Some(timeout) };
-            receive_command(cli.ctl_socket, session, stdout, timeout, dir).await
+            receive_command(cli.ctl_socket, session, use_stdout, timeout, dir).await
         }
         Command::Open { url } => {
             open_url(&url);
@@ -799,6 +820,9 @@ async fn run(cli: Cli, config: gritty::config::ConfigFile) -> anyhow::Result<()>
         Command::RemoteForward { port } => {
             let (listen_port, target_port) = parse_port_spec(&port)?;
             port_forward_command(1, listen_port, target_port).await
+        }
+        Command::Bootstrap { destination, install_dir, ssh_options } => {
+            gritty::connect::bootstrap(&destination, &ssh_options, &install_dir).await
         }
         Command::TunnelDestroy { name } => gritty::connect::disconnect(&name).await,
         Command::Tunnels => {

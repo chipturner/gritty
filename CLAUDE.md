@@ -19,6 +19,7 @@ Persistent TTY sessions over Unix domain sockets. Single binary, tmux-like CLI. 
 | `tunnels` | `tun` | List active SSH tunnels |
 | `tunnel-create <destination>` | | SSH tunnel to remote host |
 | `tunnel-destroy <name>` | | Tear down SSH tunnel |
+| `bootstrap <destination>` | | Install gritty on a remote host via scp |
 | `local-forward <port>` | `lf` | Forward TCP port: session to client |
 | `remote-forward <port>` | `rf` | Forward TCP port: client to session |
 | `send [files...]` | | Send files to a paired receiver |
@@ -84,7 +85,7 @@ Handshake: `0x16` Hello, `0x24` HelloAck. Relay: `0x01` Data, `0x02` Resize, `0x
 
 `SvcRequest`: `OpenUrl=1`, `Send=2`, `Receive=3`, `PortForward=4` (1-byte discriminator).
 
-File transfer manifest (svc socket, not Frame protocol): sender writes `[file_count: u32][per file: [name_len: u16][name: bytes][size: u64][mode: u32]]`. Server relays per-file headers `[name_len: u16][name: bytes][size: u64][mode: u32]` to receiver, then `size` bytes of data. Sentinel `[name_len: 0x0000]` ends transfer. `--stdin` spools to a temp file for size discovery.
+File transfer manifest (svc socket, not Frame protocol): sender writes `[file_count: u32][per file: [name_len: u16][name: bytes][size: u64][mode: u32]]`. Server relays per-file headers `[name_len: u16][name: bytes][size: u64][mode: u32]` to receiver, then `size` bytes of data. Sentinel `[name_len: 0x0000]` ends transfer. `-` (stdin) spools to a temp file for size discovery.
 
 ## Key Patterns
 
