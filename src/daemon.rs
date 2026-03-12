@@ -150,6 +150,7 @@ fn build_session_entries(sessions: &HashMap<u32, SessionState>) -> Vec<SessionEn
                     last_heartbeat: meta.last_heartbeat.load(Ordering::Relaxed),
                     foreground_cmd: foreground_process(meta.shell_pid),
                     cwd: foreground_cwd(meta.shell_pid),
+                    client_name: meta.client_name.lock().map(|n| n.clone()).unwrap_or_default(),
                 }
             } else {
                 SessionEntry {
@@ -162,6 +163,7 @@ fn build_session_entries(sessions: &HashMap<u32, SessionState>) -> Vec<SessionEn
                     last_heartbeat: 0,
                     foreground_cmd: "-".to_string(),
                     cwd: String::new(),
+                    client_name: String::new(),
                 }
             }
         })

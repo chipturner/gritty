@@ -80,7 +80,7 @@ Eight modules behind a lib crate (`src/lib.rs` hosts `collect_env_vars()`, `spaw
 
 Handshake: `0x16` Hello, `0x24` HelloAck. Relay: `0x01` Data, `0x02` Resize, `0x03` Exit, `0x04` Detached, `0x05` Ping, `0x06` Pong, `0x07` Env, `0x08` AgentForward, `0x09` AgentOpen, `0x0A` AgentData, `0x0B` AgentClose, `0x0C` OpenForward, `0x0D` OpenUrl, `0x0E` TunnelListen, `0x0F` TunnelOpen, `0x17` TunnelData, `0x18` TunnelClose, `0x19` SendOffer, `0x1A` SendDone, `0x1B` SendCancel, `0x1C` PortForwardListen, `0x1D` PortForwardReady, `0x1E` PortForwardOpen, `0x1F` PortForwardData, `0x26` PortForwardClose, `0x27` PortForwardStop. Control: `0x10` NewSession, `0x11` Attach, `0x12` ListSessions, `0x13` KillSession, `0x14` KillServer, `0x15` Tail, `0x25` SendFile, `0x28` RenameSession. Responses: `0x20` SessionCreated, `0x21` SessionInfo, `0x22` Ok, `0x23` Error.
 
-`SessionInfo`: `[count: u32][per entry: [id: u16-len + bytes][name: u16-len + bytes][pty_path: u16-len + bytes][shell_pid: u32][created_at: u64][attached: u8][last_heartbeat: u64][foreground_cmd: u16-len + bytes][cwd: u16-len + bytes]]`.
+`SessionInfo`: `[count: u32][per entry: [id: u16-len + bytes][name: u16-len + bytes][pty_path: u16-len + bytes][shell_pid: u32][created_at: u64][attached: u8][last_heartbeat: u64][foreground_cmd: u16-len + bytes][cwd: u16-len + bytes][client_name: u16-len + bytes]]`.
 
 `SvcRequest`: `OpenUrl=1`, `Send=2`, `Receive=3`, `PortForward=4` (1-byte discriminator).
 

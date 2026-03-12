@@ -61,12 +61,16 @@ pub(crate) async fn connect_session(
                 return Ok(());
             }
             eprintln!("\x1b[32m\u{25b8} attached {name}\x1b[0m");
+            let mut env_vars = vec![];
+            if !settings.client_name.is_empty() {
+                env_vars.push(("GRITTY_CLIENT".into(), settings.client_name.clone()));
+            }
             let code = gritty::client::run(
                 &name,
                 framed,
                 !settings.no_redraw,
                 &ctl_path,
-                vec![],
+                env_vars,
                 settings.no_escape,
                 settings.forward_agent,
                 settings.forward_open,
@@ -108,6 +112,9 @@ pub(crate) async fn connect_session(
             let mut env_vars = gritty::collect_env_vars();
             if settings.forward_open {
                 env_vars.push(("BROWSER".into(), "gritty open".into()));
+            }
+            if !settings.client_name.is_empty() {
+                env_vars.push(("GRITTY_CLIENT".into(), settings.client_name.clone()));
             }
             let code = gritty::client::run(
                 &id,
@@ -211,6 +218,7 @@ struct Row {
     age: String,
     cmd: String,
     cwd: String,
+    client: String,
     hotkey: Option<char>, // '1'-'9' for first 9 rows
 }
 
@@ -229,6 +237,7 @@ fn build_rows(sessions: &[gritty::protocol::SessionEntry]) -> Vec<Row> {
             age: format_age(now, s.created_at),
             cmd: s.foreground_cmd.clone(),
             cwd: shorten_home(&s.cwd, &home),
+            client: s.client_name.clone(),
             hotkey: if i < 9 { Some((b'1' + i as u8) as char) } else { None },
         })
         .collect()
@@ -288,6 +297,7 @@ async fn tui_pick_session(
         let tag_w = 10; // "(attached)" is 10 chars
         let age_w = rows.iter().map(|r| r.age.len()).max().unwrap_or(0);
         let cmd_w = rows.iter().map(|r| r.cmd.len()).max().unwrap_or(0);
+        let client_w = rows.iter().map(|r| r.client.len()).max().unwrap_or(0);
         let total_lines = rows.len() + 3; // header + rows + new-session + hint
 
         // If we drew before, erase old output first
@@ -323,20 +333,20 @@ async fn tui_pick_session(
                 let tag = if row.attached { "(attached)" } else { "" };
                 let _ = write!(
                     stderr,
-                    "{marker} \x1b[2m{hk}\x1b[0m \x1b[32;1m{:<name_w$}\x1b[0m  {:<tag_w$}  \x1b[32m{:<age_w$}\x1b[0m  \x1b[32m{:<cmd_w$}\x1b[0m  \x1b[32m{}\x1b[0m\r\n",
-                    row.name, tag, row.age, row.cmd, row.cwd,
+                    "{marker} \x1b[2m{hk}\x1b[0m \x1b[32;1m{:<name_w$}\x1b[0m  {:<tag_w$}  \x1b[32m{:<age_w$}\x1b[0m  \x1b[32m{:<cmd_w$}\x1b[0m  \x1b[32m{:<client_w$}\x1b[0m  \x1b[32m{}\x1b[0m\r\n",
+                    row.name, tag, row.age, row.cmd, row.client, row.cwd,
                 );
             } else if row.attached {
                 let _ = write!(
                     stderr,
-                    "{marker} \x1b[2m{hk} {:<name_w$}  {:<tag_w$}  {:<age_w$}  {:<cmd_w$}  {}\x1b[0m\r\n",
-                    row.name, "(attached)", row.age, row.cmd, row.cwd,
+                    "{marker} \x1b[2m{hk} {:<name_w$}  {:<tag_w$}  {:<age_w$}  {:<cmd_w$}  {:<client_w$}  {}\x1b[0m\r\n",
+                    row.name, "(attached)", row.age, row.cmd, row.client, row.cwd,
                 );
             } else {
                 let _ = write!(
                     stderr,
-                    "{marker} \x1b[2m{hk}\x1b[0m {:<name_w$}  {:<tag_w$}  {:<age_w$}  {:<cmd_w$}  {}\r\n",
-                    row.name, "", row.age, row.cmd, row.cwd,
+                    "{marker} \x1b[2m{hk}\x1b[0m {:<name_w$}  {:<tag_w$}  {:<age_w$}  {:<cmd_w$}  {:<client_w$}  {}\r\n",
+                    row.name, "", row.age, row.cmd, row.client, row.cwd,
                 );
             }
         }
@@ -862,6 +872,7 @@ pub(crate) async fn list_sessions(ctl_path: PathBuf) -> anyhow::Result<()> {
                             name,
                             s.foreground_cmd.clone(),
                             s.cwd.clone(),
+                            s.client_name.clone(),
                             pty,
                             pid,
                             created,
@@ -871,7 +882,7 @@ pub(crate) async fn list_sessions(ctl_path: PathBuf) -> anyhow::Result<()> {
                     .collect();
 
                 gritty::table::print_table(
-                    &["ID", "Name", "Cmd", "CWD", "PTY", "PID", "Created", "Status"],
+                    &["ID", "Name", "Cmd", "CWD", "Client", "PTY", "PID", "Created", "Status"],
                     &rows,
                 );
             }
@@ -967,6 +978,7 @@ pub(crate) async fn list_all_sessions() -> anyhow::Result<()> {
                     name,
                     s.foreground_cmd.clone(),
                     s.cwd.clone(),
+                    s.client_name.clone(),
                     pty,
                     pid,
                     created,
@@ -978,7 +990,7 @@ pub(crate) async fn list_all_sessions() -> anyhow::Result<()> {
 
     if multi_host {
         gritty::table::print_table(
-            &["Host", "ID", "Name", "Cmd", "CWD", "PTY", "PID", "Created", "Status"],
+            &["Host", "ID", "Name", "Cmd", "CWD", "Client", "PTY", "PID", "Created", "Status"],
             &rows,
         );
     } else {
@@ -986,7 +998,7 @@ pub(crate) async fn list_all_sessions() -> anyhow::Result<()> {
         println!("Host: {host}");
         let trimmed: Vec<Vec<String>> = rows.iter().map(|r| r[1..].to_vec()).collect();
         gritty::table::print_table(
-            &["ID", "Name", "Cmd", "CWD", "PTY", "PID", "Created", "Status"],
+            &["ID", "Name", "Cmd", "CWD", "Client", "PTY", "PID", "Created", "Status"],
             &trimmed,
         );
     }

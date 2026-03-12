@@ -833,6 +833,16 @@ impl ServerRelay<'_> {
                     }
                 }
             }
+            Some(Ok(Frame::Env { vars })) => {
+                // Update client name on reconnect/takeover
+                if let Some(meta) = self.metadata_slot.get() {
+                    if let Some((_, v)) = vars.iter().find(|(k, _)| k == "GRITTY_CLIENT") {
+                        if let Ok(mut name) = meta.client_name.lock() {
+                            *name = v.clone();
+                        }
+                    }
+                }
+            }
             Some(Ok(Frame::Exit { .. })) | None => {
                 return Ok(ControlFlow::Break(RelayExit::ClientGone));
             }
