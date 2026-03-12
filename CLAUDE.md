@@ -102,7 +102,7 @@ File transfer manifest (svc socket, not Frame protocol): sender writes `[file_co
 - **Escape sequences**: `~.` detach, `~R` reconnect, `~#` status, `~^Z` suspend, `~?` help, `~~` literal. 3-state machine (Normal/AfterNewline/AfterTilde). `--no-escape` disables.
 - **Security**: `umask(0o077)`, sockets 0600, dirs 0700, `SO_PEERCRED` on all accepts, payloads <= 1MB, resize 1..=10000.
 - **URL/OAuth**: Client calls `opener::open()`. OAuth tunnel: multi-channel reverse TCP with idle timeout (default 5s, configurable). Disable with `--no-oauth-redirect`.
-- **BROWSER handshake**: Client sends a sentinel `BROWSER` key in the `Env` frame when `forward_open` is enabled. Server replaces the value with `{current_exe()} open` so `$BROWSER` resolves to the server-side binary.
+- **BROWSER handshake**: Client sends a sentinel `BROWSER` key in the `Env` frame when `forward_open` is enabled. Server creates a `gritty-open` symlink (pointing to `current_exe()`) in the socket dir and sets `BROWSER` to that path. The binary detects `argv[0] == "gritty-open"` and dispatches directly to the open logic, so `$BROWSER` is a single path with no spaces.
 - **Port forwarding is loopback-only**: All `TcpListener::bind` and `TcpStream::connect` in forwarding use `127.0.0.1`. No bind-address specification (unlike SSH `-L`/`-R`).
 
 ## Development Notes

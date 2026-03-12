@@ -457,6 +457,21 @@ fn report_error(error_pipe: &Option<OwnedFd>, e: &anyhow::Error) -> ! {
 }
 
 fn main() {
+    // When invoked as "gritty-open" (symlink), dispatch directly to open.
+    if let Some(prog) = std::env::args().next() {
+        if Path::new(&prog).file_name().and_then(|f| f.to_str()) == Some("gritty-open") {
+            let url = match std::env::args().nth(1) {
+                Some(u) => u,
+                None => {
+                    eprintln!("usage: gritty-open <url>");
+                    std::process::exit(1);
+                }
+            };
+            open_url(&url);
+            return;
+        }
+    }
+
     let cli = Cli::parse();
     let verbose = cli.verbose;
     let config = gritty::config::ConfigFile::load();

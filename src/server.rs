@@ -1281,12 +1281,16 @@ pub async fn run(
         if ALLOWED_ENV_KEYS.contains(&k.as_str()) {
             cmd.env(k, v);
         } else if k == "BROWSER" {
-            // Client signals open forwarding desired; resolve to server-side binary
+            // Client signals open forwarding desired; create a gritty-open symlink
+            // so BROWSER is a single path with no spaces.
             let exe = std::env::current_exe()
                 .ok()
                 .and_then(|p| p.to_str().map(String::from))
                 .unwrap_or_else(|| "gritty".into());
-            cmd.env("BROWSER", format!("{exe} open"));
+            let open_link = svc_socket_path.parent().unwrap_or(Path::new(".")).join("gritty-open");
+            let _ = std::fs::remove_file(&open_link);
+            let _ = std::os::unix::fs::symlink(&exe, &open_link);
+            cmd.env("BROWSER", &open_link);
         } else {
             warn!(key = k, "ignoring disallowed env var from client");
         }
