@@ -30,7 +30,11 @@ curl -sSfL "$BASE/SHA256SUMS" -o "$TMPDIR/SHA256SUMS"
 
 echo "verifying checksum..."
 cd "$TMPDIR"
-grep "$TARBALL" SHA256SUMS | sha256sum -c -
+if command -v sha256sum >/dev/null 2>&1; then
+    grep "$TARBALL" SHA256SUMS | sha256sum -c -
+else
+    grep "$TARBALL" SHA256SUMS | shasum -a 256 -c -
+fi
 
 tar xzf "$TARBALL"
 
