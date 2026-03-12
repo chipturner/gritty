@@ -129,6 +129,12 @@ fn foreground_process(shell_pid: u32) -> String {
         .unwrap_or_else(|_| "-".to_string())
 }
 
+fn foreground_cwd(shell_pid: u32) -> String {
+    std::fs::read_link(format!("/proc/{shell_pid}/cwd"))
+        .map(|p| p.to_string_lossy().into_owned())
+        .unwrap_or_default()
+}
+
 fn build_session_entries(sessions: &HashMap<u32, SessionState>) -> Vec<SessionEntry> {
     let mut entries: Vec<_> = sessions
         .iter()
@@ -143,6 +149,7 @@ fn build_session_entries(sessions: &HashMap<u32, SessionState>) -> Vec<SessionEn
                     attached: meta.attached.load(Ordering::Relaxed),
                     last_heartbeat: meta.last_heartbeat.load(Ordering::Relaxed),
                     foreground_cmd: foreground_process(meta.shell_pid),
+                    cwd: foreground_cwd(meta.shell_pid),
                 }
             } else {
                 SessionEntry {
@@ -154,6 +161,7 @@ fn build_session_entries(sessions: &HashMap<u32, SessionState>) -> Vec<SessionEn
                     attached: false,
                     last_heartbeat: 0,
                     foreground_cmd: "-".to_string(),
+                    cwd: String::new(),
                 }
             }
         })

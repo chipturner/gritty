@@ -147,7 +147,11 @@ fn remote_exec_command(
     extra_ssh_opts: &[String],
     foreground: bool,
 ) -> Command {
-    let mut preamble = format!("PATH=\"{REMOTE_PATH_PREFIX}\"");
+    let mut preamble = if let Ok(dir) = std::env::var("GRITTY_BIN_DIR") {
+        format!("PATH=\"{dir}:{REMOTE_PATH_PREFIX}\"")
+    } else {
+        format!("PATH=\"{REMOTE_PATH_PREFIX}\"")
+    };
     if let Ok(dir) = std::env::var("GRITTY_SOCKET_DIR") {
         preamble.push_str(&format!("; export GRITTY_SOCKET_DIR=\"{dir}\""));
     }

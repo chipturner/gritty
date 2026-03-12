@@ -47,7 +47,7 @@ const HEADER_LEN: usize = 5; // type(1) + length(4)
 const MAX_FRAME_SIZE: usize = 1 << 20; // 1 MB
 
 /// Protocol version for handshake negotiation.
-pub const PROTOCOL_VERSION: u16 = 5;
+pub const PROTOCOL_VERSION: u16 = 6;
 
 /// Discriminator byte for the unified per-session service socket (`svc-{id}.sock`).
 /// Sent as the first byte on every connection to route to the correct handler.
@@ -86,6 +86,7 @@ pub struct SessionEntry {
     pub attached: bool,
     pub last_heartbeat: u64,
     pub foreground_cmd: String,
+    pub cwd: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -295,6 +296,8 @@ fn encode_session_info(dst: &mut BytesMut, sessions: &[SessionEntry]) {
                 + 21
                 + 2
                 + e.foreground_cmd.len()
+                + 2
+                + e.cwd.len()
         })
         .sum::<usize>();
     dst.put_u8(TYPE_SESSION_INFO);
@@ -313,6 +316,8 @@ fn encode_session_info(dst: &mut BytesMut, sessions: &[SessionEntry]) {
         dst.put_u64(e.last_heartbeat);
         dst.put_u16(e.foreground_cmd.len() as u16);
         dst.extend_from_slice(e.foreground_cmd.as_bytes());
+        dst.put_u16(e.cwd.len() as u16);
+        dst.extend_from_slice(e.cwd.as_bytes());
     }
 }
 
@@ -507,6 +512,12 @@ fn decode_session_info(payload: BytesMut) -> Result<Option<Frame>, io::Error> {
         } else {
             String::new()
         };
+        // Optional field: cwd (backwards compat -- empty if absent)
+        let cwd = if off + 2 <= p.len() {
+            read_str(p, &mut off).unwrap_or_default()
+        } else {
+            String::new()
+        };
         sessions.push(SessionEntry {
             id,
             name,
@@ -516,6 +527,7 @@ fn decode_session_info(payload: BytesMut) -> Result<Option<Frame>, io::Error> {
             attached,
             last_heartbeat,
             foreground_cmd,
+            cwd,
         });
     }
     Ok(Some(Frame::SessionInfo { sessions }))

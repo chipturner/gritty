@@ -210,6 +210,7 @@ struct Row {
     attached: bool,
     age: String,
     cmd: String,
+    cwd: String,
     hotkey: Option<char>, // '1'-'9' for first 9 rows
 }
 
@@ -218,6 +219,7 @@ fn build_rows(sessions: &[gritty::protocol::SessionEntry]) -> Vec<Row> {
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default()
         .as_secs();
+    let home = std::env::var("HOME").unwrap_or_default();
     sessions
         .iter()
         .enumerate()
@@ -226,9 +228,20 @@ fn build_rows(sessions: &[gritty::protocol::SessionEntry]) -> Vec<Row> {
             attached: s.attached,
             age: format_age(now, s.created_at),
             cmd: s.foreground_cmd.clone(),
+            cwd: shorten_home(&s.cwd, &home),
             hotkey: if i < 9 { Some((b'1' + i as u8) as char) } else { None },
         })
         .collect()
+}
+
+fn shorten_home(path: &str, home: &str) -> String {
+    if !home.is_empty() && path.starts_with(home) {
+        let rest = &path[home.len()..];
+        if rest.is_empty() || rest.starts_with('/') {
+            return format!("~{rest}");
+        }
+    }
+    path.to_string()
 }
 
 /// Interactive session picker. Returns selected session name, or None on abort.
@@ -274,6 +287,7 @@ async fn tui_pick_session(
         let name_w = rows.iter().map(|r| r.name.len()).max().unwrap_or(0).max(3);
         let tag_w = 10; // "(attached)" is 10 chars
         let age_w = rows.iter().map(|r| r.age.len()).max().unwrap_or(0);
+        let cmd_w = rows.iter().map(|r| r.cmd.len()).max().unwrap_or(0);
         let total_lines = rows.len() + 3; // header + rows + new-session + hint
 
         // If we drew before, erase old output first
@@ -309,20 +323,20 @@ async fn tui_pick_session(
                 let tag = if row.attached { "(attached)" } else { "" };
                 let _ = write!(
                     stderr,
-                    "{marker} \x1b[2m{hk}\x1b[0m \x1b[32;1m{:<name_w$}\x1b[0m  {:<tag_w$}  \x1b[32m{:<age_w$}\x1b[0m  \x1b[32m{}\x1b[0m\r\n",
-                    row.name, tag, row.age, row.cmd,
+                    "{marker} \x1b[2m{hk}\x1b[0m \x1b[32;1m{:<name_w$}\x1b[0m  {:<tag_w$}  \x1b[32m{:<age_w$}\x1b[0m  \x1b[32m{:<cmd_w$}\x1b[0m  \x1b[32m{}\x1b[0m\r\n",
+                    row.name, tag, row.age, row.cmd, row.cwd,
                 );
             } else if row.attached {
                 let _ = write!(
                     stderr,
-                    "{marker} \x1b[2m{hk} {:<name_w$}  {:<tag_w$}  {:<age_w$}  {}\x1b[0m\r\n",
-                    row.name, "(attached)", row.age, row.cmd,
+                    "{marker} \x1b[2m{hk} {:<name_w$}  {:<tag_w$}  {:<age_w$}  {:<cmd_w$}  {}\x1b[0m\r\n",
+                    row.name, "(attached)", row.age, row.cmd, row.cwd,
                 );
             } else {
                 let _ = write!(
                     stderr,
-                    "{marker} \x1b[2m{hk}\x1b[0m {:<name_w$}  {:<tag_w$}  {:<age_w$}  {}\r\n",
-                    row.name, "", row.age, row.cmd,
+                    "{marker} \x1b[2m{hk}\x1b[0m {:<name_w$}  {:<tag_w$}  {:<age_w$}  {:<cmd_w$}  {}\r\n",
+                    row.name, "", row.age, row.cmd, row.cwd,
                 );
             }
         }
@@ -847,6 +861,7 @@ pub(crate) async fn list_sessions(ctl_path: PathBuf) -> anyhow::Result<()> {
                             s.id.clone(),
                             name,
                             s.foreground_cmd.clone(),
+                            s.cwd.clone(),
                             pty,
                             pid,
                             created,
@@ -856,7 +871,7 @@ pub(crate) async fn list_sessions(ctl_path: PathBuf) -> anyhow::Result<()> {
                     .collect();
 
                 gritty::table::print_table(
-                    &["ID", "Name", "Cmd", "PTY", "PID", "Created", "Status"],
+                    &["ID", "Name", "Cmd", "CWD", "PTY", "PID", "Created", "Status"],
                     &rows,
                 );
             }
@@ -951,6 +966,7 @@ pub(crate) async fn list_all_sessions() -> anyhow::Result<()> {
                     s.id.clone(),
                     name,
                     s.foreground_cmd.clone(),
+                    s.cwd.clone(),
                     pty,
                     pid,
                     created,
@@ -962,7 +978,7 @@ pub(crate) async fn list_all_sessions() -> anyhow::Result<()> {
 
     if multi_host {
         gritty::table::print_table(
-            &["Host", "ID", "Name", "Cmd", "PTY", "PID", "Created", "Status"],
+            &["Host", "ID", "Name", "Cmd", "CWD", "PTY", "PID", "Created", "Status"],
             &rows,
         );
     } else {
@@ -970,7 +986,7 @@ pub(crate) async fn list_all_sessions() -> anyhow::Result<()> {
         println!("Host: {host}");
         let trimmed: Vec<Vec<String>> = rows.iter().map(|r| r[1..].to_vec()).collect();
         gritty::table::print_table(
-            &["ID", "Name", "Cmd", "PTY", "PID", "Created", "Status"],
+            &["ID", "Name", "Cmd", "CWD", "PTY", "PID", "Created", "Status"],
             &trimmed,
         );
     }

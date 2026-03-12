@@ -31,6 +31,10 @@ fn gritty_bin() -> PathBuf {
     path
 }
 
+fn gritty_bin_dir() -> PathBuf {
+    gritty_bin().parent().unwrap().to_owned()
+}
+
 /// Isolated test environment with its own socket directory.
 struct TestEnv {
     _tmp: tempfile::TempDir,
@@ -48,6 +52,7 @@ impl TestEnv {
         Command::new(gritty_bin())
             .args(args)
             .env("GRITTY_SOCKET_DIR", &self.socket_dir)
+            .env("GRITTY_BIN_DIR", gritty_bin_dir())
             .output()
             .expect("failed to run gritty")
     }
@@ -73,6 +78,7 @@ impl TestEnv {
         Command::new(gritty_bin())
             .args(args)
             .env("GRITTY_SOCKET_DIR", &self.socket_dir)
+            .env("GRITTY_BIN_DIR", gritty_bin_dir())
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::piped())
             .spawn()
