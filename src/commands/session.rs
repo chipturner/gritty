@@ -151,7 +151,7 @@ async fn pick_session(pick: bool, no_pick: bool, ctl_path: &Path) -> String {
     let host = host_from_ctl_path(ctl_path);
 
     if pick {
-        return pick_or_list(&host, &sessions);
+        return pick_or_list(&host, &sessions, ctl_path).await;
     }
 
     let detached: Vec<_> = sessions.iter().filter(|s| !s.attached).collect();
@@ -167,7 +167,7 @@ async fn pick_session(pick: bool, no_pick: bool, ctl_path: &Path) -> String {
     }
 
     // Ambiguous (multiple detached) or all attached: show picker
-    pick_or_list(&host, &sessions)
+    pick_or_list(&host, &sessions, ctl_path).await
 }
 
 fn session_display_name(s: &gritty::protocol::SessionEntry) -> String {
@@ -189,9 +189,13 @@ fn print_session_list(host: &str, sessions: &[gritty::protocol::SessionEntry]) {
 
 /// Show picker (TUI if stderr is a TTY, static list otherwise).
 /// Returns selected name or exits on abort/non-TTY.
-fn pick_or_list(host: &str, sessions: &[gritty::protocol::SessionEntry]) -> String {
+async fn pick_or_list(
+    host: &str,
+    sessions: &[gritty::protocol::SessionEntry],
+    ctl_path: &Path,
+) -> String {
     if std::io::IsTerminal::is_terminal(&std::io::stderr()) {
-        match tui_pick_session(host, sessions) {
+        match tui_pick_session(host, sessions, ctl_path).await {
             Some(name) => name,
             None => std::process::exit(1),
         }
@@ -201,8 +205,38 @@ fn pick_or_list(host: &str, sessions: &[gritty::protocol::SessionEntry]) -> Stri
     }
 }
 
+struct Row {
+    name: String,
+    attached: bool,
+    age: String,
+    cmd: String,
+    hotkey: Option<char>, // '1'-'9' for first 9 rows
+}
+
+fn build_rows(sessions: &[gritty::protocol::SessionEntry]) -> Vec<Row> {
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+    sessions
+        .iter()
+        .enumerate()
+        .map(|(i, s)| Row {
+            name: session_display_name(s),
+            attached: s.attached,
+            age: format_age(now, s.created_at),
+            cmd: s.foreground_cmd.clone(),
+            hotkey: if i < 9 { Some((b'1' + i as u8) as char) } else { None },
+        })
+        .collect()
+}
+
 /// Interactive session picker. Returns selected session name, or None on abort.
-fn tui_pick_session(host: &str, sessions: &[gritty::protocol::SessionEntry]) -> Option<String> {
+async fn tui_pick_session(
+    host: &str,
+    sessions: &[gritty::protocol::SessionEntry],
+    ctl_path: &Path,
+) -> Option<String> {
     use crossterm::{
         event::{self, Event, KeyCode, KeyEvent, KeyModifiers},
         terminal,
@@ -215,61 +249,63 @@ fn tui_pick_session(host: &str, sessions: &[gritty::protocol::SessionEntry]) -> 
     let initial = sessions.iter().position(|s| !s.attached).unwrap_or(0);
     let mut cursor = initial;
 
-    // Precompute column data
-    let now = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_secs();
+    let mut rows = build_rows(sessions);
+    let mut has_default = sessions.iter().any(|s| s.name == "default" || s.id == "default");
 
-    struct Row {
-        name: String,
-        attached: bool,
-        age: String,
-        cmd: String,
-        hotkey: Option<char>, // '1'-'9' for first 9 rows
+    enum Mode {
+        Pick,
+        Input { buf: String, cursor_pos: usize, rename_of: Option<String> },
+        ConfirmKill { name: String },
     }
 
-    let has_default = sessions.iter().any(|s| s.name == "default" || s.id == "default");
-
-    let rows: Vec<Row> = sessions
-        .iter()
-        .enumerate()
-        .map(|(i, s)| Row {
-            name: session_display_name(s),
-            attached: s.attached,
-            age: format_age(now, s.created_at),
-            cmd: s.foreground_cmd.clone(),
-            hotkey: if i < 9 { Some((b'1' + i as u8) as char) } else { None },
-        })
-        .collect();
-
-    let name_w = rows.iter().map(|r| r.name.len()).max().unwrap_or(0).max(3);
-    let tag_w = 10; // "(attached)" is 10 chars
-    let age_w = rows.iter().map(|r| r.age.len()).max().unwrap_or(0);
-    // header + rows + "new session" line + hint
-    let total_lines = rows.len() + 3;
+    let mut mode = Mode::Pick;
+    let mut prev_total_lines: usize = 0;
 
     // Enter raw mode
     let _ = terminal::enable_raw_mode();
     let _ = write!(stderr, "\x1b[?25l"); // hide cursor
 
-    enum Mode {
-        Pick,
-        Input { buf: String, cursor_pos: usize },
-    }
+    let render = |stderr: &mut std::io::Stderr,
+                  rows: &[Row],
+                  cursor: usize,
+                  mode: &Mode,
+                  has_default: bool,
+                  prev_total_lines: usize| {
+        let name_w = rows.iter().map(|r| r.name.len()).max().unwrap_or(0).max(3);
+        let tag_w = 10; // "(attached)" is 10 chars
+        let age_w = rows.iter().map(|r| r.age.len()).max().unwrap_or(0);
+        let total_lines = rows.len() + 3; // header + rows + new-session + hint
 
-    let render = |stderr: &mut std::io::Stderr, cursor: usize, mode: &Mode| {
-        // Header: cyan bold
+        // If we drew before, erase old output first
+        if prev_total_lines > 0 {
+            let _ = write!(stderr, "\x1b[{}A", prev_total_lines);
+            for _ in 0..prev_total_lines {
+                let _ = write!(stderr, "\x1b[2K\r\n");
+            }
+            let _ = write!(stderr, "\x1b[{}A", prev_total_lines);
+        }
+
+        // Show/hide cursor based on mode
+        match mode {
+            Mode::Pick | Mode::ConfirmKill { .. } => {
+                let _ = write!(stderr, "\x1b[?25l");
+            }
+            Mode::Input { .. } => {
+                let _ = write!(stderr, "\x1b[?25h");
+            }
+        }
+
+        // Header
         let _ = write!(stderr, "\x1b[36;1mPick a session on {host}:\x1b[0m\r\n");
         for (i, row) in rows.iter().enumerate() {
-            let marker = if i == cursor && matches!(mode, Mode::Pick) {
+            let marker = if i == cursor && matches!(mode, Mode::Pick | Mode::ConfirmKill { .. }) {
                 "\x1b[32;1m\u{25b8}\x1b[0m"
             } else {
                 " "
             };
             let hk = row.hotkey.map_or(String::from("  "), |c| format!("{c})"));
 
-            if i == cursor && matches!(mode, Mode::Pick) {
+            if i == cursor && matches!(mode, Mode::Pick | Mode::ConfirmKill { .. }) {
                 let tag = if row.attached { "(attached)" } else { "" };
                 let _ = write!(
                     stderr,
@@ -292,7 +328,7 @@ fn tui_pick_session(host: &str, sessions: &[gritty::protocol::SessionEntry]) -> 
         }
         // "New session" row / input line
         match mode {
-            Mode::Pick => {
+            Mode::Pick | Mode::ConfirmKill { .. } => {
                 let marker = if cursor == rows.len() { "\x1b[32;1m\u{25b8}\x1b[0m" } else { " " };
                 if cursor == rows.len() {
                     let _ = write!(
@@ -303,38 +339,45 @@ fn tui_pick_session(host: &str, sessions: &[gritty::protocol::SessionEntry]) -> 
                     let _ = write!(stderr, "{marker} \x1b[2m+) new session\x1b[0m\r\n");
                 }
             }
-            Mode::Input { buf, cursor_pos } => {
+            Mode::Input { buf, cursor_pos, rename_of } => {
+                let prefix = if rename_of.is_some() { "r)" } else { "+)" };
                 let (before, after) = buf.split_at(*cursor_pos);
                 let cursor_ch = after.chars().next().unwrap_or(' ');
                 let rest = if after.is_empty() { "" } else { &after[cursor_ch.len_utf8()..] };
                 let _ = write!(
                     stderr,
-                    "\x1b[32;1m\u{25b8}\x1b[0m \x1b[2m+)\x1b[0m \x1b[32;1m{before}\x1b[7m{cursor_ch}\x1b[27m{rest}\x1b[0m\r\n"
+                    "\x1b[32;1m\u{25b8}\x1b[0m \x1b[2m{prefix}\x1b[0m \x1b[32;1m{before}\x1b[7m{cursor_ch}\x1b[27m{rest}\x1b[0m\r\n"
                 );
             }
         }
         // Hint line
         let hints = match mode {
             Mode::Pick => {
-                let mut h = String::from("1-9 jump  enter select  c/n new");
+                let mut h = String::from("1-9 jump  enter select  c/n new  r rename  x kill");
                 if has_default {
                     h.push_str("  d default");
                 }
                 h.push_str("  esc quit");
                 h
             }
+            Mode::Input { rename_of: Some(_), .. } => "enter rename  esc back".to_string(),
             Mode::Input { .. } => "enter create  esc back".to_string(),
+            Mode::ConfirmKill { name } => format!("kill {name}? y/n"),
         };
         let _ = write!(stderr, "\x1b[2m  {hints}\x1b[0m\r\n");
         let _ = stderr.flush();
+        total_lines
     };
 
-    let mut mode = Mode::Pick;
-
     // Initial render
-    render(&mut stderr, cursor, &mode);
+    prev_total_lines = render(&mut stderr, &rows, cursor, &mode, has_default, prev_total_lines);
 
     let result = loop {
+        // Poll-based loop so we can yield to the async runtime
+        if !event::poll(std::time::Duration::from_millis(100)).unwrap_or(false) {
+            tokio::task::yield_now().await;
+            continue;
+        }
         let Ok(ev) = event::read() else {
             break None;
         };
@@ -360,8 +403,7 @@ fn tui_pick_session(host: &str, sessions: &[gritty::protocol::SessionEntry]) -> 
                     if cursor < rows.len() {
                         break Some(rows[cursor].name.clone());
                     }
-                    // cursor == rows.len() means "new session" row
-                    mode = Mode::Input { buf: String::new(), cursor_pos: 0 };
+                    mode = Mode::Input { buf: String::new(), cursor_pos: 0, rename_of: None };
                 }
                 // Hotkeys 1-9
                 Event::Key(KeyEvent {
@@ -388,15 +430,41 @@ fn tui_pick_session(host: &str, sessions: &[gritty::protocol::SessionEntry]) -> 
                     modifiers: KeyModifiers::NONE,
                     ..
                 }) => {
-                    mode = Mode::Input { buf: String::new(), cursor_pos: 0 };
+                    mode = Mode::Input { buf: String::new(), cursor_pos: 0, rename_of: None };
                 }
-                // '+' -> new session (also navigates to it)
+                // '+' -> new session
                 Event::Key(KeyEvent {
                     code: KeyCode::Char('+'),
                     modifiers: KeyModifiers::NONE,
                     ..
                 }) => {
-                    mode = Mode::Input { buf: String::new(), cursor_pos: 0 };
+                    mode = Mode::Input { buf: String::new(), cursor_pos: 0, rename_of: None };
+                }
+                // 'x' or Delete -> kill selected session
+                Event::Key(KeyEvent {
+                    code: KeyCode::Char('x') | KeyCode::Delete,
+                    modifiers: KeyModifiers::NONE,
+                    ..
+                }) => {
+                    if cursor < rows.len() {
+                        mode = Mode::ConfirmKill { name: rows[cursor].name.clone() };
+                    }
+                }
+                // 'r' -> rename selected session
+                Event::Key(KeyEvent {
+                    code: KeyCode::Char('r'),
+                    modifiers: KeyModifiers::NONE,
+                    ..
+                }) => {
+                    if cursor < rows.len() {
+                        let name = rows[cursor].name.clone();
+                        let len = name.len();
+                        mode = Mode::Input {
+                            buf: name.clone(),
+                            cursor_pos: len,
+                            rename_of: Some(name),
+                        };
+                    }
                 }
                 Event::Key(KeyEvent {
                     code: KeyCode::Esc | KeyCode::Char('q'),
@@ -414,28 +482,85 @@ fn tui_pick_session(host: &str, sessions: &[gritty::protocol::SessionEntry]) -> 
                 }
                 _ => continue,
             },
-            Mode::Input { buf, cursor_pos } => match ev {
+            Mode::ConfirmKill { name } => match ev {
+                Event::Key(KeyEvent { code: KeyCode::Char('y'), .. }) => {
+                    let kill_name = name.clone();
+                    let ctl = ctl_path.to_path_buf();
+                    let _ = server_request(
+                        &ctl,
+                        gritty::protocol::Frame::KillSession { session: kill_name },
+                    )
+                    .await;
+                    // Refresh session list
+                    if let Ok(gritty::protocol::Frame::SessionInfo { sessions: fresh }) =
+                        server_request(&ctl, gritty::protocol::Frame::ListSessions).await
+                    {
+                        if fresh.is_empty() {
+                            break Some("default".to_string());
+                        }
+                        has_default =
+                            fresh.iter().any(|s| s.name == "default" || s.id == "default");
+                        rows = build_rows(&fresh);
+                        cursor = cursor.min(rows.len().saturating_sub(1));
+                    }
+                    mode = Mode::Pick;
+                }
+                _ => {
+                    mode = Mode::Pick;
+                }
+            },
+            Mode::Input { buf, cursor_pos, rename_of } => match ev {
                 Event::Key(KeyEvent { code: KeyCode::Enter, .. }) => {
-                    let name = buf.trim().to_string();
-                    if name.is_empty() {
-                        // Empty name -> go back to pick mode
+                    let new_name = buf.trim().to_string();
+                    if let Some(old_name) = rename_of.take() {
+                        // Rename mode
+                        if new_name.is_empty() || new_name == old_name {
+                            mode = Mode::Pick;
+                        } else {
+                            let ctl = ctl_path.to_path_buf();
+                            let _ = server_request(
+                                &ctl,
+                                gritty::protocol::Frame::RenameSession {
+                                    session: old_name,
+                                    new_name,
+                                },
+                            )
+                            .await;
+                            // Refresh
+                            if let Ok(gritty::protocol::Frame::SessionInfo { sessions: fresh }) =
+                                server_request(&ctl, gritty::protocol::Frame::ListSessions).await
+                            {
+                                has_default =
+                                    fresh.iter().any(|s| s.name == "default" || s.id == "default");
+                                rows = build_rows(&fresh);
+                                cursor = cursor.min(rows.len().saturating_sub(1));
+                            }
+                            mode = Mode::Pick;
+                        }
+                    } else if new_name.is_empty() {
                         mode = Mode::Pick;
-                        cursor = rows.len(); // stay on "new session"
+                        cursor = rows.len();
                     } else {
-                        break Some(name);
+                        break Some(new_name);
                     }
                 }
                 Event::Key(KeyEvent { code: KeyCode::Esc, .. }) => {
+                    let back_to_new = rename_of.is_none();
                     mode = Mode::Pick;
-                    cursor = rows.len();
+                    if back_to_new {
+                        cursor = rows.len();
+                    }
                 }
                 Event::Key(KeyEvent {
                     code: KeyCode::Char('c') | KeyCode::Char('g'),
                     modifiers: KeyModifiers::CONTROL,
                     ..
                 }) => {
+                    let back_to_new = rename_of.is_none();
                     mode = Mode::Pick;
-                    cursor = rows.len();
+                    if back_to_new {
+                        cursor = rows.len();
+                    }
                 }
                 // Readline: Ctrl+A -> beginning
                 Event::Key(KeyEvent {
@@ -521,26 +646,17 @@ fn tui_pick_session(host: &str, sessions: &[gritty::protocol::SessionEntry]) -> 
                 _ => continue,
             },
         }
-        // Move cursor up to re-render in place
-        let _ = write!(stderr, "\x1b[{}A", total_lines);
-        // Show real cursor in input mode, hide in pick mode
-        match &mode {
-            Mode::Pick => {
-                let _ = write!(stderr, "\x1b[?25l");
-            }
-            Mode::Input { .. } => {
-                let _ = write!(stderr, "\x1b[?25h");
-            }
-        }
-        render(&mut stderr, cursor, &mode);
+        prev_total_lines = render(&mut stderr, &rows, cursor, &mode, has_default, prev_total_lines);
     };
 
     // Cleanup: erase picker lines, restore terminal
-    let _ = write!(stderr, "\x1b[{}A", total_lines); // move up
-    for _ in 0..total_lines {
-        let _ = write!(stderr, "\x1b[2K\r\n"); // clear each line
+    if prev_total_lines > 0 {
+        let _ = write!(stderr, "\x1b[{}A", prev_total_lines);
+        for _ in 0..prev_total_lines {
+            let _ = write!(stderr, "\x1b[2K\r\n");
+        }
+        let _ = write!(stderr, "\x1b[{}A", prev_total_lines);
     }
-    let _ = write!(stderr, "\x1b[{}A", total_lines); // move back up
     let _ = write!(stderr, "\x1b[?25h"); // show cursor
     let _ = stderr.flush();
     let _ = terminal::disable_raw_mode();
