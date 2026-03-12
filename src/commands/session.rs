@@ -226,98 +226,313 @@ fn tui_pick_session(host: &str, sessions: &[gritty::protocol::SessionEntry]) -> 
         attached: bool,
         age: String,
         cmd: String,
+        hotkey: Option<char>, // '1'-'9' for first 9 rows
     }
+
+    let has_default = sessions.iter().any(|s| s.name == "default" || s.id == "default");
 
     let rows: Vec<Row> = sessions
         .iter()
-        .map(|s| Row {
+        .enumerate()
+        .map(|(i, s)| Row {
             name: session_display_name(s),
             attached: s.attached,
             age: format_age(now, s.created_at),
             cmd: s.foreground_cmd.clone(),
+            hotkey: if i < 9 { Some((b'1' + i as u8) as char) } else { None },
         })
         .collect();
 
-    let name_w = rows.iter().map(|r| r.name.len()).max().unwrap_or(0);
+    let name_w = rows.iter().map(|r| r.name.len()).max().unwrap_or(0).max(3);
     let tag_w = 10; // "(attached)" is 10 chars
     let age_w = rows.iter().map(|r| r.age.len()).max().unwrap_or(0);
-    let total_lines = rows.len() + 2; // +1 header, +1 hint
+    // header + rows + "new session" line + hint
+    let total_lines = rows.len() + 3;
 
     // Enter raw mode
     let _ = terminal::enable_raw_mode();
     let _ = write!(stderr, "\x1b[?25l"); // hide cursor
 
-    let render = |stderr: &mut std::io::Stderr, cursor: usize| {
+    enum Mode {
+        Pick,
+        Input { buf: String, cursor_pos: usize },
+    }
+
+    let render = |stderr: &mut std::io::Stderr, cursor: usize, mode: &Mode| {
         // Header: cyan bold
         let _ = write!(stderr, "\x1b[36;1mPick a session on {host}:\x1b[0m\r\n");
         for (i, row) in rows.iter().enumerate() {
-            let marker = if i == cursor { "\x1b[32;1m\u{25b8}\x1b[0m" } else { " " };
-            let tag = if row.attached { "(attached)" } else { "" };
+            let marker = if i == cursor && matches!(mode, Mode::Pick) {
+                "\x1b[32;1m\u{25b8}\x1b[0m"
+            } else {
+                " "
+            };
+            let hk = row.hotkey.map_or(String::from("  "), |c| format!("{c})"));
 
-            if i == cursor {
-                // Selected: green bold
+            if i == cursor && matches!(mode, Mode::Pick) {
+                let tag = if row.attached { "(attached)" } else { "" };
                 let _ = write!(
                     stderr,
-                    "{marker} \x1b[32;1m{:<name_w$}\x1b[0m  {:<tag_w$}  \x1b[32m{:<age_w$}\x1b[0m  \x1b[32m{}\x1b[0m\r\n",
+                    "{marker} \x1b[2m{hk}\x1b[0m \x1b[32;1m{:<name_w$}\x1b[0m  {:<tag_w$}  \x1b[32m{:<age_w$}\x1b[0m  \x1b[32m{}\x1b[0m\r\n",
                     row.name, tag, row.age, row.cmd,
                 );
             } else if row.attached {
-                // Attached: dimmed
                 let _ = write!(
                     stderr,
-                    "{marker} \x1b[2m{:<name_w$}  {:<tag_w$}  {:<age_w$}  {}\x1b[0m\r\n",
-                    row.name, tag, row.age, row.cmd,
+                    "{marker} \x1b[2m{hk} {:<name_w$}  {:<tag_w$}  {:<age_w$}  {}\x1b[0m\r\n",
+                    row.name, "(attached)", row.age, row.cmd,
                 );
             } else {
-                // Normal
                 let _ = write!(
                     stderr,
-                    "{marker} {:<name_w$}  {:<tag_w$}  {:<age_w$}  {}\r\n",
-                    row.name, tag, row.age, row.cmd,
+                    "{marker} \x1b[2m{hk}\x1b[0m {:<name_w$}  {:<tag_w$}  {:<age_w$}  {}\r\n",
+                    row.name, "", row.age, row.cmd,
                 );
             }
         }
-        let _ = write!(
-            stderr,
-            "\x1b[2m  \u{2191}/\u{2193} navigate  enter select  esc cancel\x1b[0m\r\n"
-        );
+        // "New session" row / input line
+        match mode {
+            Mode::Pick => {
+                let marker = if cursor == rows.len() { "\x1b[32;1m\u{25b8}\x1b[0m" } else { " " };
+                if cursor == rows.len() {
+                    let _ = write!(
+                        stderr,
+                        "{marker} \x1b[2m+)\x1b[0m \x1b[32;1mnew session\x1b[0m\r\n"
+                    );
+                } else {
+                    let _ = write!(stderr, "{marker} \x1b[2m+) new session\x1b[0m\r\n");
+                }
+            }
+            Mode::Input { buf, cursor_pos } => {
+                let (before, after) = buf.split_at(*cursor_pos);
+                let cursor_ch = after.chars().next().unwrap_or(' ');
+                let rest = if after.is_empty() { "" } else { &after[cursor_ch.len_utf8()..] };
+                let _ = write!(
+                    stderr,
+                    "\x1b[32;1m\u{25b8}\x1b[0m \x1b[2m+)\x1b[0m \x1b[32;1m{before}\x1b[7m{cursor_ch}\x1b[27m{rest}\x1b[0m\r\n"
+                );
+            }
+        }
+        // Hint line
+        let hints = match mode {
+            Mode::Pick => {
+                let mut h = String::from("1-9 jump  enter select  c/n new");
+                if has_default {
+                    h.push_str("  d default");
+                }
+                h.push_str("  esc quit");
+                h
+            }
+            Mode::Input { .. } => "enter create  esc back".to_string(),
+        };
+        let _ = write!(stderr, "\x1b[2m  {hints}\x1b[0m\r\n");
         let _ = stderr.flush();
     };
 
+    let mut mode = Mode::Pick;
+
     // Initial render
-    render(&mut stderr, cursor);
+    render(&mut stderr, cursor, &mode);
 
     let result = loop {
         let Ok(ev) = event::read() else {
             break None;
         };
-        match ev {
-            Event::Key(KeyEvent { code: KeyCode::Up | KeyCode::Char('k'), .. }) => {
-                cursor = cursor.saturating_sub(1);
-            }
-            Event::Key(KeyEvent { code: KeyCode::Down | KeyCode::Char('j'), .. }) => {
-                if cursor + 1 < rows.len() {
-                    cursor += 1;
+        match &mut mode {
+            Mode::Pick => match ev {
+                Event::Key(KeyEvent {
+                    code: KeyCode::Up | KeyCode::Char('k'),
+                    modifiers: KeyModifiers::NONE,
+                    ..
+                }) => {
+                    cursor = cursor.saturating_sub(1);
                 }
-            }
-            Event::Key(KeyEvent { code: KeyCode::Enter, .. }) => {
-                break Some(rows[cursor].name.clone());
-            }
-            Event::Key(KeyEvent { code: KeyCode::Esc | KeyCode::Char('q'), .. }) => {
-                break None;
-            }
-            Event::Key(KeyEvent {
-                code: KeyCode::Char('c') | KeyCode::Char('g'),
-                modifiers: KeyModifiers::CONTROL,
-                ..
-            }) => {
-                break None;
-            }
-            _ => continue, // don't re-render for unknown events
+                Event::Key(KeyEvent {
+                    code: KeyCode::Down | KeyCode::Char('j'),
+                    modifiers: KeyModifiers::NONE,
+                    ..
+                }) => {
+                    if cursor < rows.len() {
+                        cursor += 1;
+                    }
+                }
+                Event::Key(KeyEvent { code: KeyCode::Enter, .. }) => {
+                    if cursor < rows.len() {
+                        break Some(rows[cursor].name.clone());
+                    }
+                    // cursor == rows.len() means "new session" row
+                    mode = Mode::Input { buf: String::new(), cursor_pos: 0 };
+                }
+                // Hotkeys 1-9
+                Event::Key(KeyEvent {
+                    code: KeyCode::Char(ch @ '1'..='9'),
+                    modifiers: KeyModifiers::NONE,
+                    ..
+                }) => {
+                    let idx = (ch as u8 - b'1') as usize;
+                    if idx < rows.len() {
+                        break Some(rows[idx].name.clone());
+                    }
+                }
+                // 'd' -> select "default"
+                Event::Key(KeyEvent {
+                    code: KeyCode::Char('d'),
+                    modifiers: KeyModifiers::NONE,
+                    ..
+                }) if has_default => {
+                    break Some("default".to_string());
+                }
+                // 'c' or 'n' -> new session input
+                Event::Key(KeyEvent {
+                    code: KeyCode::Char('c') | KeyCode::Char('n'),
+                    modifiers: KeyModifiers::NONE,
+                    ..
+                }) => {
+                    mode = Mode::Input { buf: String::new(), cursor_pos: 0 };
+                }
+                // '+' -> new session (also navigates to it)
+                Event::Key(KeyEvent {
+                    code: KeyCode::Char('+'),
+                    modifiers: KeyModifiers::NONE,
+                    ..
+                }) => {
+                    mode = Mode::Input { buf: String::new(), cursor_pos: 0 };
+                }
+                Event::Key(KeyEvent {
+                    code: KeyCode::Esc | KeyCode::Char('q'),
+                    modifiers: KeyModifiers::NONE,
+                    ..
+                }) => {
+                    break None;
+                }
+                Event::Key(KeyEvent {
+                    code: KeyCode::Char('c') | KeyCode::Char('g'),
+                    modifiers: KeyModifiers::CONTROL,
+                    ..
+                }) => {
+                    break None;
+                }
+                _ => continue,
+            },
+            Mode::Input { buf, cursor_pos } => match ev {
+                Event::Key(KeyEvent { code: KeyCode::Enter, .. }) => {
+                    let name = buf.trim().to_string();
+                    if name.is_empty() {
+                        // Empty name -> go back to pick mode
+                        mode = Mode::Pick;
+                        cursor = rows.len(); // stay on "new session"
+                    } else {
+                        break Some(name);
+                    }
+                }
+                Event::Key(KeyEvent { code: KeyCode::Esc, .. }) => {
+                    mode = Mode::Pick;
+                    cursor = rows.len();
+                }
+                Event::Key(KeyEvent {
+                    code: KeyCode::Char('c') | KeyCode::Char('g'),
+                    modifiers: KeyModifiers::CONTROL,
+                    ..
+                }) => {
+                    mode = Mode::Pick;
+                    cursor = rows.len();
+                }
+                // Readline: Ctrl+A -> beginning
+                Event::Key(KeyEvent {
+                    code: KeyCode::Char('a'),
+                    modifiers: KeyModifiers::CONTROL,
+                    ..
+                })
+                | Event::Key(KeyEvent { code: KeyCode::Home, .. }) => {
+                    *cursor_pos = 0;
+                }
+                // Readline: Ctrl+E -> end
+                Event::Key(KeyEvent {
+                    code: KeyCode::Char('e'),
+                    modifiers: KeyModifiers::CONTROL,
+                    ..
+                })
+                | Event::Key(KeyEvent { code: KeyCode::End, .. }) => {
+                    *cursor_pos = buf.len();
+                }
+                // Readline: Ctrl+U -> kill line
+                Event::Key(KeyEvent {
+                    code: KeyCode::Char('u'),
+                    modifiers: KeyModifiers::CONTROL,
+                    ..
+                }) => {
+                    buf.drain(..*cursor_pos);
+                    *cursor_pos = 0;
+                }
+                // Readline: Ctrl+W -> kill word backward
+                Event::Key(KeyEvent {
+                    code: KeyCode::Char('w'),
+                    modifiers: KeyModifiers::CONTROL,
+                    ..
+                }) => {
+                    let before = &buf[..*cursor_pos];
+                    let trimmed = before.trim_end();
+                    let word_start = trimmed.rfind(' ').map_or(0, |i| i + 1);
+                    buf.drain(word_start..*cursor_pos);
+                    *cursor_pos = word_start;
+                }
+                // Backspace
+                Event::Key(KeyEvent { code: KeyCode::Backspace, .. }) => {
+                    if *cursor_pos > 0 {
+                        buf.remove(*cursor_pos - 1);
+                        *cursor_pos -= 1;
+                    }
+                }
+                // Delete
+                Event::Key(KeyEvent { code: KeyCode::Delete, .. }) => {
+                    if *cursor_pos < buf.len() {
+                        buf.remove(*cursor_pos);
+                    }
+                }
+                // Left arrow / Ctrl+B
+                Event::Key(KeyEvent { code: KeyCode::Left, .. })
+                | Event::Key(KeyEvent {
+                    code: KeyCode::Char('b'),
+                    modifiers: KeyModifiers::CONTROL,
+                    ..
+                }) => {
+                    *cursor_pos = cursor_pos.saturating_sub(1);
+                }
+                // Right arrow / Ctrl+F
+                Event::Key(KeyEvent { code: KeyCode::Right, .. })
+                | Event::Key(KeyEvent {
+                    code: KeyCode::Char('f'),
+                    modifiers: KeyModifiers::CONTROL,
+                    ..
+                }) => {
+                    if *cursor_pos < buf.len() {
+                        *cursor_pos += 1;
+                    }
+                }
+                // Typing
+                Event::Key(KeyEvent {
+                    code: KeyCode::Char(ch),
+                    modifiers: KeyModifiers::NONE | KeyModifiers::SHIFT,
+                    ..
+                }) => {
+                    buf.insert(*cursor_pos, ch);
+                    *cursor_pos += 1;
+                }
+                _ => continue,
+            },
         }
         // Move cursor up to re-render in place
         let _ = write!(stderr, "\x1b[{}A", total_lines);
-        render(&mut stderr, cursor);
+        // Show real cursor in input mode, hide in pick mode
+        match &mode {
+            Mode::Pick => {
+                let _ = write!(stderr, "\x1b[?25l");
+            }
+            Mode::Input { .. } => {
+                let _ = write!(stderr, "\x1b[?25h");
+            }
+        }
+        render(&mut stderr, cursor, &mode);
     };
 
     // Cleanup: erase picker lines, restore terminal
