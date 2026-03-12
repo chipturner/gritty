@@ -272,7 +272,7 @@ enum Command {
         /// Connection name (as shown in `gritty tunnels`)
         name: String,
     },
-    /// Install gritty on a remote host (copies local binary via scp)
+    /// Install gritty on a remote host (downloads release via install script)
     #[command(display_order = 13)]
     Bootstrap {
         /// Remote destination ([user@]host[:port])

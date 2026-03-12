@@ -473,73 +473,32 @@ pub fn preflight_ssh(dest_str: &str, ssh_options: &[String]) -> anyhow::Result<(
 // Bootstrap
 // ---------------------------------------------------------------------------
 
-/// Install gritty on a remote host by copying the local binary via scp.
-///
-/// Detects the remote architecture via `uname -sm`, compares with the local
-/// architecture, and scp's the current binary if they match.
+const INSTALL_SCRIPT_URL: &str =
+    "https://raw.githubusercontent.com/chipturner/gritty/main/install.sh";
+
+/// Install gritty on a remote host by running the install script via SSH.
 pub async fn bootstrap(
     dest_str: &str,
     ssh_options: &[String],
     install_dir: &str,
 ) -> anyhow::Result<()> {
     let dest = Destination::parse(dest_str)?;
-    let ssh_dest_str = dest.ssh_dest();
 
-    // Detect remote arch
-    eprintln!("\x1b[2m\u{25b8} detecting remote architecture...\x1b[0m");
-    let remote_arch = remote_exec(&dest, "uname -sm", ssh_options, true).await?;
-    let local_arch = format!("{} {}", std::env::consts::OS, std::env::consts::ARCH);
-    // Normalize: uname gives "Linux x86_64", Rust gives "linux x86_64"
-    let remote_norm = remote_arch.to_lowercase();
-    let local_norm = local_arch.to_lowercase();
+    eprintln!("\x1b[2m\u{25b8} installing gritty on {}...\x1b[0m", dest.ssh_dest());
 
-    if remote_norm != local_norm {
-        bail!(
-            "architecture mismatch: local is {local_norm}, remote is {remote_norm}\n  \
-             install manually: ssh {ssh_dest_str} 'cargo install gritty-cli'"
-        );
-    }
+    let install_cmd =
+        format!("GRITTY_INSTALL_DIR={install_dir} sh -c \"$(curl -sSfL {INSTALL_SCRIPT_URL})\"");
 
-    let local_exe = std::env::current_exe().context("cannot determine local binary path")?;
-    eprintln!(
-        "\x1b[2m\u{25b8} uploading {} to {ssh_dest_str}:{install_dir}/gritty...\x1b[0m",
-        local_exe.display()
-    );
+    // Run interactively (foreground=true) so SSH can prompt if needed,
+    // and pipe stdout/stderr through so the user sees install progress.
+    let mut cmd = Command::new("ssh");
+    cmd.args(base_ssh_args(&dest, ssh_options, true));
+    cmd.arg(dest.ssh_dest());
+    cmd.arg(&install_cmd);
 
-    // Ensure install dir exists
-    remote_exec(&dest, &format!("mkdir -p {install_dir}"), ssh_options, true).await?;
-
-    // scp the binary
-    let mut scp = Command::new("scp");
-    scp.args(dest.port_args().iter().map(|a| if a == "-p" { "-P".to_string() } else { a.clone() }));
-    for opt in ssh_options {
-        scp.arg("-o");
-        scp.arg(opt);
-    }
-    scp.arg(local_exe.to_str().context("binary path not utf-8")?);
-    scp.arg(format!("{ssh_dest_str}:{install_dir}/gritty"));
-    scp.stdin(Stdio::null());
-
-    let status = scp.status().await.context("failed to run scp")?;
+    let status = cmd.status().await.context("failed to run ssh")?;
     if !status.success() {
-        bail!("scp failed (exit {status})");
-    }
-
-    // Make executable (scp should preserve mode, but be safe)
-    remote_exec(&dest, &format!("chmod +x {install_dir}/gritty"), ssh_options, true).await?;
-
-    // Verify
-    let remote_version =
-        remote_exec(&dest, &format!("{install_dir}/gritty protocol-version"), ssh_options, true)
-            .await;
-
-    match remote_version {
-        Ok(v) => eprintln!(
-            "\x1b[32m\u{25b8} installed gritty on {ssh_dest_str} (protocol version {v})\x1b[0m"
-        ),
-        Err(_) => eprintln!(
-            "\x1b[32m\u{25b8} uploaded to {ssh_dest_str}:{install_dir}/gritty (could not verify)\x1b[0m"
-        ),
+        bail!("remote install failed (exit {status})");
     }
 
     Ok(())

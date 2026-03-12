@@ -19,7 +19,7 @@ Persistent TTY sessions over Unix domain sockets. Single binary, tmux-like CLI. 
 | `tunnels` | `tun` | List active SSH tunnels |
 | `tunnel-create <destination>` | | SSH tunnel to remote host |
 | `tunnel-destroy <name>` | | Tear down SSH tunnel |
-| `bootstrap <destination>` | | Install gritty on a remote host via scp |
+| `bootstrap <destination>` | | Install gritty on a remote host |
 | `local-forward <port>` | `lf` | Forward TCP port: session to client |
 | `remote-forward <port>` | `rf` | Forward TCP port: client to session |
 | `send [files...]` | | Send files to a paired receiver |

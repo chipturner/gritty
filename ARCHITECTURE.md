@@ -31,7 +31,7 @@ flowchart LR
 
 A daemon listens on a single Unix socket (`ctl.sock`). Clients send a control frame declaring intent (new session, attach, list); the daemon hands off the raw socket connection to the target session and gets out of the loop. Each session owns a PTY with a login shell that persists across disconnects -- while no client is attached, the server drains PTY output into a ring buffer so the shell never blocks. On reconnect, buffered output is flushed to the new client.
 
-For remote access, `gritty tunnel-create` forwards the remote socket over SSH. All commands work identically over the tunnel. `gritty bootstrap <host>` installs the binary on the remote host by detecting the architecture and uploading via scp.
+For remote access, `gritty tunnel-create` forwards the remote socket over SSH. All commands work identically over the tunnel. `gritty bootstrap <host>` installs gritty on the remote host by running the install script over SSH.
 
 ## Self-Healing Reconnect
 
