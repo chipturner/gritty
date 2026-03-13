@@ -48,10 +48,7 @@ pub(crate) async fn connect_session(
                 return Ok(());
             }
             eprintln!("\x1b[32m\u{25b8} attached {name}\x1b[0m");
-            let mut env_vars = vec![];
-            if !settings.client_name.is_empty() {
-                env_vars.push(("GRITTY_CLIENT".into(), settings.client_name.clone()));
-            }
+            let env_vars = vec![];
             let code = gritty::client::run(
                 &name,
                 framed,
@@ -113,13 +110,7 @@ pub(crate) async fn connect_session(
             if detach {
                 return Ok(());
             }
-            let mut env_vars = gritty::collect_env_vars();
-            if settings.forward_open {
-                env_vars.push(("BROWSER".into(), "gritty open".into()));
-            }
-            if !settings.client_name.is_empty() {
-                env_vars.push(("GRITTY_CLIENT".into(), settings.client_name.clone()));
-            }
+            let env_vars = gritty::collect_env_vars();
             let id_str = id.to_string();
             let code = gritty::client::run(
                 &id_str,

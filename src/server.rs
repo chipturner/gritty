@@ -912,15 +912,8 @@ impl ServerRelay<'_> {
                     let _ = reply.send(Some(data));
                 }
             }
-            Some(Ok(Frame::Env { vars })) => {
-                // Update client name on reconnect/takeover
-                if let Some(meta) = self.metadata_slot.get() {
-                    if let Some((_, v)) = vars.iter().find(|(k, _)| k == "GRITTY_CLIENT") {
-                        if let Ok(mut name) = meta.client_name.lock() {
-                            *name = v.clone();
-                        }
-                    }
-                }
+            Some(Ok(Frame::Env { vars: _ })) => {
+                // Env vars are only used at first-client shell spawn; ignored on reconnect.
             }
             Some(Ok(Frame::Exit { .. })) | None => {
                 return Ok(ControlFlow::Break(RelayExit::ClientGone));
@@ -1373,31 +1366,25 @@ pub async fn run(
     if let Some(dir) = work_dir {
         cmd.current_dir(dir);
     }
-    // Prefer client_name from Env frame, fall back to Attach-provided name
-    let client_name = env_vars
-        .iter()
-        .find(|(k, _)| k == "GRITTY_CLIENT")
-        .map(|(_, v)| v.clone())
-        .unwrap_or(initial_client_name);
-    const ALLOWED_ENV_KEYS: &[&str] = &["TERM", "LANG", "COLORTERM", "GRITTY_CLIENT"];
+    let client_name = initial_client_name;
+    const ALLOWED_ENV_KEYS: &[&str] = &["TERM", "LANG", "COLORTERM"];
     for (k, v) in &env_vars {
         if ALLOWED_ENV_KEYS.contains(&k.as_str()) {
             cmd.env(k, v);
-        } else if k == "BROWSER" {
-            // Client signals open forwarding desired; create a gritty-open symlink
-            // so BROWSER is a single path with no spaces.
-            let exe = std::env::current_exe()
-                .ok()
-                .and_then(|p| p.to_str().map(String::from))
-                .unwrap_or_else(|| "gritty".into());
-            let open_link = svc_socket_path.parent().unwrap_or(Path::new(".")).join("gritty-open");
-            let _ = std::fs::remove_file(&open_link);
-            let _ = std::os::unix::fs::symlink(&exe, &open_link);
-            cmd.env("BROWSER", &open_link);
         } else {
             warn!(key = k, "ignoring disallowed env var from client");
         }
     }
+    cmd.env("GRITTY_CLIENT", &client_name);
+    // Create gritty-open symlink and set BROWSER unconditionally
+    let exe = std::env::current_exe()
+        .ok()
+        .and_then(|p| p.to_str().map(String::from))
+        .unwrap_or_else(|| "gritty".into());
+    let open_link = svc_socket_path.parent().unwrap_or(Path::new(".")).join("gritty-open");
+    let _ = std::fs::remove_file(&open_link);
+    let _ = std::os::unix::fs::symlink(&exe, &open_link);
+    cmd.env("BROWSER", &open_link);
     // Set SSH_AUTH_SOCK to the agent socket path
     cmd.env("SSH_AUTH_SOCK", &agent.socket_path);
     // Set GRITTY_SOCK so `gritty open`/`gritty send`/`gritty receive` find the service socket
