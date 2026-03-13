@@ -44,12 +44,30 @@ async fn setup_session() -> (
     let agent_path = unique_agent_socket_path();
     let svc_path = unique_svc_socket_path();
     let handle = tokio::spawn(async move {
-        gritty::server::run(client_rx, meta_clone, agent_path, svc_path, 0, None, None, 1 << 20, 5)
-            .await
+        gritty::server::run(
+            client_rx,
+            meta_clone,
+            agent_path,
+            svc_path,
+            0,
+            None,
+            None,
+            1 << 20,
+            5,
+            0,
+            0,
+            None,
+        )
+        .await
     });
 
     let (server_stream, client_stream) = UnixStream::pair().unwrap();
-    client_tx.send(ClientConn::Active(Framed::new(server_stream, FrameCodec))).unwrap();
+    client_tx
+        .send(ClientConn::Active {
+            framed: Framed::new(server_stream, FrameCodec),
+            client_name: String::new(),
+        })
+        .unwrap();
 
     let mut framed = Framed::new(client_stream, FrameCodec);
     // Send empty Env frame so server doesn't wait for the Env timeout before spawning shell
@@ -73,12 +91,30 @@ async fn setup_session_with_svc_path() -> (
     let svc_path = unique_svc_socket_path();
     let svc_path_clone = svc_path.clone();
     let handle = tokio::spawn(async move {
-        gritty::server::run(client_rx, meta_clone, agent_path, svc_path, 0, None, None, 1 << 20, 5)
-            .await
+        gritty::server::run(
+            client_rx,
+            meta_clone,
+            agent_path,
+            svc_path,
+            0,
+            None,
+            None,
+            1 << 20,
+            5,
+            0,
+            0,
+            None,
+        )
+        .await
     });
 
     let (server_stream, client_stream) = UnixStream::pair().unwrap();
-    client_tx.send(ClientConn::Active(Framed::new(server_stream, FrameCodec))).unwrap();
+    client_tx
+        .send(ClientConn::Active {
+            framed: Framed::new(server_stream, FrameCodec),
+            client_name: String::new(),
+        })
+        .unwrap();
 
     let mut framed = Framed::new(client_stream, FrameCodec);
     framed.send(Frame::Env { vars: vec![] }).await.unwrap();
@@ -102,12 +138,30 @@ async fn setup_session_with_env(
     let agent_path = unique_agent_socket_path();
     let svc_path = unique_svc_socket_path();
     let handle = tokio::spawn(async move {
-        gritty::server::run(client_rx, meta_clone, agent_path, svc_path, 0, None, None, 1 << 20, 5)
-            .await
+        gritty::server::run(
+            client_rx,
+            meta_clone,
+            agent_path,
+            svc_path,
+            0,
+            None,
+            None,
+            1 << 20,
+            5,
+            0,
+            0,
+            None,
+        )
+        .await
     });
 
     let (server_stream, client_stream) = UnixStream::pair().unwrap();
-    client_tx.send(ClientConn::Active(Framed::new(server_stream, FrameCodec))).unwrap();
+    client_tx
+        .send(ClientConn::Active {
+            framed: Framed::new(server_stream, FrameCodec),
+            client_name: String::new(),
+        })
+        .unwrap();
 
     let mut framed = Framed::new(client_stream, FrameCodec);
     // Send Env frame so server reads it before spawning shell
@@ -217,7 +271,12 @@ async fn reconnect_preserves_shell_session() {
 
     // Second connection via socketpair through channel
     let (server_stream, client_stream) = UnixStream::pair().unwrap();
-    client_tx.send(ClientConn::Active(Framed::new(server_stream, FrameCodec))).unwrap();
+    client_tx
+        .send(ClientConn::Active {
+            framed: Framed::new(server_stream, FrameCodec),
+            client_name: String::new(),
+        })
+        .unwrap();
     let mut framed = Framed::new(client_stream, FrameCodec);
     framed.send(Frame::Resize { cols: 80, rows: 24 }).await.unwrap();
 
@@ -262,7 +321,12 @@ async fn second_client_detaches_first() {
 
     // Second client connects via channel — should take over the session
     let (server_stream2, client_stream2) = UnixStream::pair().unwrap();
-    client_tx.send(ClientConn::Active(Framed::new(server_stream2, FrameCodec))).unwrap();
+    client_tx
+        .send(ClientConn::Active {
+            framed: Framed::new(server_stream2, FrameCodec),
+            client_name: String::new(),
+        })
+        .unwrap();
     let mut client2 = Framed::new(client_stream2, FrameCodec);
     client2.send(Frame::Resize { cols: 80, rows: 24 }).await.unwrap();
 
@@ -342,7 +406,12 @@ async fn rapid_reconnect_cycles() {
         tokio::time::sleep(Duration::from_millis(200)).await;
 
         let (server_stream, client_stream) = UnixStream::pair().unwrap();
-        client_tx.send(ClientConn::Active(Framed::new(server_stream, FrameCodec))).unwrap();
+        client_tx
+            .send(ClientConn::Active {
+                framed: Framed::new(server_stream, FrameCodec),
+                client_name: String::new(),
+            })
+            .unwrap();
         framed = Framed::new(client_stream, FrameCodec);
         framed.send(Frame::Resize { cols: 80, rows: 24 }).await.unwrap();
         read_available_data(&mut framed, Duration::from_millis(500)).await;
@@ -370,7 +439,13 @@ async fn control_frame_on_session_is_ignored() {
     framed.send(Frame::ListSessions).await.unwrap();
     framed.send(Frame::KillServer).await.unwrap();
     framed
-        .send(Frame::NewSession { name: "bogus".to_string(), command: String::new() })
+        .send(Frame::NewSession {
+            name: "bogus".to_string(),
+            command: String::new(),
+            cwd: String::new(),
+            cols: 0,
+            rows: 0,
+        })
         .await
         .unwrap();
 
@@ -409,7 +484,12 @@ async fn pty_buffer_saturation_and_resume() {
 
     // Reconnect via socketpair
     let (server_stream, client_stream) = UnixStream::pair().unwrap();
-    client_tx.send(ClientConn::Active(Framed::new(server_stream, FrameCodec))).unwrap();
+    client_tx
+        .send(ClientConn::Active {
+            framed: Framed::new(server_stream, FrameCodec),
+            client_name: String::new(),
+        })
+        .unwrap();
     let mut framed = Framed::new(client_stream, FrameCodec);
     framed.send(Frame::Resize { cols: 80, rows: 24 }).await.unwrap();
 
@@ -447,7 +527,12 @@ async fn pty_ring_buffer_drains_during_disconnect() {
 
     // Reconnect
     let (server_stream, client_stream) = UnixStream::pair().unwrap();
-    client_tx.send(ClientConn::Active(Framed::new(server_stream, FrameCodec))).unwrap();
+    client_tx
+        .send(ClientConn::Active {
+            framed: Framed::new(server_stream, FrameCodec),
+            client_name: String::new(),
+        })
+        .unwrap();
     let mut framed = Framed::new(client_stream, FrameCodec);
     framed.send(Frame::Resize { cols: 80, rows: 24 }).await.unwrap();
 
@@ -485,7 +570,12 @@ async fn pty_ring_buffer_caps_at_limit() {
 
     // Reconnect
     let (server_stream, client_stream) = UnixStream::pair().unwrap();
-    client_tx.send(ClientConn::Active(Framed::new(server_stream, FrameCodec))).unwrap();
+    client_tx
+        .send(ClientConn::Active {
+            framed: Framed::new(server_stream, FrameCodec),
+            client_name: String::new(),
+        })
+        .unwrap();
     let mut framed = Framed::new(client_stream, FrameCodec);
     framed.send(Frame::Resize { cols: 80, rows: 24 }).await.unwrap();
 
@@ -551,7 +641,12 @@ async fn metadata_reflects_attached_state() {
 
     // Reconnect and clean up
     let (server_stream, client_stream) = UnixStream::pair().unwrap();
-    client_tx.send(ClientConn::Active(Framed::new(server_stream, FrameCodec))).unwrap();
+    client_tx
+        .send(ClientConn::Active {
+            framed: Framed::new(server_stream, FrameCodec),
+            client_name: String::new(),
+        })
+        .unwrap();
     let mut framed = Framed::new(client_stream, FrameCodec);
     framed.send(Frame::Resize { cols: 80, rows: 24 }).await.unwrap();
     let _ = framed.send(Frame::Data(Bytes::from("exit\n"))).await;
@@ -573,7 +668,12 @@ async fn client_explicit_exit_frame() {
     // Server should still be running (it treats Exit as client disconnect).
     // Reconnect to verify shell is alive.
     let (server_stream, client_stream) = UnixStream::pair().unwrap();
-    client_tx.send(ClientConn::Active(Framed::new(server_stream, FrameCodec))).unwrap();
+    client_tx
+        .send(ClientConn::Active {
+            framed: Framed::new(server_stream, FrameCodec),
+            client_name: String::new(),
+        })
+        .unwrap();
     let mut framed = Framed::new(client_stream, FrameCodec);
     framed.send(Frame::Resize { cols: 80, rows: 24 }).await.unwrap();
     read_available_data(&mut framed, Duration::from_secs(1)).await;
@@ -760,12 +860,20 @@ async fn setup_session_with_agent_path() -> (
             None,
             1 << 20,
             5,
+            0,
+            0,
+            None,
         )
         .await
     });
 
     let (server_stream, client_stream) = UnixStream::pair().unwrap();
-    client_tx.send(ClientConn::Active(Framed::new(server_stream, FrameCodec))).unwrap();
+    client_tx
+        .send(ClientConn::Active {
+            framed: Framed::new(server_stream, FrameCodec),
+            client_name: String::new(),
+        })
+        .unwrap();
 
     let mut framed = Framed::new(client_stream, FrameCodec);
     framed.send(Frame::Env { vars: vec![] }).await.unwrap();
@@ -1038,7 +1146,12 @@ async fn ring_buffer_overflow_shows_truncation_marker() {
 
     // Reconnect
     let (server_stream, client_stream) = UnixStream::pair().unwrap();
-    client_tx.send(ClientConn::Active(Framed::new(server_stream, FrameCodec))).unwrap();
+    client_tx
+        .send(ClientConn::Active {
+            framed: Framed::new(server_stream, FrameCodec),
+            client_name: String::new(),
+        })
+        .unwrap();
     let mut framed = Framed::new(client_stream, FrameCodec);
     framed.send(Frame::Resize { cols: 80, rows: 24 }).await.unwrap();
 
@@ -2055,7 +2168,12 @@ async fn port_forward_client_disconnect_cleanup() {
     // Simulate client disconnect by dropping the framed connection
     // and handing off a new client
     let (server_stream2, client_stream2) = UnixStream::pair().unwrap();
-    client_tx.send(ClientConn::Active(Framed::new(server_stream2, FrameCodec))).unwrap();
+    client_tx
+        .send(ClientConn::Active {
+            framed: Framed::new(server_stream2, FrameCodec),
+            client_name: String::new(),
+        })
+        .unwrap();
     let mut framed2 = Framed::new(client_stream2, FrameCodec);
 
     // Old client should get Detached

@@ -15,10 +15,12 @@ pub async fn handshake(
     framed: &mut tokio_util::codec::Framed<tokio::net::UnixStream, protocol::FrameCodec>,
 ) -> anyhow::Result<u16> {
     use futures_util::{SinkExt, StreamExt};
-    framed.send(protocol::Frame::Hello { version: protocol::PROTOCOL_VERSION }).await?;
+    framed
+        .send(protocol::Frame::Hello { version: protocol::PROTOCOL_VERSION, capabilities: 0 })
+        .await?;
     match protocol::Frame::expect_from(framed.next().await)? {
-        protocol::Frame::HelloAck { version } => Ok(version),
-        protocol::Frame::Error { message } => anyhow::bail!("handshake rejected: {message}"),
+        protocol::Frame::HelloAck { version, .. } => Ok(version),
+        protocol::Frame::Error { message, .. } => anyhow::bail!("handshake rejected: {message}"),
         other => anyhow::bail!("expected HelloAck, got {other:?}"),
     }
 }

@@ -111,7 +111,7 @@ fn wait_for_socket(path: &Path, timeout_secs: u64) {
 }
 
 async fn do_handshake(framed: &mut Framed<UnixStream, FrameCodec>) {
-    framed.send(Frame::Hello { version: PROTOCOL_VERSION }).await.unwrap();
+    framed.send(Frame::Hello { version: PROTOCOL_VERSION, capabilities: 0 }).await.unwrap();
     let resp = timeout(Duration::from_secs(5), framed.next())
         .await
         .expect("handshake timed out")
@@ -139,10 +139,16 @@ async fn control_request(proxy_path: &Path, frame: Frame) -> Frame {
 }
 
 /// Create a named session through the proxy. Returns (session_id, attached framed connection).
-async fn create_session(proxy_path: &Path, name: &str) -> (String, Framed<UnixStream, FrameCodec>) {
+async fn create_session(proxy_path: &Path, name: &str) -> (u32, Framed<UnixStream, FrameCodec>) {
     let mut framed = connect_and_handshake(proxy_path).await;
     framed
-        .send(Frame::NewSession { name: name.to_string(), command: String::new() })
+        .send(Frame::NewSession {
+            name: name.to_string(),
+            command: String::new(),
+            cwd: String::new(),
+            cols: 0,
+            rows: 0,
+        })
         .await
         .unwrap();
     let resp = timeout(Duration::from_secs(5), framed.next())
@@ -160,7 +166,14 @@ async fn create_session(proxy_path: &Path, name: &str) -> (String, Framed<UnixSt
 /// Attach to a session through the proxy. Returns the framed connection.
 async fn attach_session(proxy_path: &Path, session: &str) -> Framed<UnixStream, FrameCodec> {
     let mut framed = connect_and_handshake(proxy_path).await;
-    framed.send(Frame::Attach { session: session.to_string() }).await.unwrap();
+    framed
+        .send(Frame::Attach {
+            session: session.to_string(),
+            client_name: String::new(),
+            force: true,
+        })
+        .await
+        .unwrap();
     let resp = timeout(Duration::from_secs(5), framed.next())
         .await
         .expect("timed out")
@@ -305,7 +318,8 @@ async fn session_create_list_kill_through_proxy() {
     }
 
     // Kill alpha
-    let resp = control_request(&env.proxy_path, Frame::KillSession { session: id_a.clone() }).await;
+    let resp =
+        control_request(&env.proxy_path, Frame::KillSession { session: id_a.to_string() }).await;
     assert_eq!(resp, Frame::Ok);
     tokio::time::sleep(Duration::from_millis(300)).await;
 
@@ -320,7 +334,8 @@ async fn session_create_list_kill_through_proxy() {
     }
 
     // Kill beta
-    let resp = control_request(&env.proxy_path, Frame::KillSession { session: id_b.clone() }).await;
+    let resp =
+        control_request(&env.proxy_path, Frame::KillSession { session: id_b.to_string() }).await;
     assert_eq!(resp, Frame::Ok);
     tokio::time::sleep(Duration::from_millis(300)).await;
 
@@ -379,7 +394,7 @@ async fn session_disconnect_reattach_preserves_state() {
     tokio::time::sleep(Duration::from_millis(500)).await;
 
     // Reattach
-    let mut framed = attach_session(&env.proxy_path, &id).await;
+    let mut framed = attach_session(&env.proxy_path, &id.to_string()).await;
     framed.send(Frame::Resize { cols: 80, rows: 24 }).await.unwrap();
     drain_data(&mut framed, Duration::from_millis(500)).await;
 
@@ -442,7 +457,7 @@ async fn second_client_detaches_first_through_proxy() {
     drain_data(&mut client1, Duration::from_millis(500)).await;
 
     // Attach client2
-    let mut client2 = attach_session(&env.proxy_path, &id).await;
+    let mut client2 = attach_session(&env.proxy_path, &id.to_string()).await;
 
     // Client1 should receive Detached
     let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
@@ -482,7 +497,7 @@ async fn rapid_takeover_cycles_through_proxy() {
 
     // Cycle 3 times
     for i in 0..3 {
-        let mut client = attach_session(&env.proxy_path, &id).await;
+        let mut client = attach_session(&env.proxy_path, &id.to_string()).await;
         client.send(Frame::Resize { cols: 80, rows: 24 }).await.unwrap();
         drain_data(&mut client, Duration::from_millis(500)).await;
 
@@ -513,7 +528,7 @@ async fn takeover_by_name_and_by_id() {
     tokio::time::sleep(Duration::from_millis(300)).await;
 
     // Attach by id
-    let mut framed = attach_session(&env.proxy_path, &id).await;
+    let mut framed = attach_session(&env.proxy_path, &id.to_string()).await;
     framed.send(Frame::Resize { cols: 80, rows: 24 }).await.unwrap();
     drain_data(&mut framed, Duration::from_millis(500)).await;
 }
@@ -542,7 +557,7 @@ async fn tunnel_death_during_active_session() {
     env.restart_socat();
 
     // Reattach
-    let mut framed = attach_session(&env.proxy_path, &id).await;
+    let mut framed = attach_session(&env.proxy_path, &id.to_string()).await;
     framed.send(Frame::Resize { cols: 80, rows: 24 }).await.unwrap();
     drain_data(&mut framed, Duration::from_millis(500)).await;
 
@@ -576,7 +591,7 @@ async fn tunnel_death_buffered_output_preserved() {
     env.restart_socat();
 
     // Reattach -- buffered output should drain
-    let mut framed = attach_session(&env.proxy_path, &id).await;
+    let mut framed = attach_session(&env.proxy_path, &id.to_string()).await;
     framed.send(Frame::Resize { cols: 80, rows: 24 }).await.unwrap();
 
     let output = drain_data(&mut framed, Duration::from_secs(3)).await;
@@ -615,7 +630,7 @@ async fn tunnel_death_ring_buffer_overflow_marker() {
     // Restart and reattach
     env.restart_socat();
 
-    let mut framed = attach_session(&env.proxy_path, &id).await;
+    let mut framed = attach_session(&env.proxy_path, &id.to_string()).await;
     framed.send(Frame::Resize { cols: 80, rows: 24 }).await.unwrap();
 
     let output = drain_data(&mut framed, Duration::from_secs(3)).await;
@@ -656,7 +671,7 @@ async fn tunnel_death_multiple_sessions_survive() {
 
     // Verify all sessions survived
     for (id, marker) in &sessions {
-        let mut framed = attach_session(&env.proxy_path, id).await;
+        let mut framed = attach_session(&env.proxy_path, &id.to_string()).await;
         framed.send(Frame::Resize { cols: 80, rows: 24 }).await.unwrap();
         drain_data(&mut framed, Duration::from_millis(500)).await;
 
@@ -686,7 +701,7 @@ async fn tunnel_flap_rapid_kill_restart() {
     }
 
     // Reattach and verify
-    let mut framed = attach_session(&env.proxy_path, &id).await;
+    let mut framed = attach_session(&env.proxy_path, &id.to_string()).await;
     framed.send(Frame::Resize { cols: 80, rows: 24 }).await.unwrap();
     drain_data(&mut framed, Duration::from_millis(500)).await;
 
@@ -708,7 +723,7 @@ async fn tail_receives_output_through_proxy() {
 
     // Open tail connection
     let mut tail = connect_and_handshake(&env.proxy_path).await;
-    tail.send(Frame::Tail { session: id.clone() }).await.unwrap();
+    tail.send(Frame::Tail { session: id.to_string() }).await.unwrap();
     let resp = timeout(Duration::from_secs(5), tail.next())
         .await
         .expect("timed out")
@@ -759,12 +774,12 @@ async fn tail_survives_tunnel_death() {
     env.restart_socat();
 
     // Re-establish both connections
-    let mut client = attach_session(&env.proxy_path, &id).await;
+    let mut client = attach_session(&env.proxy_path, &id.to_string()).await;
     client.send(Frame::Resize { cols: 80, rows: 24 }).await.unwrap();
     drain_data(&mut client, Duration::from_millis(500)).await;
 
     let mut tail = connect_and_handshake(&env.proxy_path).await;
-    tail.send(Frame::Tail { session: id.clone() }).await.unwrap();
+    tail.send(Frame::Tail { session: id.to_string() }).await.unwrap();
     let resp = timeout(Duration::from_secs(5), tail.next())
         .await
         .expect("timed out")
@@ -806,7 +821,7 @@ async fn tail_does_not_detach_active_through_proxy() {
 
     // Open tail
     let mut tail = connect_and_handshake(&env.proxy_path).await;
-    tail.send(Frame::Tail { session: id.clone() }).await.unwrap();
+    tail.send(Frame::Tail { session: id.to_string() }).await.unwrap();
     let resp = timeout(Duration::from_secs(5), tail.next())
         .await
         .expect("timed out")
@@ -839,7 +854,7 @@ async fn file_transfer_single_file_through_daemon() {
 
     // Sender: connect, handshake, SendFile with role=2 (Send)
     let mut sender = connect_and_handshake(&env.proxy_path).await;
-    sender.send(Frame::SendFile { session: id.clone() }).await.unwrap();
+    sender.send(Frame::SendFile { session: id.to_string() }).await.unwrap();
     let resp = timeout(Duration::from_secs(5), sender.next())
         .await
         .expect("timed out")
@@ -854,7 +869,7 @@ async fn file_transfer_single_file_through_daemon() {
     // Receiver: connect, handshake, SendFile with role=3 (Receive)
     let recv_dir = tempfile::tempdir().unwrap();
     let mut receiver = connect_and_handshake(&env.proxy_path).await;
-    receiver.send(Frame::SendFile { session: id.clone() }).await.unwrap();
+    receiver.send(Frame::SendFile { session: id.to_string() }).await.unwrap();
     let resp = timeout(Duration::from_secs(5), receiver.next())
         .await
         .expect("timed out")
@@ -945,7 +960,7 @@ async fn file_transfer_receiver_first_through_daemon() {
 
     // Receiver connects first
     let mut receiver = connect_and_handshake(&env.proxy_path).await;
-    receiver.send(Frame::SendFile { session: id.clone() }).await.unwrap();
+    receiver.send(Frame::SendFile { session: id.to_string() }).await.unwrap();
     let resp = timeout(Duration::from_secs(5), receiver.next())
         .await
         .expect("timed out")
@@ -964,7 +979,7 @@ async fn file_transfer_receiver_first_through_daemon() {
 
     // Then sender connects
     let mut sender = connect_and_handshake(&env.proxy_path).await;
-    sender.send(Frame::SendFile { session: id.clone() }).await.unwrap();
+    sender.send(Frame::SendFile { session: id.to_string() }).await.unwrap();
     let resp = timeout(Duration::from_secs(5), sender.next())
         .await
         .expect("timed out")
@@ -1024,7 +1039,7 @@ async fn file_transfer_survives_tunnel_death() {
     env.restart_socat();
 
     // Now do a full transfer on the restarted tunnel
-    let mut client = attach_session(&env.proxy_path, &id).await;
+    let mut client = attach_session(&env.proxy_path, &id.to_string()).await;
     client.send(Frame::Resize { cols: 80, rows: 24 }).await.unwrap();
     drain_data(&mut client, Duration::from_millis(500)).await;
 
@@ -1035,7 +1050,7 @@ async fn file_transfer_survives_tunnel_death() {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
     let mut sender = connect_and_handshake(&env.proxy_path).await;
-    sender.send(Frame::SendFile { session: id.clone() }).await.unwrap();
+    sender.send(Frame::SendFile { session: id.to_string() }).await.unwrap();
     let resp = timeout(Duration::from_secs(5), sender.next())
         .await
         .expect("timed out")
@@ -1046,7 +1061,7 @@ async fn file_transfer_survives_tunnel_death() {
     sender_stream.write_all(&[gritty::protocol::SvcRequest::Send.to_byte()]).await.unwrap();
 
     let mut receiver = connect_and_handshake(&env.proxy_path).await;
-    receiver.send(Frame::SendFile { session: id.clone() }).await.unwrap();
+    receiver.send(Frame::SendFile { session: id.to_string() }).await.unwrap();
     let resp = timeout(Duration::from_secs(5), receiver.next())
         .await
         .expect("timed out")
@@ -1189,8 +1204,11 @@ async fn attach_nonexistent_session_through_proxy() {
     skip_if_no_socat!();
     let env = TestEnv::new();
 
-    let resp =
-        control_request(&env.proxy_path, Frame::Attach { session: "ghost".to_string() }).await;
+    let resp = control_request(
+        &env.proxy_path,
+        Frame::Attach { session: "ghost".to_string(), client_name: String::new(), force: false },
+    )
+    .await;
     assert!(
         matches!(resp, Frame::Error { .. }),
         "expected Error for nonexistent session, got {resp:?}"
@@ -1212,7 +1230,7 @@ async fn no_handshake_rejected_through_proxy() {
         .expect("stream ended")
         .expect("decode error");
     match resp {
-        Frame::Error { message } => {
+        Frame::Error { message, .. } => {
             assert!(message.contains("Hello"), "error should mention Hello, got: {message}");
         }
         other => panic!("expected Error, got {other:?}"),

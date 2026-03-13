@@ -21,7 +21,10 @@ use tracing::{debug, info, warn};
 
 /// Wrapper to distinguish active, tail, and send connections arriving via channel.
 pub enum ClientConn {
-    Active(Framed<UnixStream, FrameCodec>),
+    Active {
+        framed: Framed<UnixStream, FrameCodec>,
+        client_name: String,
+    },
     Tail(Framed<UnixStream, FrameCodec>),
     /// Raw stream for file transfer (local-side commands routed through daemon).
     Send(UnixStream),
@@ -1149,9 +1152,22 @@ pub async fn run(
     command: Option<String>,
     ring_buffer_cap: usize,
     oauth_tunnel_idle_timeout: u64,
+    initial_cols: u16,
+    initial_rows: u16,
+    cwd: Option<String>,
 ) -> anyhow::Result<()> {
-    // Allocate PTY (once, before accept loop)
-    let pty = openpty(None, None)?;
+    // Allocate PTY with initial window size when available
+    let winsize = if initial_cols > 0 && initial_rows > 0 {
+        Some(nix::pty::Winsize {
+            ws_row: initial_rows,
+            ws_col: initial_cols,
+            ws_xpixel: 0,
+            ws_ypixel: 0,
+        })
+    } else {
+        None
+    };
+    let pty = openpty(winsize.as_ref(), None)?;
     let master: OwnedFd = pty.master;
     let slave: OwnedFd = pty.slave;
 
@@ -1217,11 +1233,14 @@ pub async fn run(
     // Wait for first active client before spawning shell (so we can read Env frame).
     // Tail and send clients that arrive before the first active client get handled
     // appropriately (tail subscribed to broadcast, send queued for rendezvous).
+    let initial_client_name;
     let mut framed = loop {
         tokio::select! {
             client = client_rx.recv() => match client {
-                Some(ClientConn::Active(f)) => {
+                Some(ClientConn::Active { framed: f, client_name: cn }) => {
                     info!("first client connected via channel");
+                    // Stash client_name so it's available before Env frame
+                    initial_client_name = cn;
                     break f;
                 }
                 Some(ClientConn::Tail(f)) => {
@@ -1268,14 +1287,17 @@ pub async fn run(
     } else {
         cmd.arg("-l");
     }
-    if let Some(ref dir) = home {
+    // Use cwd from NewSession if provided, otherwise fall back to $HOME
+    let work_dir = cwd.as_deref().filter(|s| !s.is_empty()).or(home.as_deref());
+    if let Some(dir) = work_dir {
         cmd.current_dir(dir);
     }
+    // Prefer client_name from Env frame, fall back to Attach-provided name
     let client_name = env_vars
         .iter()
         .find(|(k, _)| k == "GRITTY_CLIENT")
         .map(|(_, v)| v.clone())
-        .unwrap_or_default();
+        .unwrap_or(initial_client_name);
     const ALLOWED_ENV_KEYS: &[&str] = &["TERM", "LANG", "COLORTERM", "GRITTY_CLIENT"];
     for (k, v) in &env_vars {
         if ALLOWED_ENV_KEYS.contains(&k.as_str()) {
@@ -1343,9 +1365,14 @@ pub async fn run(
                 tokio::select! {
                     client = client_rx.recv() => {
                         match client {
-                            Some(ClientConn::Active(f)) => {
+                            Some(ClientConn::Active { framed: f, client_name: cn }) => {
                                 info!("client connected via channel");
                                 framed = f;
+                                if let Some(meta) = metadata_slot.get() {
+                                    if let Ok(mut n) = meta.client_name.lock() {
+                                        *n = cn;
+                                    }
+                                }
                                 break 'drain true;
                             }
                             Some(ClientConn::Tail(f)) => {
@@ -1497,13 +1524,19 @@ pub async fn run(
 
                     new_client = client_rx.recv() => {
                         match new_client {
-                            Some(ClientConn::Active(new_framed)) => {
+                            Some(ClientConn::Active { framed: new_framed, client_name: cn }) => {
                                 info!("new client via channel, detaching old client");
                                 let _ = framed.send(Frame::Detached).await;
                                 relay.agent.teardown();
                                 relay.tunnel.teardown();
                                 relay.pf.teardown();
                                 *relay.open_forward_enabled = false;
+                                // Update client_name from the new Attach
+                                if let Some(meta) = relay.metadata_slot.get() {
+                                    if let Ok(mut n) = meta.client_name.lock() {
+                                        *n = cn;
+                                    }
+                                }
                                 // Inform the new client about the takeover
                                 let was_attached = relay.metadata_slot.get()
                                     .map(|m| m.attached.load(Ordering::Relaxed))

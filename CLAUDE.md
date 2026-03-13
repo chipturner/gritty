@@ -79,9 +79,19 @@ Eight modules behind a lib crate (`src/lib.rs` hosts `collect_env_vars()`, `spaw
 
 ### Wire format
 
-Handshake: `0x16` Hello, `0x24` HelloAck. Relay: `0x01` Data, `0x02` Resize, `0x03` Exit, `0x04` Detached, `0x05` Ping, `0x06` Pong, `0x07` Env, `0x08` AgentForward, `0x09` AgentOpen, `0x0A` AgentData, `0x0B` AgentClose, `0x0C` OpenForward, `0x0D` OpenUrl, `0x0E` TunnelListen, `0x0F` TunnelOpen, `0x17` TunnelData, `0x18` TunnelClose, `0x19` SendOffer, `0x1A` SendDone, `0x1B` SendCancel, `0x1C` PortForwardListen, `0x1D` PortForwardReady, `0x1E` PortForwardOpen, `0x1F` PortForwardData, `0x26` PortForwardClose, `0x27` PortForwardStop. Control: `0x10` NewSession, `0x11` Attach, `0x12` ListSessions, `0x13` KillSession, `0x14` KillServer, `0x15` Tail, `0x25` SendFile, `0x28` RenameSession. Responses: `0x20` SessionCreated, `0x21` SessionInfo, `0x22` Ok, `0x23` Error.
+Handshake: `0x01` Hello, `0x02` HelloAck. Relay: `0x10` Data, `0x11` Resize, `0x12` Exit, `0x13` Detached, `0x14` Ping, `0x15` Pong, `0x16` Env. Agent: `0x20` AgentForward, `0x21` AgentOpen, `0x22` AgentData, `0x23` AgentClose. URL: `0x28` OpenForward, `0x29` OpenUrl. Tunnel: `0x30` TunnelListen, `0x31` TunnelOpen, `0x32` TunnelData, `0x33` TunnelClose. Transfer: `0x38` SendOffer, `0x39` SendDone, `0x3A` SendCancel, `0x3B` SendFile. Port forward: `0x40` PFListen, `0x41` PFReady, `0x42` PFOpen, `0x43` PFData, `0x44` PFClose, `0x45` PFStop. Control: `0x50` NewSession, `0x51` Attach, `0x52` ListSessions, `0x53` KillSession, `0x54` KillServer, `0x55` Tail, `0x56` RenameSession. Responses: `0x60` SessionCreated, `0x61` SessionInfo, `0x62` Ok, `0x63` Error. Reserved: `0x80-0xFF`.
 
-`SessionInfo`: `[count: u32][per entry: [id: u16-len + bytes][name: u16-len + bytes][pty_path: u16-len + bytes][shell_pid: u32][created_at: u64][attached: u8][last_heartbeat: u64][foreground_cmd: u16-len + bytes][cwd: u16-len + bytes][client_name: u16-len + bytes]]`.
+`Hello`/`HelloAck`: `[version: u16][capabilities: u32]`. Capabilities bitfield (start at 0, negotiated = client & server).
+
+`NewSession`: `[name_len: u16][name][cmd_len: u16][cmd][cwd_len: u16][cwd][cols: u16][rows: u16]`. Empty cwd = `$HOME`. Zero cols/rows = default 80x24.
+
+`Attach`: `[session_len: u16][session][client_name_len: u16][client_name][force: u8]`. Server enforces: if attached and `!force`, returns `AlreadyAttached` error.
+
+`SessionCreated`: `[id: u32]`.
+
+`Error`: `[code: u16][message: remaining bytes]`. `ErrorCode`: `NoSuchSession(1)`, `NameAlreadyExists(2)`, `InvalidName(3)`, `EmptyName(4)`, `VersionMismatch(5)`, `UnexpectedFrame(6)`, `AlreadyAttached(7)`, `Unknown(u16)`.
+
+`SessionInfo`: `[count: u32][per entry: [entry_len: u32][id: u32][name: u16-len + bytes][pty_path: u16-len + bytes][shell_pid: u32][created_at: u64][attached: u8][last_heartbeat: u64][foreground_cmd: u16-len + bytes][cwd: u16-len + bytes][client_name: u16-len + bytes]]`. Decoder skips unknown trailing bytes within each entry_len.
 
 `SvcRequest`: `OpenUrl=1`, `Send=2`, `Receive=3`, `PortForward=4` (1-byte discriminator).
 
@@ -91,7 +101,7 @@ File transfer manifest (svc socket, not Frame protocol): sender writes `[file_co
 
 - **Connection handoff**: Daemon transfers `Framed<UnixStream>` to session task via `mpsc`. Daemon exits the data path.
 - **AsyncFd + try_io**: PTY master and stdin are raw fds in `AsyncFd`. `guard.try_io()` with would-block continuation.
-- **Deferred shell spawn**: PTY allocated early, shell waits for first client's `Env` frame (TERM/LANG/COLORTERM). Spawns login shell with `CWD=$HOME`. First client feeds directly into relay (no outer-loop re-wait).
+- **Deferred shell spawn**: PTY allocated early (with initial window size from `NewSession` cols/rows when > 0), shell waits for first client's `Env` frame (TERM/LANG/COLORTERM). Spawns login shell with CWD from `NewSession` (or `$HOME` if empty). First client feeds directly into relay (no outer-loop re-wait).
 - **Ring buffer**: Client disconnect breaks inner relay; outer loop drains PTY into `VecDeque<Bytes>` (default 1MB). On reconnect, dropped-bytes marker if overflow, then flush.
 - **Client takeover**: `client_rx.recv()` in relay select. New client causes `Detached` to old, then switch.
 - **Self-daemonizing**: Fork before tokio runtime. Parent waits on pipe for readiness. PID file at `socket_dir()/daemon.pid`.
@@ -119,7 +129,9 @@ File transfer manifest (svc socket, not Frame protocol): sender writes `[file_co
 - **`PROTOCOL_VERSION`** -- bump whenever frame types, encoding, or `SessionEntry` fields change. Version mismatch is a hard gate: daemon rejects clients, `tunnel-create` aborts tunnel setup.
 - **`Frame` enum** -- update: encoder, decoder, protocol tests, all `match frame` in server.rs, client.rs, daemon.rs, main.rs.
 - **`SessionInfo`** -- entry count `u32`. Changing `SessionEntry` fields requires updating both encoder and decoder in protocol.rs.
-- **`server::run()`** -- takes `(client_rx, metadata, agent_path, svc_path, session_id, session_name, command, ring_buffer_cap, oauth_tunnel_idle_timeout)`. Called by e2e tests + daemon; update both.
+- **`server::run()`** -- takes `(client_rx, metadata, agent_path, svc_path, session_id, session_name, command, ring_buffer_cap, oauth_tunnel_idle_timeout, initial_cols, initial_rows, cwd)`. Called by e2e tests + daemon; update both.
+- **`ClientConn::Active`** -- struct variant `Active { framed, client_name }`. `client_name` propagated from `Attach` frame to session metadata.
+- **`ErrorCode`** -- `Frame::Error` carries a `code: ErrorCode` enum + `message: String`. Match on code for programmatic error handling, display message for humans.
 
 ### Testing
 - **E2e**: `UnixStream::pair()` + channel to `server::run()`. No socket files.

@@ -1,5 +1,5 @@
 use bytes::{BufMut, Bytes, BytesMut};
-use gritty::protocol::{Frame, FrameCodec, PROTOCOL_VERSION, SessionEntry};
+use gritty::protocol::{ErrorCode, Frame, FrameCodec, PROTOCOL_VERSION, SessionEntry};
 use tokio_util::codec::{Decoder, Encoder};
 
 #[test]
@@ -9,7 +9,7 @@ fn encode_data_frame() {
     codec.encode(Frame::Data(Bytes::from("hello")), &mut buf).unwrap();
     // type(1) + len(4) + payload(5) = 10
     assert_eq!(buf.len(), 10);
-    assert_eq!(buf[0], 0x01);
+    assert_eq!(buf[0], 0x10);
     assert_eq!(&buf[5..], b"hello");
 }
 
@@ -20,7 +20,7 @@ fn encode_resize_frame() {
     codec.encode(Frame::Resize { cols: 80, rows: 24 }, &mut buf).unwrap();
     // type(1) + len(4) + payload(4) = 9
     assert_eq!(buf.len(), 9);
-    assert_eq!(buf[0], 0x02);
+    assert_eq!(buf[0], 0x11);
 }
 
 #[test]
@@ -29,7 +29,7 @@ fn encode_exit_frame() {
     let mut buf = BytesMut::new();
     codec.encode(Frame::Exit { code: 42 }, &mut buf).unwrap();
     assert_eq!(buf.len(), 9);
-    assert_eq!(buf[0], 0x03);
+    assert_eq!(buf[0], 0x12);
 }
 
 #[test]
@@ -65,7 +65,7 @@ fn roundtrip_exit() {
 #[test]
 fn decode_incomplete_returns_none() {
     let mut codec = FrameCodec;
-    let mut buf = BytesMut::from(&[0x01, 0x00, 0x00][..]);
+    let mut buf = BytesMut::from(&[0x10, 0x00, 0x00][..]);
     assert!(codec.decode(&mut buf).unwrap().is_none());
 }
 
@@ -73,7 +73,7 @@ fn decode_incomplete_returns_none() {
 fn decode_partial_payload_returns_none() {
     let mut codec = FrameCodec;
     // Header says 5 bytes payload, but only 2 present
-    let mut buf = BytesMut::from(&[0x01, 0x00, 0x00, 0x00, 0x05, 0xAA, 0xBB][..]);
+    let mut buf = BytesMut::from(&[0x10, 0x00, 0x00, 0x00, 0x05, 0xAA, 0xBB][..]);
     assert!(codec.decode(&mut buf).unwrap().is_none());
 }
 
@@ -88,7 +88,13 @@ fn decode_invalid_type_returns_error() {
 fn roundtrip_new_session() {
     let mut codec = FrameCodec;
     let mut buf = BytesMut::new();
-    let original = Frame::NewSession { name: "myproject".to_string(), command: String::new() };
+    let original = Frame::NewSession {
+        name: "myproject".to_string(),
+        command: String::new(),
+        cwd: String::new(),
+        cols: 0,
+        rows: 0,
+    };
     codec.encode(original.clone(), &mut buf).unwrap();
     let decoded = codec.decode(&mut buf).unwrap().unwrap();
     assert_eq!(original, decoded);
@@ -98,7 +104,13 @@ fn roundtrip_new_session() {
 fn roundtrip_new_session_empty_name() {
     let mut codec = FrameCodec;
     let mut buf = BytesMut::new();
-    let original = Frame::NewSession { name: String::new(), command: String::new() };
+    let original = Frame::NewSession {
+        name: String::new(),
+        command: String::new(),
+        cwd: String::new(),
+        cols: 0,
+        rows: 0,
+    };
     codec.encode(original.clone(), &mut buf).unwrap();
     let decoded = codec.decode(&mut buf).unwrap().unwrap();
     assert_eq!(original, decoded);
@@ -111,6 +123,9 @@ fn roundtrip_new_session_with_command() {
     let original = Frame::NewSession {
         name: "worker".to_string(),
         command: "echo hello && sleep 999".to_string(),
+        cwd: String::new(),
+        cols: 0,
+        rows: 0,
     };
     codec.encode(original.clone(), &mut buf).unwrap();
     let decoded = codec.decode(&mut buf).unwrap().unwrap();
@@ -121,7 +136,13 @@ fn roundtrip_new_session_with_command() {
 fn roundtrip_new_session_command_only() {
     let mut codec = FrameCodec;
     let mut buf = BytesMut::new();
-    let original = Frame::NewSession { name: String::new(), command: "make build".to_string() };
+    let original = Frame::NewSession {
+        name: String::new(),
+        command: "make build".to_string(),
+        cwd: String::new(),
+        cols: 0,
+        rows: 0,
+    };
     codec.encode(original.clone(), &mut buf).unwrap();
     let decoded = codec.decode(&mut buf).unwrap().unwrap();
     assert_eq!(original, decoded);
@@ -153,7 +174,8 @@ fn roundtrip_rename_session_by_name() {
 fn roundtrip_attach() {
     let mut codec = FrameCodec;
     let mut buf = BytesMut::new();
-    let original = Frame::Attach { session: "0".to_string() };
+    let original =
+        Frame::Attach { session: "0".to_string(), client_name: String::new(), force: false };
     codec.encode(original.clone(), &mut buf).unwrap();
     let decoded = codec.decode(&mut buf).unwrap().unwrap();
     assert_eq!(original, decoded);
@@ -163,7 +185,11 @@ fn roundtrip_attach() {
 fn roundtrip_attach_by_name() {
     let mut codec = FrameCodec;
     let mut buf = BytesMut::new();
-    let original = Frame::Attach { session: "myproject".to_string() };
+    let original = Frame::Attach {
+        session: "myproject".to_string(),
+        client_name: String::new(),
+        force: false,
+    };
     codec.encode(original.clone(), &mut buf).unwrap();
     let decoded = codec.decode(&mut buf).unwrap().unwrap();
     assert_eq!(original, decoded);
@@ -173,8 +199,10 @@ fn roundtrip_attach_by_name() {
 fn roundtrip_session_created() {
     let mut codec = FrameCodec;
     let mut buf = BytesMut::new();
-    let original = Frame::SessionCreated { id: "42".to_string() };
+    let original = Frame::SessionCreated { id: 42 };
     codec.encode(original.clone(), &mut buf).unwrap();
+    // type(1) + len(4) + id(4) = 9
+    assert_eq!(buf.len(), 9);
     let decoded = codec.decode(&mut buf).unwrap().unwrap();
     assert_eq!(original, decoded);
 }
@@ -195,7 +223,7 @@ fn roundtrip_session_info() {
     let original = Frame::SessionInfo {
         sessions: vec![
             SessionEntry {
-                id: "0".to_string(),
+                id: 0,
                 name: "project-a".to_string(),
                 foreground_cmd: "vim".to_string(),
                 cwd: "/home/user/project".to_string(),
@@ -207,7 +235,7 @@ fn roundtrip_session_info() {
                 last_heartbeat: 1700000005,
             },
             SessionEntry {
-                id: "1".to_string(),
+                id: 1,
                 name: String::new(),
                 foreground_cmd: String::new(),
                 cwd: String::new(),
@@ -248,7 +276,8 @@ fn roundtrip_ok() {
 fn roundtrip_error() {
     let mut codec = FrameCodec;
     let mut buf = BytesMut::new();
-    let original = Frame::Error { message: "something failed".to_string() };
+    let original =
+        Frame::Error { code: ErrorCode::UnexpectedFrame, message: "something failed".to_string() };
     codec.encode(original.clone(), &mut buf).unwrap();
     let decoded = codec.decode(&mut buf).unwrap().unwrap();
     assert_eq!(original, decoded);
@@ -333,7 +362,7 @@ fn roundtrip_exit_negative_code() {
 fn roundtrip_error_empty_message() {
     let mut codec = FrameCodec;
     let mut buf = BytesMut::new();
-    let original = Frame::Error { message: String::new() };
+    let original = Frame::Error { code: ErrorCode::Unknown(0), message: String::new() };
     codec.encode(original.clone(), &mut buf).unwrap();
     let decoded = codec.decode(&mut buf).unwrap().unwrap();
     assert_eq!(original, decoded);
@@ -342,8 +371,8 @@ fn roundtrip_error_empty_message() {
 #[test]
 fn resize_wrong_payload_size_too_short() {
     let mut codec = FrameCodec;
-    // Resize frame type (0x02) with only 3 bytes payload instead of 4
-    let mut buf = BytesMut::from(&[0x02, 0x00, 0x00, 0x00, 0x03, 0x00, 0x50, 0x00][..]);
+    // Resize frame type (0x11) with only 3 bytes payload instead of 4
+    let mut buf = BytesMut::from(&[0x11, 0x00, 0x00, 0x00, 0x03, 0x00, 0x50, 0x00][..]);
     let err = codec.decode(&mut buf).unwrap_err();
     assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
 }
@@ -351,20 +380,20 @@ fn resize_wrong_payload_size_too_short() {
 #[test]
 fn exit_wrong_payload_size() {
     let mut codec = FrameCodec;
-    // Exit frame type (0x03) with 2 bytes payload instead of 4
-    let mut buf = BytesMut::from(&[0x03, 0x00, 0x00, 0x00, 0x02, 0x00, 0x2A][..]);
+    // Exit frame type (0x12) with 2 bytes payload instead of 4
+    let mut buf = BytesMut::from(&[0x12, 0x00, 0x00, 0x00, 0x02, 0x00, 0x2A][..]);
     let err = codec.decode(&mut buf).unwrap_err();
     assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
 }
 
 #[test]
-fn session_info_preserves_tabs_in_id() {
-    // Binary encoding preserves arbitrary content -- tabs no longer corrupt the format
+fn session_info_u32_id_roundtrip() {
+    // SessionEntry.id is now u32 -- verify a non-trivial id round-trips
     let mut codec = FrameCodec;
     let mut buf = BytesMut::new();
     let original = Frame::SessionInfo {
         sessions: vec![SessionEntry {
-            id: "has\ttab".to_string(),
+            id: 12345,
             name: "test".to_string(),
             foreground_cmd: String::new(),
             cwd: String::new(),
@@ -382,7 +411,7 @@ fn session_info_preserves_tabs_in_id() {
     match decoded {
         Frame::SessionInfo { sessions } => {
             assert_eq!(sessions.len(), 1);
-            assert_eq!(sessions[0].id, "has\ttab");
+            assert_eq!(sessions[0].id, 12345);
         }
         other => panic!("expected SessionInfo, got {other:?}"),
     }
@@ -432,7 +461,7 @@ fn session_info_preserves_newline_in_name() {
     let mut buf = BytesMut::new();
     let original = Frame::SessionInfo {
         sessions: vec![SessionEntry {
-            id: "0".to_string(),
+            id: 0,
             name: "has\nnewline".to_string(),
             foreground_cmd: String::new(),
             cwd: String::new(),
@@ -459,11 +488,18 @@ fn session_info_preserves_newline_in_name() {
 #[test]
 fn invalid_utf8_in_string_frame() {
     let mut codec = FrameCodec;
-    // NewSession (0x10) with invalid UTF-8 payload
+    // NewSession (0x50) with invalid UTF-8 in name field
+    // Wire: [name_len: u16][name][cmd_len: u16][cmd][cwd_len: u16][cwd][cols: u16][rows: u16]
+    // Minimum valid: 2+0+2+0+2+0+2+2 = 10 bytes, but name content is invalid UTF-8
     let mut buf = BytesMut::new();
-    buf.put_u8(0x10); // TYPE_NEW_SESSION
-    buf.put_u32(2);
-    buf.put_slice(&[0xFF, 0xFE]); // invalid UTF-8
+    buf.put_u8(0x50); // TYPE_NEW_SESSION
+    buf.put_u32(12); // payload length: name_len(2)+name(2)+cmd_len(2)+cmd(0)+cwd_len(2)+cwd(0)+cols(2)+rows(2)
+    buf.put_u16(2); // name_len = 2
+    buf.put_slice(&[0xFF, 0xFE]); // invalid UTF-8 name
+    buf.put_u16(0); // cmd_len = 0
+    buf.put_u16(0); // cwd_len = 0
+    buf.put_u16(0); // cols
+    buf.put_u16(0); // rows
     let err = codec.decode(&mut buf).unwrap_err();
     assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
 }
@@ -474,7 +510,7 @@ fn roundtrip_ping() {
     let mut buf = BytesMut::new();
     codec.encode(Frame::Ping, &mut buf).unwrap();
     assert_eq!(buf.len(), 5); // type(1) + len(4), zero payload
-    assert_eq!(buf[0], 0x05);
+    assert_eq!(buf[0], 0x14);
     let decoded = codec.decode(&mut buf).unwrap().unwrap();
     assert_eq!(Frame::Ping, decoded);
 }
@@ -485,7 +521,7 @@ fn roundtrip_pong() {
     let mut buf = BytesMut::new();
     codec.encode(Frame::Pong, &mut buf).unwrap();
     assert_eq!(buf.len(), 5); // type(1) + len(4), zero payload
-    assert_eq!(buf[0], 0x06);
+    assert_eq!(buf[0], 0x15);
     let decoded = codec.decode(&mut buf).unwrap().unwrap();
     assert_eq!(Frame::Pong, decoded);
 }
@@ -502,7 +538,7 @@ fn roundtrip_env() {
         ],
     };
     codec.encode(original.clone(), &mut buf).unwrap();
-    assert_eq!(buf[0], 0x07);
+    assert_eq!(buf[0], 0x16);
     let decoded = codec.decode(&mut buf).unwrap().unwrap();
     assert_eq!(original, decoded);
 }
@@ -536,7 +572,7 @@ fn decode_oversized_frame_rejected() {
     let mut codec = FrameCodec;
     let mut buf = BytesMut::new();
     // Header claiming payload of 1 MB + 1 byte (exceeds MAX_FRAME_SIZE)
-    buf.put_u8(0x01); // TYPE_DATA
+    buf.put_u8(0x10); // TYPE_DATA
     buf.put_u32((1 << 20) + 1); // 1_048_577 bytes
     let err = codec.decode(&mut buf).unwrap_err();
     assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
@@ -548,7 +584,7 @@ fn decode_exactly_max_frame_size_accepted() {
     let mut codec = FrameCodec;
     let mut buf = BytesMut::new();
     let payload = vec![0x42u8; 1 << 20]; // exactly 1 MB
-    buf.put_u8(0x01); // TYPE_DATA
+    buf.put_u8(0x10); // TYPE_DATA
     buf.put_u32(1 << 20);
     buf.put_slice(&payload);
     let decoded = codec.decode(&mut buf).unwrap().unwrap();
@@ -562,7 +598,7 @@ fn roundtrip_env_empty() {
     let original = Frame::Env { vars: vec![] };
     codec.encode(original.clone(), &mut buf).unwrap();
     assert_eq!(buf.len(), 9); // type(1) + len(4) + count(4)
-    assert_eq!(buf[0], 0x07);
+    assert_eq!(buf[0], 0x16);
     let decoded = codec.decode(&mut buf).unwrap().unwrap();
     assert_eq!(original, decoded);
 }
@@ -573,7 +609,7 @@ fn roundtrip_agent_forward() {
     let mut buf = BytesMut::new();
     codec.encode(Frame::AgentForward, &mut buf).unwrap();
     assert_eq!(buf.len(), 5); // type(1) + len(4), zero payload
-    assert_eq!(buf[0], 0x08);
+    assert_eq!(buf[0], 0x20);
     let decoded = codec.decode(&mut buf).unwrap().unwrap();
     assert_eq!(Frame::AgentForward, decoded);
 }
@@ -585,7 +621,7 @@ fn roundtrip_agent_open() {
     let original = Frame::AgentOpen { channel_id: 42 };
     codec.encode(original.clone(), &mut buf).unwrap();
     assert_eq!(buf.len(), 9); // type(1) + len(4) + channel_id(4)
-    assert_eq!(buf[0], 0x09);
+    assert_eq!(buf[0], 0x21);
     let decoded = codec.decode(&mut buf).unwrap().unwrap();
     assert_eq!(original, decoded);
 }
@@ -598,7 +634,7 @@ fn roundtrip_agent_data() {
     codec.encode(original.clone(), &mut buf).unwrap();
     // type(1) + len(4) + channel_id(4) + data(13) = 22
     assert_eq!(buf.len(), 22);
-    assert_eq!(buf[0], 0x0A);
+    assert_eq!(buf[0], 0x22);
     let decoded = codec.decode(&mut buf).unwrap().unwrap();
     assert_eq!(original, decoded);
 }
@@ -621,7 +657,7 @@ fn roundtrip_agent_close() {
     let original = Frame::AgentClose { channel_id: 99 };
     codec.encode(original.clone(), &mut buf).unwrap();
     assert_eq!(buf.len(), 9); // type(1) + len(4) + channel_id(4)
-    assert_eq!(buf[0], 0x0B);
+    assert_eq!(buf[0], 0x23);
     let decoded = codec.decode(&mut buf).unwrap().unwrap();
     assert_eq!(original, decoded);
 }
@@ -630,7 +666,7 @@ fn roundtrip_agent_close() {
 fn agent_open_wrong_payload_size() {
     let mut codec = FrameCodec;
     let mut buf = BytesMut::new();
-    buf.put_u8(0x09); // TYPE_AGENT_OPEN
+    buf.put_u8(0x21); // TYPE_AGENT_OPEN
     buf.put_u32(2); // wrong: should be 4
     buf.put_slice(&[0x00, 0x00]);
     let err = codec.decode(&mut buf).unwrap_err();
@@ -641,7 +677,7 @@ fn agent_open_wrong_payload_size() {
 fn agent_data_too_short() {
     let mut codec = FrameCodec;
     let mut buf = BytesMut::new();
-    buf.put_u8(0x0A); // TYPE_AGENT_DATA
+    buf.put_u8(0x22); // TYPE_AGENT_DATA
     buf.put_u32(2); // less than 4 bytes
     buf.put_slice(&[0x00, 0x00]);
     let err = codec.decode(&mut buf).unwrap_err();
@@ -652,7 +688,7 @@ fn agent_data_too_short() {
 fn agent_close_wrong_payload_size() {
     let mut codec = FrameCodec;
     let mut buf = BytesMut::new();
-    buf.put_u8(0x0B); // TYPE_AGENT_CLOSE
+    buf.put_u8(0x23); // TYPE_AGENT_CLOSE
     buf.put_u32(8); // wrong: should be 4
     buf.put_slice(&[0x00; 8]);
     let err = codec.decode(&mut buf).unwrap_err();
@@ -665,7 +701,7 @@ fn roundtrip_open_forward() {
     let mut buf = BytesMut::new();
     codec.encode(Frame::OpenForward, &mut buf).unwrap();
     assert_eq!(buf.len(), 5); // type(1) + len(4), zero payload
-    assert_eq!(buf[0], 0x0C);
+    assert_eq!(buf[0], 0x28);
     let decoded = codec.decode(&mut buf).unwrap().unwrap();
     assert_eq!(Frame::OpenForward, decoded);
 }
@@ -676,7 +712,7 @@ fn roundtrip_open_url() {
     let mut buf = BytesMut::new();
     let original = Frame::OpenUrl { url: "https://example.com".to_string() };
     codec.encode(original.clone(), &mut buf).unwrap();
-    assert_eq!(buf[0], 0x0D);
+    assert_eq!(buf[0], 0x29);
     let decoded = codec.decode(&mut buf).unwrap().unwrap();
     assert_eq!(original, decoded);
 }
@@ -687,7 +723,7 @@ fn roundtrip_tail() {
     let mut buf = BytesMut::new();
     let original = Frame::Tail { session: "myproject".to_string() };
     codec.encode(original.clone(), &mut buf).unwrap();
-    assert_eq!(buf[0], 0x15);
+    assert_eq!(buf[0], 0x55);
     let decoded = codec.decode(&mut buf).unwrap().unwrap();
     assert_eq!(original, decoded);
 }
@@ -706,11 +742,11 @@ fn roundtrip_tail_by_id() {
 fn roundtrip_hello() {
     let mut codec = FrameCodec;
     let mut buf = BytesMut::new();
-    let original = Frame::Hello { version: PROTOCOL_VERSION };
+    let original = Frame::Hello { version: PROTOCOL_VERSION, capabilities: 0 };
     codec.encode(original.clone(), &mut buf).unwrap();
-    // type(1) + len(4) + version(2) = 7
-    assert_eq!(buf.len(), 7);
-    assert_eq!(buf[0], 0x16);
+    // type(1) + len(4) + version(2) + capabilities(4) = 11
+    assert_eq!(buf.len(), 11);
+    assert_eq!(buf[0], 0x01);
     let decoded = codec.decode(&mut buf).unwrap().unwrap();
     assert_eq!(original, decoded);
 }
@@ -719,11 +755,11 @@ fn roundtrip_hello() {
 fn roundtrip_hello_ack() {
     let mut codec = FrameCodec;
     let mut buf = BytesMut::new();
-    let original = Frame::HelloAck { version: PROTOCOL_VERSION };
+    let original = Frame::HelloAck { version: PROTOCOL_VERSION, capabilities: 0 };
     codec.encode(original.clone(), &mut buf).unwrap();
-    // type(1) + len(4) + version(2) = 7
-    assert_eq!(buf.len(), 7);
-    assert_eq!(buf[0], 0x24);
+    // type(1) + len(4) + version(2) + capabilities(4) = 11
+    assert_eq!(buf.len(), 11);
+    assert_eq!(buf[0], 0x02);
     let decoded = codec.decode(&mut buf).unwrap().unwrap();
     assert_eq!(original, decoded);
 }
@@ -732,9 +768,9 @@ fn roundtrip_hello_ack() {
 fn hello_wrong_payload_size() {
     let mut codec = FrameCodec;
     let mut buf = BytesMut::new();
-    buf.put_u8(0x16); // TYPE_HELLO
-    buf.put_u32(4); // wrong: should be 2
-    buf.put_slice(&[0x00, 0x01, 0x00, 0x00]);
+    buf.put_u8(0x01); // TYPE_HELLO
+    buf.put_u32(2); // wrong: should be 6
+    buf.put_slice(&[0x00, 0x01]);
     let err = codec.decode(&mut buf).unwrap_err();
     assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
 }
@@ -743,8 +779,8 @@ fn hello_wrong_payload_size() {
 fn hello_ack_wrong_payload_size() {
     let mut codec = FrameCodec;
     let mut buf = BytesMut::new();
-    buf.put_u8(0x24); // TYPE_HELLO_ACK
-    buf.put_u32(1); // wrong: should be 2
+    buf.put_u8(0x02); // TYPE_HELLO_ACK
+    buf.put_u32(1); // wrong: should be 6
     buf.put_slice(&[0x01]);
     let err = codec.decode(&mut buf).unwrap_err();
     assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
@@ -757,7 +793,7 @@ fn roundtrip_tunnel_listen() {
     let original = Frame::TunnelListen { port: 8080 };
     codec.encode(original.clone(), &mut buf).unwrap();
     assert_eq!(buf.len(), 7); // type(1) + len(4) + port(2)
-    assert_eq!(buf[0], 0x0E);
+    assert_eq!(buf[0], 0x30);
     let decoded = codec.decode(&mut buf).unwrap().unwrap();
     assert_eq!(original, decoded);
 }
@@ -769,7 +805,7 @@ fn roundtrip_tunnel_open() {
     let original = Frame::TunnelOpen { channel_id: 42 };
     codec.encode(original.clone(), &mut buf).unwrap();
     assert_eq!(buf.len(), 9); // type(1) + len(4) + channel_id(4)
-    assert_eq!(buf[0], 0x0F);
+    assert_eq!(buf[0], 0x31);
     let decoded = codec.decode(&mut buf).unwrap().unwrap();
     assert_eq!(original, decoded);
 }
@@ -780,7 +816,7 @@ fn roundtrip_tunnel_data() {
     let mut buf = BytesMut::new();
     let original = Frame::TunnelData { channel_id: 7, data: Bytes::from("tunnel-payload") };
     codec.encode(original.clone(), &mut buf).unwrap();
-    assert_eq!(buf[0], 0x17);
+    assert_eq!(buf[0], 0x32);
     let decoded = codec.decode(&mut buf).unwrap().unwrap();
     assert_eq!(original, decoded);
 }
@@ -803,7 +839,7 @@ fn roundtrip_tunnel_close() {
     let original = Frame::TunnelClose { channel_id: 99 };
     codec.encode(original.clone(), &mut buf).unwrap();
     assert_eq!(buf.len(), 9); // type(1) + len(4) + channel_id(4)
-    assert_eq!(buf[0], 0x18);
+    assert_eq!(buf[0], 0x33);
     let decoded = codec.decode(&mut buf).unwrap().unwrap();
     assert_eq!(original, decoded);
 }
@@ -815,7 +851,7 @@ fn roundtrip_send_offer() {
     let original = Frame::SendOffer { file_count: 3, total_bytes: 1_234_567 };
     codec.encode(original.clone(), &mut buf).unwrap();
     assert_eq!(buf.len(), 17); // type(1) + len(4) + file_count(4) + total_bytes(8)
-    assert_eq!(buf[0], 0x19);
+    assert_eq!(buf[0], 0x38);
     let decoded = codec.decode(&mut buf).unwrap().unwrap();
     assert_eq!(original, decoded);
 }
@@ -826,7 +862,7 @@ fn roundtrip_send_done() {
     let mut buf = BytesMut::new();
     codec.encode(Frame::SendDone, &mut buf).unwrap();
     assert_eq!(buf.len(), 5); // type(1) + len(4), zero payload
-    assert_eq!(buf[0], 0x1A);
+    assert_eq!(buf[0], 0x39);
     let decoded = codec.decode(&mut buf).unwrap().unwrap();
     assert_eq!(Frame::SendDone, decoded);
 }
@@ -837,7 +873,7 @@ fn roundtrip_send_cancel() {
     let mut buf = BytesMut::new();
     let original = Frame::SendCancel { reason: "receiver disconnected".to_string() };
     codec.encode(original.clone(), &mut buf).unwrap();
-    assert_eq!(buf[0], 0x1B);
+    assert_eq!(buf[0], 0x3A);
     let decoded = codec.decode(&mut buf).unwrap().unwrap();
     assert_eq!(original, decoded);
 }
@@ -858,7 +894,7 @@ fn roundtrip_send_file() {
     let mut buf = BytesMut::new();
     let original = Frame::SendFile { session: "myproject".to_string() };
     codec.encode(original.clone(), &mut buf).unwrap();
-    assert_eq!(buf[0], 0x25);
+    assert_eq!(buf[0], 0x3B);
     let decoded = codec.decode(&mut buf).unwrap().unwrap();
     assert_eq!(original, decoded);
 }
@@ -867,7 +903,7 @@ fn roundtrip_send_file() {
 fn send_offer_wrong_payload_size() {
     let mut codec = FrameCodec;
     let mut buf = BytesMut::new();
-    buf.put_u8(0x19); // TYPE_SEND_OFFER
+    buf.put_u8(0x38); // TYPE_SEND_OFFER
     buf.put_u32(4); // wrong: should be 12
     buf.put_slice(&[0x00; 4]);
     let err = codec.decode(&mut buf).unwrap_err();
@@ -878,7 +914,7 @@ fn send_offer_wrong_payload_size() {
 fn send_file_empty_session() {
     let mut codec = FrameCodec;
     let mut buf = BytesMut::new();
-    buf.put_u8(0x25); // TYPE_SEND_FILE
+    buf.put_u8(0x3B); // TYPE_SEND_FILE
     buf.put_u32(0); // empty session
     let decoded = codec.decode(&mut buf).unwrap().unwrap();
     assert_eq!(decoded, Frame::SendFile { session: String::new() });
@@ -888,7 +924,7 @@ fn send_file_empty_session() {
 fn tunnel_listen_wrong_payload_size() {
     let mut codec = FrameCodec;
     let mut buf = BytesMut::new();
-    buf.put_u8(0x0E); // TYPE_TUNNEL_LISTEN
+    buf.put_u8(0x30); // TYPE_TUNNEL_LISTEN
     buf.put_u32(4); // wrong: should be 2
     buf.put_slice(&[0x00, 0x01, 0x00, 0x00]);
     let err = codec.decode(&mut buf).unwrap_err();
@@ -902,7 +938,7 @@ fn roundtrip_port_forward_listen() {
     let original = Frame::PortForwardListen { forward_id: 1, listen_port: 8080, target_port: 3000 };
     codec.encode(original.clone(), &mut buf).unwrap();
     assert_eq!(buf.len(), 13); // type(1) + len(4) + forward_id(4) + listen(2) + target(2)
-    assert_eq!(buf[0], 0x1C);
+    assert_eq!(buf[0], 0x40);
     let decoded = codec.decode(&mut buf).unwrap().unwrap();
     assert_eq!(original, decoded);
 }
@@ -914,7 +950,7 @@ fn roundtrip_port_forward_ready() {
     let original = Frame::PortForwardReady { forward_id: 42 };
     codec.encode(original.clone(), &mut buf).unwrap();
     assert_eq!(buf.len(), 9); // type(1) + len(4) + forward_id(4)
-    assert_eq!(buf[0], 0x1D);
+    assert_eq!(buf[0], 0x41);
     let decoded = codec.decode(&mut buf).unwrap().unwrap();
     assert_eq!(original, decoded);
 }
@@ -926,7 +962,7 @@ fn roundtrip_port_forward_open() {
     let original = Frame::PortForwardOpen { forward_id: 1, channel_id: 7, target_port: 3000 };
     codec.encode(original.clone(), &mut buf).unwrap();
     assert_eq!(buf.len(), 15); // type(1) + len(4) + forward_id(4) + channel_id(4) + target(2)
-    assert_eq!(buf[0], 0x1E);
+    assert_eq!(buf[0], 0x42);
     let decoded = codec.decode(&mut buf).unwrap().unwrap();
     assert_eq!(original, decoded);
 }
@@ -939,7 +975,7 @@ fn roundtrip_port_forward_data() {
     codec.encode(original.clone(), &mut buf).unwrap();
     // type(1) + len(4) + channel_id(4) + data(10) = 19
     assert_eq!(buf.len(), 19);
-    assert_eq!(buf[0], 0x1F);
+    assert_eq!(buf[0], 0x43);
     let decoded = codec.decode(&mut buf).unwrap().unwrap();
     assert_eq!(original, decoded);
 }
@@ -962,7 +998,7 @@ fn roundtrip_port_forward_close() {
     let original = Frame::PortForwardClose { channel_id: 99 };
     codec.encode(original.clone(), &mut buf).unwrap();
     assert_eq!(buf.len(), 9); // type(1) + len(4) + channel_id(4)
-    assert_eq!(buf[0], 0x26);
+    assert_eq!(buf[0], 0x44);
     let decoded = codec.decode(&mut buf).unwrap().unwrap();
     assert_eq!(original, decoded);
 }
@@ -974,7 +1010,7 @@ fn roundtrip_port_forward_stop() {
     let original = Frame::PortForwardStop { forward_id: 5 };
     codec.encode(original.clone(), &mut buf).unwrap();
     assert_eq!(buf.len(), 9); // type(1) + len(4) + forward_id(4)
-    assert_eq!(buf[0], 0x27);
+    assert_eq!(buf[0], 0x45);
     let decoded = codec.decode(&mut buf).unwrap().unwrap();
     assert_eq!(original, decoded);
 }
@@ -983,7 +1019,7 @@ fn roundtrip_port_forward_stop() {
 fn port_forward_listen_wrong_payload_size() {
     let mut codec = FrameCodec;
     let mut buf = BytesMut::new();
-    buf.put_u8(0x1C); // TYPE_PORT_FORWARD_LISTEN
+    buf.put_u8(0x40); // TYPE_PORT_FORWARD_LISTEN
     buf.put_u32(4); // wrong: should be 8
     buf.put_slice(&[0x00; 4]);
     let err = codec.decode(&mut buf).unwrap_err();
@@ -994,7 +1030,7 @@ fn port_forward_listen_wrong_payload_size() {
 fn port_forward_open_wrong_payload_size() {
     let mut codec = FrameCodec;
     let mut buf = BytesMut::new();
-    buf.put_u8(0x1E); // TYPE_PORT_FORWARD_OPEN
+    buf.put_u8(0x42); // TYPE_PORT_FORWARD_OPEN
     buf.put_u32(4); // wrong: should be 10
     buf.put_slice(&[0x00; 4]);
     let err = codec.decode(&mut buf).unwrap_err();
@@ -1005,7 +1041,7 @@ fn port_forward_open_wrong_payload_size() {
 fn port_forward_data_too_short() {
     let mut codec = FrameCodec;
     let mut buf = BytesMut::new();
-    buf.put_u8(0x1F); // TYPE_PORT_FORWARD_DATA
+    buf.put_u8(0x43); // TYPE_PORT_FORWARD_DATA
     buf.put_u32(2); // less than 4 bytes
     buf.put_slice(&[0x00, 0x00]);
     let err = codec.decode(&mut buf).unwrap_err();

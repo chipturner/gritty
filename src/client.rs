@@ -1217,7 +1217,11 @@ pub async fn run(
                         continue;
                     }
                     if new_framed
-                        .send(Frame::Attach { session: session.to_string() })
+                        .send(Frame::Attach {
+                            session: session.to_string(),
+                            client_name: String::new(),
+                            force: true,
+                        })
                         .await
                         .is_err()
                     {
@@ -1235,7 +1239,7 @@ pub async fn run(
                             current_redraw = true;
                             break;
                         }
-                        Some(Ok(Frame::Error { message })) => {
+                        Some(Ok(Frame::Error { message, .. })) => {
                             write_stdout_async(
                                 &async_stdout,
                                 format!(
@@ -1372,7 +1376,7 @@ pub async fn tail(
                             last_pong = Instant::now();
                             break;
                         }
-                        Some(Ok(Frame::Error { message })) => {
+                        Some(Ok(Frame::Error { message, .. })) => {
                             eprintln!("\r\x1b[31m\u{25b8} session gone: {message}\x1b[0m\x1b[K");
                             break 'outer 1;
                         }

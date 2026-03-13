@@ -21,38 +21,24 @@ pub(crate) async fn connect_session(
     use gritty::protocol::{Frame, FrameCodec};
     use tokio_util::codec::Framed;
 
-    let (name, picked) = match session {
+    let (name, _picked) = match session {
         Some(name) => (name, false),
         None => pick_session(pick, no_pick, &ctl_path).await,
     };
     let session_command = command.unwrap_or_default();
-
-    // If not forcing, check whether the target session is already attached.
-    // Skip when the user explicitly chose it from the interactive picker.
-    if !force && !picked {
-        if let Some(entry) = find_session(&name, &ctl_path).await? {
-            if entry.attached {
-                let host = host_from_ctl_path(&ctl_path);
-                eprintln!(
-                    "error: session {name} is already attached (heartbeat {}s ago)",
-                    std::time::SystemTime::now()
-                        .duration_since(std::time::UNIX_EPOCH)
-                        .unwrap_or_default()
-                        .as_secs()
-                        .saturating_sub(entry.last_heartbeat)
-                );
-                eprintln!("  gritty connect {host}:{name} --force   to take over",);
-                std::process::exit(1);
-            }
-        }
-    }
 
     let stream = super::util::connect_or_start(&ctl_path, &auto_start_mode, wait).await?;
     let mut framed = Framed::new(stream, FrameCodec);
     gritty::handshake(&mut framed).await?;
 
     // Try attach first
-    framed.send(Frame::Attach { session: name.clone() }).await?;
+    framed
+        .send(Frame::Attach {
+            session: name.clone(),
+            client_name: settings.client_name.clone(),
+            force,
+        })
+        .await?;
 
     match Frame::expect_from(framed.next().await)? {
         Frame::Ok => {
@@ -83,13 +69,19 @@ pub(crate) async fn connect_session(
             .await?;
             std::process::exit(code);
         }
-        Frame::Error { message } if message.starts_with("no such session:") => {
+        Frame::Error { code: gritty::protocol::ErrorCode::NoSuchSession, .. } => {
             if no_create {
                 anyhow::bail!("no such session: {name}");
             }
             // Fall through to create
         }
-        Frame::Error { message } => anyhow::bail!("{message}"),
+        Frame::Error { code: gritty::protocol::ErrorCode::AlreadyAttached, message, .. } => {
+            let host = host_from_ctl_path(&ctl_path);
+            eprintln!("error: {message}");
+            eprintln!("  gritty connect {host}:{name} --force   to take over");
+            std::process::exit(1);
+        }
+        Frame::Error { message, .. } => anyhow::bail!("{message}"),
         other => anyhow::bail!("unexpected response from server: {other:?}"),
     }
 
@@ -98,7 +90,17 @@ pub(crate) async fn connect_session(
     let stream = super::util::connect_or_start(&ctl_path, &auto_start_mode, wait).await?;
     let mut framed = Framed::new(stream, FrameCodec);
     gritty::handshake(&mut framed).await?;
-    framed.send(Frame::NewSession { name: name.clone(), command: session_command }).await?;
+    // Get terminal size for initial PTY dimensions
+    let (cols, rows) = crossterm::terminal::size().unwrap_or((0, 0));
+    framed
+        .send(Frame::NewSession {
+            name: name.clone(),
+            command: session_command,
+            cwd: String::new(),
+            cols,
+            rows,
+        })
+        .await?;
 
     match Frame::expect_from(framed.next().await)? {
         Frame::SessionCreated { id } => {
@@ -117,8 +119,9 @@ pub(crate) async fn connect_session(
             if !settings.client_name.is_empty() {
                 env_vars.push(("GRITTY_CLIENT".into(), settings.client_name.clone()));
             }
+            let id_str = id.to_string();
             let code = gritty::client::run(
-                &id,
+                &id_str,
                 framed,
                 false, // no redraw on new session -- nothing to redraw
                 &ctl_path,
@@ -134,7 +137,7 @@ pub(crate) async fn connect_session(
             .await?;
             std::process::exit(code);
         }
-        Frame::Error { message } => anyhow::bail!("{message}"),
+        Frame::Error { message, .. } => anyhow::bail!("{message}"),
         other => anyhow::bail!("unexpected response from server: {other:?}"),
     }
 }
@@ -180,7 +183,7 @@ async fn pick_session(pick: bool, no_pick: bool, ctl_path: &Path) -> (String, bo
 }
 
 fn session_display_name(s: &gritty::protocol::SessionEntry) -> String {
-    if s.name.is_empty() { s.id.clone() } else { s.name.clone() }
+    if s.name.is_empty() { s.id.to_string() } else { s.name.clone() }
 }
 
 /// Suggest a name for a new session. Returns "default" if unused, otherwise "session-N".
@@ -692,27 +695,6 @@ async fn tui_pick_session(
     result
 }
 
-/// Query the daemon for a specific session by name, returning its entry if found.
-/// Returns Ok(None) if the server isn't running or the session doesn't exist.
-async fn find_session(
-    name: &str,
-    ctl_path: &Path,
-) -> anyhow::Result<Option<gritty::protocol::SessionEntry>> {
-    use gritty::protocol::Frame;
-
-    let resp = match server_request(&ctl_path.to_path_buf(), Frame::ListSessions).await {
-        Ok(r) => r,
-        Err(_) => return Ok(None),
-    };
-    let Frame::SessionInfo { sessions } = resp else {
-        return Ok(None);
-    };
-    Ok(sessions.into_iter().find(|s| {
-        let display = if s.name.is_empty() { &s.id } else { &s.name };
-        display == name
-    }))
-}
-
 /// Extract a display-friendly host name from a ctl socket path.
 fn host_from_ctl_path(ctl_path: &Path) -> String {
     // Tunnel sockets: .../connect-<host>.sock -> host is <host>
@@ -741,7 +723,7 @@ async fn alert_detached_sessions(current_name: &str, ctl_path: &Path) {
         .iter()
         .filter(|s| {
             !s.attached && {
-                let display = if s.name.is_empty() { &s.id } else { &s.name };
+                let display = if s.name.is_empty() { s.id.to_string() } else { s.name.clone() };
                 display != current_name
             }
         })
@@ -751,7 +733,7 @@ async fn alert_detached_sessions(current_name: &str, ctl_path: &Path) {
     }
     let names: Vec<_> = detached
         .iter()
-        .map(|s| if s.name.is_empty() { s.id.clone() } else { s.name.clone() })
+        .map(|s| if s.name.is_empty() { s.id.to_string() } else { s.name.clone() })
         .collect();
     eprintln!("\x1b[2;33m\u{25b8} detached sessions: {}\x1b[0m", names.join(", "));
 }
@@ -774,7 +756,7 @@ pub(crate) async fn tail_session(target: String, ctl_path: PathBuf) -> anyhow::R
             eprintln!("\x1b[2;33m\u{25b8} tailing {target}\x1b[0m");
             gritty::client::tail(&target, framed, &ctl_path).await
         }
-        Frame::Error { message } => anyhow::bail!("{message}"),
+        Frame::Error { message, .. } => anyhow::bail!("{message}"),
         other => anyhow::bail!("unexpected response from server: {other:?}"),
     }
 }
@@ -796,7 +778,7 @@ pub(crate) async fn rename_session(
             eprintln!("\x1b[32m\u{25b8} renamed {target} -> {new_name}\x1b[0m");
             Ok(())
         }
-        Frame::Error { message } => anyhow::bail!("{message}"),
+        Frame::Error { message, .. } => anyhow::bail!("{message}"),
         other => anyhow::bail!("unexpected response from server: {other:?}"),
     }
 }
@@ -809,7 +791,7 @@ pub(crate) async fn kill_session(target: String, ctl_path: PathBuf) -> anyhow::R
             eprintln!("\x1b[32m\u{25b8} session {target} killed\x1b[0m");
             Ok(())
         }
-        Frame::Error { message } => anyhow::bail!("{message}"),
+        Frame::Error { message, .. } => anyhow::bail!("{message}"),
         other => anyhow::bail!("unexpected response from server: {other:?}"),
     }
 }
@@ -822,7 +804,7 @@ pub(crate) async fn kill_server(ctl_path: PathBuf) -> anyhow::Result<()> {
             eprintln!("\x1b[32m\u{25b8} server killed\x1b[0m");
             Ok(())
         }
-        Frame::Error { message } => anyhow::bail!("{message}"),
+        Frame::Error { message, .. } => anyhow::bail!("{message}"),
         other => anyhow::bail!("unexpected response from server: {other:?}"),
     }
 }
@@ -872,7 +854,7 @@ pub(crate) async fn list_sessions(ctl_path: PathBuf) -> anyhow::Result<()> {
                             )
                         };
                         vec![
-                            s.id.clone(),
+                            s.id.to_string(),
                             name,
                             s.foreground_cmd.clone(),
                             s.cwd.clone(),
@@ -978,7 +960,7 @@ pub(crate) async fn list_all_sessions() -> anyhow::Result<()> {
                 };
                 vec![
                     host.clone(),
-                    s.id.clone(),
+                    s.id.to_string(),
                     name,
                     s.foreground_cmd.clone(),
                     s.cwd.clone(),

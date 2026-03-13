@@ -32,7 +32,7 @@ async fn wait_for_daemon(ctl_path: &std::path::Path) {
 
 /// Perform Hello handshake on a framed connection.
 async fn do_handshake(framed: &mut Framed<UnixStream, FrameCodec>) {
-    framed.send(Frame::Hello { version: PROTOCOL_VERSION }).await.unwrap();
+    framed.send(Frame::Hello { version: PROTOCOL_VERSION, capabilities: 0 }).await.unwrap();
     let resp = timeout(Duration::from_secs(3), framed.next())
         .await
         .expect("timed out")
@@ -63,11 +63,17 @@ async fn drain_data(framed: &mut Framed<UnixStream, FrameCodec>, wait: Duration)
 async fn create_session(ctl_path: &std::path::Path, name: &str) -> String {
     let resp = control_request(
         ctl_path,
-        Frame::NewSession { name: name.to_string(), command: String::new() },
+        Frame::NewSession {
+            name: name.to_string(),
+            command: String::new(),
+            cwd: String::new(),
+            cols: 0,
+            rows: 0,
+        },
     )
     .await;
     match resp {
-        Frame::SessionCreated { id } => id,
+        Frame::SessionCreated { id } => id.to_string(),
         other => panic!("expected SessionCreated, got {other:?}"),
     }
 }
@@ -80,7 +86,14 @@ async fn attach_session(
     let stream = UnixStream::connect(ctl_path).await.unwrap();
     let mut framed = Framed::new(stream, FrameCodec);
     do_handshake(&mut framed).await;
-    framed.send(Frame::Attach { session: session.to_string() }).await.unwrap();
+    framed
+        .send(Frame::Attach {
+            session: session.to_string(),
+            client_name: String::new(),
+            force: true,
+        })
+        .await
+        .unwrap();
     let resp = timeout(Duration::from_secs(3), framed.next())
         .await
         .expect("timed out")
@@ -119,14 +132,14 @@ async fn daemon_rejects_version_mismatch() {
 
     let stream = UnixStream::connect(&ctl_path).await.unwrap();
     let mut framed = Framed::new(stream, FrameCodec);
-    framed.send(Frame::Hello { version: PROTOCOL_VERSION + 1 }).await.unwrap();
+    framed.send(Frame::Hello { version: PROTOCOL_VERSION + 1, capabilities: 0 }).await.unwrap();
     let resp = timeout(Duration::from_secs(3), framed.next())
         .await
         .expect("timed out")
         .expect("stream ended")
         .expect("decode error");
     match resp {
-        Frame::Error { message } => {
+        Frame::Error { message, .. } => {
             assert!(message.contains("protocol version mismatch"), "unexpected error: {message}");
         }
         other => panic!("expected Error, got {other:?}"),
@@ -148,7 +161,7 @@ async fn daemon_creates_and_lists_sessions() {
     match &resp {
         Frame::SessionInfo { sessions } => {
             assert_eq!(sessions.len(), 1);
-            assert_eq!(sessions[0].id, id);
+            assert_eq!(sessions[0].id.to_string(), id);
             assert_eq!(sessions[0].name, "mytest");
         }
         other => panic!("expected SessionInfo, got {other:?}"),
@@ -170,7 +183,13 @@ async fn daemon_rejects_duplicate_name() {
     // Try to create session with same name again
     let resp = control_request(
         &ctl_path,
-        Frame::NewSession { name: "dupname".to_string(), command: String::new() },
+        Frame::NewSession {
+            name: "dupname".to_string(),
+            command: String::new(),
+            cwd: String::new(),
+            cols: 0,
+            rows: 0,
+        },
     )
     .await;
     assert!(matches!(resp, Frame::Error { .. }), "expected Error for duplicate name, got {resp:?}");
@@ -188,7 +207,13 @@ async fn daemon_rejects_name_with_tab() {
 
     let resp = control_request(
         &ctl_path,
-        Frame::NewSession { name: "bad\tname".to_string(), command: String::new() },
+        Frame::NewSession {
+            name: "bad\tname".to_string(),
+            command: String::new(),
+            cwd: String::new(),
+            cols: 0,
+            rows: 0,
+        },
     )
     .await;
     assert!(matches!(resp, Frame::Error { .. }), "expected Error for name with tab, got {resp:?}");
@@ -206,7 +231,13 @@ async fn daemon_rejects_name_with_newline() {
 
     let resp = control_request(
         &ctl_path,
-        Frame::NewSession { name: "bad\nname".to_string(), command: String::new() },
+        Frame::NewSession {
+            name: "bad\nname".to_string(),
+            command: String::new(),
+            cwd: String::new(),
+            cols: 0,
+            rows: 0,
+        },
     )
     .await;
     assert!(
@@ -336,7 +367,7 @@ async fn create_after_kill_same_name() {
         let resp = control_request(&ctl_path, Frame::ListSessions).await;
         match &resp {
             Frame::SessionInfo { sessions } if sessions.len() == 1 && sessions[0].shell_pid > 0 => {
-                assert_eq!(sessions[0].id, id2);
+                assert_eq!(sessions[0].id.to_string(), id2);
                 assert_eq!(sessions[0].name, "reuse");
                 break;
             }
@@ -363,9 +394,9 @@ async fn multiple_concurrent_sessions() {
     match &resp {
         Frame::SessionInfo { sessions } => {
             assert_eq!(sessions.len(), 2, "expected 2 sessions");
-            let ids: Vec<&str> = sessions.iter().map(|s| s.id.as_str()).collect();
-            assert!(ids.contains(&id1.as_str()), "should contain session 1");
-            assert!(ids.contains(&id2.as_str()), "should contain session 2");
+            let ids: Vec<String> = sessions.iter().map(|s| s.id.to_string()).collect();
+            assert!(ids.contains(&id1), "should contain session 1");
+            assert!(ids.contains(&id2), "should contain session 2");
         }
         other => panic!("expected SessionInfo, got {other:?}"),
     }
@@ -512,11 +543,17 @@ async fn list_before_session_ready() {
     // Create session via NewSession (don't wait the usual 200ms from helper)
     let resp = control_request(
         &ctl_path,
-        Frame::NewSession { name: "early".to_string(), command: String::new() },
+        Frame::NewSession {
+            name: "early".to_string(),
+            command: String::new(),
+            cwd: String::new(),
+            cols: 0,
+            rows: 0,
+        },
     )
     .await;
     let id = match resp {
-        Frame::SessionCreated { id } => id,
+        Frame::SessionCreated { id } => id.to_string(),
         other => panic!("expected SessionCreated, got {other:?}"),
     };
 
@@ -525,7 +562,7 @@ async fn list_before_session_ready() {
     match &resp {
         Frame::SessionInfo { sessions } => {
             assert_eq!(sessions.len(), 1, "session should appear in list immediately");
-            assert_eq!(sessions[0].id, id);
+            assert_eq!(sessions[0].id.to_string(), id);
         }
         other => panic!("expected SessionInfo, got {other:?}"),
     }
@@ -668,8 +705,15 @@ async fn attach_nonexistent_returns_error() {
     let _daemon = tokio::spawn(async move { gritty::daemon::run(&ctl, None).await });
     wait_for_daemon(&ctl_path).await;
 
-    let resp =
-        control_request(&ctl_path, Frame::Attach { session: "nonexistent".to_string() }).await;
+    let resp = control_request(
+        &ctl_path,
+        Frame::Attach {
+            session: "nonexistent".to_string(),
+            client_name: String::new(),
+            force: false,
+        },
+    )
+    .await;
     assert!(
         matches!(resp, Frame::Error { .. }),
         "expected Error for nonexistent attach, got {resp:?}"
@@ -713,7 +757,11 @@ async fn attach_dead_session_returns_error() {
     tokio::time::sleep(Duration::from_secs(1)).await;
 
     // Attach should get an error, not Ok + disconnect
-    let resp = control_request(&ctl_path, Frame::Attach { session: id.clone() }).await;
+    let resp = control_request(
+        &ctl_path,
+        Frame::Attach { session: id.clone(), client_name: String::new(), force: false },
+    )
+    .await;
     assert!(
         matches!(resp, Frame::Error { .. }),
         "expected Error for dead session attach, got {resp:?}"
@@ -829,7 +877,10 @@ async fn reconnect_via_daemon_after_disconnect() {
     let stream = UnixStream::connect(&ctl_path).await.unwrap();
     let mut framed = Framed::new(stream, FrameCodec);
     do_handshake(&mut framed).await;
-    framed.send(Frame::Attach { session: id.clone() }).await.unwrap();
+    framed
+        .send(Frame::Attach { session: id.clone(), client_name: String::new(), force: false })
+        .await
+        .unwrap();
     let resp = timeout(Duration::from_secs(3), framed.next())
         .await
         .expect("timed out")
@@ -878,8 +929,12 @@ async fn reconnect_after_session_killed_returns_error() {
     assert_eq!(resp, Frame::Ok);
     tokio::time::sleep(Duration::from_millis(300)).await;
 
-    // Try to re-attach — should get Error
-    let resp = control_request(&ctl_path, Frame::Attach { session: id.clone() }).await;
+    // Try to re-attach -- should get Error
+    let resp = control_request(
+        &ctl_path,
+        Frame::Attach { session: id.clone(), client_name: String::new(), force: false },
+    )
+    .await;
     assert!(
         matches!(resp, Frame::Error { .. }),
         "expected Error when attaching to killed session, got {resp:?}"
@@ -936,7 +991,7 @@ async fn daemon_rejects_non_hello_first_frame() {
         .expect("stream ended")
         .expect("decode error");
     match resp {
-        Frame::Error { message } => {
+        Frame::Error { message, .. } => {
             assert!(message.contains("Hello"), "error should mention Hello, got: {message}");
         }
         other => panic!("expected Error for non-Hello first frame, got {other:?}"),
@@ -960,11 +1015,17 @@ async fn daemon_rejects_purely_numeric_name() {
 
     let resp = control_request(
         &ctl_path,
-        Frame::NewSession { name: "42".to_string(), command: String::new() },
+        Frame::NewSession {
+            name: "42".to_string(),
+            command: String::new(),
+            cwd: String::new(),
+            cols: 0,
+            rows: 0,
+        },
     )
     .await;
     match resp {
-        Frame::Error { message } => {
+        Frame::Error { message, .. } => {
             assert!(
                 message.contains("purely numeric"),
                 "error should mention purely numeric, got: {message}"
@@ -1025,7 +1086,7 @@ async fn rename_session_to_taken_name() {
     )
     .await;
     match resp {
-        Frame::Error { message } => {
+        Frame::Error { message, .. } => {
             assert!(
                 message.contains("already exists"),
                 "error should mention duplicate, got: {message}"
@@ -1054,7 +1115,7 @@ async fn rename_session_to_numeric_name() {
     )
     .await;
     match resp {
-        Frame::Error { message } => {
+        Frame::Error { message, .. } => {
             assert!(
                 message.contains("purely numeric"),
                 "error should mention numeric, got: {message}"
@@ -1080,12 +1141,20 @@ async fn attach_dash_resolves_to_last_session() {
     // After creating beta, last_attached = beta's id
 
     // Explicitly attach to alpha (updates last_attached to alpha)
-    let resp = control_request(&ctl_path, Frame::Attach { session: id_a.clone() }).await;
+    let resp = control_request(
+        &ctl_path,
+        Frame::Attach { session: id_a.clone(), client_name: String::new(), force: false },
+    )
+    .await;
     assert_eq!(resp, Frame::Ok);
     tokio::time::sleep(Duration::from_millis(100)).await;
 
     // Now "-" should resolve to alpha (last explicitly attached)
-    let resp = control_request(&ctl_path, Frame::Attach { session: "-".to_string() }).await;
+    let resp = control_request(
+        &ctl_path,
+        Frame::Attach { session: "-".to_string(), client_name: String::new(), force: false },
+    )
+    .await;
     assert_eq!(resp, Frame::Ok, "attach - should resolve to last attached session (alpha)");
 
     kill_cleanup(&ctl_path, &id_a).await;
@@ -1101,9 +1170,13 @@ async fn attach_dash_no_previous_session() {
     wait_for_daemon(&ctl_path).await;
 
     // No sessions created at all, "-" should fail
-    let resp = control_request(&ctl_path, Frame::Attach { session: "-".to_string() }).await;
+    let resp = control_request(
+        &ctl_path,
+        Frame::Attach { session: "-".to_string(), client_name: String::new(), force: false },
+    )
+    .await;
     match resp {
-        Frame::Error { message } => {
+        Frame::Error { message, .. } => {
             assert!(
                 message.contains("no such session"),
                 "expected no-such-session error, got: {message}"

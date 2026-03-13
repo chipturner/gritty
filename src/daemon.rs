@@ -1,4 +1,4 @@
-use crate::protocol::{Frame, FrameCodec, PROTOCOL_VERSION, SessionEntry};
+use crate::protocol::{ErrorCode, Frame, FrameCodec, PROTOCOL_VERSION, SessionEntry};
 use crate::server::{self, ClientConn, SessionMetadata};
 use futures_util::{SinkExt, StreamExt};
 use std::collections::HashMap;
@@ -141,7 +141,7 @@ fn build_session_entries(sessions: &HashMap<u32, SessionState>) -> Vec<SessionEn
         .map(|(&id, state)| {
             if let Some(meta) = state.metadata.get() {
                 SessionEntry {
-                    id: id.to_string(),
+                    id,
                     name: state.name.clone().unwrap_or_default(),
                     pty_path: meta.pty_path.clone(),
                     shell_pid: meta.shell_pid,
@@ -154,7 +154,7 @@ fn build_session_entries(sessions: &HashMap<u32, SessionState>) -> Vec<SessionEn
                 }
             } else {
                 SessionEntry {
-                    id: id.to_string(),
+                    id,
                     name: state.name.clone().unwrap_or_default(),
                     pty_path: String::new(),
                     shell_pid: 0,
@@ -168,7 +168,7 @@ fn build_session_entries(sessions: &HashMap<u32, SessionState>) -> Vec<SessionEn
             }
         })
         .collect();
-    entries.sort_by_key(|e| e.id.parse::<u32>().unwrap_or(u32::MAX));
+    entries.sort_by_key(|e| e.id);
     entries
 }
 
@@ -191,11 +191,14 @@ async fn connection_handshake(
 
     // Read Hello handshake (5s timeout)
     let hello = match tokio::time::timeout(Duration::from_secs(5), framed.next()).await {
-        Ok(Some(Ok(Frame::Hello { version }))) => version,
+        Ok(Some(Ok(Frame::Hello { version, .. }))) => version,
         Ok(Some(Ok(_))) => {
             let _ = timed_send(
                 &mut framed,
-                Frame::Error { message: "expected Hello handshake".to_string() },
+                Frame::Error {
+                    code: ErrorCode::UnexpectedFrame,
+                    message: "expected Hello handshake".to_string(),
+                },
             )
             .await;
             return;
@@ -216,6 +219,7 @@ async fn connection_handshake(
         let _ = timed_send(
             &mut framed,
             Frame::Error {
+                code: ErrorCode::VersionMismatch,
                 message: format!(
                     "protocol version mismatch: client={hello} server={PROTOCOL_VERSION}; \
                      both sides must run the same version"
@@ -225,7 +229,10 @@ async fn connection_handshake(
         .await;
         return;
     }
-    if timed_send(&mut framed, Frame::HelloAck { version: PROTOCOL_VERSION }).await.is_err() {
+    if timed_send(&mut framed, Frame::HelloAck { version: PROTOCOL_VERSION, capabilities: 0 })
+        .await
+        .is_err()
+    {
         return;
     }
 
@@ -350,15 +357,17 @@ async fn dispatch_control(
     oauth_tunnel_idle_timeout: u64,
 ) -> bool {
     match frame {
-        Frame::NewSession { name, command } => {
+        Frame::NewSession { name, command, cwd, cols, rows } => {
             // Reject names containing control characters
             let name_opt = if name.is_empty() { None } else { Some(name) };
             let command_opt = if command.is_empty() { None } else { Some(command) };
+            let cwd_opt = if cwd.is_empty() { None } else { Some(cwd) };
             if let Some(ref n) = name_opt {
                 if n.bytes().any(|b| b.is_ascii_control()) {
                     let _ = timed_send(
                         &mut framed,
                         Frame::Error {
+                            code: ErrorCode::InvalidName,
                             message: "session name must not contain control characters".to_string(),
                         },
                     )
@@ -369,6 +378,7 @@ async fn dispatch_control(
                     let _ = timed_send(
                         &mut framed,
                         Frame::Error {
+                            code: ErrorCode::InvalidName,
                             message: "session name must not be purely numeric (ambiguous with session IDs)".to_string(),
                         },
                     )
@@ -379,7 +389,10 @@ async fn dispatch_control(
                 if dup {
                     let _ = timed_send(
                         &mut framed,
-                        Frame::Error { message: format!("session name already exists: {n}") },
+                        Frame::Error {
+                            code: ErrorCode::NameAlreadyExists,
+                            message: format!("session name already exists: {n}"),
+                        },
                     )
                     .await;
                     return false;
@@ -397,6 +410,7 @@ async fn dispatch_control(
             let svc_socket_path = sock_dir.join(format!("svc-{id}.sock"));
             let name_for_server = name_opt.clone();
             let cmd_for_server = command_opt;
+            let cwd_for_server = cwd_opt;
             let handle = tokio::spawn(async move {
                 server::run(
                     client_rx,
@@ -408,6 +422,9 @@ async fn dispatch_control(
                     cmd_for_server,
                     ring_buffer_cap,
                     oauth_tunnel_idle_timeout,
+                    cols,
+                    rows,
+                    cwd_for_server,
                 )
                 .await
             });
@@ -424,17 +441,16 @@ async fn dispatch_control(
 
             info!(id, name = ?name_opt, "session created");
 
-            if timed_send(&mut framed, Frame::SessionCreated { id: id.to_string() }).await.is_err()
-            {
+            if timed_send(&mut framed, Frame::SessionCreated { id }).await.is_err() {
                 return false;
             }
 
             // Hand off connection to session for auto-attach
             *last_attached = Some(id);
-            let _ = client_tx.send(ClientConn::Active(framed));
+            let _ = client_tx.send(ClientConn::Active { framed, client_name: String::new() });
             false
         }
-        Frame::Attach { session } => {
+        Frame::Attach { session, client_name, force } => {
             reap_sessions(sessions);
             if let Some(id) = resolve_session(sessions, &session, *last_attached) {
                 let state = &sessions[&id];
@@ -442,17 +458,40 @@ async fn dispatch_control(
                     sessions.remove(&id);
                     let _ = timed_send(
                         &mut framed,
-                        Frame::Error { message: format!("no such session: {session}") },
+                        Frame::Error {
+                            code: ErrorCode::NoSuchSession,
+                            message: format!("no such session: {session}"),
+                        },
                     )
                     .await;
-                } else if timed_send(&mut framed, Frame::Ok).await.is_ok() {
-                    *last_attached = Some(id);
-                    let _ = state.client_tx.send(ClientConn::Active(framed));
+                } else {
+                    // Check if session is already attached and force not requested
+                    let is_attached = state
+                        .metadata
+                        .get()
+                        .map(|m| m.attached.load(Ordering::Relaxed))
+                        .unwrap_or(false);
+                    if is_attached && !force {
+                        let _ = timed_send(
+                            &mut framed,
+                            Frame::Error {
+                                code: ErrorCode::AlreadyAttached,
+                                message: format!("session {session} is already attached"),
+                            },
+                        )
+                        .await;
+                    } else if timed_send(&mut framed, Frame::Ok).await.is_ok() {
+                        *last_attached = Some(id);
+                        let _ = state.client_tx.send(ClientConn::Active { framed, client_name });
+                    }
                 }
             } else {
                 let _ = timed_send(
                     &mut framed,
-                    Frame::Error { message: format!("no such session: {session}") },
+                    Frame::Error {
+                        code: ErrorCode::NoSuchSession,
+                        message: format!("no such session: {session}"),
+                    },
                 )
                 .await;
             }
@@ -466,7 +505,10 @@ async fn dispatch_control(
                     sessions.remove(&id);
                     let _ = timed_send(
                         &mut framed,
-                        Frame::Error { message: format!("no such session: {session}") },
+                        Frame::Error {
+                            code: ErrorCode::NoSuchSession,
+                            message: format!("no such session: {session}"),
+                        },
                     )
                     .await;
                 } else if timed_send(&mut framed, Frame::Ok).await.is_ok() {
@@ -475,7 +517,10 @@ async fn dispatch_control(
             } else {
                 let _ = timed_send(
                     &mut framed,
-                    Frame::Error { message: format!("no such session: {session}") },
+                    Frame::Error {
+                        code: ErrorCode::NoSuchSession,
+                        message: format!("no such session: {session}"),
+                    },
                 )
                 .await;
             }
@@ -497,7 +542,10 @@ async fn dispatch_control(
             } else {
                 let _ = timed_send(
                     &mut framed,
-                    Frame::Error { message: format!("no such session: {session}") },
+                    Frame::Error {
+                        code: ErrorCode::NoSuchSession,
+                        message: format!("no such session: {session}"),
+                    },
                 )
                 .await;
             }
@@ -511,7 +559,10 @@ async fn dispatch_control(
                     sessions.remove(&id);
                     let _ = timed_send(
                         &mut framed,
-                        Frame::Error { message: format!("no such session: {session}") },
+                        Frame::Error {
+                            code: ErrorCode::NoSuchSession,
+                            message: format!("no such session: {session}"),
+                        },
                     )
                     .await;
                 } else if timed_send(&mut framed, Frame::Ok).await.is_ok() {
@@ -521,7 +572,10 @@ async fn dispatch_control(
             } else {
                 let _ = timed_send(
                     &mut framed,
-                    Frame::Error { message: format!("no such session: {session}") },
+                    Frame::Error {
+                        code: ErrorCode::NoSuchSession,
+                        message: format!("no such session: {session}"),
+                    },
                 )
                 .await;
             }
@@ -533,13 +587,17 @@ async fn dispatch_control(
                 if new_name.is_empty() {
                     let _ = timed_send(
                         &mut framed,
-                        Frame::Error { message: "new name must not be empty".to_string() },
+                        Frame::Error {
+                            code: ErrorCode::EmptyName,
+                            message: "new name must not be empty".to_string(),
+                        },
                     )
                     .await;
                 } else if new_name.bytes().any(|b| b.is_ascii_control()) {
                     let _ = timed_send(
                         &mut framed,
                         Frame::Error {
+                            code: ErrorCode::InvalidName,
                             message: "session name must not contain control characters".to_string(),
                         },
                     )
@@ -548,6 +606,7 @@ async fn dispatch_control(
                     let _ = timed_send(
                         &mut framed,
                         Frame::Error {
+                            code: ErrorCode::InvalidName,
                             message: "session name must not be purely numeric (ambiguous with session IDs)".to_string(),
                         },
                     )
@@ -556,6 +615,7 @@ async fn dispatch_control(
                     let _ = timed_send(
                         &mut framed,
                         Frame::Error {
+                            code: ErrorCode::NameAlreadyExists,
                             message: format!("session name already exists: {new_name}"),
                         },
                     )
@@ -568,7 +628,10 @@ async fn dispatch_control(
             } else {
                 let _ = timed_send(
                     &mut framed,
-                    Frame::Error { message: format!("no such session: {session}") },
+                    Frame::Error {
+                        code: ErrorCode::NoSuchSession,
+                        message: format!("no such session: {session}"),
+                    },
                 )
                 .await;
             }
@@ -584,7 +647,10 @@ async fn dispatch_control(
             error!(?other, "unexpected frame on control socket");
             let _ = timed_send(
                 &mut framed,
-                Frame::Error { message: "unexpected frame type".to_string() },
+                Frame::Error {
+                    code: ErrorCode::UnexpectedFrame,
+                    message: "unexpected frame type".to_string(),
+                },
             )
             .await;
             false

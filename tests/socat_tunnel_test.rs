@@ -166,7 +166,7 @@ async fn tunnel_death_session_persists() {
     // Create a session via protocol through the proxy
     let stream = UnixStream::connect(&proxy_sock).await.unwrap();
     let mut framed = Framed::new(stream, FrameCodec);
-    framed.send(Frame::Hello { version: PROTOCOL_VERSION }).await.unwrap();
+    framed.send(Frame::Hello { version: PROTOCOL_VERSION, capabilities: 0 }).await.unwrap();
     let ack = timeout(Duration::from_secs(5), framed.next())
         .await
         .expect("timed out")
@@ -174,7 +174,13 @@ async fn tunnel_death_session_persists() {
         .expect("decode error");
     assert!(matches!(ack, Frame::HelloAck { .. }));
     framed
-        .send(Frame::NewSession { name: "persist-test".to_string(), command: String::new() })
+        .send(Frame::NewSession {
+            name: "persist-test".to_string(),
+            command: String::new(),
+            cwd: String::new(),
+            cols: 0,
+            rows: 0,
+        })
         .await
         .unwrap();
     let resp = timeout(Duration::from_secs(5), framed.next())
@@ -207,7 +213,7 @@ async fn tunnel_death_session_persists() {
     // List sessions -- our session should still be there
     let stream = UnixStream::connect(&proxy_sock).await.unwrap();
     let mut framed = Framed::new(stream, FrameCodec);
-    framed.send(Frame::Hello { version: PROTOCOL_VERSION }).await.unwrap();
+    framed.send(Frame::Hello { version: PROTOCOL_VERSION, capabilities: 0 }).await.unwrap();
     let ack = timeout(Duration::from_secs(5), framed.next())
         .await
         .expect("timed out")
@@ -223,7 +229,7 @@ async fn tunnel_death_session_persists() {
     match resp {
         Frame::SessionInfo { sessions } => {
             assert!(
-                sessions.iter().any(|s| s.id.to_string() == session_id),
+                sessions.iter().any(|s| s.id == session_id),
                 "session {session_id} not found in: {sessions:?}"
             );
         }

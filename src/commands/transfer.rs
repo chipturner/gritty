@@ -38,7 +38,7 @@ async fn probe_daemon_sessions(ctl_path: &Path) -> Vec<DiscoveredSession> {
         Ok(Frame::SessionInfo { sessions }) => sessions
             .into_iter()
             .map(|s| DiscoveredSession {
-                session_id: if s.name.is_empty() { s.id } else { s.name },
+                session_id: if s.name.is_empty() { s.id.to_string() } else { s.name },
                 ctl_path: ctl_path.to_path_buf(),
             })
             .collect(),
@@ -110,7 +110,7 @@ async fn send_file_handshake(
 
     match Frame::expect_from(framed.next().await)? {
         Frame::Ok => {}
-        Frame::Error { message } => anyhow::bail!("{message}"),
+        Frame::Error { message, .. } => anyhow::bail!("{message}"),
         other => anyhow::bail!("unexpected response: {other:?}"),
     }
 
