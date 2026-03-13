@@ -180,6 +180,7 @@ async fn tunnel_death_session_persists() {
             cwd: String::new(),
             cols: 0,
             rows: 0,
+            client_name: String::new(),
         })
         .await
         .unwrap();

@@ -445,6 +445,7 @@ async fn control_frame_on_session_is_ignored() {
             cwd: String::new(),
             cols: 0,
             rows: 0,
+            client_name: String::new(),
         })
         .await
         .unwrap();

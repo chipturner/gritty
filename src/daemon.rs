@@ -357,7 +357,7 @@ async fn dispatch_control(
     oauth_tunnel_idle_timeout: u64,
 ) -> bool {
     match frame {
-        Frame::NewSession { name, command, cwd, cols, rows } => {
+        Frame::NewSession { name, command, cwd, cols, rows, client_name } => {
             // Reject names containing control characters
             let name_opt = if name.is_empty() { None } else { Some(name) };
             let command_opt = if command.is_empty() { None } else { Some(command) };
@@ -447,7 +447,7 @@ async fn dispatch_control(
 
             // Hand off connection to session for auto-attach
             *last_attached = Some(id);
-            let _ = client_tx.send(ClientConn::Active { framed, client_name: String::new() });
+            let _ = client_tx.send(ClientConn::Active { framed, client_name });
             false
         }
         Frame::Attach { session, client_name, force } => {

@@ -69,6 +69,7 @@ async fn create_session(ctl_path: &std::path::Path, name: &str) -> String {
             cwd: String::new(),
             cols: 0,
             rows: 0,
+            client_name: String::new(),
         },
     )
     .await;
@@ -189,6 +190,7 @@ async fn daemon_rejects_duplicate_name() {
             cwd: String::new(),
             cols: 0,
             rows: 0,
+            client_name: String::new(),
         },
     )
     .await;
@@ -213,6 +215,7 @@ async fn daemon_rejects_name_with_tab() {
             cwd: String::new(),
             cols: 0,
             rows: 0,
+            client_name: String::new(),
         },
     )
     .await;
@@ -237,6 +240,7 @@ async fn daemon_rejects_name_with_newline() {
             cwd: String::new(),
             cols: 0,
             rows: 0,
+            client_name: String::new(),
         },
     )
     .await;
@@ -549,6 +553,7 @@ async fn list_before_session_ready() {
             cwd: String::new(),
             cols: 0,
             rows: 0,
+            client_name: String::new(),
         },
     )
     .await;
@@ -1021,6 +1026,7 @@ async fn daemon_rejects_purely_numeric_name() {
             cwd: String::new(),
             cols: 0,
             rows: 0,
+            client_name: String::new(),
         },
     )
     .await;

@@ -69,7 +69,7 @@ const HEADER_LEN: usize = 5; // type(1) + length(4)
 const MAX_FRAME_SIZE: usize = 1 << 20; // 1 MB
 
 /// Protocol version for handshake negotiation.
-pub const PROTOCOL_VERSION: u16 = 8;
+pub const PROTOCOL_VERSION: u16 = 9;
 
 /// Structured error codes for forward-compatible error handling.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -284,6 +284,7 @@ pub enum Frame {
         cwd: String,
         cols: u16,
         rows: u16,
+        client_name: String,
     },
     Attach {
         session: String,
@@ -810,7 +811,7 @@ impl Decoder for FrameCodec {
 
             // Structured frames
             TYPE_NEW_SESSION => {
-                expect_min_len(&payload, 10, "new session")?;
+                expect_min_len(&payload, 12, "new session")?;
                 let p = &payload[..];
                 let mut off = 0usize;
                 let name_len = read_u16(p, off) as usize;
@@ -849,7 +850,22 @@ impl Decoder for FrameCodec {
                 let cols = read_u16(p, off);
                 off += 2;
                 let rows = read_u16(p, off);
-                Ok(Some(Frame::NewSession { name, command, cwd, cols, rows }))
+                off += 2;
+                let client_name = if off + 2 <= p.len() {
+                    let cn_len = read_u16(p, off) as usize;
+                    off += 2;
+                    if off + cn_len > p.len() {
+                        return Err(io::Error::new(
+                            io::ErrorKind::InvalidData,
+                            "new session frame truncated",
+                        ));
+                    }
+                    String::from_utf8(p[off..off + cn_len].to_vec())
+                        .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?
+                } else {
+                    String::new()
+                };
+                Ok(Some(Frame::NewSession { name, command, cwd, cols, rows, client_name }))
             }
             TYPE_ATTACH => {
                 expect_min_len(&payload, 5, "attach")?;
@@ -1023,11 +1039,13 @@ impl Encoder<Frame> for FrameCodec {
             }
 
             // Structured frames
-            Frame::NewSession { name, command, cwd, cols, rows } => {
+            Frame::NewSession { name, command, cwd, cols, rows, client_name } => {
                 let nb = name.as_bytes();
                 let cb = command.as_bytes();
                 let cwdb = cwd.as_bytes();
-                let payload_len = 2 + nb.len() + 2 + cb.len() + 2 + cwdb.len() + 2 + 2;
+                let cnb = client_name.as_bytes();
+                let payload_len =
+                    2 + nb.len() + 2 + cb.len() + 2 + cwdb.len() + 2 + 2 + 2 + cnb.len();
                 dst.put_u8(TYPE_NEW_SESSION);
                 dst.put_u32(payload_len as u32);
                 dst.put_u16(nb.len() as u16);
@@ -1038,6 +1056,8 @@ impl Encoder<Frame> for FrameCodec {
                 dst.extend_from_slice(cwdb);
                 dst.put_u16(cols);
                 dst.put_u16(rows);
+                dst.put_u16(cnb.len() as u16);
+                dst.extend_from_slice(cnb);
             }
             Frame::Attach { session, client_name, force } => {
                 let sb = session.as_bytes();

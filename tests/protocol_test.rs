@@ -94,6 +94,7 @@ fn roundtrip_new_session() {
         cwd: String::new(),
         cols: 0,
         rows: 0,
+        client_name: "alice-laptop".to_string(),
     };
     codec.encode(original.clone(), &mut buf).unwrap();
     let decoded = codec.decode(&mut buf).unwrap().unwrap();
@@ -110,6 +111,7 @@ fn roundtrip_new_session_empty_name() {
         cwd: String::new(),
         cols: 0,
         rows: 0,
+        client_name: String::new(),
     };
     codec.encode(original.clone(), &mut buf).unwrap();
     let decoded = codec.decode(&mut buf).unwrap().unwrap();
@@ -126,6 +128,7 @@ fn roundtrip_new_session_with_command() {
         cwd: String::new(),
         cols: 0,
         rows: 0,
+        client_name: String::new(),
     };
     codec.encode(original.clone(), &mut buf).unwrap();
     let decoded = codec.decode(&mut buf).unwrap().unwrap();
@@ -142,6 +145,7 @@ fn roundtrip_new_session_command_only() {
         cwd: String::new(),
         cols: 0,
         rows: 0,
+        client_name: String::new(),
     };
     codec.encode(original.clone(), &mut buf).unwrap();
     let decoded = codec.decode(&mut buf).unwrap().unwrap();

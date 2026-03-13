@@ -99,6 +99,7 @@ pub(crate) async fn connect_session(
             cwd: String::new(),
             cols,
             rows,
+            client_name: settings.client_name.clone(),
         })
         .await?;
 

@@ -148,6 +148,7 @@ async fn create_session(proxy_path: &Path, name: &str) -> (u32, Framed<UnixStrea
             cwd: String::new(),
             cols: 0,
             rows: 0,
+            client_name: String::new(),
         })
         .await
         .unwrap();
