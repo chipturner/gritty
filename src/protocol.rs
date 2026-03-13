@@ -420,16 +420,6 @@ fn decode_string(payload: BytesMut) -> Result<String, io::Error> {
     String::from_utf8(payload.to_vec()).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))
 }
 
-fn expect_len(payload: &BytesMut, expected: usize, name: &str) -> Result<(), io::Error> {
-    if payload.len() != expected {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            format!("{name} frame must be {expected} bytes"),
-        ));
-    }
-    Ok(())
-}
-
 fn expect_min_len(payload: &BytesMut, min: usize, name: &str) -> Result<(), io::Error> {
     if payload.len() < min {
         return Err(io::Error::new(
@@ -694,51 +684,51 @@ impl Decoder for FrameCodec {
 
             // Fixed-field frames (PayloadReader auto-tracks offsets)
             TYPE_RESIZE => {
-                expect_len(&payload, 4, "resize")?;
+                expect_min_len(&payload, 4, "resize")?;
                 let mut r = PayloadReader::new(&payload);
                 Ok(Some(Frame::Resize { cols: r.u16(), rows: r.u16() }))
             }
             TYPE_EXIT => {
-                expect_len(&payload, 4, "exit")?;
+                expect_min_len(&payload, 4, "exit")?;
                 Ok(Some(Frame::Exit { code: PayloadReader::new(&payload).i32() }))
             }
             TYPE_HELLO => {
-                expect_len(&payload, 6, "hello")?;
+                expect_min_len(&payload, 6, "hello")?;
                 let mut r = PayloadReader::new(&payload);
                 Ok(Some(Frame::Hello { version: r.u16(), capabilities: r.u32() }))
             }
             TYPE_HELLO_ACK => {
-                expect_len(&payload, 6, "hello ack")?;
+                expect_min_len(&payload, 6, "hello ack")?;
                 let mut r = PayloadReader::new(&payload);
                 Ok(Some(Frame::HelloAck { version: r.u16(), capabilities: r.u32() }))
             }
             TYPE_AGENT_OPEN => {
-                expect_len(&payload, 4, "agent open")?;
+                expect_min_len(&payload, 4, "agent open")?;
                 Ok(Some(Frame::AgentOpen { channel_id: PayloadReader::new(&payload).u32() }))
             }
             TYPE_AGENT_CLOSE => {
-                expect_len(&payload, 4, "agent close")?;
+                expect_min_len(&payload, 4, "agent close")?;
                 Ok(Some(Frame::AgentClose { channel_id: PayloadReader::new(&payload).u32() }))
             }
             TYPE_TUNNEL_LISTEN => {
-                expect_len(&payload, 2, "tunnel listen")?;
+                expect_min_len(&payload, 2, "tunnel listen")?;
                 Ok(Some(Frame::TunnelListen { port: PayloadReader::new(&payload).u16() }))
             }
             TYPE_TUNNEL_OPEN => {
-                expect_len(&payload, 4, "tunnel open")?;
+                expect_min_len(&payload, 4, "tunnel open")?;
                 Ok(Some(Frame::TunnelOpen { channel_id: PayloadReader::new(&payload).u32() }))
             }
             TYPE_TUNNEL_CLOSE => {
-                expect_len(&payload, 4, "tunnel close")?;
+                expect_min_len(&payload, 4, "tunnel close")?;
                 Ok(Some(Frame::TunnelClose { channel_id: PayloadReader::new(&payload).u32() }))
             }
             TYPE_SEND_OFFER => {
-                expect_len(&payload, 12, "send offer")?;
+                expect_min_len(&payload, 12, "send offer")?;
                 let mut r = PayloadReader::new(&payload);
                 Ok(Some(Frame::SendOffer { file_count: r.u32(), total_bytes: r.u64() }))
             }
             TYPE_PORT_FORWARD_LISTEN => {
-                expect_len(&payload, 8, "port forward listen")?;
+                expect_min_len(&payload, 8, "port forward listen")?;
                 let mut r = PayloadReader::new(&payload);
                 Ok(Some(Frame::PortForwardListen {
                     forward_id: r.u32(),
@@ -747,11 +737,11 @@ impl Decoder for FrameCodec {
                 }))
             }
             TYPE_PORT_FORWARD_READY => {
-                expect_len(&payload, 4, "port forward ready")?;
+                expect_min_len(&payload, 4, "port forward ready")?;
                 Ok(Some(Frame::PortForwardReady { forward_id: PayloadReader::new(&payload).u32() }))
             }
             TYPE_PORT_FORWARD_OPEN => {
-                expect_len(&payload, 10, "port forward open")?;
+                expect_min_len(&payload, 10, "port forward open")?;
                 let mut r = PayloadReader::new(&payload);
                 Ok(Some(Frame::PortForwardOpen {
                     forward_id: r.u32(),
@@ -760,15 +750,15 @@ impl Decoder for FrameCodec {
                 }))
             }
             TYPE_PORT_FORWARD_CLOSE => {
-                expect_len(&payload, 4, "port forward close")?;
+                expect_min_len(&payload, 4, "port forward close")?;
                 Ok(Some(Frame::PortForwardClose { channel_id: PayloadReader::new(&payload).u32() }))
             }
             TYPE_PORT_FORWARD_STOP => {
-                expect_len(&payload, 4, "port forward stop")?;
+                expect_min_len(&payload, 4, "port forward stop")?;
                 Ok(Some(Frame::PortForwardStop { forward_id: PayloadReader::new(&payload).u32() }))
             }
             TYPE_SESSION_CREATED => {
-                expect_len(&payload, 4, "session created")?;
+                expect_min_len(&payload, 4, "session created")?;
                 Ok(Some(Frame::SessionCreated { id: PayloadReader::new(&payload).u32() }))
             }
 

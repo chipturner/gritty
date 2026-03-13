@@ -369,18 +369,18 @@ fn roundtrip_error_empty_message() {
 }
 
 #[test]
-fn resize_wrong_payload_size_too_short() {
+fn resize_too_short_payload_rejected() {
     let mut codec = FrameCodec;
-    // Resize frame type (0x11) with only 3 bytes payload instead of 4
+    // Resize frame type (0x11) with only 3 bytes payload instead of min 4
     let mut buf = BytesMut::from(&[0x11, 0x00, 0x00, 0x00, 0x03, 0x00, 0x50, 0x00][..]);
     let err = codec.decode(&mut buf).unwrap_err();
     assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
 }
 
 #[test]
-fn exit_wrong_payload_size() {
+fn exit_too_short_payload_rejected() {
     let mut codec = FrameCodec;
-    // Exit frame type (0x12) with 2 bytes payload instead of 4
+    // Exit frame type (0x12) with 2 bytes payload instead of min 4
     let mut buf = BytesMut::from(&[0x12, 0x00, 0x00, 0x00, 0x02, 0x00, 0x2A][..]);
     let err = codec.decode(&mut buf).unwrap_err();
     assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
@@ -685,14 +685,14 @@ fn agent_data_too_short() {
 }
 
 #[test]
-fn agent_close_wrong_payload_size() {
+fn agent_close_tolerates_trailing_bytes() {
     let mut codec = FrameCodec;
     let mut buf = BytesMut::new();
     buf.put_u8(0x23); // TYPE_AGENT_CLOSE
-    buf.put_u32(8); // wrong: should be 4
+    buf.put_u32(8); // 4 known + 4 trailing
     buf.put_slice(&[0x00; 8]);
-    let err = codec.decode(&mut buf).unwrap_err();
-    assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
+    let decoded = codec.decode(&mut buf).unwrap().unwrap();
+    assert_eq!(decoded, Frame::AgentClose { channel_id: 0 });
 }
 
 #[test]
@@ -921,14 +921,14 @@ fn send_file_empty_session() {
 }
 
 #[test]
-fn tunnel_listen_wrong_payload_size() {
+fn tunnel_listen_tolerates_trailing_bytes() {
     let mut codec = FrameCodec;
     let mut buf = BytesMut::new();
     buf.put_u8(0x30); // TYPE_TUNNEL_LISTEN
-    buf.put_u32(4); // wrong: should be 2
+    buf.put_u32(4); // 2 known + 2 trailing
     buf.put_slice(&[0x00, 0x01, 0x00, 0x00]);
-    let err = codec.decode(&mut buf).unwrap_err();
-    assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
+    let decoded = codec.decode(&mut buf).unwrap().unwrap();
+    assert_eq!(decoded, Frame::TunnelListen { port: 1 });
 }
 
 #[test]
@@ -1090,4 +1090,40 @@ fn roundtrip_clipboard_set_empty() {
     codec.encode(original.clone(), &mut buf).unwrap();
     let decoded = codec.decode(&mut buf).unwrap().unwrap();
     assert_eq!(original, decoded);
+}
+
+#[test]
+fn resize_tolerates_trailing_bytes() {
+    let mut codec = FrameCodec;
+    let mut buf = BytesMut::new();
+    codec.encode(Frame::Resize { cols: 80, rows: 24 }, &mut buf).unwrap();
+    let old_len = u32::from_be_bytes([buf[1], buf[2], buf[3], buf[4]]);
+    buf[1..5].copy_from_slice(&(old_len + 2).to_be_bytes());
+    buf.extend_from_slice(&[0xFF, 0xFF]);
+    let decoded = codec.decode(&mut buf).unwrap().unwrap();
+    assert_eq!(decoded, Frame::Resize { cols: 80, rows: 24 });
+}
+
+#[test]
+fn hello_tolerates_trailing_bytes() {
+    let mut codec = FrameCodec;
+    let mut buf = BytesMut::new();
+    codec.encode(Frame::Hello { version: 9, capabilities: 1 }, &mut buf).unwrap();
+    let old_len = u32::from_be_bytes([buf[1], buf[2], buf[3], buf[4]]);
+    buf[1..5].copy_from_slice(&(old_len + 4).to_be_bytes());
+    buf.extend_from_slice(&[0x00, 0x00, 0x00, 0x42]);
+    let decoded = codec.decode(&mut buf).unwrap().unwrap();
+    assert_eq!(decoded, Frame::Hello { version: 9, capabilities: 1 });
+}
+
+#[test]
+fn session_created_tolerates_trailing_bytes() {
+    let mut codec = FrameCodec;
+    let mut buf = BytesMut::new();
+    codec.encode(Frame::SessionCreated { id: 7 }, &mut buf).unwrap();
+    let old_len = u32::from_be_bytes([buf[1], buf[2], buf[3], buf[4]]);
+    buf[1..5].copy_from_slice(&(old_len + 2).to_be_bytes());
+    buf.extend_from_slice(&[0xAB, 0xCD]);
+    let decoded = codec.decode(&mut buf).unwrap().unwrap();
+    assert_eq!(decoded, Frame::SessionCreated { id: 7 });
 }
