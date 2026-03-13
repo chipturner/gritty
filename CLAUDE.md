@@ -22,7 +22,7 @@ Persistent TTY sessions over Unix domain sockets. Single binary, tmux-like CLI. 
 | `bootstrap <destination>` | | Install gritty on a remote host |
 | `local-forward <port>` | `lf` | Forward TCP port: session to client |
 | `remote-forward <port>` | `rf` | Forward TCP port: client to session |
-| `send [files...]` | | Send files to a paired receiver |
+| `send [files...]` | | Send files to a paired receiver (`-r` for directories) |
 | `receive [dir]` | | Receive files from a paired sender |
 | `open <url>` | | Open a URL on the local machine (for use inside gritty sessions) |
 | `info` | | Show diagnostics |

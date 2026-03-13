@@ -12,6 +12,25 @@ fn sanitize_basename(name: &str) -> anyhow::Result<String> {
     Ok(basename.to_string())
 }
 
+/// Sanitize a relative path, allowing `/` separators but rejecting `..` components and absolute paths.
+fn sanitize_path(name: &str) -> anyhow::Result<String> {
+    let p = Path::new(name);
+    if p.is_absolute() {
+        anyhow::bail!("absolute path not allowed: {name}");
+    }
+    for component in p.components() {
+        match component {
+            std::path::Component::ParentDir => anyhow::bail!("'..' not allowed in path: {name}"),
+            std::path::Component::RootDir => anyhow::bail!("absolute path not allowed: {name}"),
+            _ => {}
+        }
+    }
+    if name.is_empty() {
+        anyhow::bail!("empty path");
+    }
+    Ok(name.to_string())
+}
+
 struct DiscoveredSession {
     session_id: String,
     ctl_path: PathBuf,
@@ -233,11 +252,37 @@ fn print_progress(name: &str, transferred: u64, total: u64, last_render: &mut st
     );
 }
 
+/// Recursively walk a directory, collecting regular files with paths relative to `base`.
+fn walk_dir(
+    dir: &Path,
+    base: &Path,
+    entries: &mut Vec<(String, u64, u32, PathBuf)>,
+) -> anyhow::Result<()> {
+    for entry in std::fs::read_dir(dir).map_err(|e| anyhow::anyhow!("{}: {e}", dir.display()))? {
+        let entry = entry?;
+        let path = entry.path();
+        let ft = entry.file_type()?;
+        if ft.is_symlink() {
+            continue;
+        }
+        if ft.is_dir() {
+            walk_dir(&path, base, entries)?;
+        } else if ft.is_file() {
+            let rel = path.strip_prefix(base).unwrap_or(&path);
+            let wire_name = rel.to_string_lossy().to_string();
+            let meta = std::fs::metadata(&path)?;
+            entries.push((wire_name, meta.len(), meta.permissions().mode(), path));
+        }
+    }
+    Ok(())
+}
+
 pub(crate) async fn send_command(
     ctl_socket: Option<PathBuf>,
     session: Option<String>,
     use_stdin: bool,
     timeout: Option<u64>,
+    recursive: bool,
     files: Vec<PathBuf>,
 ) -> anyhow::Result<()> {
     use tokio::io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt};
@@ -261,15 +306,20 @@ pub(crate) async fn send_command(
     };
 
     // Validate files exist and collect metadata
+    // entries: (wire_name, size, mode, disk_path)
     let mut entries: Vec<(String, u64, u32, PathBuf)> = Vec::with_capacity(files.len());
     for path in &files {
         let meta =
             std::fs::metadata(path).map_err(|e| anyhow::anyhow!("{}: {e}", path.display()))?;
         if meta.is_dir() {
-            anyhow::bail!(
-                "{}: is a directory (use tar: tar czf - dir | gritty send -)",
-                path.display()
-            );
+            if !recursive {
+                anyhow::bail!(
+                    "{}: is a directory (use -r to send recursively, or tar: tar czf - dir | gritty send -)",
+                    path.display()
+                );
+            }
+            let base = path.parent().unwrap_or(Path::new(""));
+            walk_dir(path, base, &mut entries)?;
         } else if meta.is_file() {
             let basename = sanitize_basename(&path.to_string_lossy())?;
             let mode = meta.permissions().mode();
@@ -431,7 +481,7 @@ pub(crate) async fn receive_command(
         let mut name_buf = vec![0u8; name_len];
         stream.read_exact(&mut name_buf).await?;
         let name = String::from_utf8(name_buf)?;
-        let name = sanitize_basename(&name)?;
+        let name = sanitize_path(&name)?;
 
         // Read file_size (u64 BE) and mode (u32 BE)
         let mut buf8 = [0u8; 8];
@@ -513,5 +563,60 @@ mod tests {
     #[test]
     fn sanitize_basename_rejects_dotdot() {
         assert!(sanitize_basename("..").is_err());
+    }
+
+    #[test]
+    fn sanitize_path_allows_nested() {
+        assert_eq!(sanitize_path("a/b/foo.txt").unwrap(), "a/b/foo.txt");
+    }
+
+    #[test]
+    fn sanitize_path_allows_simple() {
+        assert_eq!(sanitize_path("foo.txt").unwrap(), "foo.txt");
+    }
+
+    #[test]
+    fn sanitize_path_rejects_dotdot() {
+        assert!(sanitize_path("a/../b").is_err());
+        assert!(sanitize_path("..").is_err());
+    }
+
+    #[test]
+    fn sanitize_path_rejects_absolute() {
+        assert!(sanitize_path("/etc/passwd").is_err());
+    }
+
+    #[test]
+    fn sanitize_path_rejects_empty() {
+        assert!(sanitize_path("").is_err());
+    }
+
+    #[test]
+    fn walk_dir_collects_files() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("mydir");
+        std::fs::create_dir_all(root.join("sub")).unwrap();
+        std::fs::write(root.join("a.txt"), "hello").unwrap();
+        std::fs::write(root.join("sub/b.txt"), "world").unwrap();
+
+        let mut entries = Vec::new();
+        walk_dir(&root, tmp.path(), &mut entries).unwrap();
+        let mut names: Vec<_> = entries.iter().map(|(n, _, _, _)| n.clone()).collect();
+        names.sort();
+        assert_eq!(names, vec!["mydir/a.txt", "mydir/sub/b.txt"]);
+    }
+
+    #[test]
+    fn walk_dir_skips_symlinks() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("d");
+        std::fs::create_dir(&root).unwrap();
+        std::fs::write(root.join("real.txt"), "data").unwrap();
+        std::os::unix::fs::symlink(root.join("real.txt"), root.join("link.txt")).unwrap();
+
+        let mut entries = Vec::new();
+        walk_dir(&root, tmp.path(), &mut entries).unwrap();
+        let names: Vec<_> = entries.iter().map(|(n, _, _, _)| n.clone()).collect();
+        assert_eq!(names, vec!["d/real.txt"]);
     }
 }

@@ -184,6 +184,10 @@ enum Command {
         #[arg(long, hide = true)]
         stdin: bool,
 
+        /// Send directories recursively
+        #[arg(short, long)]
+        recursive: bool,
+
         /// Timeout in seconds waiting for a receiver (default: 300)
         #[arg(long, default_value_t = 300)]
         timeout: u64,
@@ -795,13 +799,13 @@ async fn run(cli: Cli, config: gritty::config::ConfigFile) -> anyhow::Result<()>
             println!("{}", ctl_path.display());
             Ok(())
         }
-        Command::Send { session, stdin, timeout, no_timeout, mut files } => {
+        Command::Send { session, stdin, timeout, no_timeout, recursive, mut files } => {
             let use_stdin = stdin || files.iter().any(|f| f.as_os_str() == "-");
             if use_stdin {
                 files.retain(|f| f.as_os_str() != "-");
             }
             let timeout = if no_timeout { None } else { Some(timeout) };
-            send_command(cli.ctl_socket, session, use_stdin, timeout, files).await
+            send_command(cli.ctl_socket, session, use_stdin, timeout, recursive, files).await
         }
         Command::Receive { session, stdout, timeout, no_timeout, dir } => {
             let use_stdout = stdout || dir.as_deref().is_some_and(|d| d.as_os_str() == "-");

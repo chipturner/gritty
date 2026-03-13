@@ -52,6 +52,7 @@ Transfer files through the session (run one side locally, one remotely):
 
 ```bash
 gritty send file1.txt file2.txt     # auto-detects which session to use
+gritty send -r mydir                # send a directory recursively
 gritty receive /tmp/dest
 
 command | gritty send -              # pipe mode
@@ -77,7 +78,7 @@ Local-only sessions (`gritty connect local:scratch`) are available for testing b
 - **SSH agent forwarding** -- `git push`, `ssh`, and other agent-dependent commands work remotely using your local keys (on by default); survives reconnects without stale sockets
 - **URL open forwarding** -- `$BROWSER` requests forwarded to your local machine, with automatic OAuth callback tunneling (on by default)
 - **Port forwarding** -- `gritty lf 8080` to quick-check a remote web server locally, `gritty rf 5432` to let the session reach local postgres
-- **File transfer** -- `gritty send` / `gritty receive` through the session connection, preserving permissions; pipe mode with `-` for composing with `tar` etc.
+- **File transfer** -- `gritty send` / `gritty receive` through the session connection, preserving permissions; `-r` for recursive directory transfer; pipe mode with `-` for composing with `tar` etc.
 - **Single binary, no network protocol** -- Unix domain sockets locally, SSH handles encryption and auth; optional TOML config for per-host defaults
 
 ## Commands
@@ -137,15 +138,16 @@ The `<host>` in `host:session` is a **connection name**, not an SSH destination.
 
 **Send/receive options:**
 - `--session host:session`: target a specific session
+- `-r` / `--recursive` (`send`): send directories recursively (preserves structure, skips symlinks)
 - `-` (`send`): read data from stdin; (`receive`): write data to stdout
 - `--timeout <seconds>`: deadline for pairing with a receiver/sender
 
-File permissions are preserved. For directories, use tar with pipe mode:
+File permissions are preserved. Directories can be sent with `-r`, or via tar for compression:
 
 ```bash
-# sender (remote)
+gritty send -r mydir                # recursive (preserves directory structure)
+# or with tar for compression:
 tar czf - mydir | gritty send -
-# receiver (local)
 gritty receive - | tar xzf -
 ```
 
