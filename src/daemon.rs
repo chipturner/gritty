@@ -1,4 +1,6 @@
-use crate::protocol::{ErrorCode, Frame, FrameCodec, PROTOCOL_VERSION, SessionEntry};
+use crate::protocol::{
+    CAP_CLIPBOARD, ErrorCode, Frame, FrameCodec, PROTOCOL_VERSION, SessionEntry,
+};
 use crate::server::{self, ClientConn, SessionMetadata};
 use futures_util::{SinkExt, StreamExt};
 use std::collections::HashMap;
@@ -185,43 +187,44 @@ fn shutdown(sessions: &mut HashMap<u32, SessionState>, ctl_path: &Path) {
 /// Spawned as a per-connection task so slow clients don't block the accept loop.
 async fn connection_handshake(
     stream: UnixStream,
-    tx: mpsc::Sender<(Frame, Framed<UnixStream, FrameCodec>)>,
+    tx: mpsc::Sender<(Frame, Framed<UnixStream, FrameCodec>, u32)>,
 ) {
     let mut framed = Framed::new(stream, FrameCodec);
 
     // Read Hello handshake (5s timeout)
-    let hello = match tokio::time::timeout(Duration::from_secs(5), framed.next()).await {
-        Ok(Some(Ok(Frame::Hello { version, .. }))) => version,
-        Ok(Some(Ok(_))) => {
-            let _ = timed_send(
-                &mut framed,
-                Frame::Error {
-                    code: ErrorCode::UnexpectedFrame,
-                    message: "expected Hello handshake".to_string(),
-                },
-            )
-            .await;
-            return;
-        }
-        Ok(Some(Err(e))) => {
-            warn!("frame decode error: {e}");
-            return;
-        }
-        Ok(None) => return,
-        Err(_) => {
-            warn!("control connection timed out (hello)");
-            return;
-        }
-    };
+    let (version, client_caps) =
+        match tokio::time::timeout(Duration::from_secs(5), framed.next()).await {
+            Ok(Some(Ok(Frame::Hello { version, capabilities }))) => (version, capabilities),
+            Ok(Some(Ok(_))) => {
+                let _ = timed_send(
+                    &mut framed,
+                    Frame::Error {
+                        code: ErrorCode::UnexpectedFrame,
+                        message: "expected Hello handshake".to_string(),
+                    },
+                )
+                .await;
+                return;
+            }
+            Ok(Some(Err(e))) => {
+                warn!("frame decode error: {e}");
+                return;
+            }
+            Ok(None) => return,
+            Err(_) => {
+                warn!("control connection timed out (hello)");
+                return;
+            }
+        };
 
     // Reject version mismatch
-    if hello != PROTOCOL_VERSION {
+    if version != PROTOCOL_VERSION {
         let _ = timed_send(
             &mut framed,
             Frame::Error {
                 code: ErrorCode::VersionMismatch,
                 message: format!(
-                    "protocol version mismatch: client={hello} server={PROTOCOL_VERSION}; \
+                    "protocol version mismatch: client={version} server={PROTOCOL_VERSION}; \
                      both sides must run the same version"
                 ),
             },
@@ -229,12 +232,19 @@ async fn connection_handshake(
         .await;
         return;
     }
-    if timed_send(&mut framed, Frame::HelloAck { version: PROTOCOL_VERSION, capabilities: 0 })
-        .await
-        .is_err()
+
+    let server_caps = CAP_CLIPBOARD;
+    if timed_send(
+        &mut framed,
+        Frame::HelloAck { version: PROTOCOL_VERSION, capabilities: server_caps },
+    )
+    .await
+    .is_err()
     {
         return;
     }
+
+    let negotiated = client_caps & server_caps;
 
     // Read control frame (5s timeout)
     let frame = match tokio::time::timeout(Duration::from_secs(5), framed.next()).await {
@@ -250,7 +260,7 @@ async fn connection_handshake(
         }
     };
 
-    let _ = tx.send((frame, framed)).await;
+    let _ = tx.send((frame, framed, negotiated)).await;
 }
 
 /// Run the daemon, listening on its socket.
@@ -300,7 +310,7 @@ pub async fn run(ctl_path: &Path, ready_fd: Option<OwnedFd>) -> anyhow::Result<(
     let mut sigint = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::interrupt())?;
 
     // Channel for handshake results -- spawned tasks send completed handshakes here
-    let (conn_tx, mut conn_rx) = mpsc::channel::<(Frame, Framed<UnixStream, FrameCodec>)>(64);
+    let (conn_tx, mut conn_rx) = mpsc::channel::<(Frame, Framed<UnixStream, FrameCodec>, u32)>(64);
 
     loop {
         reap_sessions(&mut sessions);
@@ -316,10 +326,10 @@ pub async fn run(ctl_path: &Path, ready_fd: Option<OwnedFd>) -> anyhow::Result<(
                 }
                 false
             }
-            Some((frame, framed)) = conn_rx.recv() => {
+            Some((frame, framed, capabilities)) = conn_rx.recv() => {
                 dispatch_control(
                     frame, framed, &mut sessions, &mut next_id, ctl_path, &mut last_attached,
-                    ring_buffer_cap, oauth_tunnel_idle_timeout,
+                    ring_buffer_cap, oauth_tunnel_idle_timeout, capabilities,
                 ).await
             }
             _ = sigterm.recv() => {
@@ -355,6 +365,7 @@ async fn dispatch_control(
     last_attached: &mut Option<u32>,
     ring_buffer_cap: usize,
     oauth_tunnel_idle_timeout: u64,
+    capabilities: u32,
 ) -> bool {
     match frame {
         Frame::NewSession { name, command, cwd, cols, rows, client_name } => {
@@ -447,7 +458,7 @@ async fn dispatch_control(
 
             // Hand off connection to session for auto-attach
             *last_attached = Some(id);
-            let _ = client_tx.send(ClientConn::Active { framed, client_name });
+            let _ = client_tx.send(ClientConn::Active { framed, client_name, capabilities });
             false
         }
         Frame::Attach { session, client_name, force } => {
@@ -482,7 +493,11 @@ async fn dispatch_control(
                         .await;
                     } else if timed_send(&mut framed, Frame::Ok).await.is_ok() {
                         *last_attached = Some(id);
-                        let _ = state.client_tx.send(ClientConn::Active { framed, client_name });
+                        let _ = state.client_tx.send(ClientConn::Active {
+                            framed,
+                            client_name,
+                            capabilities,
+                        });
                     }
                 }
             } else {

@@ -24,6 +24,7 @@ pub enum ClientConn {
     Active {
         framed: Framed<UnixStream, FrameCodec>,
         client_name: String,
+        capabilities: u32,
     },
     Tail(Framed<UnixStream, FrameCodec>),
     /// Raw stream for file transfer (local-side commands routed through daemon).
@@ -456,6 +457,7 @@ fn spawn_svc_acceptor(
     send_event_tx: mpsc::UnboundedSender<SendEvent>,
     pf_event_tx: mpsc::UnboundedSender<PortForwardEvent>,
     clipboard_event_tx: mpsc::UnboundedSender<ClipboardEvent>,
+    negotiated_caps: Arc<std::sync::atomic::AtomicU32>,
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
         loop {
@@ -485,6 +487,7 @@ fn spawn_svc_acceptor(
             let stx = send_event_tx.clone();
             let ptx = pf_event_tx.clone();
             let ctx = clipboard_event_tx.clone();
+            let caps = Arc::clone(&negotiated_caps);
             tokio::spawn(async move {
                 // Read discriminator byte
                 let mut disc = [0u8; 1];
@@ -547,6 +550,13 @@ fn spawn_svc_acceptor(
                     }
                     Some(crate::protocol::SvcRequest::Clipboard) => {
                         use tokio::io::AsyncWriteExt;
+                        if caps.load(std::sync::atomic::Ordering::Relaxed)
+                            & crate::protocol::CAP_CLIPBOARD
+                            == 0
+                        {
+                            debug!("svc socket: clipboard request but client lacks CAP_CLIPBOARD");
+                            return;
+                        }
                         let mut op = [0u8; 1];
                         if stream.read_exact(&mut op).await.is_err() {
                             return;
@@ -720,6 +730,7 @@ struct ServerRelay<'a> {
     send_notify_tx: &'a mpsc::UnboundedSender<Frame>,
     capability_warn_deadline: Option<tokio::time::Instant>,
     pending_paste: &'a mut Option<tokio::sync::oneshot::Sender<Option<Bytes>>>,
+    negotiated_caps: &'a Arc<std::sync::atomic::AtomicU32>,
 }
 
 impl ServerRelay<'_> {
@@ -1293,6 +1304,9 @@ pub async fn run(
     let (clipboard_event_tx, mut clipboard_event_rx) = mpsc::unbounded_channel::<ClipboardEvent>();
     let mut pending_paste: Option<tokio::sync::oneshot::Sender<Option<Bytes>>> = None;
 
+    // Negotiated capabilities (shared with svc acceptor)
+    let negotiated_caps = Arc::new(std::sync::atomic::AtomicU32::new(0));
+
     // Bind unified service socket immediately (always available)
     if let Some(listener) = bind_agent_listener(&svc_socket_path) {
         svc_acceptor = Some(spawn_svc_acceptor(
@@ -1301,6 +1315,7 @@ pub async fn run(
             send_event_tx.clone(),
             pf_event_tx.clone(),
             clipboard_event_tx.clone(),
+            Arc::clone(&negotiated_caps),
         ));
     }
 
@@ -1311,8 +1326,9 @@ pub async fn run(
     let mut framed = loop {
         tokio::select! {
             client = client_rx.recv() => match client {
-                Some(ClientConn::Active { framed: f, client_name: cn }) => {
+                Some(ClientConn::Active { framed: f, client_name: cn, capabilities: caps }) => {
                     info!("first client connected via channel");
+                    negotiated_caps.store(caps, std::sync::atomic::Ordering::Relaxed);
                     // Stash client_name so it's available before Env frame
                     initial_client_name = cn;
                     break f;
@@ -1435,8 +1451,9 @@ pub async fn run(
                 tokio::select! {
                     client = client_rx.recv() => {
                         match client {
-                            Some(ClientConn::Active { framed: f, client_name: cn }) => {
+                            Some(ClientConn::Active { framed: f, client_name: cn, capabilities: caps }) => {
                                 info!("client connected via channel");
+                                negotiated_caps.store(caps, std::sync::atomic::Ordering::Relaxed);
                                 framed = f;
                                 if let Some(meta) = metadata_slot.get() {
                                     if let Ok(mut n) = meta.client_name.lock() {
@@ -1564,6 +1581,7 @@ pub async fn run(
                 send_notify_tx: &send_notify_tx,
                 capability_warn_deadline: cap_deadline,
                 pending_paste: &mut pending_paste,
+                negotiated_caps: &negotiated_caps,
             };
             loop {
                 tokio::select! {
@@ -1603,8 +1621,9 @@ pub async fn run(
 
                     new_client = client_rx.recv() => {
                         match new_client {
-                            Some(ClientConn::Active { framed: new_framed, client_name: cn }) => {
+                            Some(ClientConn::Active { framed: new_framed, client_name: cn, capabilities: caps }) => {
                                 info!("new client via channel, detaching old client");
+                                relay.negotiated_caps.store(caps, std::sync::atomic::Ordering::Relaxed);
                                 let _ = framed.send(Frame::Detached).await;
                                 relay.agent.teardown();
                                 relay.tunnel.teardown();
@@ -1700,17 +1719,26 @@ pub async fn run(
 
                     event = clipboard_event_rx.recv() => {
                         if let Some(event) = event {
-                            match event {
-                                ClipboardEvent::Copy { data } => {
-                                    let _ = framed.send(Frame::ClipboardSet { data }).await;
+                            if relay.negotiated_caps.load(std::sync::atomic::Ordering::Relaxed)
+                                & crate::protocol::CAP_CLIPBOARD == 0
+                            {
+                                // Client doesn't support clipboard -- drop the event
+                                if let ClipboardEvent::Paste { reply } = event {
+                                    let _ = reply.send(None);
                                 }
-                                ClipboardEvent::Paste { reply } => {
-                                    // Drop any previous pending paste
-                                    if let Some(old) = relay.pending_paste.take() {
-                                        let _ = old.send(None);
+                            } else {
+                                match event {
+                                    ClipboardEvent::Copy { data } => {
+                                        let _ = framed.send(Frame::ClipboardSet { data }).await;
                                     }
-                                    *relay.pending_paste = Some(reply);
-                                    let _ = framed.send(Frame::ClipboardGet).await;
+                                    ClipboardEvent::Paste { reply } => {
+                                        // Drop any previous pending paste
+                                        if let Some(old) = relay.pending_paste.take() {
+                                            let _ = old.send(None);
+                                        }
+                                        *relay.pending_paste = Some(reply);
+                                        let _ = framed.send(Frame::ClipboardGet).await;
+                                    }
                                 }
                             }
                         }

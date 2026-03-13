@@ -71,6 +71,9 @@ const MAX_FRAME_SIZE: usize = 1 << 20; // 1 MB
 /// Protocol version for handshake negotiation.
 pub const PROTOCOL_VERSION: u16 = 9;
 
+/// Capability bit: client/server supports clipboard forwarding.
+pub const CAP_CLIPBOARD: u32 = 0x01;
+
 /// Structured error codes for forward-compatible error handling.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ErrorCode {

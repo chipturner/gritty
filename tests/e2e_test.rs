@@ -66,6 +66,7 @@ async fn setup_session() -> (
         .send(ClientConn::Active {
             framed: Framed::new(server_stream, FrameCodec),
             client_name: String::new(),
+            capabilities: 0,
         })
         .unwrap();
 
@@ -113,6 +114,7 @@ async fn setup_session_with_svc_path() -> (
         .send(ClientConn::Active {
             framed: Framed::new(server_stream, FrameCodec),
             client_name: String::new(),
+            capabilities: 0,
         })
         .unwrap();
 
@@ -160,6 +162,7 @@ async fn setup_session_with_env(
         .send(ClientConn::Active {
             framed: Framed::new(server_stream, FrameCodec),
             client_name: String::new(),
+            capabilities: 0,
         })
         .unwrap();
 
@@ -275,6 +278,7 @@ async fn reconnect_preserves_shell_session() {
         .send(ClientConn::Active {
             framed: Framed::new(server_stream, FrameCodec),
             client_name: String::new(),
+            capabilities: 0,
         })
         .unwrap();
     let mut framed = Framed::new(client_stream, FrameCodec);
@@ -325,6 +329,7 @@ async fn second_client_detaches_first() {
         .send(ClientConn::Active {
             framed: Framed::new(server_stream2, FrameCodec),
             client_name: String::new(),
+            capabilities: 0,
         })
         .unwrap();
     let mut client2 = Framed::new(client_stream2, FrameCodec);
@@ -410,6 +415,7 @@ async fn rapid_reconnect_cycles() {
             .send(ClientConn::Active {
                 framed: Framed::new(server_stream, FrameCodec),
                 client_name: String::new(),
+                capabilities: 0,
             })
             .unwrap();
         framed = Framed::new(client_stream, FrameCodec);
@@ -489,6 +495,7 @@ async fn pty_buffer_saturation_and_resume() {
         .send(ClientConn::Active {
             framed: Framed::new(server_stream, FrameCodec),
             client_name: String::new(),
+            capabilities: 0,
         })
         .unwrap();
     let mut framed = Framed::new(client_stream, FrameCodec);
@@ -532,6 +539,7 @@ async fn pty_ring_buffer_drains_during_disconnect() {
         .send(ClientConn::Active {
             framed: Framed::new(server_stream, FrameCodec),
             client_name: String::new(),
+            capabilities: 0,
         })
         .unwrap();
     let mut framed = Framed::new(client_stream, FrameCodec);
@@ -575,6 +583,7 @@ async fn pty_ring_buffer_caps_at_limit() {
         .send(ClientConn::Active {
             framed: Framed::new(server_stream, FrameCodec),
             client_name: String::new(),
+            capabilities: 0,
         })
         .unwrap();
     let mut framed = Framed::new(client_stream, FrameCodec);
@@ -646,6 +655,7 @@ async fn metadata_reflects_attached_state() {
         .send(ClientConn::Active {
             framed: Framed::new(server_stream, FrameCodec),
             client_name: String::new(),
+            capabilities: 0,
         })
         .unwrap();
     let mut framed = Framed::new(client_stream, FrameCodec);
@@ -673,6 +683,7 @@ async fn client_explicit_exit_frame() {
         .send(ClientConn::Active {
             framed: Framed::new(server_stream, FrameCodec),
             client_name: String::new(),
+            capabilities: 0,
         })
         .unwrap();
     let mut framed = Framed::new(client_stream, FrameCodec);
@@ -873,6 +884,7 @@ async fn setup_session_with_agent_path() -> (
         .send(ClientConn::Active {
             framed: Framed::new(server_stream, FrameCodec),
             client_name: String::new(),
+            capabilities: 0,
         })
         .unwrap();
 
@@ -1151,6 +1163,7 @@ async fn ring_buffer_overflow_shows_truncation_marker() {
         .send(ClientConn::Active {
             framed: Framed::new(server_stream, FrameCodec),
             client_name: String::new(),
+            capabilities: 0,
         })
         .unwrap();
     let mut framed = Framed::new(client_stream, FrameCodec);
@@ -2173,6 +2186,7 @@ async fn port_forward_client_disconnect_cleanup() {
         .send(ClientConn::Active {
             framed: Framed::new(server_stream2, FrameCodec),
             client_name: String::new(),
+            capabilities: 0,
         })
         .unwrap();
     let mut framed2 = Framed::new(client_stream2, FrameCodec);

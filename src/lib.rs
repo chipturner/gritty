@@ -13,13 +13,18 @@ pub mod table;
 /// negotiated version (min of client and server).
 pub async fn handshake(
     framed: &mut tokio_util::codec::Framed<tokio::net::UnixStream, protocol::FrameCodec>,
-) -> anyhow::Result<u16> {
+) -> anyhow::Result<(u16, u32)> {
     use futures_util::{SinkExt, StreamExt};
     framed
-        .send(protocol::Frame::Hello { version: protocol::PROTOCOL_VERSION, capabilities: 0 })
+        .send(protocol::Frame::Hello {
+            version: protocol::PROTOCOL_VERSION,
+            capabilities: protocol::CAP_CLIPBOARD,
+        })
         .await?;
     match protocol::Frame::expect_from(framed.next().await)? {
-        protocol::Frame::HelloAck { version, .. } => Ok(version),
+        protocol::Frame::HelloAck { version, capabilities } => {
+            Ok((version, protocol::CAP_CLIPBOARD & capabilities))
+        }
         protocol::Frame::Error { message, .. } => anyhow::bail!("handshake rejected: {message}"),
         other => anyhow::bail!("expected HelloAck, got {other:?}"),
     }
