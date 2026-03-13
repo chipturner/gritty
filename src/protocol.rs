@@ -25,6 +25,11 @@ const TYPE_AGENT_CLOSE: u8 = 0x23;
 const TYPE_OPEN_FORWARD: u8 = 0x28;
 const TYPE_OPEN_URL: u8 = 0x29;
 
+// Clipboard
+const TYPE_CLIPBOARD_SET: u8 = 0x2A;
+const TYPE_CLIPBOARD_GET: u8 = 0x2B;
+const TYPE_CLIPBOARD_DATA: u8 = 0x2C;
+
 // Tunnel
 const TYPE_TUNNEL_LISTEN: u8 = 0x30;
 const TYPE_TUNNEL_OPEN: u8 = 0x31;
@@ -115,6 +120,7 @@ pub enum SvcRequest {
     Send = 2,
     Receive = 3,
     PortForward = 4,
+    Clipboard = 5,
 }
 
 impl SvcRequest {
@@ -124,6 +130,7 @@ impl SvcRequest {
             2 => Some(Self::Send),
             3 => Some(Self::Receive),
             4 => Some(Self::PortForward),
+            5 => Some(Self::Clipboard),
             _ => None,
         }
     }
@@ -182,6 +189,16 @@ pub enum Frame {
     /// Close an agent channel (bidirectional).
     AgentClose {
         channel_id: u32,
+    },
+    /// Server tells client to put data in the clipboard (server → client).
+    ClipboardSet {
+        data: Bytes,
+    },
+    /// Server asks client for clipboard contents (server → client).
+    ClipboardGet,
+    /// Client sends clipboard contents to server (client → server).
+    ClipboardData {
+        data: Bytes,
     },
     /// Client signals it can handle URL open forwarding (client → server).
     OpenForward,
@@ -672,6 +689,8 @@ impl Decoder for FrameCodec {
         match frame_type {
             // Blob frames
             TYPE_DATA => Ok(Some(Frame::Data(payload.freeze()))),
+            TYPE_CLIPBOARD_SET => Ok(Some(Frame::ClipboardSet { data: payload.freeze() })),
+            TYPE_CLIPBOARD_DATA => Ok(Some(Frame::ClipboardData { data: payload.freeze() })),
 
             // Fixed-field frames (PayloadReader auto-tracks offsets)
             TYPE_RESIZE => {
@@ -782,6 +801,7 @@ impl Decoder for FrameCodec {
             TYPE_PONG => Ok(Some(Frame::Pong)),
             TYPE_AGENT_FORWARD => Ok(Some(Frame::AgentForward)),
             TYPE_OPEN_FORWARD => Ok(Some(Frame::OpenForward)),
+            TYPE_CLIPBOARD_GET => Ok(Some(Frame::ClipboardGet)),
             TYPE_SEND_DONE => Ok(Some(Frame::SendDone)),
             TYPE_LIST_SESSIONS => Ok(Some(Frame::ListSessions)),
             TYPE_KILL_SERVER => Ok(Some(Frame::KillServer)),
@@ -917,6 +937,8 @@ impl Encoder<Frame> for FrameCodec {
         match frame {
             // Blob frames
             Frame::Data(data) => encode_blob(dst, TYPE_DATA, &data),
+            Frame::ClipboardSet { data } => encode_blob(dst, TYPE_CLIPBOARD_SET, &data),
+            Frame::ClipboardData { data } => encode_blob(dst, TYPE_CLIPBOARD_DATA, &data),
 
             // Fixed-field frames (encode_fields! auto-computes payload length)
             Frame::Resize { cols, rows } => {
@@ -987,6 +1009,7 @@ impl Encoder<Frame> for FrameCodec {
             Frame::Pong => encode_empty(dst, TYPE_PONG),
             Frame::AgentForward => encode_empty(dst, TYPE_AGENT_FORWARD),
             Frame::OpenForward => encode_empty(dst, TYPE_OPEN_FORWARD),
+            Frame::ClipboardGet => encode_empty(dst, TYPE_CLIPBOARD_GET),
             Frame::SendDone => encode_empty(dst, TYPE_SEND_DONE),
             Frame::ListSessions => encode_empty(dst, TYPE_LIST_SESSIONS),
             Frame::KillServer => encode_empty(dst, TYPE_KILL_SERVER),

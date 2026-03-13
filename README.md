@@ -79,6 +79,7 @@ Local-only sessions (`gritty connect local:scratch`) are available for testing b
 - **URL open forwarding** -- `$BROWSER` requests forwarded to your local machine, with automatic OAuth callback tunneling (on by default)
 - **Port forwarding** -- `gritty lf 8080` to quick-check a remote web server locally, `gritty rf 5432` to let the session reach local postgres
 - **File transfer** -- `gritty send` / `gritty receive` through the session connection, preserving permissions; `-r` for recursive directory transfer; pipe mode with `-` for composing with `tar` etc.
+- **Clipboard forwarding** -- `gritty copy` / `gritty paste` forward clipboard between remote session and local machine (uses `pbcopy`/`pbpaste` on macOS, `wl-copy`/`wl-paste` or `xclip`/`xsel` on Linux)
 - **Single binary, no network protocol** -- Unix domain sockets locally, SSH handles encryption and auth; optional TOML config for per-host defaults
 
 ## Commands
@@ -100,6 +101,8 @@ Local-only sessions (`gritty connect local:scratch`) are available for testing b
 | `gritty send [files...]` | | Send files to a paired receiver |
 | `gritty receive [dir]` | | Receive files from a paired sender |
 | `gritty open <url>` | | Open a URL on the local machine (for use inside gritty sessions) |
+| `gritty copy` | | Copy stdin to the client clipboard (for use inside gritty sessions) |
+| `gritty paste` | | Paste client clipboard to stdout (for use inside gritty sessions) |
 | `gritty info` | | Show diagnostics (paths, server status, tunnels) |
 | `gritty config-edit` | | Open config in `$VISUAL`/`$EDITOR`/vi (creates from template if missing) |
 | `gritty server` | `s` | Start the server (backgrounds by default; `-f` for foreground) |

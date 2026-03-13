@@ -291,6 +291,62 @@ fn get_terminal_size() -> (u16, u16) {
     terminal_size::terminal_size().map(|(w, h)| (w.0, h.0)).unwrap_or((80, 24))
 }
 
+/// Write data to the system clipboard.
+fn clipboard_set(data: &[u8]) {
+    use std::process::{Command, Stdio};
+    let programs: &[&[&str]] = if cfg!(target_os = "macos") {
+        &[&["pbcopy"]]
+    } else {
+        &[&["wl-copy"], &["xclip", "-selection", "clipboard"], &["xsel", "--clipboard", "--input"]]
+    };
+    for prog in programs {
+        if let Ok(mut child) = Command::new(prog[0])
+            .args(&prog[1..])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+        {
+            if let Some(ref mut stdin) = child.stdin {
+                use std::io::Write;
+                let _ = stdin.write_all(data);
+            }
+            let _ = child.wait();
+            return;
+        }
+    }
+    debug!("no clipboard program available");
+}
+
+/// Read data from the system clipboard.
+fn clipboard_get() -> Option<Vec<u8>> {
+    use std::process::{Command, Stdio};
+    let programs: &[&[&str]] = if cfg!(target_os = "macos") {
+        &[&["pbpaste"]]
+    } else {
+        &[
+            &["wl-paste", "--no-newline"],
+            &["xclip", "-selection", "clipboard", "-o"],
+            &["xsel", "--clipboard", "--output"],
+        ]
+    };
+    for prog in programs {
+        if let Ok(output) = Command::new(prog[0])
+            .args(&prog[1..])
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .output()
+        {
+            if output.status.success() {
+                return Some(output.stdout);
+            }
+        }
+    }
+    debug!("no clipboard program available");
+    None
+}
+
 /// Send a frame with a timeout. Returns false if the send failed or timed out.
 async fn timed_send(framed: &mut Framed<UnixStream, FrameCodec>, frame: Frame) -> bool {
     match tokio::time::timeout(SEND_TIMEOUT, framed.send(frame)).await {
@@ -524,6 +580,18 @@ impl ClientRelay<'_> {
                 } else {
                     debug!("rejected non-http(s) URL: {url}");
                 }
+            }
+            Some(Ok(Frame::ClipboardSet { data })) => {
+                debug!(len = data.len(), "clipboard set from remote");
+                tokio::task::spawn_blocking(move || {
+                    clipboard_set(&data);
+                });
+            }
+            Some(Ok(Frame::ClipboardGet)) => {
+                debug!("clipboard get requested by remote");
+                let data = tokio::task::spawn_blocking(clipboard_get).await.ok().flatten();
+                let data = data.unwrap_or_default();
+                let _ = timed_send(framed, Frame::ClipboardData { data: Bytes::from(data) }).await;
             }
             Some(Ok(Frame::TunnelListen { port })) => {
                 if !self.oauth_redirect {

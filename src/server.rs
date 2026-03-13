@@ -89,6 +89,14 @@ enum OpenEvent {
     Url { url: String, stream: UnixStream },
 }
 
+/// Events from clipboard svc connections to the main relay loop.
+enum ClipboardEvent {
+    /// Copy data to client clipboard.
+    Copy { data: Bytes },
+    /// Paste request: send ClipboardGet to client, return data via oneshot.
+    Paste { reply: tokio::sync::oneshot::Sender<Option<Bytes>> },
+}
+
 /// Events from tunnel TCP connection tasks to the main relay loop.
 enum TunnelEvent {
     Connected { channel_id: u32, stream: tokio::net::TcpStream },
@@ -447,6 +455,7 @@ fn spawn_svc_acceptor(
     open_event_tx: mpsc::UnboundedSender<OpenEvent>,
     send_event_tx: mpsc::UnboundedSender<SendEvent>,
     pf_event_tx: mpsc::UnboundedSender<PortForwardEvent>,
+    clipboard_event_tx: mpsc::UnboundedSender<ClipboardEvent>,
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
         loop {
@@ -475,6 +484,7 @@ fn spawn_svc_acceptor(
             let otx = open_event_tx.clone();
             let stx = send_event_tx.clone();
             let ptx = pf_event_tx.clone();
+            let ctx = clipboard_event_tx.clone();
             tokio::spawn(async move {
                 // Read discriminator byte
                 let mut disc = [0u8; 1];
@@ -534,6 +544,33 @@ fn spawn_svc_acceptor(
                             listen_port,
                             target_port,
                         });
+                    }
+                    Some(crate::protocol::SvcRequest::Clipboard) => {
+                        use tokio::io::AsyncWriteExt;
+                        let mut op = [0u8; 1];
+                        if stream.read_exact(&mut op).await.is_err() {
+                            return;
+                        }
+                        match op[0] {
+                            0x01 => {
+                                // Copy: read all remaining data
+                                let mut data = Vec::new();
+                                let _ = stream.read_to_end(&mut data).await;
+                                if !data.is_empty() {
+                                    let _ =
+                                        ctx.send(ClipboardEvent::Copy { data: Bytes::from(data) });
+                                }
+                            }
+                            0x02 => {
+                                // Paste: request clipboard from client
+                                let (tx, rx) = tokio::sync::oneshot::channel();
+                                let _ = ctx.send(ClipboardEvent::Paste { reply: tx });
+                                if let Ok(Some(data)) = rx.await {
+                                    let _ = stream.write_all(&data).await;
+                                }
+                            }
+                            _ => debug!("svc socket: unknown clipboard op: 0x{:02x}", op[0]),
+                        }
                     }
                     None => {
                         debug!("svc socket: unknown request byte: 0x{:02x}", disc[0]);
@@ -682,6 +719,7 @@ struct ServerRelay<'a> {
     pf_event_tx: &'a mpsc::UnboundedSender<PortForwardEvent>,
     send_notify_tx: &'a mpsc::UnboundedSender<Frame>,
     capability_warn_deadline: Option<tokio::time::Instant>,
+    pending_paste: &'a mut Option<tokio::sync::oneshot::Sender<Option<Bytes>>>,
 }
 
 impl ServerRelay<'_> {
@@ -867,6 +905,11 @@ impl ServerRelay<'_> {
                     for ch_id in fwd.channels.keys() {
                         self.pf.channels.remove(ch_id);
                     }
+                }
+            }
+            Some(Ok(Frame::ClipboardData { data })) => {
+                if let Some(reply) = self.pending_paste.take() {
+                    let _ = reply.send(Some(data));
                 }
             }
             Some(Ok(Frame::Env { vars })) => {
@@ -1253,6 +1296,10 @@ pub async fn run(
     let (pf_event_tx, mut pf_event_rx) = mpsc::unbounded_channel::<PortForwardEvent>();
     let mut pf = PortForwardTable::new();
 
+    // Clipboard event channel and paste-pending state
+    let (clipboard_event_tx, mut clipboard_event_rx) = mpsc::unbounded_channel::<ClipboardEvent>();
+    let mut pending_paste: Option<tokio::sync::oneshot::Sender<Option<Bytes>>> = None;
+
     // Bind unified service socket immediately (always available)
     if let Some(listener) = bind_agent_listener(&svc_socket_path) {
         svc_acceptor = Some(spawn_svc_acceptor(
@@ -1260,6 +1307,7 @@ pub async fn run(
             open_event_tx.clone(),
             send_event_tx.clone(),
             pf_event_tx.clone(),
+            clipboard_event_tx.clone(),
         ));
     }
 
@@ -1528,6 +1576,7 @@ pub async fn run(
                 pf_event_tx: &pf_event_tx,
                 send_notify_tx: &send_notify_tx,
                 capability_warn_deadline: cap_deadline,
+                pending_paste: &mut pending_paste,
             };
             loop {
                 tokio::select! {
@@ -1574,6 +1623,9 @@ pub async fn run(
                                 relay.tunnel.teardown();
                                 relay.pf.teardown();
                                 *relay.open_forward_enabled = false;
+                                if let Some(old) = relay.pending_paste.take() {
+                                    let _ = old.send(None);
+                                }
                                 // Update client_name from the new Attach
                                 if let Some(meta) = relay.metadata_slot.get() {
                                     if let Ok(mut n) = meta.client_name.lock() {
@@ -1657,6 +1709,24 @@ pub async fn run(
 
                     event = pf_event_rx.recv() => {
                         relay.handle_pf_event(&mut framed, event).await;
+                    }
+
+                    event = clipboard_event_rx.recv() => {
+                        if let Some(event) = event {
+                            match event {
+                                ClipboardEvent::Copy { data } => {
+                                    let _ = framed.send(Frame::ClipboardSet { data }).await;
+                                }
+                                ClipboardEvent::Paste { reply } => {
+                                    // Drop any previous pending paste
+                                    if let Some(old) = relay.pending_paste.take() {
+                                        let _ = old.send(None);
+                                    }
+                                    *relay.pending_paste = Some(reply);
+                                    let _ = framed.send(Frame::ClipboardGet).await;
+                                }
+                            }
+                        }
                     }
 
                     _ = async {

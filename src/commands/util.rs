@@ -193,6 +193,64 @@ pub(crate) async fn port_forward_command(
     Ok(())
 }
 
+/// Read stdin and send to client clipboard via svc socket.
+pub(crate) fn clipboard_copy() {
+    use std::io::{Read, Write};
+
+    let sock_path = match std::env::var("GRITTY_SOCK") {
+        Ok(p) => p,
+        Err(_) => {
+            eprintln!("error: GRITTY_SOCK not set (are you inside a gritty session?)");
+            std::process::exit(1);
+        }
+    };
+    let mut data = Vec::new();
+    if let Err(e) = std::io::stdin().read_to_end(&mut data) {
+        eprintln!("error: reading stdin: {e}");
+        std::process::exit(1);
+    }
+    match std::os::unix::net::UnixStream::connect(&sock_path) {
+        Ok(mut stream) => {
+            let _ = stream.write_all(&[gritty::protocol::SvcRequest::Clipboard.to_byte()]);
+            let _ = stream.write_all(&[0x01]); // copy operation
+            let _ = stream.write_all(&data);
+        }
+        Err(e) => {
+            eprintln!("error: could not connect to service socket ({sock_path}): {e}");
+            std::process::exit(1);
+        }
+    }
+}
+
+/// Request clipboard from client via svc socket and write to stdout.
+pub(crate) fn clipboard_paste() {
+    use std::io::{Read, Write};
+
+    let sock_path = match std::env::var("GRITTY_SOCK") {
+        Ok(p) => p,
+        Err(_) => {
+            eprintln!("error: GRITTY_SOCK not set (are you inside a gritty session?)");
+            std::process::exit(1);
+        }
+    };
+    match std::os::unix::net::UnixStream::connect(&sock_path) {
+        Ok(mut stream) => {
+            let _ = stream.write_all(&[gritty::protocol::SvcRequest::Clipboard.to_byte()]);
+            let _ = stream.write_all(&[0x02]); // paste operation
+            let _ = stream.shutdown(std::net::Shutdown::Write);
+            let mut data = Vec::new();
+            let _ = stream.set_read_timeout(Some(std::time::Duration::from_secs(5)));
+            if stream.read_to_end(&mut data).is_ok() && !data.is_empty() {
+                let _ = std::io::stdout().write_all(&data);
+            }
+        }
+        Err(e) => {
+            eprintln!("error: could not connect to service socket ({sock_path}): {e}");
+            std::process::exit(1);
+        }
+    }
+}
+
 pub(crate) fn open_url(url: &str) {
     use std::io::{Read, Write};
 

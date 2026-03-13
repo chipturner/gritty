@@ -42,6 +42,8 @@ In-session (run inside a gritty session):
   send                   Send files to a paired receiver
   receive                Receive files from a paired sender
   open                   Open a URL on the local machine
+  copy                   Copy stdin to the client clipboard
+  paste                  Paste client clipboard to stdout
 
 Configuration:
   info                   Show diagnostics (paths, server, tunnels)
@@ -227,6 +229,12 @@ enum Command {
         /// URL to open
         url: String,
     },
+    /// Copy stdin to the client clipboard (for use inside gritty sessions)
+    #[command(display_order = 35)]
+    Copy,
+    /// Paste client clipboard to stdout (for use inside gritty sessions)
+    #[command(display_order = 36)]
+    Paste,
     /// Forward a port from the session to the client (listen on session, connect on client)
     #[command(display_order = 30, visible_alias = "lf")]
     LocalForward {
@@ -815,6 +823,14 @@ async fn run(cli: Cli, config: gritty::config::ConfigFile) -> anyhow::Result<()>
         }
         Command::Open { url } => {
             open_url(&url);
+            Ok(())
+        }
+        Command::Copy => {
+            clipboard_copy();
+            Ok(())
+        }
+        Command::Paste => {
+            clipboard_paste();
             Ok(())
         }
         Command::LocalForward { port } => {

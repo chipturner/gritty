@@ -1047,3 +1047,47 @@ fn port_forward_data_too_short() {
     let err = codec.decode(&mut buf).unwrap_err();
     assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
 }
+
+#[test]
+fn roundtrip_clipboard_set() {
+    let mut codec = FrameCodec;
+    let mut buf = BytesMut::new();
+    let original = Frame::ClipboardSet { data: Bytes::from("copied text") };
+    codec.encode(original.clone(), &mut buf).unwrap();
+    assert_eq!(buf[0], 0x2A);
+    let decoded = codec.decode(&mut buf).unwrap().unwrap();
+    assert_eq!(original, decoded);
+}
+
+#[test]
+fn roundtrip_clipboard_get() {
+    let mut codec = FrameCodec;
+    let mut buf = BytesMut::new();
+    let original = Frame::ClipboardGet;
+    codec.encode(original.clone(), &mut buf).unwrap();
+    assert_eq!(buf.len(), 5); // type(1) + len(4) + no payload
+    assert_eq!(buf[0], 0x2B);
+    let decoded = codec.decode(&mut buf).unwrap().unwrap();
+    assert_eq!(original, decoded);
+}
+
+#[test]
+fn roundtrip_clipboard_data() {
+    let mut codec = FrameCodec;
+    let mut buf = BytesMut::new();
+    let original = Frame::ClipboardData { data: Bytes::from("pasted text") };
+    codec.encode(original.clone(), &mut buf).unwrap();
+    assert_eq!(buf[0], 0x2C);
+    let decoded = codec.decode(&mut buf).unwrap().unwrap();
+    assert_eq!(original, decoded);
+}
+
+#[test]
+fn roundtrip_clipboard_set_empty() {
+    let mut codec = FrameCodec;
+    let mut buf = BytesMut::new();
+    let original = Frame::ClipboardSet { data: Bytes::new() };
+    codec.encode(original.clone(), &mut buf).unwrap();
+    let decoded = codec.decode(&mut buf).unwrap().unwrap();
+    assert_eq!(original, decoded);
+}

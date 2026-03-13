@@ -24,6 +24,8 @@ Persistent TTY sessions over Unix domain sockets. Single binary, tmux-like CLI. 
 | `remote-forward <port>` | `rf` | Forward TCP port: client to session |
 | `send [files...]` | | Send files to a paired receiver (`-r` for directories) |
 | `receive [dir]` | | Receive files from a paired sender |
+| `copy` | | Copy stdin to the client clipboard |
+| `paste` | | Paste client clipboard to stdout |
 | `open <url>` | | Open a URL on the local machine (for use inside gritty sessions) |
 | `info` | | Show diagnostics |
 | `config-edit` | | Open config in `$VISUAL`/`$EDITOR`/vi |
@@ -79,7 +81,7 @@ Eight modules behind a lib crate (`src/lib.rs` hosts `collect_env_vars()`, `spaw
 
 ### Wire format
 
-Handshake: `0x01` Hello, `0x02` HelloAck. Relay: `0x10` Data, `0x11` Resize, `0x12` Exit, `0x13` Detached, `0x14` Ping, `0x15` Pong, `0x16` Env. Agent: `0x20` AgentForward, `0x21` AgentOpen, `0x22` AgentData, `0x23` AgentClose. URL: `0x28` OpenForward, `0x29` OpenUrl. Tunnel: `0x30` TunnelListen, `0x31` TunnelOpen, `0x32` TunnelData, `0x33` TunnelClose. Transfer: `0x38` SendOffer, `0x39` SendDone, `0x3A` SendCancel, `0x3B` SendFile. Port forward: `0x40` PFListen, `0x41` PFReady, `0x42` PFOpen, `0x43` PFData, `0x44` PFClose, `0x45` PFStop. Control: `0x50` NewSession, `0x51` Attach, `0x52` ListSessions, `0x53` KillSession, `0x54` KillServer, `0x55` Tail, `0x56` RenameSession. Responses: `0x60` SessionCreated, `0x61` SessionInfo, `0x62` Ok, `0x63` Error. Reserved: `0x80-0xFF`.
+Handshake: `0x01` Hello, `0x02` HelloAck. Relay: `0x10` Data, `0x11` Resize, `0x12` Exit, `0x13` Detached, `0x14` Ping, `0x15` Pong, `0x16` Env. Agent: `0x20` AgentForward, `0x21` AgentOpen, `0x22` AgentData, `0x23` AgentClose. URL/clipboard: `0x28` OpenForward, `0x29` OpenUrl, `0x2A` ClipboardSet, `0x2B` ClipboardGet, `0x2C` ClipboardData. Tunnel: `0x30` TunnelListen, `0x31` TunnelOpen, `0x32` TunnelData, `0x33` TunnelClose. Transfer: `0x38` SendOffer, `0x39` SendDone, `0x3A` SendCancel, `0x3B` SendFile. Port forward: `0x40` PFListen, `0x41` PFReady, `0x42` PFOpen, `0x43` PFData, `0x44` PFClose, `0x45` PFStop. Control: `0x50` NewSession, `0x51` Attach, `0x52` ListSessions, `0x53` KillSession, `0x54` KillServer, `0x55` Tail, `0x56` RenameSession. Responses: `0x60` SessionCreated, `0x61` SessionInfo, `0x62` Ok, `0x63` Error. Reserved: `0x80-0xFF`.
 
 `Hello`/`HelloAck`: `[version: u16][capabilities: u32]`. Capabilities bitfield (start at 0, negotiated = client & server).
 
@@ -93,7 +95,7 @@ Handshake: `0x01` Hello, `0x02` HelloAck. Relay: `0x10` Data, `0x11` Resize, `0x
 
 `SessionInfo`: `[count: u32][per entry: [entry_len: u32][id: u32][name: u16-len + bytes][pty_path: u16-len + bytes][shell_pid: u32][created_at: u64][attached: u8][last_heartbeat: u64][foreground_cmd: u16-len + bytes][cwd: u16-len + bytes][client_name: u16-len + bytes]]`. Decoder skips unknown trailing bytes within each entry_len.
 
-`SvcRequest`: `OpenUrl=1`, `Send=2`, `Receive=3`, `PortForward=4` (1-byte discriminator).
+`SvcRequest`: `OpenUrl=1`, `Send=2`, `Receive=3`, `PortForward=4`, `Clipboard=5` (1-byte discriminator). Clipboard sub-protocol: `[0x01][data]` = copy, `[0x02]` = paste (server responds with clipboard content).
 
 File transfer manifest (svc socket, not Frame protocol): sender writes `[file_count: u32][per file: [name_len: u16][name: bytes][size: u64][mode: u32]]`. Server relays per-file headers `[name_len: u16][name: bytes][size: u64][mode: u32]` to receiver, then `size` bytes of data. Sentinel `[name_len: 0x0000]` ends transfer. `-` (stdin) spools to a temp file for size discovery.
 
