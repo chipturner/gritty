@@ -95,9 +95,11 @@ Forwarding multiplexes over the existing session connection -- no extra tunnels.
 
 **URL open forwarding** (on by default; disable with `--no-forward-open`): the session creates a `gritty-open` symlink in the socket dir (pointing to the gritty binary) and sets `BROWSER` to that path. The binary detects `argv[0] == "gritty-open"` and dispatches to the open logic, so `$BROWSER` is a single path with no spaces. When invoked, the URL is relayed to the client which opens it locally. **OAuth callback tunneling:** if the URL contains a `redirect_uri` pointing to `localhost` or `127.0.0.1`, gritty automatically creates a multi-channel reverse TCP tunnel (with idle timeout) so the OAuth callback reaches the remote program -- this binds a TCP port on your local machine for the duration of the callback. This handles the common case where a CLI tool opens a browser for OAuth login and waits for the redirect on a local port. Disable with `--no-oauth-redirect`; adjust the accept timeout with `--oauth-timeout <seconds>` (default: 180). Note that URL open forwarding is a trust grant -- it gives processes inside the remote session the ability to open URLs and bind TCP ports on your local machine. Only use it with sessions you control.
 
+**Clipboard forwarding** (requires `CAP_CLIPBOARD` negotiation): `gritty copy` and `gritty paste` inside a session relay clipboard data through the svc socket and session connection to the client. The client interacts with the local system clipboard. Paste has a 5-second timeout -- if the client doesn't respond, the paste returns empty.
+
 ## Single-Socket Protocol
 
-All communication goes through one Unix domain socket per server instance. The wire format is `[type: u8][length: u32 BE][payload]`. Every connection starts with a Hello/HelloAck version handshake, then a control frame declares intent.
+All communication goes through one Unix domain socket per server instance. The wire format is `[type: u8][length: u32 BE][payload]`. Every connection starts with a Hello/HelloAck version handshake (which also negotiates capabilities via a `u32` bitfield), then a control frame declares intent.
 
 For session relay, the daemon hands off the raw `UnixStream` to the session task -- the daemon is no longer in the data path. Session frames include Data (PTY I/O), Resize, Ping/Pong, Env, and the various forwarding frames (Agent, Open, Tunnel, PortForward, Send).
 

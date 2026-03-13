@@ -83,9 +83,9 @@ Eight modules behind a lib crate (`src/lib.rs` hosts `collect_env_vars()`, `spaw
 
 Handshake: `0x01` Hello, `0x02` HelloAck. Relay: `0x10` Data, `0x11` Resize, `0x12` Exit, `0x13` Detached, `0x14` Ping, `0x15` Pong, `0x16` Env. Agent: `0x20` AgentForward, `0x21` AgentOpen, `0x22` AgentData, `0x23` AgentClose. URL/clipboard: `0x28` OpenForward, `0x29` OpenUrl, `0x2A` ClipboardSet, `0x2B` ClipboardGet, `0x2C` ClipboardData. Tunnel: `0x30` TunnelListen, `0x31` TunnelOpen, `0x32` TunnelData, `0x33` TunnelClose. Transfer: `0x38` SendOffer, `0x39` SendDone, `0x3A` SendCancel, `0x3B` SendFile. Port forward: `0x40` PFListen, `0x41` PFReady, `0x42` PFOpen, `0x43` PFData, `0x44` PFClose, `0x45` PFStop. Control: `0x50` NewSession, `0x51` Attach, `0x52` ListSessions, `0x53` KillSession, `0x54` KillServer, `0x55` Tail, `0x56` RenameSession. Responses: `0x60` SessionCreated, `0x61` SessionInfo, `0x62` Ok, `0x63` Error. Reserved: `0x80-0xFF`.
 
-`Hello`/`HelloAck`: `[version: u16][capabilities: u32]`. Capabilities bitfield (start at 0, negotiated = client & server).
+`Hello`/`HelloAck`: `[version: u16][capabilities: u32]`. Capabilities bitfield, negotiated = client & server (bitwise AND). Defined bits: `CAP_CLIPBOARD (0x01)` -- gates clipboard frame forwarding and svc socket clipboard requests.
 
-`NewSession`: `[name_len: u16][name][cmd_len: u16][cmd][cwd_len: u16][cwd][cols: u16][rows: u16]`. Empty cwd = `$HOME`. Zero cols/rows = default 80x24.
+`NewSession`: `[name_len: u16][name][cmd_len: u16][cmd][cwd_len: u16][cwd][cols: u16][rows: u16][client_name_len: u16][client_name]`. Empty cwd = `$HOME`. Zero cols/rows = default 80x24. `client_name` propagated to session metadata.
 
 `Attach`: `[session_len: u16][session][client_name_len: u16][client_name][force: u8]`. Server enforces: if attached and `!force`, returns `AlreadyAttached` error.
 
@@ -115,7 +115,8 @@ File transfer manifest (svc socket, not Frame protocol): sender writes `[file_co
 - **Escape sequences**: `~.` detach, `~R` reconnect, `~#` status, `~^Z` suspend, `~?` help, `~~` literal. 3-state machine (Normal/AfterNewline/AfterTilde). `--no-escape` disables.
 - **Security**: `umask(0o077)`, sockets 0600, dirs 0700, `SO_PEERCRED` on all accepts, payloads <= 1MB, resize 1..=10000.
 - **URL/OAuth**: Client calls `opener::open()`. OAuth tunnel: multi-channel reverse TCP with idle timeout (default 5s, configurable). Disable with `--no-oauth-redirect`.
-- **BROWSER handshake**: Client sends a sentinel `BROWSER` key in the `Env` frame when `forward_open` is enabled. Server creates a `gritty-open` symlink (pointing to `current_exe()`) in the socket dir and sets `BROWSER` to that path. The binary detects `argv[0] == "gritty-open"` and dispatches directly to the open logic, so `$BROWSER` is a single path with no spaces.
+- **BROWSER setup**: Server creates a `gritty-open` symlink (pointing to `current_exe()`) in the socket dir unconditionally at shell spawn and sets `BROWSER` to that path. The binary detects `argv[0] == "gritty-open"` and dispatches directly to the open logic, so `$BROWSER` is a single path with no spaces.
+- **Capability negotiation**: `Hello` and `HelloAck` carry a `capabilities: u32` bitfield. Negotiated capabilities = client & server (bitwise AND). `CAP_CLIPBOARD (0x01)` gates clipboard frame forwarding. Capabilities propagate from daemon `connection_handshake()` through `ClientConn::Active` to the session server, refreshed on each reconnect/takeover. Clipboard paste has a 5-second timeout -- if the client doesn't reply with `ClipboardData`, the pending paste is resolved with `None`.
 - **Port forwarding is loopback-only**: All `TcpListener::bind` and `TcpStream::connect` in forwarding use `127.0.0.1`. No bind-address specification (unlike SSH `-L`/`-R`).
 
 ## Development Notes
@@ -128,11 +129,12 @@ File transfer manifest (svc socket, not Frame protocol): sender writes `[file_co
 - **Fork before tokio** -- `daemonize()` MUST fork before creating the tokio runtime. `main()` is sync (no `#[tokio::main]`).
 
 ### Changing protocol/signatures
-- **`PROTOCOL_VERSION`** -- bump whenever frame types, encoding, or `SessionEntry` fields change. Version mismatch is a hard gate: daemon rejects clients, `tunnel-create` aborts tunnel setup.
+- **`PROTOCOL_VERSION`** -- bump whenever frame types, encoding, or `SessionEntry` fields change. Version mismatch is a hard gate: daemon rejects clients, `tunnel-create` aborts tunnel setup. Currently v9.
+- **`expect_min_len`** -- all fixed-field decoders use `expect_min_len` (not exact length checks), so trailing bytes are tolerated for forward extensibility.
 - **`Frame` enum** -- update: encoder, decoder, protocol tests, all `match frame` in server.rs, client.rs, daemon.rs, main.rs.
 - **`SessionInfo`** -- entry count `u32`. Changing `SessionEntry` fields requires updating both encoder and decoder in protocol.rs.
 - **`server::run()`** -- takes `(client_rx, metadata, agent_path, svc_path, session_id, session_name, command, ring_buffer_cap, oauth_tunnel_idle_timeout, initial_cols, initial_rows, cwd)`. Called by e2e tests + daemon; update both.
-- **`ClientConn::Active`** -- struct variant `Active { framed, client_name }`. `client_name` propagated from `Attach` frame to session metadata.
+- **`ClientConn::Active`** -- struct variant `Active { framed, client_name, capabilities }`. `client_name` propagated from `Attach`/`NewSession` frame to session metadata. `capabilities` is the negotiated bitfield from handshake.
 - **`ErrorCode`** -- `Frame::Error` carries a `code: ErrorCode` enum + `message: String`. Match on code for programmatic error handling, display message for humans.
 
 ### Testing
