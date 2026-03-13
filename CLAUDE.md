@@ -103,7 +103,7 @@ File transfer manifest (svc socket, not Frame protocol): sender writes `[file_co
 - **AsyncFd + try_io**: PTY master and stdin are raw fds in `AsyncFd`. `guard.try_io()` with would-block continuation.
 - **Deferred shell spawn**: PTY allocated early (with initial window size from `NewSession` cols/rows when > 0), shell waits for first client's `Env` frame (TERM/LANG/COLORTERM). Spawns login shell with CWD from `NewSession` (or `$HOME` if empty). First client feeds directly into relay (no outer-loop re-wait).
 - **Ring buffer**: Client disconnect breaks inner relay; outer loop drains PTY into `VecDeque<Bytes>` (default 1MB). On reconnect, dropped-bytes marker if overflow, then flush.
-- **Client takeover**: `client_rx.recv()` in relay select. New client causes `Detached` to old, then switch.
+- **Client takeover**: `client_rx.recv()` in relay select. New client causes `Detached` to old, then switch. Capability check (500ms deadline) warns if reconnecting client is missing `-A`/`-O` that the session expects.
 - **Self-daemonizing**: Fork before tokio runtime. Parent waits on pipe for readiness. PID file at `socket_dir()/daemon.pid`.
 - **Lockfile-based liveness**: `flock()` on `connect-{name}.lock`. Non-blocking probe distinguishes live vs dead tunnels.
 - **Multi-channel forwarding**: Agent, tunnel, and port forwarding use `channel_id: u32` + `spawn_channel_relay<R, W>()`. State cleared on disconnect/takeover.
