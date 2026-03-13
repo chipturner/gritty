@@ -729,6 +729,7 @@ struct ServerRelay<'a> {
     pf_event_tx: &'a mpsc::UnboundedSender<PortForwardEvent>,
     send_notify_tx: &'a mpsc::UnboundedSender<Frame>,
     capability_warn_deadline: Option<tokio::time::Instant>,
+    paste_deadline: Option<tokio::time::Instant>,
     pending_paste: &'a mut Option<tokio::sync::oneshot::Sender<Option<Bytes>>>,
     negotiated_caps: &'a Arc<std::sync::atomic::AtomicU32>,
 }
@@ -919,6 +920,7 @@ impl ServerRelay<'_> {
                 }
             }
             Some(Ok(Frame::ClipboardData { data })) => {
+                self.paste_deadline = None;
                 if let Some(reply) = self.pending_paste.take() {
                     let _ = reply.send(Some(data));
                 }
@@ -1580,6 +1582,7 @@ pub async fn run(
                 pf_event_tx: &pf_event_tx,
                 send_notify_tx: &send_notify_tx,
                 capability_warn_deadline: cap_deadline,
+                paste_deadline: None,
                 pending_paste: &mut pending_paste,
                 negotiated_caps: &negotiated_caps,
             };
@@ -1629,6 +1632,7 @@ pub async fn run(
                                 relay.tunnel.teardown();
                                 relay.pf.teardown();
                                 *relay.open_forward_enabled = false;
+                                relay.paste_deadline = None;
                                 if let Some(old) = relay.pending_paste.take() {
                                     let _ = old.send(None);
                                 }
@@ -1737,6 +1741,9 @@ pub async fn run(
                                             let _ = old.send(None);
                                         }
                                         *relay.pending_paste = Some(reply);
+                                        relay.paste_deadline = Some(
+                                            tokio::time::Instant::now() + std::time::Duration::from_secs(5),
+                                        );
                                         let _ = framed.send(Frame::ClipboardGet).await;
                                     }
                                 }
@@ -1751,6 +1758,18 @@ pub async fn run(
                         }
                     } => {
                         relay.check_capability_warning(&mut framed).await;
+                    }
+
+                    _ = async {
+                        match relay.paste_deadline {
+                            Some(deadline) => tokio::time::sleep_until(deadline).await,
+                            None => std::future::pending().await,
+                        }
+                    } => {
+                        relay.paste_deadline = None;
+                        if let Some(reply) = relay.pending_paste.take() {
+                            let _ = reply.send(None);
+                        }
                     }
 
                     status = managed.child.wait() => {
