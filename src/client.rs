@@ -1,4 +1,4 @@
-use crate::protocol::{Frame, FrameCodec};
+use crate::protocol::{ErrorCode, Frame, FrameCodec};
 use bytes::Bytes;
 use futures_util::{SinkExt, StreamExt};
 use nix::sys::termios::{self, FlushArg, LocalFlags, SetArg, SpecialCharacterIndices, Termios};
@@ -1181,6 +1181,7 @@ pub async fn run(
     oauth_timeout: u64,
     heartbeat_interval: u64,
     heartbeat_timeout: u64,
+    client_name: String,
 ) -> anyhow::Result<i32> {
     let stdin = io::stdin();
     let stdin_fd = stdin.as_fd();
@@ -1287,8 +1288,8 @@ pub async fn run(
                     if new_framed
                         .send(Frame::Attach {
                             session: session.to_string(),
-                            client_name: String::new(),
-                            force: true,
+                            client_name: client_name.clone(),
+                            force: false,
                         })
                         .await
                         .is_err()
@@ -1306,6 +1307,18 @@ pub async fn run(
                             framed = new_framed;
                             current_redraw = true;
                             break;
+                        }
+                        Some(Ok(Frame::Error { code: ErrorCode::AlreadyAttached, .. })) => {
+                            let elapsed = reconnect_started.elapsed().as_secs();
+                            write_stdout_async(
+                                &async_stdout,
+                                format!(
+                                    "\r\x1b[2;33m\u{25b8} session attached to another client, waiting... {elapsed}s (Ctrl-C to abort)\x1b[0m\x1b[K"
+                                )
+                                .as_bytes(),
+                            )
+                            .await?;
+                            continue;
                         }
                         Some(Ok(Frame::Error { message, .. })) => {
                             write_stdout_async(

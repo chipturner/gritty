@@ -63,6 +63,7 @@ pub(crate) async fn connect_session(
                 settings.oauth_timeout,
                 settings.heartbeat_interval,
                 settings.heartbeat_timeout,
+                settings.client_name.clone(),
             )
             .await?;
             std::process::exit(code);
@@ -126,6 +127,7 @@ pub(crate) async fn connect_session(
                 settings.oauth_timeout,
                 settings.heartbeat_interval,
                 settings.heartbeat_timeout,
+                settings.client_name.clone(),
             )
             .await?;
             std::process::exit(code);
