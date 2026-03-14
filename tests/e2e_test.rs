@@ -1869,6 +1869,11 @@ async fn stale_sender_does_not_poison_next_transfer() {
 // Port forwarding tests
 // ---------------------------------------------------------------------------
 
+/// Pick an ephemeral port that is currently free.
+fn find_free_port() -> u16 {
+    std::net::TcpListener::bind("127.0.0.1:0").unwrap().local_addr().unwrap().port()
+}
+
 /// Helper: connect to svc socket and send a PortForward request.
 /// Returns the svc stream (kept open to keep the forward alive).
 async fn request_port_forward(
@@ -1918,10 +1923,8 @@ async fn local_forward_data_roundtrip() {
         tokio::time::sleep(Duration::from_millis(100)).await;
     }
 
-    // Use port 0 trick: we can't pick a fixed port, so we request a specific port
-    // that we hope is free. Use a high ephemeral port.
-    let listen_port = 19876u16;
-    let target_port = listen_port; // same port for simplicity
+    let listen_port = find_free_port();
+    let target_port = listen_port;
 
     // Request local-forward (direction=0): server binds TCP on listen_port
     let mut svc_stream = request_port_forward(&svc_path, 0, listen_port, target_port).await;
@@ -2016,11 +2019,10 @@ async fn remote_forward_data_roundtrip() {
         tokio::time::sleep(Duration::from_millis(100)).await;
     }
 
-    let listen_port = 19877u16;
-    let target_port = 19878u16;
-
-    // Start a TCP echo server on target_port (simulating the session-side service)
-    let echo_listener = tokio::net::TcpListener::bind(("127.0.0.1", target_port)).await.unwrap();
+    // Bind echo server first to eliminate TOCTOU
+    let echo_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let target_port = echo_listener.local_addr().unwrap().port();
+    let listen_port = find_free_port();
     let echo_handle = tokio::spawn(async move {
         if let Ok((mut stream, _)) = echo_listener.accept().await {
             let mut buf = vec![0u8; 1024];
@@ -2126,7 +2128,7 @@ async fn port_forward_svc_drop_teardown() {
         tokio::time::sleep(Duration::from_millis(100)).await;
     }
 
-    let listen_port = 19879u16;
+    let listen_port = find_free_port();
 
     // Request local-forward
     let mut svc_stream = request_port_forward(&svc_path, 0, listen_port, listen_port).await;
@@ -2167,7 +2169,7 @@ async fn port_forward_client_disconnect_cleanup() {
         tokio::time::sleep(Duration::from_millis(100)).await;
     }
 
-    let listen_port = 19880u16;
+    let listen_port = find_free_port();
 
     // Request local-forward
     let mut svc_stream = request_port_forward(&svc_path, 0, listen_port, listen_port).await;
@@ -2233,7 +2235,7 @@ async fn local_forward_multiple_concurrent_connections() {
         tokio::time::sleep(Duration::from_millis(100)).await;
     }
 
-    let listen_port = 19881u16;
+    let listen_port = find_free_port();
 
     // Request local-forward
     let mut svc_stream = request_port_forward(&svc_path, 0, listen_port, listen_port).await;
@@ -2344,10 +2346,13 @@ async fn local_forward_different_listen_and_target_ports() {
         tokio::time::sleep(Duration::from_millis(100)).await;
     }
 
-    let listen_port = 19882u16;
-    let target_port = 19883u16; // different from listen_port
+    let listen_port = find_free_port();
+    let mut target_port = find_free_port();
+    if target_port == listen_port {
+        target_port = find_free_port();
+    }
 
-    // Request local-forward: listen on 19882, target 19883
+    // Request local-forward with different listen and target ports
     let mut svc_stream = request_port_forward(&svc_path, 0, listen_port, target_port).await;
     let resp = read_svc_response(&mut svc_stream).await;
     assert!(resp.is_ok(), "local-forward bind failed: {resp:?}");
@@ -2355,7 +2360,7 @@ async fn local_forward_different_listen_and_target_ports() {
     // Connect to the listen port
     let _tcp = tokio::net::TcpStream::connect(("127.0.0.1", listen_port)).await.unwrap();
 
-    // PortForwardOpen should carry target_port (19883), not listen_port
+    // PortForwardOpen should carry target_port, not listen_port
     let open_target = loop {
         match timeout(Duration::from_secs(3), framed.next()).await {
             Ok(Some(Ok(Frame::PortForwardOpen { target_port: tp, .. }))) => break tp,

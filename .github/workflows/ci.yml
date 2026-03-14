@@ -59,7 +59,7 @@ jobs:
         run: cargo nextest run --test socat_tunnel_test -j 1
 
   container-tests:
-    name: Container Tests (lifecycle + SSH tunnel)
+    name: Container Tests
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v6
@@ -75,6 +75,15 @@ jobs:
         run: |
           docker build -t gritty-container-test -f tests/container/Dockerfile .
           docker run --rm gritty-container-test
+
+  msrv:
+    name: MSRV (1.85)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - uses: dtolnay/rust-toolchain@1.85.0
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo check --locked
 
   socat-bridge:
     name: Socat Bridge Tests

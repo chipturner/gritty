@@ -1,0 +1,11 @@
+FROM debian:trixie-slim
+ENV TERM=xterm-256color
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        tmux openssh-server openssh-client python3 asciinema \
+    && rm -rf /var/lib/apt/lists/*
+COPY target/debug/gritty /usr/local/bin/gritty
+COPY tests/container/ssh-setup.sh /setup/ssh-setup.sh
+COPY docs/demos/ /demos/
+RUN chmod +x /setup/*.sh /demos/*.sh /usr/local/bin/gritty
+WORKDIR /demos
+CMD ["/demos/record-all.sh"]

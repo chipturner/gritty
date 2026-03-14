@@ -47,7 +47,7 @@ just test                            # all tests (pass args to filter: just test
 just test-protocol                   # codec unit tests only
 just test-daemon                     # daemon integration tests only
 just test-e2e                        # e2e session tests only
-just test-ssh                        # SSH integration tests (auto-detects ssh localhost)
+just test-container                   # container tests (lifecycle + SSH tunnel + features)
 just test-socat                      # socat tunnel disruption tests (requires socat)
 just test-socat-bridge               # socat bridge tests (requires socat)
 just stress 10                       # run full suite N times, report pass/fail tally

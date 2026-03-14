@@ -13,3 +13,7 @@ retries = 2
 filter = 'binary(socat_tunnel_test) | binary(socat_bridge_test)'
 test-group = 'serial'
 retries = 2
+
+[[profile.default.overrides]]
+filter = 'binary(protocol_proptest)'
+retries = 0

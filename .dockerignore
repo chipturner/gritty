@@ -1,0 +1,4 @@
+*
+!target/debug/gritty
+!tests/container/
+!docs/demos/

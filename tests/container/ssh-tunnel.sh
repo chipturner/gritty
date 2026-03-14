@@ -18,30 +18,9 @@ fail() {
 }
 
 # ---------------------------------------------------------------------------
-# SSH setup
+# SSH setup (shared)
 # ---------------------------------------------------------------------------
-setup_ssh() {
-    # Generate host keys
-    ssh-keygen -A 2>/dev/null
-
-    # Start sshd
-    mkdir -p /run/sshd
-    /usr/sbin/sshd
-
-    # Generate user key and authorize it
-    mkdir -p ~/.ssh
-    chmod 700 ~/.ssh
-    ssh-keygen -t ed25519 -f ~/.ssh/id_ed25519 -N "" -q
-    cat ~/.ssh/id_ed25519.pub >> ~/.ssh/authorized_keys
-    chmod 600 ~/.ssh/authorized_keys
-    ssh-keyscan -q localhost >> ~/.ssh/known_hosts 2>/dev/null
-
-    # Verify SSH works
-    if ! ssh -o BatchMode=yes localhost true; then
-        echo "FATAL: ssh localhost failed"
-        exit 1
-    fi
-}
+. /tests/ssh-setup.sh
 
 # Helper: run gritty and assert success
 gritty_ok() {
