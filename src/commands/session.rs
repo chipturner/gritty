@@ -21,10 +21,11 @@ pub(crate) async fn connect_session(
     use gritty::protocol::{Frame, FrameCodec};
     use tokio_util::codec::Framed;
 
-    let (name, _picked) = match session {
-        Some(name) => (name, false),
+    let (name, _picked, picker_force) = match session {
+        Some(name) => (name, false, false),
         None => pick_session(pick, no_pick, &ctl_path).await,
     };
+    let force = force || picker_force;
     let session_command = command.unwrap_or_default();
 
     let stream = super::util::connect_or_start(&ctl_path, &auto_start_mode, wait).await?;
@@ -136,20 +137,20 @@ pub(crate) async fn connect_session(
 
 /// Resolve session name when none was explicitly given.
 /// Returns `(name, picked)` where `picked` is true if the user chose interactively.
-async fn pick_session(pick: bool, no_pick: bool, ctl_path: &Path) -> (String, bool) {
+async fn pick_session(pick: bool, no_pick: bool, ctl_path: &Path) -> (String, bool, bool) {
     use gritty::protocol::Frame;
 
     if no_pick {
-        return ("default".to_string(), false);
+        return ("default".to_string(), false, false);
     }
 
     let sessions = match server_request(&ctl_path.to_path_buf(), Frame::ListSessions).await {
         Ok(Frame::SessionInfo { sessions }) => sessions,
-        _ => return ("default".to_string(), false),
+        _ => return ("default".to_string(), false, false),
     };
 
     if sessions.is_empty() {
-        return ("default".to_string(), false);
+        return ("default".to_string(), false, false);
     }
 
     let host = host_from_ctl_path(ctl_path);
@@ -162,12 +163,12 @@ async fn pick_session(pick: bool, no_pick: bool, ctl_path: &Path) -> (String, bo
 
     // One session, detached: attach directly
     if sessions.len() == 1 && detached.len() == 1 {
-        return (session_display_name(&sessions[0]), false);
+        return (session_display_name(&sessions[0]), false, false);
     }
 
     // Multiple sessions, exactly one detached: attach to the detached one
     if detached.len() == 1 {
-        return (session_display_name(detached[0]), false);
+        return (session_display_name(detached[0]), false, false);
     }
 
     // Ambiguous (multiple detached) or all attached: show picker
@@ -211,10 +212,10 @@ async fn pick_or_list(
     host: &str,
     sessions: &[gritty::protocol::SessionEntry],
     ctl_path: &Path,
-) -> (String, bool) {
+) -> (String, bool, bool) {
     if std::io::IsTerminal::is_terminal(&std::io::stderr()) {
         match tui_pick_session(host, sessions, ctl_path).await {
-            Some(name) => (name, true),
+            Some((name, force)) => (name, true, force),
             None => std::process::exit(1),
         }
     } else {
@@ -269,7 +270,7 @@ async fn tui_pick_session(
     host: &str,
     sessions: &[gritty::protocol::SessionEntry],
     ctl_path: &Path,
-) -> Option<String> {
+) -> Option<(String, bool)> {
     use crossterm::{
         event::{self, Event, KeyCode, KeyEvent, KeyModifiers},
         terminal,
@@ -388,7 +389,7 @@ async fn tui_pick_session(
         // Hint line
         let hints = match mode {
             Mode::Pick => {
-                "1-9 jump  enter select  c/n new (named)  d default  r rename  x kill  esc quit"
+                "1-9 jump  enter select  f force  c/n new (named)  d default  r rename  x kill  esc quit"
                     .to_string()
             }
             Mode::Input { rename_of: Some(_), .. } => "enter rename  esc back".to_string(),
@@ -432,10 +433,10 @@ async fn tui_pick_session(
                 }
                 Event::Key(KeyEvent { code: KeyCode::Enter, .. }) => {
                     if cursor < rows.len() {
-                        break Some(rows[cursor].name.clone());
+                        break Some((rows[cursor].name.clone(), false));
                     }
                     // On the "new session" row: create immediately with suggested name
-                    break Some(suggest_name(&rows));
+                    break Some((suggest_name(&rows), false));
                 }
                 // Hotkeys 1-9
                 Event::Key(KeyEvent {
@@ -445,7 +446,7 @@ async fn tui_pick_session(
                 }) => {
                     let idx = (ch as u8 - b'1') as usize;
                     if idx < rows.len() {
-                        break Some(rows[idx].name.clone());
+                        break Some((rows[idx].name.clone(), false));
                     }
                 }
                 // 'd' -> select or create "default"
@@ -454,7 +455,7 @@ async fn tui_pick_session(
                     modifiers: KeyModifiers::NONE,
                     ..
                 }) => {
-                    break Some("default".to_string());
+                    break Some(("default".to_string(), false));
                 }
                 // 'c' or 'n' or '+' -> new session input with suggested name
                 Event::Key(KeyEvent {
@@ -493,6 +494,16 @@ async fn tui_pick_session(
                         };
                     }
                 }
+                // 'f' -> force-attach (take over) selected session
+                Event::Key(KeyEvent {
+                    code: KeyCode::Char('f'),
+                    modifiers: KeyModifiers::NONE,
+                    ..
+                }) => {
+                    if cursor < rows.len() {
+                        break Some((rows[cursor].name.clone(), true));
+                    }
+                }
                 Event::Key(KeyEvent {
                     code: KeyCode::Esc | KeyCode::Char('q'),
                     modifiers: KeyModifiers::NONE,
@@ -523,7 +534,7 @@ async fn tui_pick_session(
                         server_request(&ctl, gritty::protocol::Frame::ListSessions).await
                     {
                         if fresh.is_empty() {
-                            break Some("default".to_string());
+                            break Some(("default".to_string(), false));
                         }
                         rows = build_rows(&fresh);
                         cursor = cursor.min(rows.len().saturating_sub(1));
@@ -564,7 +575,7 @@ async fn tui_pick_session(
                         mode = Mode::Pick;
                         cursor = rows.len();
                     } else {
-                        break Some(new_name);
+                        break Some((new_name, false));
                     }
                 }
                 Event::Key(KeyEvent { code: KeyCode::Esc, .. }) => {
