@@ -2,7 +2,7 @@
 name = "gritty-cli"
 version = "0.9.3"
 edition = "2024"
-rust-version = "1.85"
+rust-version = "1.87"
 license = "MIT OR Apache-2.0"
 description = "Persistent TTY sessions over Unix domain sockets"
 readme = "README.md"

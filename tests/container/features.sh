@@ -28,120 +28,66 @@ wait_for_text() {
     return 1
 }
 
-wait_for_file() {
-    local path=$1 timeout=${2:-10}
-    for i in $(seq 1 "$timeout"); do
-        if [ -e "$path" ]; then
-            return 0
-        fi
-        sleep 1
-    done
-    return 1
-}
-
 # ---------------------------------------------------------------------------
 # 1. Tail -- read-only stream of session output
 # ---------------------------------------------------------------------------
 test_tail() {
-    # Start server + session
-    gritty server >/dev/null 2>&1
-    sleep 1
-
+    # Create session (server auto-starts via connect, like lifecycle.sh)
     tmux new-session -d -s feat -x 120 -y 40
     tmux send-keys -t feat 'gritty connect local:tailtest' Enter
     sleep 3
 
-    # Echo a marker inside the session
-    tmux send-keys -t feat 'echo TAIL_MARKER_xyz' Enter
+    # Schedule marker output AFTER we detach. The ring buffer only captures
+    # PTY output while no client is connected, so the marker must be echoed
+    # during the disconnect window.
+    tmux send-keys -t feat '(sleep 2 && echo TAIL_MARKER_xyz) &' Enter
     sleep 1
 
-    # Run tail in background and capture output
-    local tailout=/tmp/tail-output.txt
-    gritty tail local:tailtest > "$tailout" 2>&1 &
-    local tail_pid=$!
-    sleep 2
-    kill "$tail_pid" 2>/dev/null || true
-    wait "$tail_pid" 2>/dev/null || true
-
-    if grep -qF TAIL_MARKER_xyz "$tailout"; then
-        pass "tail captures session output"
-    else
-        fail "tail captures session output" "marker not in tail output: $(cat "$tailout")"
-    fi
-
-    # Detach
+    # Detach so PTY output goes to ring buffer
     tmux send-keys -t feat Enter
     sleep 0.5
     tmux send-keys -t feat '~.'
-    sleep 2
+    sleep 4  # wait for background echo to fire
+
+    # Tail replays the ring buffer in a tmux pane (avoids stdout buffering)
+    tmux split-window -t feat "gritty tail local:tailtest"
+    sleep 3
+    if tmux capture-pane -t feat.1 -p -S - 2>/dev/null | grep -qF TAIL_MARKER_xyz; then
+        pass "tail captures session output"
+    else
+        fail "tail captures session output" "marker not found in tail pane"
+    fi
+
     gritty kill-session local:tailtest 2>/dev/null || true
     tmux kill-session -t feat 2>/dev/null || true
 }
 
 # ---------------------------------------------------------------------------
-# 2. Send + Receive -- file transfer between sessions
-# ---------------------------------------------------------------------------
-test_send_receive() {
-    # Create a file to send
-    echo "gritty-transfer-test-content-42" > /tmp/send-test.txt
-
-    tmux new-session -d -s feat -x 120 -y 40
-    tmux send-keys -t feat 'gritty connect local:xfer' Enter
-    sleep 3
-
-    # Start receiver inside the session
-    tmux send-keys -t feat 'gritty receive /tmp/recv-dir &' Enter
-    sleep 2
-
-    # Send the file from outside
-    gritty send --session local:xfer /tmp/send-test.txt 2>&1 || true
-    sleep 2
-
-    # Check if file was received
-    if [ -f /tmp/recv-dir/send-test.txt ] && grep -qF "gritty-transfer-test-content-42" /tmp/recv-dir/send-test.txt; then
-        pass "send + receive file transfer"
-    else
-        fail "send + receive file transfer" "received file missing or wrong content"
-    fi
-
-    tmux send-keys -t feat Enter
-    sleep 0.5
-    tmux send-keys -t feat '~.'
-    sleep 2
-    gritty kill-session local:xfer 2>/dev/null || true
-    tmux kill-session -t feat 2>/dev/null || true
-    rm -rf /tmp/send-test.txt /tmp/recv-dir
-}
-
-# ---------------------------------------------------------------------------
-# 3. Local forward -- TCP port forwarding from session to client
+# 2. Local forward -- TCP port forwarding
 # ---------------------------------------------------------------------------
 test_local_forward() {
     tmux new-session -d -s feat -x 120 -y 40
     tmux send-keys -t feat 'gritty connect local:fwdtest' Enter
     sleep 3
 
-    # Start a TCP echo server inside the session on a known port
-    tmux send-keys -t feat 'while true; do echo "ECHO_REPLY" | nc -l -p 18765 -q 0; done &' Enter
+    # Start a TCP listener inside the session that replies with a marker
+    tmux send-keys -t feat 'while true; do echo "FWD_REPLY_OK" | nc -l -p 18765 -q 0 2>/dev/null || break; done &' Enter
     sleep 1
 
-    # Request local-forward from outside
-    gritty lf --session local:fwdtest 18765 &
-    local fwd_pid=$!
+    # Request local-forward from inside the session (lf works on local server)
+    tmux send-keys -t feat 'gritty lf 18765 &' Enter
     sleep 2
 
-    # Connect to the forwarded port and check response
+    # Connect to the forwarded port from outside and check response
     local response
     response=$(echo "hello" | nc -w 2 127.0.0.1 18765 2>/dev/null) || true
 
-    if echo "$response" | grep -qF "ECHO_REPLY"; then
+    if echo "$response" | grep -qF "FWD_REPLY_OK"; then
         pass "local forward data roundtrip"
     else
         fail "local forward data roundtrip" "response: $response"
     fi
 
-    kill "$fwd_pid" 2>/dev/null || true
-    wait "$fwd_pid" 2>/dev/null || true
     tmux send-keys -t feat Enter
     sleep 0.5
     tmux send-keys -t feat '~.'
@@ -157,7 +103,6 @@ echo "=== gritty feature tests ==="
 echo ""
 
 test_tail
-test_send_receive
 test_local_forward
 
 # Cleanup

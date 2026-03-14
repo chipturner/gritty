@@ -38,7 +38,7 @@ Sessions have auto-incrementing IDs with optional names (`host:name`). Numeric n
 
 ## Build & Test
 
-Rust edition 2024, MSRV 1.85. Uses `just` as the task runner. Tests via `cargo-nextest` (concurrency in `.config/nextest.toml`).
+Rust edition 2024, MSRV 1.87. Uses `just` as the task runner. Tests via `cargo-nextest` (concurrency in `.config/nextest.toml`).
 
 ```bash
 just check                           # clippy + full test suite (pre-push gate)
