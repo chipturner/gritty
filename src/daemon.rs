@@ -104,8 +104,9 @@ fn resolve_session(
     None
 }
 
-/// Read the foreground process command name for a shell pid via /proc.
-/// Returns "-" on any failure (non-Linux, permission denied, etc.).
+/// Read the foreground process command name for a shell pid.
+/// Returns "-" on any failure.
+#[cfg(target_os = "linux")]
 fn foreground_process(shell_pid: u32) -> String {
     // Read /proc/{shell_pid}/stat to get tpgid (field 8, 1-indexed)
     let stat = match std::fs::read_to_string(format!("/proc/{shell_pid}/stat")) {
@@ -131,10 +132,57 @@ fn foreground_process(shell_pid: u32) -> String {
         .unwrap_or_else(|_| "-".to_string())
 }
 
+/// Read the foreground process command name for a shell pid via libproc.
+/// Returns "-" on any failure.
+#[cfg(target_os = "macos")]
+fn foreground_process(shell_pid: u32) -> String {
+    use libproc::libproc::bsd_info::BSDInfo;
+    use libproc::libproc::proc_pid::{name, pidinfo};
+
+    let pid = shell_pid as i32;
+    let tpgid = match pidinfo::<BSDInfo>(pid, 0) {
+        Ok(info) if info.e_tpgid > 0 => info.e_tpgid as i32,
+        _ => return "-".to_string(),
+    };
+    name(tpgid).unwrap_or_else(|_| "-".to_string())
+}
+
+#[cfg(target_os = "linux")]
 fn foreground_cwd(shell_pid: u32) -> String {
-    std::fs::read_link(format!("/proc/{shell_pid}/cwd"))
+    libproc::libproc::proc_pid::pidcwd(shell_pid as i32)
         .map(|p| p.to_string_lossy().into_owned())
         .unwrap_or_default()
+}
+
+#[cfg(target_os = "macos")]
+fn foreground_cwd(shell_pid: u32) -> String {
+    // libproc's pidcwd is unimplemented on macOS; call proc_pidinfo directly.
+    const PROC_PIDVNODEPATHINFO: i32 = 9;
+    const MAXPATHLEN: usize = 1024;
+    // vnode_info: vinfo_stat(136) + vi_type(4) + vi_pad(4) + vi_fsid(8) = 152
+    const VNODE_INFO_SIZE: usize = 152;
+    // vnode_info_path: vnode_info + path
+    const VNODE_INFO_PATH_SIZE: usize = VNODE_INFO_SIZE + MAXPATHLEN;
+    // proc_vnodepathinfo: cdir + rdir
+    const BUF_SIZE: usize = VNODE_INFO_PATH_SIZE * 2;
+
+    let mut buf = vec![0u8; BUF_SIZE];
+    let ret = unsafe {
+        libc::proc_pidinfo(
+            shell_pid as i32,
+            PROC_PIDVNODEPATHINFO,
+            0,
+            buf.as_mut_ptr().cast(),
+            BUF_SIZE as i32,
+        )
+    };
+    if ret <= 0 {
+        return String::new();
+    }
+    // cdir path starts after the vnode_info struct
+    let path_bytes = &buf[VNODE_INFO_SIZE..VNODE_INFO_SIZE + MAXPATHLEN];
+    let len = path_bytes.iter().position(|&b| b == 0).unwrap_or(MAXPATHLEN);
+    String::from_utf8_lossy(&path_bytes[..len]).into_owned()
 }
 
 fn build_session_entries(sessions: &HashMap<u32, SessionState>) -> Vec<SessionEntry> {
