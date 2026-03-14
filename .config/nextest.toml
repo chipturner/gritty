@@ -10,6 +10,6 @@ test-group = 'pty-tests'
 retries = 2
 
 [[profile.default.overrides]]
-filter = 'binary(socat_tunnel_test) | binary(socat_bridge_test) | binary(ssh_integration_test)'
+filter = 'binary(socat_tunnel_test) | binary(socat_bridge_test)'
 test-group = 'serial'
 retries = 2

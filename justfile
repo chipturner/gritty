@@ -36,10 +36,6 @@ test-e2e:
 test-daemon:
     cargo nextest run --test daemon_test
 
-# SSH integration tests (requires sshd + ssh localhost; skips gracefully if missing)
-test-ssh:
-    cargo nextest run --test ssh_integration_test -j 1
-
 # Socat tunnel disruption tests (requires socat; skips gracefully if missing)
 test-socat:
     cargo nextest run --test socat_tunnel_test -j 1
@@ -100,11 +96,11 @@ cargo-upgrade *args:
     cargo clippy -- -D warnings
     cargo nextest run
 
-# Container lifecycle test (requires Docker; Linux only)
+# Container tests: lifecycle + SSH tunnel (requires Docker; Linux only)
 test-container:
     cargo build
-    docker build -t gritty-lifecycle-test -f tests/container/Dockerfile .
-    docker run --rm gritty-lifecycle-test
+    docker build -t gritty-container-test -f tests/container/Dockerfile .
+    docker run --rm gritty-container-test
 
 # Clean all build artifacts
 clean:

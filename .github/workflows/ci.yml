@@ -37,62 +37,6 @@ jobs:
       - name: Test
         run: cargo nextest run --locked
 
-  ssh-integration:
-    name: SSH Integration (${{ matrix.os }})
-    runs-on: ${{ matrix.os }}
-    strategy:
-      matrix:
-        os: [ubuntu-latest, macos-latest]
-    steps:
-      - uses: actions/checkout@v6
-
-      - uses: dtolnay/rust-toolchain@stable
-
-      - uses: Swatinem/rust-cache@v2
-
-      - name: Install and start sshd
-        if: runner.os == 'Linux'
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y openssh-server
-          sudo systemctl enable --now ssh
-
-      - name: Enable sshd
-        if: runner.os == 'macOS'
-        run: |
-          sudo systemsetup -setremotelogin on
-          # Ensure sshd accepts pubkey auth and knows where to find authorized_keys
-          sudo sed -i '' 's/^#PubkeyAuthentication.*/PubkeyAuthentication yes/' /etc/ssh/sshd_config
-          sudo sed -i '' 's/^#AuthorizedKeysFile.*/AuthorizedKeysFile .ssh\/authorized_keys/' /etc/ssh/sshd_config
-          # Disable PAM keyboard-interactive to avoid "Too many auth failures"
-          sudo sed -i '' 's/^UsePAM.*/UsePAM no/' /etc/ssh/sshd_config
-          sudo sed -i '' 's/^#UsePAM.*/UsePAM no/' /etc/ssh/sshd_config
-          sudo launchctl stop com.openssh.sshd || true
-          sudo launchctl start com.openssh.sshd
-
-      - name: Configure SSH key auth
-        run: |
-          mkdir -p ~/.ssh
-          chmod 700 ~/.ssh
-          ssh-keygen -t ed25519 -f ~/.ssh/id_ed25519 -N ""
-          cat ~/.ssh/id_ed25519.pub >> ~/.ssh/authorized_keys
-          chmod 600 ~/.ssh/authorized_keys
-          ssh-keyscan localhost >> ~/.ssh/known_hosts
-          # Verify SSH works
-          ssh -o BatchMode=yes -o StrictHostKeyChecking=no localhost whoami
-
-      - uses: taiki-e/install-action@nextest
-
-      - name: Build and install gritty
-        run: |
-          cargo build
-          mkdir -p ~/.local/bin
-          cp target/debug/gritty ~/.local/bin/
-          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
-
-      - name: SSH integration tests
-        run: cargo nextest run --test ssh_integration_test -j 1
-
   socat-tunnel:
     name: Socat Tunnel Tests
     runs-on: ubuntu-latest
@@ -114,8 +58,8 @@ jobs:
       - name: Socat tunnel tests
         run: cargo nextest run --test socat_tunnel_test -j 1
 
-  container-lifecycle:
-    name: Container Lifecycle Test
+  container-tests:
+    name: Container Tests (lifecycle + SSH tunnel)
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v6
@@ -127,10 +71,10 @@ jobs:
       - name: Build
         run: cargo build
 
-      - name: Container lifecycle test
+      - name: Container tests
         run: |
-          docker build -t gritty-lifecycle-test -f tests/container/Dockerfile .
-          docker run --rm gritty-lifecycle-test
+          docker build -t gritty-container-test -f tests/container/Dockerfile .
+          docker run --rm gritty-container-test
 
   socat-bridge:
     name: Socat Bridge Tests
