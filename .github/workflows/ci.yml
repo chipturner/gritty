@@ -114,6 +114,24 @@ jobs:
       - name: Socat tunnel tests
         run: cargo nextest run --test socat_tunnel_test -j 1
 
+  container-lifecycle:
+    name: Container Lifecycle Test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Build
+        run: cargo build
+
+      - name: Container lifecycle test
+        run: |
+          docker build -t gritty-lifecycle-test -f tests/container/Dockerfile .
+          docker run --rm gritty-lifecycle-test
+
   socat-bridge:
     name: Socat Bridge Tests
     runs-on: ubuntu-latest

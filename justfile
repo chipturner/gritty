@@ -100,6 +100,12 @@ cargo-upgrade *args:
     cargo clippy -- -D warnings
     cargo nextest run
 
+# Container lifecycle test (requires Docker; Linux only)
+test-container:
+    cargo build
+    docker build -t gritty-lifecycle-test -f tests/container/Dockerfile .
+    docker run --rm gritty-lifecycle-test
+
 # Clean all build artifacts
 clean:
     cargo clean
