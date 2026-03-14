@@ -23,7 +23,7 @@ pub struct SessionSettings {
 }
 
 fn default_client_name() -> String {
-    std::fs::read_to_string("/etc/hostname").map(|s| s.trim().to_string()).unwrap_or_default()
+    nix::unistd::gethostname().ok().and_then(|s| s.into_string().ok()).unwrap_or_default()
 }
 
 impl Default for SessionSettings {

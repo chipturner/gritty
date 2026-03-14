@@ -31,7 +31,7 @@ futures-util = { version = "0.3", features = ["sink"] }
 humansize = "2"
 jiff = "0.2"
 libc = "0.2"
-nix = { version = "0.31", features = ["term", "process", "signal", "fs"] }
+nix = { version = "0.31", features = ["term", "process", "signal", "fs", "hostname"] }
 opener = "0.8"
 serde = { version = "1", features = ["derive"] }
 shlex = "1"
