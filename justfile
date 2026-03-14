@@ -107,7 +107,7 @@ record-demos:
     cargo build
     docker build -t gritty-demo -f tests/container/Dockerfile.demo .
     mkdir -p docs/demos/output
-    docker run --rm -v "$(pwd)/docs/demos/output:/demos/output" gritty-demo
+    docker run --rm --hostname devbox -v "$(pwd)/docs/demos/output:/demos/output" gritty-demo
 
 # Record demos locally (uses your SSH config + installed tools)
 record-demos-local:

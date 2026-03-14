@@ -18,8 +18,8 @@ set -euo pipefail
 #   pause                   Wait for Enter in the driver terminal (manual step)
 
 TMUX_SESSION=gritty-demo
-COLS=100
-ROWS=30
+COLS=120
+ROWS=36
 
 die() { echo "error: $*" >&2; exit 1; }
 
