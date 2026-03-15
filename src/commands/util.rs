@@ -60,36 +60,40 @@ pub(crate) fn auto_start(args: &[&str]) -> anyhow::Result<()> {
 /// Try to connect to the control socket. On failure, auto-start the
 /// appropriate process and retry with a bounded loop (or indefinitely
 /// with `--wait`).
+/// Returns `(stream, auto_started)` where `auto_started` is true when the
+/// server or tunnel had to be launched before connecting.
 pub(crate) async fn connect_or_start(
     ctl_path: &Path,
     auto_start_mode: &AutoStart,
     wait: bool,
-) -> anyhow::Result<tokio::net::UnixStream> {
+) -> anyhow::Result<(tokio::net::UnixStream, bool)> {
     use tokio::net::UnixStream;
 
-    match UnixStream::connect(ctl_path).await {
-        Ok(s) => return Ok(s),
+    let auto_started = match UnixStream::connect(ctl_path).await {
+        Ok(s) => return Ok((s, false)),
         Err(_) => match auto_start_mode {
             AutoStart::Server => {
                 eprintln!("\x1b[2;33m\u{25b8} starting server...\x1b[0m");
                 auto_start(&["server"])?;
+                true
             }
             AutoStart::Tunnel(host) => {
                 eprintln!("\x1b[2;33m\u{25b8} starting tunnel {host}...\x1b[0m");
                 auto_start(&["tunnel-create", host])?;
+                true
             }
-            AutoStart::None if wait => {}
+            AutoStart::None if wait => false,
             AutoStart::None => {
                 anyhow::bail!("no server running (could not connect to {})", ctl_path.display());
             }
         },
-    }
+    };
 
     // Retry loop: bounded (10 retries, 500ms apart) or indefinite (--wait)
     let max_retries = if wait { u32::MAX } else { 10 };
     for _ in 0..max_retries {
         match UnixStream::connect(ctl_path).await {
-            Ok(s) => return Ok(s),
+            Ok(s) => return Ok((s, auto_started)),
             Err(_) => {
                 if wait {
                     eprintln!("\x1b[2;33m\u{25b8} waiting for server...\x1b[0m");

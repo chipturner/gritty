@@ -28,7 +28,8 @@ pub(crate) async fn connect_session(
     let force = force || picker_force;
     let session_command = command.unwrap_or_default();
 
-    let stream = super::util::connect_or_start(&ctl_path, &auto_start_mode, wait).await?;
+    let (stream, auto_started) =
+        super::util::connect_or_start(&ctl_path, &auto_start_mode, wait).await?;
     let mut framed = Framed::new(stream, FrameCodec);
     gritty::handshake(&mut framed).await?;
 
@@ -74,6 +75,56 @@ pub(crate) async fn connect_session(
             }
             // Fall through to create
         }
+        Frame::Error { code: gritty::protocol::ErrorCode::AlreadyAttached, .. }
+            if auto_started && !force =>
+        {
+            // Tunnel was just (re)started -- the old client is dead, so the
+            // "attached" state is stale.  Reconnect with force.
+            eprintln!("\x1b[2;33m\u{25b8} reconnecting...\x1b[0m");
+            drop(framed);
+            let (stream, _) =
+                super::util::connect_or_start(&ctl_path, &auto_start_mode, wait).await?;
+            let mut framed = Framed::new(stream, FrameCodec);
+            gritty::handshake(&mut framed).await?;
+            framed
+                .send(Frame::Attach {
+                    session: name.clone(),
+                    client_name: settings.client_name.clone(),
+                    force: true,
+                })
+                .await?;
+            match Frame::expect_from(framed.next().await)? {
+                Frame::Ok => {
+                    if detach {
+                        eprintln!(
+                            "\x1b[32m\u{25b8} session {name} exists (not attaching, -d)\x1b[0m"
+                        );
+                        return Ok(());
+                    }
+                    eprintln!("\x1b[32m\u{25b8} attached {name}\x1b[0m");
+                    let env_vars = vec![];
+                    let code = gritty::client::run(
+                        &name,
+                        framed,
+                        !settings.no_redraw,
+                        &ctl_path,
+                        env_vars,
+                        settings.no_escape,
+                        settings.forward_agent,
+                        settings.forward_open,
+                        settings.oauth_redirect,
+                        settings.oauth_timeout,
+                        settings.heartbeat_interval,
+                        settings.heartbeat_timeout,
+                        settings.client_name.clone(),
+                    )
+                    .await?;
+                    std::process::exit(code);
+                }
+                Frame::Error { message, .. } => anyhow::bail!("{message}"),
+                other => anyhow::bail!("unexpected response from server: {other:?}"),
+            }
+        }
         Frame::Error { code: gritty::protocol::ErrorCode::AlreadyAttached, message, .. } => {
             let host = host_from_ctl_path(&ctl_path);
             eprintln!("error: {message}");
@@ -86,7 +137,7 @@ pub(crate) async fn connect_session(
 
     // Create new session -- need a fresh connection since the previous one
     // was consumed by the failed attach
-    let stream = super::util::connect_or_start(&ctl_path, &auto_start_mode, wait).await?;
+    let (stream, _) = super::util::connect_or_start(&ctl_path, &auto_start_mode, wait).await?;
     let mut framed = Framed::new(stream, FrameCodec);
     gritty::handshake(&mut framed).await?;
     // Get terminal size for initial PTY dimensions
