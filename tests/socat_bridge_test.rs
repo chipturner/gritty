@@ -209,6 +209,22 @@ async fn drain_data(framed: &mut Framed<UnixStream, FrameCodec>, wait: Duration)
     out
 }
 
+async fn wait_for_pong(framed: &mut Framed<UnixStream, FrameCodec>) {
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    loop {
+        match timeout(Duration::from_secs(1), framed.next()).await {
+            Ok(Some(Ok(Frame::Pong))) => return,
+            Ok(Some(Ok(Frame::Data(_)))) => continue,
+            Ok(Some(Err(e))) => panic!("decode error waiting for Pong: {e}"),
+            Ok(None) => panic!("stream closed while waiting for Pong"),
+            Err(_) if tokio::time::Instant::now() >= deadline => {
+                panic!("no Pong received within 5s")
+            }
+            _ => continue,
+        }
+    }
+}
+
 /// Send a command and wait until `expected` appears in output, or timeout.
 async fn send_and_expect(
     framed: &mut Framed<UnixStream, FrameCodec>,
@@ -1124,15 +1140,7 @@ async fn ping_pong_through_proxy() {
     drain_data(&mut framed, Duration::from_millis(500)).await;
 
     framed.send(Frame::Ping).await.unwrap();
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
-    loop {
-        match timeout(Duration::from_secs(1), framed.next()).await {
-            Ok(Some(Ok(Frame::Pong))) => break,
-            Ok(Some(Ok(Frame::Data(_)))) => continue,
-            _ if tokio::time::Instant::now() >= deadline => panic!("no Pong received"),
-            _ => continue,
-        }
-    }
+    wait_for_pong(&mut framed).await;
 }
 
 #[tokio::test]
@@ -1146,15 +1154,7 @@ async fn heartbeat_updates_metadata_through_proxy() {
 
     // Send Ping and wait for Pong
     framed.send(Frame::Ping).await.unwrap();
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
-    loop {
-        match timeout(Duration::from_secs(1), framed.next()).await {
-            Ok(Some(Ok(Frame::Pong))) => break,
-            Ok(Some(Ok(Frame::Data(_)))) => continue,
-            _ if tokio::time::Instant::now() >= deadline => panic!("no Pong received"),
-            _ => continue,
-        }
-    }
+    wait_for_pong(&mut framed).await;
 
     // Check heartbeat metadata via ListSessions (use a separate connection)
     let resp = control_request(&env.proxy_path, Frame::ListSessions).await;
@@ -1170,15 +1170,7 @@ async fn heartbeat_updates_metadata_through_proxy() {
     // Wait a moment, send another Ping
     tokio::time::sleep(Duration::from_secs(1)).await;
     framed.send(Frame::Ping).await.unwrap();
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
-    loop {
-        match timeout(Duration::from_secs(1), framed.next()).await {
-            Ok(Some(Ok(Frame::Pong))) => break,
-            Ok(Some(Ok(Frame::Data(_)))) => continue,
-            _ if tokio::time::Instant::now() >= deadline => panic!("no Pong received"),
-            _ => continue,
-        }
-    }
+    wait_for_pong(&mut framed).await;
 
     // Heartbeat should have increased
     let resp = control_request(&env.proxy_path, Frame::ListSessions).await;
