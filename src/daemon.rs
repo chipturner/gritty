@@ -49,10 +49,10 @@ pub fn socket_dir() -> PathBuf {
     if let Ok(dir) = std::env::var("GRITTY_SOCKET_DIR") {
         return PathBuf::from(dir);
     }
-    if let Some(proj) = directories::ProjectDirs::from("", "", "gritty") {
-        if let Some(runtime) = proj.runtime_dir() {
-            return runtime.to_path_buf();
-        }
+    if let Some(proj) = directories::ProjectDirs::from("", "", "gritty")
+        && let Some(runtime) = proj.runtime_dir()
+    {
+        return runtime.to_path_buf();
     }
     let uid = unsafe { libc::getuid() };
     PathBuf::from(format!("/tmp/gritty-{uid}"))

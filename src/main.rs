@@ -485,18 +485,18 @@ fn report_error(error_pipe: &Option<OwnedFd>, e: &anyhow::Error) -> ! {
 
 fn main() {
     // When invoked as "gritty-open" (symlink), dispatch directly to open.
-    if let Some(prog) = std::env::args().next() {
-        if Path::new(&prog).file_name().and_then(|f| f.to_str()) == Some("gritty-open") {
-            let url = match std::env::args().nth(1) {
-                Some(u) => u,
-                None => {
-                    eprintln!("usage: gritty-open <url>");
-                    std::process::exit(1);
-                }
-            };
-            open_url(&url);
-            return;
-        }
+    if let Some(prog) = std::env::args().next()
+        && Path::new(&prog).file_name().and_then(|f| f.to_str()) == Some("gritty-open")
+    {
+        let url = match std::env::args().nth(1) {
+            Some(u) => u,
+            None => {
+                eprintln!("usage: gritty-open <url>");
+                std::process::exit(1);
+            }
+        };
+        open_url(&url);
+        return;
     }
 
     let cli = Cli::parse();
@@ -581,11 +581,12 @@ fn main() {
             let out_path = socket_dir.join(format!("connect-{connection_name}.out"));
             let log_path = socket_dir.join(format!("connect-{connection_name}.log"));
 
-            if !foreground && !dry_run {
-                if let Err(e) = gritty::connect::preflight_ssh(&destination, &ssh_options) {
-                    eprintln!("error: {e}");
-                    std::process::exit(1);
-                }
+            if !foreground
+                && !dry_run
+                && let Err(e) = gritty::connect::preflight_ssh(&destination, &ssh_options)
+            {
+                eprintln!("error: {e}");
+                std::process::exit(1);
             }
 
             let ready_fd = if foreground || dry_run {
@@ -795,10 +796,10 @@ async fn run(cli: Cli, config: gritty::config::ConfigFile) -> anyhow::Result<()>
             let host = target.as_deref().map(|t| parse_target(t).0);
             let ctl_path = resolve_ctl_path(cli.ctl_socket, host.as_deref())?;
             kill_server(ctl_path).await?;
-            if let Some(h) = host.as_deref() {
-                if h != "local" {
-                    gritty::connect::disconnect(h).await?;
-                }
+            if let Some(h) = host.as_deref()
+                && h != "local"
+            {
+                gritty::connect::disconnect(h).await?;
             }
             Ok(())
         }

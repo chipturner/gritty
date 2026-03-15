@@ -806,14 +806,14 @@ impl ServerRelay<'_> {
                 if let Some(meta) = self.metadata_slot.get() {
                     meta.wants_agent.store(true, Ordering::Relaxed);
                 }
-                if self.agent.acceptor.is_none() {
-                    if let Some(listener) = bind_agent_listener(&self.agent.socket_path) {
-                        self.agent.acceptor = Some(spawn_agent_acceptor(
-                            listener,
-                            self.agent_event_tx.clone(),
-                            self.agent.next_channel_id.clone(),
-                        ));
-                    }
+                if self.agent.acceptor.is_none()
+                    && let Some(listener) = bind_agent_listener(&self.agent.socket_path)
+                {
+                    self.agent.acceptor = Some(spawn_agent_acceptor(
+                        listener,
+                        self.agent_event_tx.clone(),
+                        self.agent.next_channel_id.clone(),
+                    ));
                 }
             }
             Some(Ok(Frame::AgentData { channel_id, data })) => {
@@ -895,10 +895,10 @@ impl ServerRelay<'_> {
                 }
             }
             Some(Ok(Frame::PortForwardClose { channel_id })) => {
-                if let Some((forward_id, _)) = self.pf.channels.remove(&channel_id) {
-                    if let Some(fwd) = self.pf.forwards.get_mut(&forward_id) {
-                        fwd.channels.remove(&channel_id);
-                    }
+                if let Some((forward_id, _)) = self.pf.channels.remove(&channel_id)
+                    && let Some(fwd) = self.pf.forwards.get_mut(&forward_id)
+                {
+                    fwd.channels.remove(&channel_id);
                 }
             }
             Some(Ok(Frame::PortForwardStop { forward_id })) => {
@@ -974,12 +974,12 @@ impl ServerRelay<'_> {
             Some(OpenEvent::Url { url, mut stream }) => {
                 use tokio::io::AsyncWriteExt;
                 if *self.open_forward_enabled {
-                    if let Some(port) = extract_redirect_port(&url) {
-                        if port_in_use(port) {
-                            debug!(port, "setting up reverse tunnel for OAuth callback");
-                            self.tunnel.port = Some(port);
-                            let _ = framed.send(Frame::TunnelListen { port }).await;
-                        }
+                    if let Some(port) = extract_redirect_port(&url)
+                        && port_in_use(port)
+                    {
+                        debug!(port, "setting up reverse tunnel for OAuth callback");
+                        self.tunnel.port = Some(port);
+                        let _ = framed.send(Frame::TunnelListen { port }).await;
                     }
                     let _ = framed.send(Frame::OpenUrl { url }).await;
                     let _ = stream.write_all(&[0x01]).await;
@@ -1457,10 +1457,10 @@ pub async fn run(
                                 info!("client connected via channel");
                                 negotiated_caps.store(caps, std::sync::atomic::Ordering::Relaxed);
                                 framed = f;
-                                if let Some(meta) = metadata_slot.get() {
-                                    if let Ok(mut n) = meta.client_name.lock() {
-                                        *n = cn;
-                                    }
+                                if let Some(meta) = metadata_slot.get()
+                                    && let Ok(mut n) = meta.client_name.lock()
+                                {
+                                    *n = cn;
                                 }
                                 break 'drain true;
                             }
@@ -1637,10 +1637,10 @@ pub async fn run(
                                     let _ = old.send(None);
                                 }
                                 // Update client_name from the new Attach
-                                if let Some(meta) = relay.metadata_slot.get() {
-                                    if let Ok(mut n) = meta.client_name.lock() {
-                                        *n = cn;
-                                    }
+                                if let Some(meta) = relay.metadata_slot.get()
+                                    && let Ok(mut n) = meta.client_name.lock()
+                                {
+                                    *n = cn;
                                 }
                                 // Inform the new client about the takeover
                                 let was_attached = relay.metadata_slot.get()

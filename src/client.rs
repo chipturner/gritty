@@ -337,10 +337,9 @@ fn clipboard_get() -> Option<Vec<u8>> {
             .stdout(Stdio::piped())
             .stderr(Stdio::null())
             .output()
+            && output.status.success()
         {
-            if output.status.success() {
-                return Some(output.stdout);
-            }
+            return Some(output.stdout);
         }
     }
     debug!("no clipboard program available");
@@ -819,10 +818,10 @@ impl ClientRelay<'_> {
             }
             // Port forward: teardown from server
             Some(Ok(Frame::PortForwardStop { forward_id })) => {
-                if let Some(fwd) = self.pf.forwards.remove(&forward_id) {
-                    if let Some(h) = fwd.listener_handle {
-                        h.abort();
-                    }
+                if let Some(fwd) = self.pf.forwards.remove(&forward_id)
+                    && let Some(h) = fwd.listener_handle
+                {
+                    h.abort();
                 }
                 // Remove channels belonging to this forward
                 self.pf.channels.retain(|_, (fid, _)| *fid != forward_id);
