@@ -594,19 +594,17 @@ async fn kill_session_while_client_connected() {
     let resp = control_request(&ctl_path, Frame::KillSession { session: id.clone() }).await;
     assert_eq!(resp, Frame::Ok);
 
-    // Client should see the stream end
-    let result = timeout(Duration::from_secs(3), framed.next()).await;
-    match result {
-        Ok(None) | Ok(Some(Err(_))) | Err(_) => {}
-        Ok(Some(Ok(Frame::Data(_)))) => {
-            let end = timeout(Duration::from_secs(2), framed.next()).await;
-            assert!(
-                matches!(end, Ok(None) | Ok(Some(Err(_))) | Err(_)),
-                "client should eventually see stream end after kill"
-            );
-        }
-        Ok(Some(Ok(other))) => {
-            panic!("unexpected frame after session kill: {other:?}");
+    // Client should see the stream end (drain any in-flight data/exit frames)
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    loop {
+        match timeout(Duration::from_secs(1), framed.next()).await {
+            Ok(None) | Ok(Some(Err(_))) => break,
+            Ok(Some(Ok(Frame::Data(_) | Frame::Exit { .. }))) => continue,
+            Err(_) if tokio::time::Instant::now() >= deadline => {
+                panic!("stream did not end within 5s after kill")
+            }
+            Err(_) => continue,
+            Ok(Some(Ok(other))) => panic!("unexpected frame after session kill: {other:?}"),
         }
     }
 }
