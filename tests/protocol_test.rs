@@ -1020,6 +1020,34 @@ fn roundtrip_port_forward_stop() {
 }
 
 #[test]
+fn roundtrip_port_forward_request() {
+    let mut codec = FrameCodec;
+    let mut buf = BytesMut::new();
+    let original = Frame::PortForwardRequest {
+        forward_id: 42,
+        direction: 1,
+        listen_port: 8080,
+        target_port: 3000,
+    };
+    codec.encode(original.clone(), &mut buf).unwrap();
+    assert_eq!(buf.len(), 14); // type(1) + len(4) + forward_id(4) + direction(1) + listen_port(2) + target_port(2)
+    assert_eq!(buf[0], 0x46);
+    let decoded = codec.decode(&mut buf).unwrap().unwrap();
+    assert_eq!(original, decoded);
+}
+
+#[test]
+fn port_forward_request_wrong_payload_size() {
+    let mut codec = FrameCodec;
+    let mut buf = BytesMut::new();
+    buf.put_u8(0x46); // TYPE_PORT_FORWARD_REQUEST
+    buf.put_u32(4); // wrong: should be 9
+    buf.put_slice(&[0x00; 4]);
+    let err = codec.decode(&mut buf).unwrap_err();
+    assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
+}
+
+#[test]
 fn port_forward_listen_wrong_payload_size() {
     let mut codec = FrameCodec;
     let mut buf = BytesMut::new();

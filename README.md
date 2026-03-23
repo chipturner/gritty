@@ -46,7 +46,7 @@ Make sure you can `ssh devbox` first (to accept the host key / enter your passwo
 gritty connect devbox:work
 ```
 
-That's it. gritty auto-starts the SSH tunnel and remote server. Agent forwarding and URL/OAuth forwarding are on by default. If the session already exists, `connect` reattaches to it.
+That's it. gritty auto-starts the SSH tunnel and remote server. URL/OAuth forwarding is on by default; agent forwarding is opt-in via `-A`. If the session already exists, `connect` reattaches to it.
 
 Transfer files through the session (run one side locally, one remotely):
 
@@ -75,9 +75,9 @@ Local-only sessions (`gritty connect local:scratch`) are available for testing b
 
 - **Self-healing connections** -- heartbeat detection, automatic tunnel respawn, transparent reconnect
 - **Persistent sessions** -- shells survive disconnect, network failure, laptop sleep; `connect` reattaches or creates; multiple named sessions
-- **SSH agent forwarding** -- `git push`, `ssh`, and other agent-dependent commands work remotely using your local keys (on by default); survives reconnects without stale sockets
+- **SSH agent forwarding** -- `git push`, `ssh`, and other agent-dependent commands work remotely using your local keys (opt-in via `-A`); survives reconnects without stale sockets
 - **URL open forwarding** -- `$BROWSER` requests forwarded to your local machine, with automatic OAuth callback tunneling (on by default)
-- **Port forwarding** -- `gritty lf 8080` to quick-check a remote web server locally, `gritty rf 5432` to let the session reach local postgres
+- **Port forwarding** -- `gritty lf remote:work 8080` to quick-check a remote web server locally, `gritty rf remote:work 5432` to let the session reach local postgres; client-initiated only (a compromised server cannot open forwards)
 - **File transfer** -- `gritty send` / `gritty receive` through the session connection, preserving permissions; `-r` for recursive directory transfer; pipe mode with `-` for composing with `tar` etc.
 - **Clipboard forwarding** -- `gritty copy` / `gritty paste` forward clipboard between remote session and local machine (uses `pbcopy`/`pbpaste` on macOS, `wl-copy`/`wl-paste` or `xclip`/`xsel` on Linux)
 - **Single binary, no network protocol** -- Unix domain sockets locally, SSH handles encryption and auth; optional TOML config for per-host defaults
@@ -96,8 +96,8 @@ Local-only sessions (`gritty connect local:scratch`) are available for testing b
 | `gritty tunnel-create <destination>` | | Set up SSH tunnel to remote host |
 | `gritty tunnel-destroy <name>` | | Tear down an SSH tunnel |
 | `gritty bootstrap <destination>` | | Install gritty on a remote host |
-| `gritty local-forward <port>` | `lf` | Forward a TCP port from session to client |
-| `gritty remote-forward <port>` | `rf` | Forward a TCP port from client to session |
+| `gritty local-forward <target> <port>` | `lf` | Forward a TCP port from session to client |
+| `gritty remote-forward <target> <port>` | `rf` | Forward a TCP port from client to session |
 | `gritty send [files...]` | | Send files to a paired receiver |
 | `gritty receive [dir]` | | Receive files from a paired sender |
 | `gritty open <url>` | | Open a URL on the local machine (for use inside gritty sessions) |
@@ -117,7 +117,7 @@ The `<host>` in `host:session` is a **connection name**, not an SSH destination.
 - `--ctl-socket <path>`: override the server socket path
 
 **Session options** (`connect`):
-- `-A` / `--forward-agent`: forward your local SSH agent (on by default; disable with `--no-forward-agent`)
+- `-A` / `--forward-agent`: forward your local SSH agent (off by default)
 - `-O` / `--forward-open`: forward URL opens to local machine (on by default; disable with `--no-forward-open`)
 - `-c <cmd>` / `--command`: run a command instead of a login shell (when creating)
 - `-d` / `--detach`: create session without attaching (background jobs)
@@ -156,7 +156,7 @@ gritty receive - | tar xzf -
 
 **Environment inside sessions:** `GRITTY_SOCK` (svc socket for `gritty open`/`send`/`receive`/port forwarding), `GRITTY_SESSION` (session ID), and `GRITTY_SESSION_NAME` (if named) are set in the shell environment. Useful for prompt customization or scripts that need to know which session they're in.
 
-**Port forwarding:** port spec is `PORT` (same on both ends) or `LISTEN_PORT:TARGET_PORT`. Runs inside a session (`GRITTY_SOCK` required). Ctrl-C stops the forward. All forwarding binds to `127.0.0.1` only -- there is no bind-address option (unlike SSH's `-L`/`-R`). These are transient, on-demand forwards -- great for quick checks during development. For always-on port forwarding, configure it on the SSH tunnel instead: `gritty tunnel-create devbox -o "LocalForward=8080 localhost:8080"` or add it to `ssh-options` in your config file.
+**Port forwarding:** `gritty lf <target> <port>` and `gritty rf <target> <port>` where `<target>` is a `host:session` specifier (e.g. `devbox:work`). Port spec is `PORT` (same on both ends) or `LISTEN_PORT:TARGET_PORT`. Port forwards are client-initiated -- they communicate with the client process through a local forward socket, and the client sends `PortForwardRequest` frames to the server. A compromised server cannot initiate port forwards. Ctrl-C stops the forward. All forwarding binds to `127.0.0.1` only -- there is no bind-address option (unlike SSH's `-L`/`-R`). These are transient, on-demand forwards -- great for quick checks during development. For always-on port forwarding, configure it on the SSH tunnel instead: `gritty tunnel-create devbox -o "LocalForward=8080 localhost:8080"` or add it to `ssh-options` in your config file.
 
 ## Comparison
 
@@ -190,7 +190,7 @@ gritty works out of the box with no config file. Optionally, set persistent defa
 ```toml
 # Global defaults for all sessions/connections.
 [defaults]
-# forward-agent = true
+# forward-agent = false
 # forward-open = true
 # no-escape = false
 # no-redraw = false
@@ -272,6 +272,19 @@ All communication -- control and session relay -- flows through a single server 
 Locally, the socket is `0600`, the directory is `0700`, and every `accept()` verifies the peer UID. The attack surface is small because there's very little to attack.
 
 See [ARCHITECTURE.md](ARCHITECTURE.md) for diagrams and detailed protocol description.
+
+## Security Model
+
+gritty is designed so that a compromised remote server cannot leverage the session connection to attack your local machine. The client gates all sensitive operations:
+
+- **Port forwarding is client-initiated only.** The `lf`/`rf` commands talk to the client process through a local forward socket and the client sends `PortForwardRequest` frames to the server. The server cannot initiate port forwards on its own.
+- **URL opening is opt-in and rate limited.** `OpenUrl` frames are only processed when `--forward-open` is enabled on the client. Rate limited to 2 opens per 30 seconds.
+- **Clipboard is push-only.** The server can push to the client clipboard (`ClipboardSet`, rate limited to 5 per 30s), but cannot read it -- `ClipboardGet` always returns empty.
+- **Agent forwarding is opt-in.** SSH agent forwarding defaults to off; enable with `-A` or `forward-agent = true` in config. `AgentOpen` is rate limited to 10 per 30 seconds.
+- **Tunnel creation is rate limited.** `TunnelListen` frames are rate limited to 2 per 30 seconds.
+- **Audit logging.** All security-sensitive operations (forwarding requests, clipboard access, agent connections) are logged at info/warn level on both client and server.
+
+**Recommendations for untrusted hosts:** use `--no-forward-open` and avoid `-A` to minimize the trust surface. Port forwarding is always safe since it requires explicit client-side action.
 
 ## Status
 

@@ -6,7 +6,7 @@
 
 # Global defaults for all sessions and tunnels.
 [defaults]
-# forward-agent = true
+# forward-agent = false
 # forward-open = true
 # no-escape = false
 # no-redraw = false

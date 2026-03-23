@@ -20,8 +20,8 @@ Persistent TTY sessions over Unix domain sockets. Single binary, tmux-like CLI. 
 | `tunnel-create <destination>` | | SSH tunnel to remote host |
 | `tunnel-destroy <name>` | | Tear down SSH tunnel |
 | `bootstrap <destination>` | | Install gritty on a remote host |
-| `local-forward <port>` | `lf` | Forward TCP port: session to client |
-| `remote-forward <port>` | `rf` | Forward TCP port: client to session |
+| `local-forward <target> <port>` | `lf` | Forward TCP port: session to client |
+| `remote-forward <target> <port>` | `rf` | Forward TCP port: client to session |
 | `send [files...]` | | Send files to a paired receiver (`-r` for directories) |
 | `receive [dir]` | | Receive files from a paired sender |
 | `copy` | | Copy stdin to the client clipboard |
@@ -74,14 +74,14 @@ Eight modules behind a lib crate (`src/lib.rs` hosts `collect_env_vars()`, `spaw
 - **`config`** -- TOML config (`$XDG_CONFIG_HOME/gritty/config.toml`). `[defaults]` + `[host.<name>]`. Precedence: CLI > host > defaults > built-in.
 - **`protocol`** -- `Frame` enum, `Encoder`/`Decoder`, wire `[type: u8][length: u32 BE][payload]`. `PROTOCOL_VERSION: u16`. `SessionEntry` for list metadata. `SvcRequest` enum for svc socket dispatch.
 - **`daemon`** -- Accept loop on `ctl.sock`. Handshake, control frame, route. `HashMap<u32, SessionState>`. Hands off `Framed<UnixStream>` to session tasks via `mpsc`.
-- **`server`** -- Per-session: PTY, client relay, ring buffer, forwarding (agent/URL/tunnel/port), file transfer, tail broadcast. Per-session sockets: `agent-{id}.sock` + `svc-{id}.sock`.
+- **`server`** -- Per-session: PTY, client relay, ring buffer, forwarding (agent/URL/tunnel/port), file transfer, tail broadcast. Per-session sockets: `agent-{id}.sock` + `svc-{id}.sock`. Client-side forward socket: `fwd-{host}-{session}.sock` (created by the client, used by `gritty lf`/`gritty rf` to request port forwards).
 - **`connect`** (module, implements `tunnel-create` CLI) -- Self-backgrounding SSH tunnel. Monitor respawns on transient failure (backoff 1s to 60s, resets after 30s healthy). Per-tunnel files: `.sock`, `.pid`, `.lock`, `.dest`, `.log`, `.out`. `ConnectGuard` Drop cleans up.
 - **`table`** -- `print_table()` for tabular output.
 - **`client`** -- Raw mode, escape processor, heartbeat (5s ping / 15s timeout), auto-reconnect, forwarding relay. `tail()` is read-only variant.
 
 ### Wire format
 
-Handshake: `0x01` Hello, `0x02` HelloAck. Relay: `0x10` Data, `0x11` Resize, `0x12` Exit, `0x13` Detached, `0x14` Ping, `0x15` Pong, `0x16` Env. Agent: `0x20` AgentForward, `0x21` AgentOpen, `0x22` AgentData, `0x23` AgentClose. URL/clipboard: `0x28` OpenForward, `0x29` OpenUrl, `0x2A` ClipboardSet, `0x2B` ClipboardGet, `0x2C` ClipboardData. Tunnel: `0x30` TunnelListen, `0x31` TunnelOpen, `0x32` TunnelData, `0x33` TunnelClose. Transfer: `0x38` SendOffer, `0x39` SendDone, `0x3A` SendCancel, `0x3B` SendFile. Port forward: `0x40` PFListen, `0x41` PFReady, `0x42` PFOpen, `0x43` PFData, `0x44` PFClose, `0x45` PFStop. Control: `0x50` NewSession, `0x51` Attach, `0x52` ListSessions, `0x53` KillSession, `0x54` KillServer, `0x55` Tail, `0x56` RenameSession. Responses: `0x60` SessionCreated, `0x61` SessionInfo, `0x62` Ok, `0x63` Error. Reserved: `0x80-0xFF`.
+Handshake: `0x01` Hello, `0x02` HelloAck. Relay: `0x10` Data, `0x11` Resize, `0x12` Exit, `0x13` Detached, `0x14` Ping, `0x15` Pong, `0x16` Env. Agent: `0x20` AgentForward, `0x21` AgentOpen, `0x22` AgentData, `0x23` AgentClose. URL/clipboard: `0x28` OpenForward, `0x29` OpenUrl, `0x2A` ClipboardSet, `0x2B` ClipboardGet, `0x2C` ClipboardData. Tunnel: `0x30` TunnelListen, `0x31` TunnelOpen, `0x32` TunnelData, `0x33` TunnelClose. Transfer: `0x38` SendOffer, `0x39` SendDone, `0x3A` SendCancel, `0x3B` SendFile. Port forward: `0x40` PFListen, `0x41` PFReady, `0x42` PFOpen, `0x43` PFData, `0x44` PFClose, `0x45` PFStop, `0x46` PortForwardRequest. Control: `0x50` NewSession, `0x51` Attach, `0x52` ListSessions, `0x53` KillSession, `0x54` KillServer, `0x55` Tail, `0x56` RenameSession. Responses: `0x60` SessionCreated, `0x61` SessionInfo, `0x62` Ok, `0x63` Error. Reserved: `0x80-0xFF`.
 
 `Hello`/`HelloAck`: `[version: u16][capabilities: u32]`. Capabilities bitfield, negotiated = client & server (bitwise AND). Defined bits: `CAP_CLIPBOARD (0x01)` -- gates clipboard frame forwarding and svc socket clipboard requests.
 
@@ -95,7 +95,9 @@ Handshake: `0x01` Hello, `0x02` HelloAck. Relay: `0x10` Data, `0x11` Resize, `0x
 
 `SessionInfo`: `[count: u32][per entry: [entry_len: u32][id: u32][name: u16-len + bytes][pty_path: u16-len + bytes][shell_pid: u32][created_at: u64][attached: u8][last_heartbeat: u64][foreground_cmd: u16-len + bytes][cwd: u16-len + bytes][client_name: u16-len + bytes]]`. Decoder skips unknown trailing bytes within each entry_len.
 
-`SvcRequest`: `OpenUrl=1`, `Send=2`, `Receive=3`, `PortForward=4`, `Clipboard=5` (1-byte discriminator). Clipboard sub-protocol: `[0x01][data]` = copy, `[0x02]` = paste (server responds with clipboard content).
+`SvcRequest`: `OpenUrl=1`, `Send=2`, `Receive=3`, `Clipboard=5` (1-byte discriminator). Clipboard sub-protocol: `[0x01][data]` = copy, `[0x02]` = paste (server responds with clipboard content).
+
+`PortForwardRequest`: `[forward_id: u32][direction: u8][listen_port: u16][target_port: u16]`. Client sends to server. Direction `0` = local-forward (server listens), `1` = remote-forward (client listens).
 
 File transfer manifest (svc socket, not Frame protocol): sender writes `[file_count: u32][per file: [name_len: u16][name: bytes][size: u64][mode: u32]]`. Server relays per-file headers `[name_len: u16][name: bytes][size: u64][mode: u32]` to receiver, then `size` bytes of data. Sentinel `[name_len: 0x0000]` ends transfer. `-` (stdin) spools to a temp file for size discovery.
 
@@ -117,7 +119,9 @@ File transfer manifest (svc socket, not Frame protocol): sender writes `[file_co
 - **URL/OAuth**: Client calls `opener::open()`. OAuth tunnel: multi-channel reverse TCP with idle timeout (default 5s, configurable). Disable with `--no-oauth-redirect`.
 - **BROWSER setup**: Server creates a `gritty-open` symlink (pointing to `current_exe()`) in the socket dir unconditionally at shell spawn and sets `BROWSER` to that path. The binary detects `argv[0] == "gritty-open"` and dispatches directly to the open logic, so `$BROWSER` is a single path with no spaces.
 - **Capability negotiation**: `Hello` and `HelloAck` carry a `capabilities: u32` bitfield. Negotiated capabilities = client & server (bitwise AND). `CAP_CLIPBOARD (0x01)` gates clipboard frame forwarding. Capabilities propagate from daemon `connection_handshake()` through `ClientConn::Active` to the session server, refreshed on each reconnect/takeover. Clipboard paste has a 5-second timeout -- if the client doesn't reply with `ClipboardData`, the pending paste is resolved with `None`.
+- **Client-initiated port forwarding**: Port forwards are requested by the client via `PortForwardRequest` frames through the session connection, not through the svc socket. The `lf`/`rf` commands communicate with the client process through a client-side forward socket (`{socket_dir}/fwd-{host}-{session}.sock`). A compromised server cannot initiate port forwards.
 - **Port forwarding is loopback-only**: All `TcpListener::bind` and `TcpStream::connect` in forwarding use `127.0.0.1`. No bind-address specification (unlike SSH `-L`/`-R`).
+- **Client-side security gates**: URL opening gated by `forward_open` on the client (rate limited 2/30s). Clipboard is push-only -- server can push `ClipboardSet` (rate limited 5/30s) but `ClipboardGet` returns empty. Agent forwarding defaults to off (opt-in via `-A`). `TunnelListen` rate limited 2/30s, `AgentOpen` rate limited 10/30s. Audit logging at info/warn level for all security-sensitive operations.
 
 ## Development Notes
 
@@ -129,7 +133,7 @@ File transfer manifest (svc socket, not Frame protocol): sender writes `[file_co
 - **Fork before tokio** -- `daemonize()` MUST fork before creating the tokio runtime. `main()` is sync (no `#[tokio::main]`).
 
 ### Changing protocol/signatures
-- **`PROTOCOL_VERSION`** -- bump whenever frame types, encoding, or `SessionEntry` fields change. Version mismatch is a hard gate: daemon rejects clients, `tunnel-create` aborts tunnel setup. Currently v9.
+- **`PROTOCOL_VERSION`** -- bump whenever frame types, encoding, or `SessionEntry` fields change. Version mismatch is a hard gate: daemon rejects clients, `tunnel-create` aborts tunnel setup. Currently v10.
 - **`expect_min_len`** -- all fixed-field decoders use `expect_min_len` (not exact length checks), so trailing bytes are tolerated for forward extensibility.
 - **`Frame` enum** -- update: encoder, decoder, protocol tests, all `match frame` in server.rs, client.rs, daemon.rs, main.rs.
 - **`SessionInfo`** -- entry count `u32`. Changing `SessionEntry` fields requires updating both encoder and decoder in protocol.rs.

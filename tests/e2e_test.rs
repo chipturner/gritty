@@ -1874,62 +1874,46 @@ fn find_free_port() -> u16 {
     std::net::TcpListener::bind("127.0.0.1:0").unwrap().local_addr().unwrap().port()
 }
 
-/// Helper: connect to svc socket and send a PortForward request.
-/// Returns the svc stream (kept open to keep the forward alive).
-async fn request_port_forward(
-    svc_path: &std::path::Path,
+/// Helper: send a PortForwardRequest frame and wait for PortForwardReady.
+/// Returns the forward_id on success, panics on PortForwardStop.
+async fn send_port_forward_request(
+    framed: &mut Framed<UnixStream, FrameCodec>,
+    forward_id: u32,
     direction: u8,
     listen_port: u16,
     target_port: u16,
-) -> UnixStream {
-    let mut stream = UnixStream::connect(svc_path).await.unwrap();
-    // Discriminator
-    stream.write_all(&[gritty::protocol::SvcRequest::PortForward.to_byte()]).await.unwrap();
-    // Header: [direction: u8][listen_port: u16 BE][target_port: u16 BE]
-    let mut hdr = [0u8; 5];
-    hdr[0] = direction;
-    hdr[1..3].copy_from_slice(&listen_port.to_be_bytes());
-    hdr[3..5].copy_from_slice(&target_port.to_be_bytes());
-    stream.write_all(&hdr).await.unwrap();
-    stream
-}
-
-/// Helper: read svc response byte. Returns Ok(()) for success, Err(msg) for failure.
-async fn read_svc_response(stream: &mut UnixStream) -> Result<(), String> {
-    let mut resp = [0u8; 1];
-    stream.read_exact(&mut resp).await.unwrap();
-    match resp[0] {
-        0x01 => Ok(()),
-        0x02 => {
-            let mut buf = vec![0u8; 256];
-            let n = stream.read(&mut buf).await.unwrap_or(0);
-            Err(String::from_utf8_lossy(&buf[..n]).to_string())
+) {
+    framed
+        .send(Frame::PortForwardRequest { forward_id, direction, listen_port, target_port })
+        .await
+        .unwrap();
+    loop {
+        match timeout(Duration::from_secs(3), framed.next()).await {
+            Ok(Some(Ok(Frame::PortForwardReady { forward_id: fid }))) => {
+                assert_eq!(fid, forward_id);
+                return;
+            }
+            Ok(Some(Ok(Frame::PortForwardStop { forward_id: fid }))) => {
+                panic!("port forward request {fid} rejected by server");
+            }
+            Ok(Some(Ok(Frame::Data(_)))) => continue,
+            other => panic!("expected PortForwardReady, got: {other:?}"),
         }
-        other => Err(format!("unexpected response: 0x{other:02x}")),
     }
 }
 
 #[tokio::test]
 async fn local_forward_data_roundtrip() {
-    let (_tx, mut framed, server, _meta, svc_path) = setup_session_with_svc_path().await;
+    let (_tx, mut framed, server, _meta, _svc_path) = setup_session_with_svc_path().await;
     wait_for_shell(&mut framed).await;
     read_available_data(&mut framed, Duration::from_secs(1)).await;
 
-    // Wait for svc socket to be bound
-    for _ in 0..50 {
-        if svc_path.exists() {
-            break;
-        }
-        tokio::time::sleep(Duration::from_millis(100)).await;
-    }
-
     let listen_port = find_free_port();
     let target_port = listen_port;
+    let forward_id = 100;
 
     // Request local-forward (direction=0): server binds TCP on listen_port
-    let mut svc_stream = request_port_forward(&svc_path, 0, listen_port, target_port).await;
-    let resp = read_svc_response(&mut svc_stream).await;
-    assert!(resp.is_ok(), "local-forward bind failed: {resp:?}");
+    send_port_forward_request(&mut framed, forward_id, 0, listen_port, target_port).await;
 
     // Connect to the forwarded port (server side TCP listener)
     let mut tcp_stream = tokio::net::TcpStream::connect(("127.0.0.1", listen_port)).await.unwrap();
@@ -1944,9 +1928,9 @@ async fn local_forward_data_roundtrip() {
             other => panic!("expected PortForwardOpen, got: {other:?}"),
         }
     };
+    assert_eq!(open_fwd_id, forward_id);
     assert_eq!(open_target, target_port);
 
-    // Simulate client connecting to target and relaying data back:
     // Send data from client -> server via PortForwardData
     let payload = b"hello from client";
     framed
@@ -1989,18 +1973,8 @@ async fn local_forward_data_roundtrip() {
         }
     }
 
-    // Drop svc stream -> forward teardown -> PortForwardStop
-    drop(svc_stream);
-    loop {
-        match timeout(Duration::from_secs(3), framed.next()).await {
-            Ok(Some(Ok(Frame::PortForwardStop { forward_id }))) => {
-                assert_eq!(forward_id, open_fwd_id);
-                break;
-            }
-            Ok(Some(Ok(Frame::Data(_)))) => continue,
-            other => panic!("expected PortForwardStop, got: {other:?}"),
-        }
-    }
+    // Send PortForwardStop to tear down the forward
+    framed.send(Frame::PortForwardStop { forward_id }).await.unwrap();
 
     let _ = framed.send(Frame::Data(Bytes::from("exit\n"))).await;
     let _ = timeout(Duration::from_secs(3), server).await;
@@ -2008,16 +1982,9 @@ async fn local_forward_data_roundtrip() {
 
 #[tokio::test]
 async fn remote_forward_data_roundtrip() {
-    let (_tx, mut framed, server, _meta, svc_path) = setup_session_with_svc_path().await;
+    let (_tx, mut framed, server, _meta, _svc_path) = setup_session_with_svc_path().await;
     wait_for_shell(&mut framed).await;
     read_available_data(&mut framed, Duration::from_secs(1)).await;
-
-    for _ in 0..50 {
-        if svc_path.exists() {
-            break;
-        }
-        tokio::time::sleep(Duration::from_millis(100)).await;
-    }
 
     // Bind echo server first to eliminate TOCTOU
     let echo_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -2038,37 +2005,14 @@ async fn remote_forward_data_roundtrip() {
         }
     });
 
-    // Request remote-forward (direction=1): client should bind listen_port
-    let mut svc_stream = request_port_forward(&svc_path, 1, listen_port, target_port).await;
+    let forward_id = 200;
 
-    // Server sends PortForwardListen to client
-    let (fwd_id, l_port, t_port) = loop {
-        match timeout(Duration::from_secs(3), framed.next()).await {
-            Ok(Some(Ok(Frame::PortForwardListen {
-                forward_id,
-                listen_port: lp,
-                target_port: tp,
-            }))) => break (forward_id, lp, tp),
-            Ok(Some(Ok(Frame::Data(_)))) => continue,
-            other => panic!("expected PortForwardListen, got: {other:?}"),
-        }
-    };
-    assert_eq!(l_port, listen_port);
-    assert_eq!(t_port, target_port);
-
-    // Client sends PortForwardReady
-    framed.send(Frame::PortForwardReady { forward_id: fwd_id }).await.unwrap();
-
-    // Svc should get success response
-    let resp = read_svc_response(&mut svc_stream).await;
-    assert!(resp.is_ok(), "remote-forward ready failed: {resp:?}");
+    // Request remote-forward (direction=1): server registers forward_id
+    send_port_forward_request(&mut framed, forward_id, 1, listen_port, target_port).await;
 
     // Simulate client accepting a TCP connection: send PortForwardOpen
     let channel_id = 42u32;
-    framed
-        .send(Frame::PortForwardOpen { forward_id: fwd_id, channel_id, target_port })
-        .await
-        .unwrap();
+    framed.send(Frame::PortForwardOpen { forward_id, channel_id, target_port }).await.unwrap();
 
     // Server should connect to target_port and start relaying.
     // Send data client -> server -> echo server -> server -> client
@@ -2097,18 +2041,8 @@ async fn remote_forward_data_roundtrip() {
     framed.send(Frame::PortForwardClose { channel_id }).await.unwrap();
     tokio::time::sleep(Duration::from_millis(100)).await;
 
-    // Drop svc stream -> PortForwardStop
-    drop(svc_stream);
-    loop {
-        match timeout(Duration::from_secs(3), framed.next()).await {
-            Ok(Some(Ok(Frame::PortForwardStop { forward_id }))) => {
-                assert_eq!(forward_id, fwd_id);
-                break;
-            }
-            Ok(Some(Ok(Frame::Data(_) | Frame::PortForwardClose { .. }))) => continue,
-            other => panic!("expected PortForwardStop, got: {other:?}"),
-        }
-    }
+    // Tear down the forward
+    framed.send(Frame::PortForwardStop { forward_id }).await.unwrap();
 
     echo_handle.abort();
     let _ = framed.send(Frame::Data(Bytes::from("exit\n"))).await;
@@ -2116,39 +2050,22 @@ async fn remote_forward_data_roundtrip() {
 }
 
 #[tokio::test]
-async fn port_forward_svc_drop_teardown() {
-    let (_tx, mut framed, server, _meta, svc_path) = setup_session_with_svc_path().await;
+async fn port_forward_stop_teardown() {
+    let (_tx, mut framed, server, _meta, _svc_path) = setup_session_with_svc_path().await;
     wait_for_shell(&mut framed).await;
     read_available_data(&mut framed, Duration::from_secs(1)).await;
 
-    for _ in 0..50 {
-        if svc_path.exists() {
-            break;
-        }
-        tokio::time::sleep(Duration::from_millis(100)).await;
-    }
-
     let listen_port = find_free_port();
+    let forward_id = 300;
 
     // Request local-forward
-    let mut svc_stream = request_port_forward(&svc_path, 0, listen_port, listen_port).await;
-    let resp = read_svc_response(&mut svc_stream).await;
-    assert!(resp.is_ok(), "local-forward bind failed: {resp:?}");
+    send_port_forward_request(&mut framed, forward_id, 0, listen_port, listen_port).await;
 
-    // Drop svc stream immediately (simulates Ctrl-C)
-    drop(svc_stream);
-
-    // Should receive PortForwardStop
-    loop {
-        match timeout(Duration::from_secs(3), framed.next()).await {
-            Ok(Some(Ok(Frame::PortForwardStop { .. }))) => break,
-            Ok(Some(Ok(Frame::Data(_)))) => continue,
-            other => panic!("expected PortForwardStop, got: {other:?}"),
-        }
-    }
+    // Send PortForwardStop immediately (simulates teardown)
+    framed.send(Frame::PortForwardStop { forward_id }).await.unwrap();
 
     // Port should be released -- verify we can bind it again
-    tokio::time::sleep(Duration::from_millis(100)).await;
+    tokio::time::sleep(Duration::from_millis(200)).await;
     let rebound = tokio::net::TcpListener::bind(("127.0.0.1", listen_port)).await;
     assert!(rebound.is_ok(), "port {listen_port} not released after teardown");
 
@@ -2158,23 +2075,15 @@ async fn port_forward_svc_drop_teardown() {
 
 #[tokio::test]
 async fn port_forward_client_disconnect_cleanup() {
-    let (client_tx, mut framed, server, _meta, svc_path) = setup_session_with_svc_path().await;
+    let (client_tx, mut framed, server, _meta, _svc_path) = setup_session_with_svc_path().await;
     wait_for_shell(&mut framed).await;
     read_available_data(&mut framed, Duration::from_secs(1)).await;
 
-    for _ in 0..50 {
-        if svc_path.exists() {
-            break;
-        }
-        tokio::time::sleep(Duration::from_millis(100)).await;
-    }
-
     let listen_port = find_free_port();
+    let forward_id = 400;
 
     // Request local-forward
-    let mut svc_stream = request_port_forward(&svc_path, 0, listen_port, listen_port).await;
-    let resp = read_svc_response(&mut svc_stream).await;
-    assert!(resp.is_ok(), "local-forward bind failed: {resp:?}");
+    send_port_forward_request(&mut framed, forward_id, 0, listen_port, listen_port).await;
 
     // Connect a TCP client to verify the forward is active
     let tcp_conn = tokio::net::TcpStream::connect(("127.0.0.1", listen_port)).await.unwrap();
@@ -2209,14 +2118,10 @@ async fn port_forward_client_disconnect_cleanup() {
     framed2.send(Frame::Resize { cols: 80, rows: 24 }).await.unwrap();
     tokio::time::sleep(Duration::from_millis(200)).await;
 
-    // The old forward's svc stream is still alive, so the forward persists.
-    // Drop it to clean up.
-    drop(svc_stream);
-    tokio::time::sleep(Duration::from_millis(200)).await;
-
-    // Port should be released after cleanup
+    // Port forward is torn down on client disconnect (pf.teardown())
+    // Port should be released
     let rebound = tokio::net::TcpListener::bind(("127.0.0.1", listen_port)).await;
-    assert!(rebound.is_ok(), "port {listen_port} not released after client disconnect + svc drop");
+    assert!(rebound.is_ok(), "port {listen_port} not released after client disconnect");
 
     let _ = framed2.send(Frame::Data(Bytes::from("exit\n"))).await;
     let _ = timeout(Duration::from_secs(3), server).await;
@@ -2224,23 +2129,15 @@ async fn port_forward_client_disconnect_cleanup() {
 
 #[tokio::test]
 async fn local_forward_multiple_concurrent_connections() {
-    let (_tx, mut framed, server, _meta, svc_path) = setup_session_with_svc_path().await;
+    let (_tx, mut framed, server, _meta, _svc_path) = setup_session_with_svc_path().await;
     wait_for_shell(&mut framed).await;
     read_available_data(&mut framed, Duration::from_secs(1)).await;
 
-    for _ in 0..50 {
-        if svc_path.exists() {
-            break;
-        }
-        tokio::time::sleep(Duration::from_millis(100)).await;
-    }
-
     let listen_port = find_free_port();
+    let forward_id = 500;
 
     // Request local-forward
-    let mut svc_stream = request_port_forward(&svc_path, 0, listen_port, listen_port).await;
-    let resp = read_svc_response(&mut svc_stream).await;
-    assert!(resp.is_ok(), "local-forward bind failed: {resp:?}");
+    send_port_forward_request(&mut framed, forward_id, 0, listen_port, listen_port).await;
 
     // Open 3 concurrent TCP connections
     let mut tcp1 = tokio::net::TcpStream::connect(("127.0.0.1", listen_port)).await.unwrap();
@@ -2320,14 +2217,7 @@ async fn local_forward_multiple_concurrent_connections() {
         }
     }
 
-    drop(svc_stream);
-    loop {
-        match timeout(Duration::from_secs(3), framed.next()).await {
-            Ok(Some(Ok(Frame::PortForwardStop { .. }))) => break,
-            Ok(Some(Ok(Frame::Data(_)))) => continue,
-            other => panic!("expected PortForwardStop, got: {other:?}"),
-        }
-    }
+    framed.send(Frame::PortForwardStop { forward_id }).await.unwrap();
 
     let _ = framed.send(Frame::Data(Bytes::from("exit\n"))).await;
     let _ = timeout(Duration::from_secs(3), server).await;
@@ -2335,27 +2225,19 @@ async fn local_forward_multiple_concurrent_connections() {
 
 #[tokio::test]
 async fn local_forward_different_listen_and_target_ports() {
-    let (_tx, mut framed, server, _meta, svc_path) = setup_session_with_svc_path().await;
+    let (_tx, mut framed, server, _meta, _svc_path) = setup_session_with_svc_path().await;
     wait_for_shell(&mut framed).await;
     read_available_data(&mut framed, Duration::from_secs(1)).await;
-
-    for _ in 0..50 {
-        if svc_path.exists() {
-            break;
-        }
-        tokio::time::sleep(Duration::from_millis(100)).await;
-    }
 
     let listen_port = find_free_port();
     let mut target_port = find_free_port();
     if target_port == listen_port {
         target_port = find_free_port();
     }
+    let forward_id = 600;
 
     // Request local-forward with different listen and target ports
-    let mut svc_stream = request_port_forward(&svc_path, 0, listen_port, target_port).await;
-    let resp = read_svc_response(&mut svc_stream).await;
-    assert!(resp.is_ok(), "local-forward bind failed: {resp:?}");
+    send_port_forward_request(&mut framed, forward_id, 0, listen_port, target_port).await;
 
     // Connect to the listen port
     let _tcp = tokio::net::TcpStream::connect(("127.0.0.1", listen_port)).await.unwrap();
@@ -2374,14 +2256,7 @@ async fn local_forward_different_listen_and_target_ports() {
     );
     assert_ne!(open_target, listen_port);
 
-    drop(svc_stream);
-    loop {
-        match timeout(Duration::from_secs(3), framed.next()).await {
-            Ok(Some(Ok(Frame::PortForwardStop { .. }))) => break,
-            Ok(Some(Ok(_))) => continue,
-            other => panic!("expected PortForwardStop, got: {other:?}"),
-        }
-    }
+    framed.send(Frame::PortForwardStop { forward_id }).await.unwrap();
 
     let _ = framed.send(Frame::Data(Bytes::from("exit\n"))).await;
     let _ = timeout(Duration::from_secs(3), server).await;

@@ -49,6 +49,7 @@ const TYPE_PORT_FORWARD_OPEN: u8 = 0x42;
 const TYPE_PORT_FORWARD_DATA: u8 = 0x43;
 const TYPE_PORT_FORWARD_CLOSE: u8 = 0x44;
 const TYPE_PORT_FORWARD_STOP: u8 = 0x45;
+const TYPE_PORT_FORWARD_REQUEST: u8 = 0x46;
 
 // Control requests
 const TYPE_NEW_SESSION: u8 = 0x50;
@@ -69,7 +70,7 @@ const HEADER_LEN: usize = 5; // type(1) + length(4)
 const MAX_FRAME_SIZE: usize = 1 << 20; // 1 MB
 
 /// Protocol version for handshake negotiation.
-pub const PROTOCOL_VERSION: u16 = 9;
+pub const PROTOCOL_VERSION: u16 = 10;
 
 /// Capability bit: client/server supports clipboard forwarding.
 pub const CAP_CLIPBOARD: u32 = 0x01;
@@ -122,7 +123,6 @@ pub enum SvcRequest {
     OpenUrl = 1,
     Send = 2,
     Receive = 3,
-    PortForward = 4,
     Clipboard = 5,
 }
 
@@ -132,7 +132,6 @@ impl SvcRequest {
             1 => Some(Self::OpenUrl),
             2 => Some(Self::Send),
             3 => Some(Self::Receive),
-            4 => Some(Self::PortForward),
             5 => Some(Self::Clipboard),
             _ => None,
         }
@@ -265,6 +264,14 @@ pub enum Frame {
     /// Tear down an entire port forward (server → client).
     PortForwardStop {
         forward_id: u32,
+    },
+    /// Client requests a port forward (client → server).
+    /// Direction 0 = local-forward (server listens), 1 = remote-forward (client listens).
+    PortForwardRequest {
+        forward_id: u32,
+        direction: u8,
+        listen_port: u16,
+        target_port: u16,
     },
     /// Protocol version handshake (client → server, first frame on connection).
     Hello {
@@ -761,6 +768,16 @@ impl Decoder for FrameCodec {
                 expect_min_len(&payload, 4, "port forward stop")?;
                 Ok(Some(Frame::PortForwardStop { forward_id: PayloadReader::new(&payload).u32() }))
             }
+            TYPE_PORT_FORWARD_REQUEST => {
+                expect_min_len(&payload, 9, "port forward request")?;
+                let p = &payload[..];
+                Ok(Some(Frame::PortForwardRequest {
+                    forward_id: read_u32(p, 0),
+                    direction: p[4],
+                    listen_port: read_u16(p, 5),
+                    target_port: read_u16(p, 7),
+                }))
+            }
             TYPE_SESSION_CREATED => {
                 expect_min_len(&payload, 4, "session created")?;
                 Ok(Some(Frame::SessionCreated { id: PayloadReader::new(&payload).u32() }))
@@ -996,6 +1013,10 @@ impl Encoder<Frame> for FrameCodec {
             }
             Frame::PortForwardStop { forward_id } => {
                 encode_fields!(dst, TYPE_PORT_FORWARD_STOP, forward_id => put_u32);
+            }
+            Frame::PortForwardRequest { forward_id, direction, listen_port, target_port } => {
+                encode_fields!(dst, TYPE_PORT_FORWARD_REQUEST,
+                    forward_id => put_u32, direction => put_u8, listen_port => put_u16, target_port => put_u16);
             }
             Frame::SessionCreated { id } => {
                 encode_fields!(dst, TYPE_SESSION_CREATED, id => put_u32);

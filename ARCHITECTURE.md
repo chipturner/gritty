@@ -75,7 +75,7 @@ flowchart LR
         svc_sock["svc-N.sock<br/>(GRITTY_SOCK)"]
         S["gritty session"]
         agent_sock <-->|"agent fwd"| S
-        svc_sock -->|"open / send / receive / lf / rf"| S
+        svc_sock -->|"open / send / receive"| S
     end
 
     S <-->|"relayed over<br/>session connection"| C
@@ -91,11 +91,13 @@ flowchart LR
 
 Forwarding multiplexes over the existing session connection -- no extra tunnels.
 
-**SSH agent forwarding** (on by default; disable with `--no-forward-agent`): the session creates `agent-N.sock` and sets `SSH_AUTH_SOCK`. When a remote process (e.g. `git push`) connects, the request is relayed to the client's local SSH agent and back.
+**SSH agent forwarding** (off by default; enable with `-A`): the session creates `agent-N.sock` and sets `SSH_AUTH_SOCK`. When a remote process (e.g. `git push`) connects, the request is relayed to the client's local SSH agent and back. Rate limited to 10 agent opens per 30 seconds.
 
-**URL open forwarding** (on by default; disable with `--no-forward-open`): the session creates a `gritty-open` symlink in the socket dir (pointing to the gritty binary) and sets `BROWSER` to that path. The binary detects `argv[0] == "gritty-open"` and dispatches to the open logic, so `$BROWSER` is a single path with no spaces. When invoked, the URL is relayed to the client which opens it locally. **OAuth callback tunneling:** if the URL contains a `redirect_uri` pointing to `localhost` or `127.0.0.1`, gritty automatically creates a multi-channel reverse TCP tunnel (with idle timeout) so the OAuth callback reaches the remote program -- this binds a TCP port on your local machine for the duration of the callback. This handles the common case where a CLI tool opens a browser for OAuth login and waits for the redirect on a local port. Disable with `--no-oauth-redirect`; adjust the accept timeout with `--oauth-timeout <seconds>` (default: 180). Note that URL open forwarding is a trust grant -- it gives processes inside the remote session the ability to open URLs and bind TCP ports on your local machine. Only use it with sessions you control.
+**URL open forwarding** (on by default; disable with `--no-forward-open`): the session creates a `gritty-open` symlink in the socket dir (pointing to the gritty binary) and sets `BROWSER` to that path. The binary detects `argv[0] == "gritty-open"` and dispatches to the open logic, so `$BROWSER` is a single path with no spaces. When invoked, the URL is relayed to the client which opens it locally. `OpenUrl` frames are only processed when `forward_open` is enabled on the client, and are rate limited to 2 per 30 seconds. **OAuth callback tunneling:** if the URL contains a `redirect_uri` pointing to `localhost` or `127.0.0.1`, gritty automatically creates a multi-channel reverse TCP tunnel (with idle timeout) so the OAuth callback reaches the remote program -- this binds a TCP port on your local machine for the duration of the callback. This handles the common case where a CLI tool opens a browser for OAuth login and waits for the redirect on a local port. Disable with `--no-oauth-redirect`; adjust the accept timeout with `--oauth-timeout <seconds>` (default: 180). Note that URL open forwarding is a trust grant -- it gives processes inside the remote session the ability to open URLs and bind TCP ports on your local machine. Only use it with sessions you control.
 
-**Clipboard forwarding** (requires `CAP_CLIPBOARD` negotiation): `gritty copy` and `gritty paste` inside a session relay clipboard data through the svc socket and session connection to the client. The client interacts with the local system clipboard. Paste has a 5-second timeout -- if the client doesn't respond, the paste returns empty.
+**Port forwarding** is client-initiated only. The `lf`/`rf` commands communicate with the client process through a local forward socket (`fwd-{host}-{session}.sock`), and the client sends `PortForwardRequest` frames to the server. A compromised server cannot initiate port forwards. All forwarding binds to `127.0.0.1` only.
+
+**Clipboard forwarding** (requires `CAP_CLIPBOARD` negotiation): `gritty copy` and `gritty paste` inside a session relay clipboard data through the svc socket and session connection to the client. The client interacts with the local system clipboard. Clipboard is push-only -- the server can push `ClipboardSet` to the client (rate limited to 5 per 30s), but `ClipboardGet` always returns empty. This prevents a compromised server from reading the client clipboard.
 
 ## Single-Socket Protocol
 
@@ -113,3 +115,7 @@ See `CLAUDE.md` for the full protocol reference.
 - **Frame size limits** -- decoder rejects payloads > 1 MB
 - **Resize clamping** -- values clamped to 1..=10000
 - **Symlink rejection** -- `/tmp` fallback directories validated for ownership
+- **Client-initiated port forwarding** -- port forwards requested via client-side forward socket and `PortForwardRequest` frames; server cannot initiate forwards
+- **Client-side gates** -- URL opening (`--forward-open`), agent forwarding (`-A`), and clipboard read are all gated on the client
+- **Rate limiting** -- `OpenUrl` (2/30s), `ClipboardSet` (5/30s), `TunnelListen` (2/30s), `AgentOpen` (10/30s)
+- **Audit logging** -- info/warn level logging for all security-sensitive operations on client and server

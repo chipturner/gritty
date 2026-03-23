@@ -238,12 +238,16 @@ enum Command {
     /// Forward a port from the session to the client (listen on session, connect on client)
     #[command(display_order = 30, visible_alias = "lf")]
     LocalForward {
+        /// Target session (host[:session])
+        target: String,
         /// Port spec: PORT or LISTEN_PORT:TARGET_PORT
         port: String,
     },
     /// Forward a port from the client to the session (listen on client, connect on session)
     #[command(display_order = 31, visible_alias = "rf")]
     RemoteForward {
+        /// Target session (host[:session])
+        target: String,
         /// Port spec: PORT or LISTEN_PORT:TARGET_PORT
         port: String,
     },
@@ -834,13 +838,13 @@ async fn run(cli: Cli, config: gritty::config::ConfigFile) -> anyhow::Result<()>
             clipboard_paste();
             Ok(())
         }
-        Command::LocalForward { port } => {
+        Command::LocalForward { target, port } => {
             let (listen_port, target_port) = parse_port_spec(&port)?;
-            port_forward_command(0, listen_port, target_port).await
+            port_forward_client_command(&target, 0, listen_port, target_port).await
         }
-        Command::RemoteForward { port } => {
+        Command::RemoteForward { target, port } => {
             let (listen_port, target_port) = parse_port_spec(&port)?;
-            port_forward_command(1, listen_port, target_port).await
+            port_forward_client_command(&target, 1, listen_port, target_port).await
         }
         Command::Bootstrap { destination, install_dir, ssh_options } => {
             gritty::connect::bootstrap(&destination, &ssh_options, &install_dir).await

@@ -6,7 +6,7 @@ use std::collections::HashMap;
 use std::io::{self, Read, Write};
 use std::ops::ControlFlow;
 use std::os::fd::{AsFd, AsRawFd, BorrowedFd};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::time::Duration;
@@ -16,6 +16,23 @@ use tokio::signal::unix::{SignalKind, signal};
 use tokio::sync::mpsc;
 use tokio::time::Instant;
 
+/// Compute the path for the forward socket used by `gritty lf`/`gritty rf`.
+pub fn forward_socket_path(ctl_path: &Path, session: &str) -> PathBuf {
+    let dir = ctl_path.parent().unwrap_or(Path::new("."));
+    let host = ctl_path
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .map(|s| {
+            if s == "ctl" {
+                "local".to_string()
+            } else {
+                s.strip_prefix("connect-").unwrap_or(s).to_string()
+            }
+        })
+        .unwrap_or_else(|| "unknown".to_string());
+    dir.join(format!("fwd-{host}-{session}.sock"))
+}
+
 /// Outcome from a client relay loop iteration.
 enum RelayExit {
     /// Shell or server reported an exit code (or detach/signal).
@@ -24,7 +41,36 @@ enum RelayExit {
     Disconnected,
 }
 use tokio_util::codec::Framed;
-use tracing::{debug, info};
+use tracing::{debug, info, warn};
+
+// --- Rate limiter ---
+
+use std::collections::VecDeque;
+
+struct RateLimiter {
+    timestamps: VecDeque<Instant>,
+    max_count: usize,
+    window: Duration,
+}
+
+impl RateLimiter {
+    fn new(max_count: usize, window: Duration) -> Self {
+        Self { timestamps: VecDeque::new(), max_count, window }
+    }
+
+    /// Returns true if the action is allowed, false if rate limited.
+    fn check(&mut self) -> bool {
+        let now = Instant::now();
+        while self.timestamps.front().is_some_and(|t| now - *t > self.window) {
+            self.timestamps.pop_front();
+        }
+        if self.timestamps.len() >= self.max_count {
+            return false;
+        }
+        self.timestamps.push_back(now);
+        true
+    }
+}
 
 // --- Escape sequence processing (SSH-style ~. detach, ~^Z suspend, ~? help) ---
 
@@ -318,34 +364,6 @@ fn clipboard_set(data: &[u8]) {
     debug!("no clipboard program available");
 }
 
-/// Read data from the system clipboard.
-fn clipboard_get() -> Option<Vec<u8>> {
-    use std::process::{Command, Stdio};
-    let programs: &[&[&str]] = if cfg!(target_os = "macos") {
-        &[&["pbpaste"]]
-    } else {
-        &[
-            &["wl-paste", "--no-newline"],
-            &["xclip", "-selection", "clipboard", "-o"],
-            &["xsel", "--clipboard", "--output"],
-        ]
-    };
-    for prog in programs {
-        if let Ok(output) = Command::new(prog[0])
-            .args(&prog[1..])
-            .stdin(Stdio::null())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::null())
-            .output()
-            && output.status.success()
-        {
-            return Some(output.stdout);
-        }
-    }
-    debug!("no clipboard program available");
-    None
-}
-
 /// Send a frame with a timeout. Returns false if the send failed or timed out.
 async fn timed_send(framed: &mut Framed<UnixStream, FrameCodec>, frame: Frame) -> bool {
     match tokio::time::timeout(SEND_TIMEOUT, framed.send(frame)).await {
@@ -379,9 +397,23 @@ enum ClientTunnelEvent {
 
 /// Events from port forward TCP acceptors/connections on the client side.
 enum ClientPortForwardEvent {
-    Accepted { forward_id: u32, channel_id: u32, writer_tx: mpsc::Sender<Bytes> },
-    Data { channel_id: u32, data: Bytes },
-    Closed { channel_id: u32 },
+    /// Client accepted a TCP connection on a client-initiated remote-forward listener.
+    Accepted {
+        forward_id: u32,
+        channel_id: u32,
+        writer_tx: mpsc::Sender<Bytes>,
+    },
+    Data {
+        channel_id: u32,
+        data: Bytes,
+    },
+    Closed {
+        channel_id: u32,
+    },
+    /// The controlling `gritty lf`/`gritty rf` process disconnected -- tear down the forward.
+    ForwardStopped {
+        forward_id: u32,
+    },
 }
 
 /// Per-forward state on the client side.
@@ -495,13 +527,19 @@ struct ClientRelay<'a> {
     tunnel_event_tx: &'a mpsc::UnboundedSender<ClientTunnelEvent>,
     oauth_redirect: bool,
     oauth_timeout: u64,
+    forward_open: bool,
     pf: &'a mut ClientPortForwardTable,
     pf_event_tx: &'a mpsc::UnboundedSender<ClientPortForwardEvent>,
+    client_initiated_forwards: &'a mut std::collections::HashSet<u32>,
     last_pong: &'a mut Instant,
     last_ping_sent: &'a mut Instant,
     last_rtt: &'a mut Option<Duration>,
     connected_at: Instant,
     bytes_relayed: &'a mut u64,
+    url_limiter: &'a mut RateLimiter,
+    clipboard_set_limiter: &'a mut RateLimiter,
+    tunnel_listen_limiter: &'a mut RateLimiter,
+    agent_open_limiter: &'a mut RateLimiter,
 }
 
 impl ClientRelay<'_> {
@@ -534,7 +572,9 @@ impl ClientRelay<'_> {
                 return Ok(ControlFlow::Break(RelayExit::Exit(0)));
             }
             Some(Ok(Frame::AgentOpen { channel_id })) => {
-                if let Some(sock_path) = self.agent_socket {
+                if let Some(sock_path) =
+                    self.agent_socket.filter(|_| self.agent_open_limiter.check())
+                {
                     match tokio::net::UnixStream::connect(sock_path).await {
                         Ok(stream) => {
                             let (read_half, write_half) = stream.into_split();
@@ -571,8 +611,12 @@ impl ClientRelay<'_> {
                 self.agent.channels.remove(&channel_id);
             }
             Some(Ok(Frame::OpenUrl { url })) => {
-                if url.starts_with("http://") || url.starts_with("https://") {
-                    debug!("opening URL locally: {url}");
+                if !self.forward_open {
+                    debug!("rejected OpenUrl: forward_open disabled");
+                } else if !self.url_limiter.check() {
+                    warn!(url, "rate limited OpenUrl");
+                } else if url.starts_with("http://") || url.starts_with("https://") {
+                    info!(url, "opening URL from remote");
                     tokio::task::spawn_blocking(move || {
                         let _ = opener::open(&url);
                     });
@@ -581,20 +625,25 @@ impl ClientRelay<'_> {
                 }
             }
             Some(Ok(Frame::ClipboardSet { data })) => {
-                debug!(len = data.len(), "clipboard set from remote");
-                tokio::task::spawn_blocking(move || {
-                    clipboard_set(&data);
-                });
+                if self.clipboard_set_limiter.check() {
+                    info!(len = data.len(), "clipboard set from remote");
+                    tokio::task::spawn_blocking(move || {
+                        clipboard_set(&data);
+                    });
+                } else {
+                    warn!("rate limited ClipboardSet");
+                }
             }
             Some(Ok(Frame::ClipboardGet)) => {
-                debug!("clipboard get requested by remote");
-                let data = tokio::task::spawn_blocking(clipboard_get).await.ok().flatten();
-                let data = data.unwrap_or_default();
-                let _ = timed_send(framed, Frame::ClipboardData { data: Bytes::from(data) }).await;
+                warn!("rejected clipboard read from remote");
+                let _ = timed_send(framed, Frame::ClipboardData { data: Bytes::new() }).await;
             }
             Some(Ok(Frame::TunnelListen { port })) => {
                 if !self.oauth_redirect {
                     debug!(port, "tunnel: oauth-redirect disabled, declining");
+                    let _ = timed_send(framed, Frame::TunnelClose { channel_id: 0 }).await;
+                } else if !self.tunnel_listen_limiter.check() {
+                    warn!(port, "rate limited TunnelListen");
                     let _ = timed_send(framed, Frame::TunnelClose { channel_id: 0 }).await;
                 } else {
                     // Bind synchronously to guarantee port is ready before OpenUrl
@@ -713,96 +762,43 @@ impl ClientRelay<'_> {
             Some(Ok(Frame::TunnelClose { channel_id })) => {
                 self.tunnel.channels.remove(&channel_id);
             }
-            // Port forward: server asks client to bind a port (remote-fwd)
-            Some(Ok(Frame::PortForwardListen { forward_id, listen_port, target_port })) => {
-                match std::net::TcpListener::bind(("127.0.0.1", listen_port)) {
-                    Ok(std_listener) => {
-                        debug!(forward_id, listen_port, "port forward: bound local port");
-                        std_listener.set_nonblocking(true).ok();
-                        let listener = tokio::net::TcpListener::from_std(std_listener).unwrap();
-                        let tx = self.pf_event_tx.clone();
-                        let nid = self.pf.next_channel_id.clone();
-                        let handle = tokio::spawn(async move {
-                            loop {
-                                let (stream, _) = match listener.accept().await {
-                                    Ok(conn) => conn,
-                                    Err(_) => break,
-                                };
-                                let channel_id =
-                                    nid.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                                let (read_half, write_half) = stream.into_split();
-                                let data_tx = tx.clone();
-                                let close_tx = tx.clone();
-                                let writer_tx = crate::spawn_channel_relay(
-                                    channel_id,
-                                    read_half,
-                                    write_half,
-                                    move |id, data| {
-                                        data_tx
-                                            .send(ClientPortForwardEvent::Data {
-                                                channel_id: id,
-                                                data,
-                                            })
-                                            .is_ok()
-                                    },
-                                    move |id| {
-                                        let _ = close_tx.send(ClientPortForwardEvent::Closed {
-                                            channel_id: id,
-                                        });
-                                    },
-                                );
-                                if tx
-                                    .send(ClientPortForwardEvent::Accepted {
-                                        forward_id,
-                                        channel_id,
-                                        writer_tx,
-                                    })
-                                    .is_err()
-                                {
-                                    break;
-                                }
-                            }
-                        });
-                        self.pf.forwards.insert(
-                            forward_id,
-                            ClientPortForwardState { listener_handle: Some(handle), target_port },
-                        );
-                        if !timed_send(framed, Frame::PortForwardReady { forward_id }).await {
-                            return Ok(ControlFlow::Break(RelayExit::Disconnected));
-                        }
-                    }
-                    Err(e) => {
-                        debug!(forward_id, listen_port, "port forward: bind failed: {e}");
-                        let _ = timed_send(framed, Frame::PortForwardStop { forward_id }).await;
-                    }
-                }
+            // Port forward: server asks client to bind a port -- rejected (client-initiated only)
+            Some(Ok(Frame::PortForwardListen { forward_id, listen_port, .. })) => {
+                warn!(forward_id, listen_port, "rejected server-initiated port bind");
+                let _ = timed_send(framed, Frame::PortForwardStop { forward_id }).await;
             }
-            // Port forward: new TCP connection from server side
+            // Port forward: new TCP connection from server side (only accept client-initiated)
             Some(Ok(Frame::PortForwardOpen { forward_id, channel_id, target_port })) => {
-                match tokio::net::TcpStream::connect(("127.0.0.1", target_port)).await {
-                    Ok(stream) => {
-                        let (read_half, write_half) = stream.into_split();
-                        let data_tx = self.pf_event_tx.clone();
-                        let close_tx = self.pf_event_tx.clone();
-                        let writer_tx = crate::spawn_channel_relay(
-                            channel_id,
-                            read_half,
-                            write_half,
-                            move |id, data| {
-                                data_tx
-                                    .send(ClientPortForwardEvent::Data { channel_id: id, data })
-                                    .is_ok()
-                            },
-                            move |id| {
-                                let _ = close_tx
-                                    .send(ClientPortForwardEvent::Closed { channel_id: id });
-                            },
-                        );
-                        self.pf.channels.insert(channel_id, (forward_id, writer_tx));
-                    }
-                    Err(e) => {
-                        debug!(channel_id, target_port, "pf connect failed: {e}");
-                        let _ = timed_send(framed, Frame::PortForwardClose { channel_id }).await;
+                if !self.client_initiated_forwards.contains(&forward_id) {
+                    warn!(forward_id, target_port, "rejected unsolicited port forward open");
+                    let _ = timed_send(framed, Frame::PortForwardClose { channel_id }).await;
+                } else {
+                    match tokio::net::TcpStream::connect(("127.0.0.1", target_port)).await {
+                        Ok(stream) => {
+                            let (read_half, write_half) = stream.into_split();
+                            let data_tx = self.pf_event_tx.clone();
+                            let close_tx = self.pf_event_tx.clone();
+                            let writer_tx = crate::spawn_channel_relay(
+                                channel_id,
+                                read_half,
+                                write_half,
+                                move |id, data| {
+                                    data_tx
+                                        .send(ClientPortForwardEvent::Data { channel_id: id, data })
+                                        .is_ok()
+                                },
+                                move |id| {
+                                    let _ = close_tx
+                                        .send(ClientPortForwardEvent::Closed { channel_id: id });
+                                },
+                            );
+                            self.pf.channels.insert(channel_id, (forward_id, writer_tx));
+                        }
+                        Err(e) => {
+                            debug!(channel_id, target_port, "pf connect failed: {e}");
+                            let _ =
+                                timed_send(framed, Frame::PortForwardClose { channel_id }).await;
+                        }
                     }
                 }
             }
@@ -926,9 +922,126 @@ impl ClientRelay<'_> {
                     return false;
                 }
             }
+            Some(ClientPortForwardEvent::ForwardStopped { forward_id }) => {
+                if let Some(fwd) = self.pf.forwards.remove(&forward_id)
+                    && let Some(h) = fwd.listener_handle
+                {
+                    h.abort();
+                }
+                self.pf.channels.retain(|_, (fid, _)| *fid != forward_id);
+                self.client_initiated_forwards.remove(&forward_id);
+                if !timed_send(framed, Frame::PortForwardStop { forward_id }).await {
+                    return false;
+                }
+            }
             None => {}
         }
         true
+    }
+
+    async fn handle_fwd_request(
+        &mut self,
+        framed: &mut Framed<UnixStream, FrameCodec>,
+        mut fwd_stream: tokio::net::UnixStream,
+    ) {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let mut header = [0u8; 5];
+        if fwd_stream.read_exact(&mut header).await.is_err() {
+            return;
+        }
+        let direction = header[0];
+        let listen_port = u16::from_be_bytes([header[1], header[2]]);
+        let target_port = u16::from_be_bytes([header[3], header[4]]);
+
+        let forward_id = self.pf.next_channel_id.fetch_add(1, Ordering::Relaxed);
+
+        if direction == 1 {
+            // Remote-forward: client binds locally
+            match std::net::TcpListener::bind(("127.0.0.1", listen_port)) {
+                Ok(std_listener) => {
+                    std_listener.set_nonblocking(true).ok();
+                    let listener = tokio::net::TcpListener::from_std(std_listener).unwrap();
+                    let tx = self.pf_event_tx.clone();
+                    let nid = self.pf.next_channel_id.clone();
+                    let fwd_id = forward_id;
+                    let handle = tokio::spawn(async move {
+                        loop {
+                            let (stream, _) = match listener.accept().await {
+                                Ok(conn) => conn,
+                                Err(_) => break,
+                            };
+                            let channel_id = nid.fetch_add(1, Ordering::Relaxed);
+                            let (read_half, write_half) = stream.into_split();
+                            let data_tx = tx.clone();
+                            let close_tx = tx.clone();
+                            let writer_tx = crate::spawn_channel_relay(
+                                channel_id,
+                                read_half,
+                                write_half,
+                                move |id, data| {
+                                    data_tx
+                                        .send(ClientPortForwardEvent::Data { channel_id: id, data })
+                                        .is_ok()
+                                },
+                                move |id| {
+                                    let _ = close_tx
+                                        .send(ClientPortForwardEvent::Closed { channel_id: id });
+                                },
+                            );
+                            if tx
+                                .send(ClientPortForwardEvent::Accepted {
+                                    forward_id: fwd_id,
+                                    channel_id,
+                                    writer_tx,
+                                })
+                                .is_err()
+                            {
+                                break;
+                            }
+                        }
+                    });
+                    self.pf.forwards.insert(
+                        forward_id,
+                        ClientPortForwardState { listener_handle: Some(handle), target_port },
+                    );
+                    info!(
+                        forward_id,
+                        listen_port, target_port, "remote-forward: listening locally"
+                    );
+                }
+                Err(e) => {
+                    warn!(listen_port, "remote-forward: bind failed: {e}");
+                    let _ = fwd_stream.write_all(&[0x02]).await;
+                    let _ = fwd_stream.write_all(format!("bind failed: {e}").as_bytes()).await;
+                    return;
+                }
+            }
+        }
+
+        // Send PortForwardRequest to server
+        self.client_initiated_forwards.insert(forward_id);
+        if !timed_send(
+            framed,
+            Frame::PortForwardRequest { forward_id, direction, listen_port, target_port },
+        )
+        .await
+        {
+            let _ = fwd_stream.write_all(&[0x02]).await;
+            let _ = fwd_stream.write_all(b"server connection lost").await;
+            return;
+        }
+
+        info!(forward_id, direction, listen_port, target_port, "port forward established");
+        let _ = fwd_stream.write_all(&[0x01]).await;
+
+        // Keepalive: when the controlling process disconnects, tear down the forward.
+        let pf_tx = self.pf_event_tx.clone();
+        tokio::spawn(async move {
+            let mut buf = [0u8; 1];
+            let _ = fwd_stream.read(&mut buf).await;
+            let _ = pf_tx.send(ClientPortForwardEvent::ForwardStopped { forward_id });
+        });
     }
 }
 
@@ -946,9 +1059,11 @@ async fn relay(
     agent_socket: Option<&str>,
     oauth_redirect: bool,
     oauth_timeout: u64,
+    forward_open: bool,
     session: &str,
     hb_interval: Duration,
     hb_timeout: Duration,
+    fwd_listener: &Option<tokio::net::UnixListener>,
 ) -> anyhow::Result<RelayExit> {
     let mut sigterm = signal(SignalKind::terminate())?;
     let mut sighup = signal(SignalKind::hangup())?;
@@ -972,6 +1087,12 @@ async fn relay(
     let mut pf = ClientPortForwardTable::new();
 
     let mut bytes_relayed = 0u64;
+    let mut client_initiated_forwards = std::collections::HashSet::new();
+    let rate_window = Duration::from_secs(30);
+    let mut url_limiter = RateLimiter::new(2, rate_window);
+    let mut clipboard_set_limiter = RateLimiter::new(5, rate_window);
+    let mut tunnel_listen_limiter = RateLimiter::new(2, rate_window);
+    let mut agent_open_limiter = RateLimiter::new(10, rate_window);
     let mut relay = ClientRelay {
         async_stdout,
         agent: &mut agent,
@@ -981,13 +1102,19 @@ async fn relay(
         tunnel_event_tx: &tunnel_event_tx,
         oauth_redirect,
         oauth_timeout,
+        forward_open,
         pf: &mut pf,
         pf_event_tx: &pf_event_tx,
+        client_initiated_forwards: &mut client_initiated_forwards,
         last_pong: &mut last_pong,
         last_ping_sent: &mut last_ping_sent,
         last_rtt: &mut last_rtt,
         connected_at: Instant::now(),
         bytes_relayed: &mut bytes_relayed,
+        url_limiter: &mut url_limiter,
+        clipboard_set_limiter: &mut clipboard_set_limiter,
+        tunnel_listen_limiter: &mut tunnel_listen_limiter,
+        agent_open_limiter: &mut agent_open_limiter,
     };
 
     loop {
@@ -1134,6 +1261,18 @@ async fn relay(
                 }
             }
 
+            result = async {
+                match fwd_listener.as_ref() {
+                    Some(listener) => listener.accept().await,
+                    None => std::future::pending().await,
+                }
+            } => {
+                if let Ok((stream, _)) = result
+                    && crate::security::verify_peer_uid(&stream).is_ok() {
+                        relay.handle_fwd_request(framed, stream).await;
+                    }
+            }
+
             _ = sigwinch.recv() => {
                 let (cols, rows) = get_terminal_size();
                 debug!(cols, rows, "SIGWINCH → resize");
@@ -1203,6 +1342,23 @@ pub async fn run(
     let mut escape = if no_escape { None } else { Some(EscapeProcessor::new()) };
     let agent_socket = if forward_agent { std::env::var("SSH_AUTH_SOCK").ok() } else { None };
 
+    // Forward socket: lets `gritty lf`/`gritty rf` request port forwards from this client.
+    let fwd_path = forward_socket_path(ctl_path, session);
+    let fwd_listener = match crate::security::bind_unix_listener(&fwd_path) {
+        Ok(listener) => Some(listener),
+        Err(e) => {
+            debug!("forward socket bind failed (non-fatal): {e}");
+            None
+        }
+    };
+    struct FwdCleanup(PathBuf);
+    impl Drop for FwdCleanup {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_file(&self.0);
+        }
+    }
+    let _fwd_cleanup = FwdCleanup(fwd_path);
+
     loop {
         let result = if send_init_frames(
             &mut framed,
@@ -1226,9 +1382,11 @@ pub async fn run(
                 agent_socket.as_deref(),
                 oauth_redirect,
                 oauth_timeout,
+                forward_open,
                 session,
                 Duration::from_secs(heartbeat_interval),
                 Duration::from_secs(heartbeat_timeout),
+                &fwd_listener,
             )
             .await?
         } else {

@@ -29,7 +29,7 @@ fn default_client_name() -> String {
 impl Default for SessionSettings {
     fn default() -> Self {
         Self {
-            forward_agent: true,
+            forward_agent: false,
             forward_open: true,
             no_escape: false,
             no_redraw: false,
@@ -143,7 +143,7 @@ impl ConfigFile {
         let h = host.and_then(|name| self.host.get(name));
 
         SessionSettings {
-            forward_agent: h.and_then(|h| h.forward_agent).or(d.forward_agent).unwrap_or(true),
+            forward_agent: h.and_then(|h| h.forward_agent).or(d.forward_agent).unwrap_or(false),
             forward_open: h.and_then(|h| h.forward_open).or(d.forward_open).unwrap_or(true),
             no_escape: pick(h.and_then(|h| h.no_escape), d.no_escape),
             no_redraw: pick(h.and_then(|h| h.no_redraw), d.no_redraw),

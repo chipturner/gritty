@@ -108,8 +108,6 @@ enum TunnelEvent {
 
 /// Events from port forward TCP acceptors and connections to the main relay loop.
 enum PortForwardEvent {
-    /// Svc socket requested a port forward.
-    Requested { stream: UnixStream, direction: u8, listen_port: u16, target_port: u16 },
     /// TCP connection accepted on a listening port.
     Accepted { forward_id: u32, channel_id: u32, writer_tx: mpsc::Sender<Bytes> },
     /// Background TCP connect completed (remote-fwd PortForwardOpen).
@@ -122,8 +120,6 @@ enum PortForwardEvent {
     Closed { channel_id: u32 },
     /// Svc socket dropped -- teardown forward.
     Stopped { forward_id: u32 },
-    /// Remote-forward: client didn't respond with PortForwardReady in time.
-    RemoteTimeout { forward_id: u32 },
 }
 
 /// Per-forward state tracked by the server.
@@ -192,7 +188,6 @@ struct PortForwardTable {
     forwards: HashMap<u32, PortForwardState>,
     channels: HashMap<u32, (u32, mpsc::Sender<Bytes>)>,
     pending_remote: HashMap<u32, UnixStream>,
-    next_forward_id: u32,
     next_channel_id: Arc<AtomicU32>,
 }
 
@@ -202,7 +197,6 @@ impl PortForwardTable {
             forwards: HashMap::new(),
             channels: HashMap::new(),
             pending_remote: HashMap::new(),
-            next_forward_id: 0,
             next_channel_id: Arc::new(AtomicU32::new(0)),
         }
     }
@@ -455,7 +449,6 @@ fn spawn_svc_acceptor(
     listener: UnixListener,
     open_event_tx: mpsc::UnboundedSender<OpenEvent>,
     send_event_tx: mpsc::UnboundedSender<SendEvent>,
-    pf_event_tx: mpsc::UnboundedSender<PortForwardEvent>,
     clipboard_event_tx: mpsc::UnboundedSender<ClipboardEvent>,
     negotiated_caps: Arc<std::sync::atomic::AtomicU32>,
 ) -> tokio::task::JoinHandle<()> {
@@ -485,7 +478,6 @@ fn spawn_svc_acceptor(
 
             let otx = open_event_tx.clone();
             let stx = send_event_tx.clone();
-            let ptx = pf_event_tx.clone();
             let ctx = clipboard_event_tx.clone();
             let caps = Arc::clone(&negotiated_caps);
             tokio::spawn(async move {
@@ -531,22 +523,6 @@ fn spawn_svc_acceptor(
                             }
                             Err(e) => debug!("svc socket: bad receiver dest: {e}"),
                         }
-                    }
-                    Some(crate::protocol::SvcRequest::PortForward) => {
-                        // Wire: [direction: u8][listen_port: u16 BE][target_port: u16 BE]
-                        let mut hdr = [0u8; 5];
-                        if stream.read_exact(&mut hdr).await.is_err() {
-                            return;
-                        }
-                        let direction = hdr[0];
-                        let listen_port = u16::from_be_bytes([hdr[1], hdr[2]]);
-                        let target_port = u16::from_be_bytes([hdr[3], hdr[4]]);
-                        let _ = ptx.send(PortForwardEvent::Requested {
-                            stream,
-                            direction,
-                            listen_port,
-                            target_port,
-                        });
                     }
                     Some(crate::protocol::SvcRequest::Clipboard) => {
                         use tokio::io::AsyncWriteExt;
@@ -925,6 +901,57 @@ impl ServerRelay<'_> {
                     let _ = reply.send(Some(data));
                 }
             }
+            Some(Ok(Frame::PortForwardRequest {
+                forward_id,
+                direction,
+                listen_port,
+                target_port,
+            })) => {
+                info!(
+                    forward_id,
+                    direction, listen_port, target_port, "port forward request from client"
+                );
+                if direction == 0 {
+                    // Local-forward: server binds TCP, forwards to client
+                    match tokio::net::TcpListener::bind(("127.0.0.1", listen_port)).await {
+                        Ok(listener) => {
+                            debug!(forward_id, listen_port, target_port, "local-forward: bound");
+                            let handle = spawn_pf_tcp_acceptor(
+                                listener,
+                                forward_id,
+                                self.pf.next_channel_id.clone(),
+                                self.pf_event_tx.clone(),
+                            );
+                            self.pf.forwards.insert(
+                                forward_id,
+                                PortForwardState {
+                                    listener_handle: Some(handle),
+                                    channels: HashMap::new(),
+                                    stop_handle: None,
+                                    target_port,
+                                },
+                            );
+                            let _ = framed.send(Frame::PortForwardReady { forward_id }).await;
+                        }
+                        Err(e) => {
+                            warn!(forward_id, listen_port, "local-forward: bind failed: {e}");
+                            let _ = framed.send(Frame::PortForwardStop { forward_id }).await;
+                        }
+                    }
+                } else {
+                    // Remote-forward: register forward_id so PortForwardOpen from client is accepted
+                    self.pf.forwards.insert(
+                        forward_id,
+                        PortForwardState {
+                            listener_handle: None,
+                            channels: HashMap::new(),
+                            stop_handle: None,
+                            target_port,
+                        },
+                    );
+                    let _ = framed.send(Frame::PortForwardReady { forward_id }).await;
+                }
+            }
             Some(Ok(Frame::Env { vars: _ })) => {
                 // Env vars are only used at first-client shell spawn; ignored on reconnect.
             }
@@ -945,6 +972,7 @@ impl ServerRelay<'_> {
         match event {
             Some(AgentEvent::Accepted { channel_id, writer_tx }) => {
                 if self.agent.enabled {
+                    info!(channel_id, "relaying agent open");
                     self.agent.channels.insert(channel_id, writer_tx);
                     let _ = framed.send(Frame::AgentOpen { channel_id }).await;
                 }
@@ -981,6 +1009,7 @@ impl ServerRelay<'_> {
                         self.tunnel.port = Some(port);
                         let _ = framed.send(Frame::TunnelListen { port }).await;
                     }
+                    info!(url, "forwarding URL to client");
                     let _ = framed.send(Frame::OpenUrl { url }).await;
                     let _ = stream.write_all(&[0x01]).await;
                 } else {
@@ -1077,71 +1106,6 @@ impl ServerRelay<'_> {
         event: Option<PortForwardEvent>,
     ) {
         match event {
-            Some(PortForwardEvent::Requested { stream, direction, listen_port, target_port }) => {
-                use tokio::io::AsyncWriteExt;
-                let fwd_id = self.pf.next_forward_id;
-                self.pf.next_forward_id += 1;
-                if direction == 0 {
-                    // Local-forward: server binds TCP, forwards to client
-                    match tokio::net::TcpListener::bind(("127.0.0.1", listen_port)).await {
-                        Ok(listener) => {
-                            debug!(fwd_id, listen_port, target_port, "local-forward: bound");
-                            let handle = spawn_pf_tcp_acceptor(
-                                listener,
-                                fwd_id,
-                                self.pf.next_channel_id.clone(),
-                                self.pf_event_tx.clone(),
-                            );
-                            let mut s = stream;
-                            let _ = s.write_all(&[0x01]).await;
-                            let stream = s;
-                            let stop_handle =
-                                spawn_pf_svc_watcher(stream, fwd_id, self.pf_event_tx.clone());
-                            self.pf.forwards.insert(
-                                fwd_id,
-                                PortForwardState {
-                                    listener_handle: Some(handle),
-                                    channels: HashMap::new(),
-                                    stop_handle: Some(stop_handle),
-                                    target_port,
-                                },
-                            );
-                        }
-                        Err(e) => {
-                            debug!(listen_port, "local-forward: bind failed: {e}");
-                            let mut s = stream;
-                            let msg = format!("bind failed: {e}");
-                            let _ = s.write_all(&[0x02]).await;
-                            let _ = s.write_all(msg.as_bytes()).await;
-                        }
-                    }
-                } else {
-                    // Remote-forward: tell client to bind, wait for Ready
-                    let _ = framed
-                        .send(Frame::PortForwardListen {
-                            forward_id: fwd_id,
-                            listen_port,
-                            target_port,
-                        })
-                        .await;
-                    self.pf.pending_remote.insert(fwd_id, stream);
-                    let timeout_tx = self.pf_event_tx.clone();
-                    tokio::spawn(async move {
-                        tokio::time::sleep(Duration::from_secs(5)).await;
-                        let _ =
-                            timeout_tx.send(PortForwardEvent::RemoteTimeout { forward_id: fwd_id });
-                    });
-                    self.pf.forwards.insert(
-                        fwd_id,
-                        PortForwardState {
-                            listener_handle: None,
-                            channels: HashMap::new(),
-                            stop_handle: None,
-                            target_port,
-                        },
-                    );
-                }
-            }
             Some(PortForwardEvent::Accepted { forward_id, channel_id, writer_tx }) => {
                 if let Some(fwd) = self.pf.forwards.get_mut(&forward_id) {
                     fwd.channels.insert(channel_id, writer_tx.clone());
@@ -1205,16 +1169,6 @@ impl ServerRelay<'_> {
                     for ch_id in fwd.channels.keys() {
                         self.pf.channels.remove(ch_id);
                     }
-                    let _ = framed.send(Frame::PortForwardStop { forward_id }).await;
-                }
-            }
-            Some(PortForwardEvent::RemoteTimeout { forward_id }) => {
-                if let Some(mut svc_stream) = self.pf.pending_remote.remove(&forward_id) {
-                    use tokio::io::AsyncWriteExt;
-                    debug!(forward_id, "remote-forward: client did not respond in time");
-                    let _ = svc_stream.write_all(&[0x02]).await;
-                    let _ = svc_stream.write_all(b"timed out waiting for client").await;
-                    self.pf.forwards.remove(&forward_id);
                     let _ = framed.send(Frame::PortForwardStop { forward_id }).await;
                 }
             }
@@ -1315,7 +1269,6 @@ pub async fn run(
             listener,
             open_event_tx.clone(),
             send_event_tx.clone(),
-            pf_event_tx.clone(),
             clipboard_event_tx.clone(),
             Arc::clone(&negotiated_caps),
         ));
@@ -1733,9 +1686,11 @@ pub async fn run(
                             } else {
                                 match event {
                                     ClipboardEvent::Copy { data } => {
+                                        info!("clipboard operation forwarded");
                                         let _ = framed.send(Frame::ClipboardSet { data }).await;
                                     }
                                     ClipboardEvent::Paste { reply } => {
+                                        info!("clipboard operation forwarded");
                                         // Drop any previous pending paste
                                         if let Some(old) = relay.pending_paste.take() {
                                             let _ = old.send(None);

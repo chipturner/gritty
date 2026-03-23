@@ -137,30 +137,33 @@ pub(crate) fn parse_port_spec(spec: &str) -> anyhow::Result<(u16, u16)> {
     }
 }
 
-/// Run a port forward command. Connects to GRITTY_SOCK, sends the request,
-/// reads the response, prints status, and blocks until SIGINT or EOF.
-pub(crate) async fn port_forward_command(
+/// Run a port forward command via the client-side forward socket.
+/// Connects to fwd-{host}-{session}.sock, sends the request, and blocks.
+pub(crate) async fn port_forward_client_command(
+    target: &str,
     direction: u8,
     listen_port: u16,
     target_port: u16,
 ) -> anyhow::Result<()> {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
-    let sock_path = match std::env::var("GRITTY_SOCK") {
-        Ok(p) => p,
-        Err(_) => {
-            anyhow::bail!("GRITTY_SOCK not set (are you inside a gritty session?)");
-        }
-    };
+    let (host, session) = parse_target(target);
+    let session = session.unwrap_or_else(|| "default".to_string());
+    let ctl_path = resolve_ctl_path(None, Some(&host))?;
+    let fwd_path = gritty::client::forward_socket_path(&ctl_path, &session);
 
-    let mut stream = tokio::net::UnixStream::connect(&sock_path).await?;
+    let mut stream = tokio::net::UnixStream::connect(&fwd_path).await.map_err(|_| {
+        anyhow::anyhow!(
+            "no client attached to {host}:{session} (could not connect to {})",
+            fwd_path.display()
+        )
+    })?;
 
-    // Write: [discriminator][direction][listen_port BE][target_port BE]
-    let mut header = [0u8; 6];
-    header[0] = gritty::protocol::SvcRequest::PortForward.to_byte();
-    header[1] = direction;
-    header[2..4].copy_from_slice(&listen_port.to_be_bytes());
-    header[4..6].copy_from_slice(&target_port.to_be_bytes());
+    // Write: [direction][listen_port BE][target_port BE]
+    let mut header = [0u8; 5];
+    header[0] = direction;
+    header[1..3].copy_from_slice(&listen_port.to_be_bytes());
+    header[3..5].copy_from_slice(&target_port.to_be_bytes());
     stream.write_all(&header).await?;
 
     // Read response: 0x01 = success, 0x02 + message = error
@@ -184,7 +187,7 @@ pub(crate) async fn port_forward_command(
     };
     eprintln!("\x1b[32m\u{25b8} {dir_str}-forward {port_str} active\x1b[0m");
 
-    // Block until SIGINT or stream EOF
+    // Block until SIGINT or stream EOF (teardown on disconnect)
     let mut sigint = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::interrupt())?;
     let mut sigterm = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
     let mut buf = [0u8; 1];
@@ -193,7 +196,6 @@ pub(crate) async fn port_forward_command(
         _ = sigterm.recv() => {}
         _ = stream.read(&mut buf) => {}
     }
-    // Stream drop closes the connection, triggering server-side cleanup
     Ok(())
 }
 
