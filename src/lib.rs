@@ -1,3 +1,4 @@
+pub mod alt_screen;
 pub mod client;
 pub mod config;
 pub mod connect;
