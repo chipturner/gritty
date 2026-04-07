@@ -965,7 +965,10 @@ impl ServerRelay<'_> {
                 return Ok(ControlFlow::Break(RelayExit::ClientGone));
             }
             Some(Ok(_)) => {}
-            Some(Err(e)) => return Err(e.into()),
+            Some(Err(e)) => {
+                warn!(error = %e, "client stream error, treating as disconnect");
+                return Ok(ControlFlow::Break(RelayExit::ClientGone));
+            }
         }
         Ok(ControlFlow::Continue(()))
     }
@@ -1516,19 +1519,28 @@ pub async fn run(
         let is_reconnect = !first_client;
         first_client = false;
 
-        // Reconnect: replay scrollback, separator, then disconnect buffer
+        // Reconnect: replay scrollback, separator, then disconnect buffer.
+        // A send failure here (client dropped mid-flush) must re-enter drain,
+        // not kill the session.
+        let mut flush_failed = false;
         if is_reconnect && !alt_screen.in_alternate_screen() {
             // 1. Scrollback: last N lines from before disconnect
-            if !scrollback.lines().is_empty() {
-                for line in scrollback.lines() {
-                    framed.send(Frame::Data(line.clone())).await?;
+            for line in scrollback.lines() {
+                if let Err(e) = framed.send(Frame::Data(line.clone())).await {
+                    warn!(error = %e, "client send failed during scrollback replay, detaching");
+                    flush_failed = true;
+                    break;
                 }
-                scrollback.clear();
             }
-
-            // 2. Separator
-            let msg = "\r\n\x1b[2;33m[gritty: reconnected]\x1b[0m\r\n";
-            framed.send(Frame::Data(Bytes::from(msg))).await?;
+            if !flush_failed {
+                scrollback.clear();
+                // 2. Separator
+                let msg = "\r\n\x1b[2;33m[gritty: reconnected]\x1b[0m\r\n";
+                if let Err(e) = framed.send(Frame::Data(Bytes::from(msg))).await {
+                    warn!(error = %e, "client send failed during scrollback replay, detaching");
+                    flush_failed = true;
+                }
+            }
         } else if is_reconnect {
             // Alternate screen: Ctrl-L to PTY for TUI redraw
             let mut written = 0;
@@ -1546,7 +1558,7 @@ pub async fn run(
         }
 
         // 3. Flush disconnect ring buffer (output produced while disconnected)
-        if !ring_buf.is_empty() {
+        if !flush_failed && !ring_buf.is_empty() {
             debug!(
                 chunks = ring_buf.len(),
                 bytes = ring_buf_size,
@@ -1558,13 +1570,29 @@ pub async fn run(
                     "\r\n\x1b[2;33m[gritty: {} bytes of output dropped]\x1b[0m\r\n",
                     ring_buf_dropped
                 );
-                framed.send(Frame::Data(Bytes::from(msg))).await?;
-                ring_buf_dropped = 0;
+                if let Err(e) = framed.send(Frame::Data(Bytes::from(msg))).await {
+                    warn!(error = %e, "client send failed during ring-buffer flush, detaching");
+                    flush_failed = true;
+                } else {
+                    ring_buf_dropped = 0;
+                }
             }
-            while let Some(chunk) = ring_buf.pop_front() {
-                framed.send(Frame::Data(chunk)).await?;
+            while !flush_failed {
+                let Some(chunk) = ring_buf.pop_front() else { break };
+                ring_buf_size -= chunk.len();
+                if let Err(e) = framed.send(Frame::Data(chunk.clone())).await {
+                    warn!(error = %e, "client send failed during ring-buffer flush, detaching");
+                    ring_buf_size += chunk.len();
+                    ring_buf.push_front(chunk);
+                    flush_failed = true;
+                }
             }
-            ring_buf_size = 0;
+        }
+        if flush_failed {
+            if let Some(meta) = metadata_slot.get() {
+                meta.attached.store(false, Ordering::Relaxed);
+            }
+            continue;
         }
 
         // Inner loop: relay between socket and PTY.
@@ -1620,7 +1648,10 @@ pub async fn run(
                                 if relay.tail_tx.receiver_count() > 0 {
                                     let _ = relay.tail_tx.send(TailEvent::Data(chunk.clone()));
                                 }
-                                framed.send(Frame::Data(chunk)).await?;
+                                if let Err(e) = framed.send(Frame::Data(chunk)).await {
+                                    warn!(error = %e, "client send failed, detaching");
+                                    break RelayExit::ClientGone;
+                                }
                             }
                             Ok(Err(e)) => {
                                 if e.raw_os_error() == Some(libc::EIO) {
