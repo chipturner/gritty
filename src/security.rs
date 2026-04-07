@@ -74,13 +74,25 @@ pub fn verify_peer_uid(stream: &tokio::net::UnixStream) -> io::Result<()> {
     Ok(())
 }
 
-/// `dup(2)` that returns an `OwnedFd` or an error (instead of silently returning -1).
+/// `dup(2)` that returns an `OwnedFd` with `FD_CLOEXEC` set, or an error.
 pub fn checked_dup(fd: RawFd) -> io::Result<OwnedFd> {
-    let new_fd = unsafe { libc::dup(fd) };
+    let new_fd = unsafe { libc::fcntl(fd, libc::F_DUPFD_CLOEXEC, 0) };
     if new_fd == -1 {
         return Err(io::Error::last_os_error());
     }
     Ok(unsafe { OwnedFd::from_raw_fd(new_fd) })
+}
+
+/// Set `FD_CLOEXEC` on a raw fd so it is not inherited across `exec`.
+pub fn set_cloexec(fd: RawFd) -> io::Result<()> {
+    let flags = unsafe { libc::fcntl(fd, libc::F_GETFD) };
+    if flags == -1 {
+        return Err(io::Error::last_os_error());
+    }
+    if unsafe { libc::fcntl(fd, libc::F_SETFD, flags | libc::FD_CLOEXEC) } == -1 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(())
 }
 
 /// Clamp window-size values to a sane range, preventing zero-sized or absurdly large values.
@@ -285,5 +297,26 @@ mod tests {
     #[test]
     fn checked_dup_invalid_fd() {
         assert!(checked_dup(-1).is_err());
+    }
+
+    #[test]
+    fn checked_dup_sets_cloexec() {
+        use std::os::fd::AsRawFd;
+        let fd = checked_dup(1).unwrap();
+        let flags = unsafe { libc::fcntl(fd.as_raw_fd(), libc::F_GETFD) };
+        assert_ne!(flags & libc::FD_CLOEXEC, 0);
+    }
+
+    #[test]
+    fn set_cloexec_on_plain_dup() {
+        let raw = unsafe { libc::dup(1) };
+        assert!(raw >= 0);
+        let fd = unsafe { OwnedFd::from_raw_fd(raw) };
+        use std::os::fd::AsRawFd;
+        let before = unsafe { libc::fcntl(fd.as_raw_fd(), libc::F_GETFD) };
+        assert_eq!(before & libc::FD_CLOEXEC, 0);
+        set_cloexec(fd.as_raw_fd()).unwrap();
+        let after = unsafe { libc::fcntl(fd.as_raw_fd(), libc::F_GETFD) };
+        assert_ne!(after & libc::FD_CLOEXEC, 0);
     }
 }

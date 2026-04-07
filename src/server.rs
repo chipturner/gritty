@@ -1208,6 +1208,8 @@ pub async fn run(
     let pty = openpty(winsize.as_ref(), None)?;
     let master: OwnedFd = pty.master;
     let slave: OwnedFd = pty.slave;
+    crate::security::set_cloexec(master.as_raw_fd())?;
+    crate::security::set_cloexec(slave.as_raw_fd())?;
 
     // Get PTY slave name before we drop the slave fd
     let pty_path =
