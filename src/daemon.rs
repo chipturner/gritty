@@ -518,7 +518,7 @@ async fn dispatch_control(
             let _ = client_tx.send(ClientConn::Active { framed, client_name, capabilities });
             false
         }
-        Frame::Attach { session, client_name, force } => {
+        Frame::Attach { session, client_name, force, no_replay } => {
             reap_sessions(sessions);
             if let Some(id) = resolve_session(sessions, &session, *last_attached) {
                 let state = &sessions[&id];
@@ -532,6 +532,11 @@ async fn dispatch_control(
                         },
                     )
                     .await;
+                } else if no_replay {
+                    // Probe only (`connect -d`): confirm existence without
+                    // handing off to the session task, so the ring buffer is
+                    // not drained and no attached client is evicted.
+                    let _ = timed_send(&mut framed, Frame::Ok).await;
                 } else {
                     // Check if session is already attached and force not requested
                     let is_attached = state

@@ -70,7 +70,7 @@ const HEADER_LEN: usize = 5; // type(1) + length(4)
 const MAX_FRAME_SIZE: usize = 1 << 20; // 1 MB
 
 /// Protocol version for handshake negotiation.
-pub const PROTOCOL_VERSION: u16 = 10;
+pub const PROTOCOL_VERSION: u16 = 11;
 
 /// Capability bit: client/server supports clipboard forwarding.
 pub const CAP_CLIPBOARD: u32 = 0x01;
@@ -301,6 +301,9 @@ pub enum Frame {
         session: String,
         client_name: String,
         force: bool,
+        /// Existence probe only: daemon replies `Ok` without handing the
+        /// connection to the session task (no ring-buffer flush, no takeover).
+        no_replay: bool,
     },
     /// Read-only tail of a session's PTY output (client → server).
     Tail {
@@ -927,7 +930,9 @@ impl Decoder for FrameCodec {
                     .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
                 off += cn_len;
                 let force = p[off] != 0;
-                Ok(Some(Frame::Attach { session, client_name, force }))
+                off += 1;
+                let no_replay = p.get(off).copied().unwrap_or(0) != 0;
+                Ok(Some(Frame::Attach { session, client_name, force, no_replay }))
             }
             TYPE_RENAME_SESSION => {
                 if payload.len() < 2 {
@@ -1096,10 +1101,10 @@ impl Encoder<Frame> for FrameCodec {
                 dst.put_u16(cnb.len() as u16);
                 dst.extend_from_slice(cnb);
             }
-            Frame::Attach { session, client_name, force } => {
+            Frame::Attach { session, client_name, force, no_replay } => {
                 let sb = session.as_bytes();
                 let cnb = client_name.as_bytes();
-                let payload_len = 2 + sb.len() + 2 + cnb.len() + 1;
+                let payload_len = 2 + sb.len() + 2 + cnb.len() + 2;
                 dst.put_u8(TYPE_ATTACH);
                 dst.put_u32(payload_len as u32);
                 dst.put_u16(sb.len() as u16);
@@ -1107,6 +1112,7 @@ impl Encoder<Frame> for FrameCodec {
                 dst.put_u16(cnb.len() as u16);
                 dst.extend_from_slice(cnb);
                 dst.put_u8(if force { 1 } else { 0 });
+                dst.put_u8(if no_replay { 1 } else { 0 });
             }
             Frame::Error { code, message } => {
                 let mb = message.as_bytes();

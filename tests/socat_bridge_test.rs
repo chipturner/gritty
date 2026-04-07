@@ -172,6 +172,7 @@ async fn attach_session(proxy_path: &Path, session: &str) -> Framed<UnixStream, 
             session: session.to_string(),
             client_name: String::new(),
             force: true,
+            no_replay: false,
         })
         .await
         .unwrap();
@@ -1199,7 +1200,12 @@ async fn attach_nonexistent_session_through_proxy() {
 
     let resp = control_request(
         &env.proxy_path,
-        Frame::Attach { session: "ghost".to_string(), client_name: String::new(), force: false },
+        Frame::Attach {
+            session: "ghost".to_string(),
+            client_name: String::new(),
+            force: false,
+            no_replay: false,
+        },
     )
     .await;
     assert!(

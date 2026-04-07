@@ -92,6 +92,7 @@ async fn attach_session(
             session: session.to_string(),
             client_name: String::new(),
             force: true,
+            no_replay: false,
         })
         .await
         .unwrap();
@@ -714,6 +715,7 @@ async fn attach_nonexistent_returns_error() {
             session: "nonexistent".to_string(),
             client_name: String::new(),
             force: false,
+            no_replay: false,
         },
     )
     .await;
@@ -762,7 +764,12 @@ async fn attach_dead_session_returns_error() {
     // Attach should get an error, not Ok + disconnect
     let resp = control_request(
         &ctl_path,
-        Frame::Attach { session: id.clone(), client_name: String::new(), force: false },
+        Frame::Attach {
+            session: id.clone(),
+            client_name: String::new(),
+            force: false,
+            no_replay: false,
+        },
     )
     .await;
     assert!(
@@ -881,7 +888,12 @@ async fn reconnect_via_daemon_after_disconnect() {
     let mut framed = Framed::new(stream, FrameCodec);
     do_handshake(&mut framed).await;
     framed
-        .send(Frame::Attach { session: id.clone(), client_name: String::new(), force: false })
+        .send(Frame::Attach {
+            session: id.clone(),
+            client_name: String::new(),
+            force: false,
+            no_replay: false,
+        })
         .await
         .unwrap();
     let resp = timeout(Duration::from_secs(3), framed.next())
@@ -935,7 +947,12 @@ async fn reconnect_after_session_killed_returns_error() {
     // Try to re-attach -- should get Error
     let resp = control_request(
         &ctl_path,
-        Frame::Attach { session: id.clone(), client_name: String::new(), force: false },
+        Frame::Attach {
+            session: id.clone(),
+            client_name: String::new(),
+            force: false,
+            no_replay: false,
+        },
     )
     .await;
     assert!(
@@ -1147,7 +1164,12 @@ async fn attach_dash_resolves_to_last_session() {
     // Explicitly attach to alpha (updates last_attached to alpha)
     let resp = control_request(
         &ctl_path,
-        Frame::Attach { session: id_a.clone(), client_name: String::new(), force: false },
+        Frame::Attach {
+            session: id_a.clone(),
+            client_name: String::new(),
+            force: false,
+            no_replay: false,
+        },
     )
     .await;
     assert_eq!(resp, Frame::Ok);
@@ -1156,7 +1178,12 @@ async fn attach_dash_resolves_to_last_session() {
     // Now "-" should resolve to alpha (last explicitly attached)
     let resp = control_request(
         &ctl_path,
-        Frame::Attach { session: "-".to_string(), client_name: String::new(), force: false },
+        Frame::Attach {
+            session: "-".to_string(),
+            client_name: String::new(),
+            force: false,
+            no_replay: false,
+        },
     )
     .await;
     assert_eq!(resp, Frame::Ok, "attach - should resolve to last attached session (alpha)");
@@ -1176,7 +1203,12 @@ async fn attach_dash_no_previous_session() {
     // No sessions created at all, "-" should fail
     let resp = control_request(
         &ctl_path,
-        Frame::Attach { session: "-".to_string(), client_name: String::new(), force: false },
+        Frame::Attach {
+            session: "-".to_string(),
+            client_name: String::new(),
+            force: false,
+            no_replay: false,
+        },
     )
     .await;
     match resp {

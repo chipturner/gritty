@@ -1587,6 +1587,7 @@ pub async fn run(
                                 session: session.to_string(),
                                 client_name: client_name.clone(),
                                 force: true,
+                                no_replay: false,
                             })
                             .await
                             .is_err()

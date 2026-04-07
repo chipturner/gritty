@@ -90,7 +90,7 @@ Handshake: `0x01` Hello, `0x02` HelloAck. Relay: `0x10` Data, `0x11` Resize, `0x
 
 `NewSession`: `[name_len: u16][name][cmd_len: u16][cmd][cwd_len: u16][cwd][cols: u16][rows: u16][client_name_len: u16][client_name]`. Empty cwd = `$HOME`. Zero cols/rows = default 80x24. `client_name` propagated to session metadata.
 
-`Attach`: `[session_len: u16][session][client_name_len: u16][client_name][force: u8]`. Server enforces: if attached and `!force`, returns `AlreadyAttached` error.
+`Attach`: `[session_len: u16][session][client_name_len: u16][client_name][force: u8][no_replay: u8]`. Server enforces: if attached and `!force`, returns `AlreadyAttached` error. `no_replay` = existence probe only (daemon replies `Ok` without session handoff).
 
 `SessionCreated`: `[id: u32]`.
 
@@ -137,7 +137,7 @@ File transfer manifest (svc socket, not Frame protocol): sender writes `[file_co
 - **Fork before tokio** -- `daemonize()` MUST fork before creating the tokio runtime. `main()` is sync (no `#[tokio::main]`).
 
 ### Changing protocol/signatures
-- **`PROTOCOL_VERSION`** -- bump whenever frame types, encoding, or `SessionEntry` fields change. Version mismatch is a hard gate: daemon rejects clients, `tunnel-create` aborts tunnel setup. Currently v10.
+- **`PROTOCOL_VERSION`** -- bump whenever frame types, encoding, or `SessionEntry` fields change. Version mismatch is a hard gate: daemon rejects clients, `tunnel-create` aborts tunnel setup. Currently v11.
 - **`expect_min_len`** -- all fixed-field decoders use `expect_min_len` (not exact length checks), so trailing bytes are tolerated for forward extensibility.
 - **`Frame` enum** -- update: encoder, decoder, protocol tests, all `match frame` in server.rs, client.rs, daemon.rs, main.rs.
 - **`SessionInfo`** -- entry count `u32`. Changing `SessionEntry` fields requires updating both encoder and decoder in protocol.rs.

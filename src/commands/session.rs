@@ -39,6 +39,7 @@ pub(crate) async fn connect_session(
             session: name.clone(),
             client_name: settings.client_name.clone(),
             force,
+            no_replay: detach,
         })
         .await?;
 
@@ -90,6 +91,7 @@ pub(crate) async fn connect_session(
                     session: name.clone(),
                     client_name: settings.client_name.clone(),
                     force: true,
+                    no_replay: detach,
                 })
                 .await?;
             match Frame::expect_from(framed.next().await)? {
@@ -155,19 +157,24 @@ pub(crate) async fn connect_session(
         Frame::SessionCreated { id } => {
             eprintln!("\x1b[32m\u{25b8} session {name}\x1b[0m");
 
-            // Alert about other detached sessions
-            alert_detached_sessions(&name, &ctl_path).await;
+            // Send Env immediately so the server's 2s deferred-spawn deadline
+            // is satisfied before -d returns or alert_detached_sessions runs
+            // its own multi-RTT round-trip.
+            framed.send(Frame::Env { vars: gritty::collect_env_vars() }).await?;
 
             if detach {
                 return Ok(());
             }
-            let env_vars = gritty::collect_env_vars();
+
+            // Alert about other detached sessions
+            alert_detached_sessions(&name, &ctl_path).await;
+
             let id_str = id.to_string();
             let code = gritty::client::run(
                 &id_str,
                 framed,
                 &ctl_path,
-                env_vars,
+                vec![], // Env already sent above
                 settings.no_escape,
                 settings.forward_agent,
                 settings.forward_open,
