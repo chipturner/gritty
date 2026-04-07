@@ -564,18 +564,16 @@ async fn pty_ring_buffer_caps_at_limit() {
     wait_for_shell(&mut framed).await;
     read_available_data(&mut framed, Duration::from_secs(1)).await;
 
-    // Generate ~2MB of output (exceeds 1MB ring buffer cap)
+    // Generate ~1.3MB of output (exceeds 1MB ring buffer cap)
     framed
-        .send(Frame::Data(Bytes::from(
-            "{ sleep 0.3; dd if=/dev/zero bs=1024 count=2048 2>/dev/null | base64; echo CAP_TEST_DONE; } &\n",
-        )))
+        .send(Frame::Data(Bytes::from("{ sleep 0.3; seq 1 200000; echo CAP_TEST_DONE; } &\n")))
         .await
         .unwrap();
     read_available_data(&mut framed, Duration::from_millis(200)).await;
 
     // Disconnect and wait for output to complete
     drop(framed);
-    tokio::time::sleep(Duration::from_secs(5)).await;
+    tokio::time::sleep(Duration::from_secs(10)).await;
 
     // Reconnect
     let (server_stream, client_stream) = UnixStream::pair().unwrap();

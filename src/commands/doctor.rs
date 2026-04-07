@@ -1,5 +1,5 @@
 use std::os::unix::fs::{MetadataExt, PermissionsExt};
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
 use gritty::connect::{TunnelStatus, enumerate_tunnels, probe_tunnel_status, read_pid_hint};
 use gritty::protocol::{Frame, PROTOCOL_VERSION};
@@ -167,7 +167,7 @@ fn read_pid_file(path: &Path) -> Option<u32> {
 /// Attempt a handshake and return (version, session_count).
 /// On version mismatch, the server returns an Error frame -- we return Err with context.
 async fn probe_server(
-    ctl_path: &PathBuf,
+    ctl_path: &Path,
 ) -> Result<(u16, Vec<gritty::protocol::SessionEntry>), String> {
     // Try handshake + ListSessions
     match server_request(ctl_path, Frame::ListSessions).await {
