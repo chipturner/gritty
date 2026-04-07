@@ -289,6 +289,17 @@ async fn wait_for_socket(path: &Path, timeout: Duration) -> anyhow::Result<()> {
     }
 }
 
+/// Drain a child's piped stderr in the background so it can never fill the
+/// kernel pipe buffer and wedge SSH. Output goes to our own stderr, which in
+/// daemonized mode is the tunnel's `.out` file.
+fn drain_stderr(child: &mut Child) {
+    if let Some(mut stderr) = child.stderr.take() {
+        tokio::spawn(async move {
+            let _ = tokio::io::copy(&mut stderr, &mut tokio::io::stderr()).await;
+        });
+    }
+}
+
 /// Background task: monitor SSH child, respawn on transient failure.
 /// Uses exponential backoff (1s..60s) and never gives up on transient errors.
 async fn tunnel_monitor(
@@ -305,6 +316,7 @@ async fn tunnel_monitor(
     const HEALTHY_THRESHOLD: Duration = Duration::from_secs(30);
 
     loop {
+        drain_stderr(&mut child);
         let spawned_at = Instant::now();
 
         tokio::select! {
