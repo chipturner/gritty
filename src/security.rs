@@ -116,7 +116,11 @@ fn is_trusted_root(path: &Path) -> bool {
     if matches!(path.to_str(), Some("/" | "/tmp" | "/run")) {
         return true;
     }
-    std::env::var("XDG_RUNTIME_DIR").ok().is_some_and(|xdg| path == Path::new(&xdg))
+    env_path_matches("XDG_RUNTIME_DIR", path) || env_path_matches("TMPDIR", path)
+}
+
+fn env_path_matches(var: &str, path: &Path) -> bool {
+    std::env::var(var).ok().is_some_and(|v| path == Path::new(v.trim_end_matches('/')))
 }
 
 fn validate_dir(path: &Path) -> io::Result<()> {
