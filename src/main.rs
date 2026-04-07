@@ -431,7 +431,13 @@ fn daemonize(on_ready: impl FnOnce(u32), output_path: Option<&Path>) -> anyhow::
                     std::process::exit(0);
                 }
                 ForkResult::Child => {
-                    // Grandchild: not a session leader
+                    // Grandchild: not a session leader. Become our own process-group
+                    // leader so `killpg(our_pid)` (e.g. from `tunnel-destroy`) reaches
+                    // us and any children we spawn.
+                    let _ = nix::unistd::setpgid(
+                        nix::unistd::Pid::from_raw(0),
+                        nix::unistd::Pid::from_raw(0),
+                    );
                     let _ = std::env::set_current_dir("/");
 
                     // stdin always to /dev/null

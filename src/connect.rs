@@ -566,12 +566,16 @@ pub fn read_pid_hint(name: &str) -> Option<u32> {
     std::fs::read_to_string(connect_pid_path(name)).ok().and_then(|s| s.trim().parse().ok())
 }
 
-fn cleanup_stale_files(name: &str) {
+fn cleanup_stale_files(name: &str, remove_lock: bool) {
     let _ = std::fs::remove_file(local_socket_path(name));
     let _ = std::fs::remove_file(connect_pid_path(name));
-    // Lock file is NOT removed here -- we already hold the flock on it.
-    // It's cleaned up by ConnectGuard::Drop when the tunnel exits.
     let _ = std::fs::remove_file(connect_dest_path(name));
+    // Callers that hold the flock (run()) must NOT remove the lock file out
+    // from under themselves; external callers (disconnect, get_tunnel_info)
+    // pass true so stale locks don't accumulate forever.
+    if remove_lock {
+        let _ = std::fs::remove_file(connect_lock_path(name));
+    }
 }
 
 /// Extract tunnel connection names by globbing lock files in the socket dir.
@@ -684,7 +688,7 @@ pub async fn run(opts: ConnectOpts, ready_fd: Option<OwnedFd>) -> anyhow::Result
         Ok(lock) => {
             // We got the lock -- any leftover files are stale (process died).
             debug!("cleaning stale tunnel files for {connection_name}");
-            cleanup_stale_files(&connection_name);
+            cleanup_stale_files(&connection_name, false);
             lock
         }
         Err(_) => {
@@ -794,7 +798,7 @@ pub async fn run(opts: ConnectOpts, ready_fd: Option<OwnedFd>) -> anyhow::Result
 
     // 8. Hand off the child to the tunnel monitor background task
     let original_child = guard.child.take().unwrap();
-    let monitor_handle = tokio::spawn(tunnel_monitor(
+    let mut monitor_handle = tokio::spawn(tunnel_monitor(
         original_child,
         dest,
         local_sock.clone(),
@@ -803,14 +807,22 @@ pub async fn run(opts: ConnectOpts, ready_fd: Option<OwnedFd>) -> anyhow::Result
         stop.clone(),
     ));
 
-    // 9. Wait for signal or monitor death
+    // 9. Wait for signal or monitor death. Handle SIGINT too so `--foreground`
+    // Ctrl-C runs cleanup instead of the default terminate-without-Drop.
     let mut sigterm = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
-    tokio::select! {
-        _ = sigterm.recv() => {}
-        _ = monitor_handle => {}
-    }
+    let mut sigint = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::interrupt())?;
+    let monitor_done = tokio::select! {
+        _ = sigterm.recv() => false,
+        _ = sigint.recv() => false,
+        res = &mut monitor_handle => { let _ = res; true }
+    };
 
-    // 10. Cleanup (guard Drop handles ssh kill + file removal + lock release)
+    // 10. Cleanup: cancel the monitor and wait for it to reap the SSH child
+    // before we exit(0), otherwise the child.kill() races process teardown.
+    stop.cancel();
+    if !monitor_done {
+        let _ = monitor_handle.await;
+    }
     drop(guard);
 
     Ok(0)
@@ -835,7 +847,7 @@ pub async fn disconnect(name: &str) -> anyhow::Result<()> {
     validate_connection_name(name)?;
     match probe_tunnel_status(name) {
         TunnelStatus::Stale => {
-            cleanup_stale_files(name);
+            cleanup_stale_files(name, true);
             eprintln!("\x1b[2;33m\u{25b8} tunnel {name} already stopped\x1b[0m");
             return Ok(());
         }
@@ -852,7 +864,7 @@ pub async fn disconnect(name: &str) -> anyhow::Result<()> {
 
     let lock_path = connect_lock_path(name);
     if !is_lock_held(&lock_path) {
-        cleanup_stale_files(name);
+        cleanup_stale_files(name, true);
         eprintln!("\x1b[2;33m\u{25b8} tunnel {name} already stopped\x1b[0m");
         return Ok(());
     }
@@ -865,7 +877,7 @@ pub async fn disconnect(name: &str) -> anyhow::Result<()> {
     loop {
         tokio::time::sleep(Duration::from_millis(100)).await;
         if !is_lock_held(&lock_path) {
-            cleanup_stale_files(name);
+            cleanup_stale_files(name, true);
             eprintln!("\x1b[32m\u{25b8} tunnel {name} stopped\x1b[0m");
             return Ok(());
         }
@@ -882,7 +894,7 @@ pub async fn disconnect(name: &str) -> anyhow::Result<()> {
         }
     }
     tokio::time::sleep(Duration::from_millis(100)).await;
-    cleanup_stale_files(name);
+    cleanup_stale_files(name, true);
     eprintln!("\x1b[32m\u{25b8} tunnel {name} killed\x1b[0m");
     Ok(())
 }
@@ -907,7 +919,7 @@ pub fn get_tunnel_info() -> Vec<TunnelInfo> {
         let status = probe_tunnel_status(name);
         if status == TunnelStatus::Stale {
             debug!("cleaning stale tunnel: {name}");
-            cleanup_stale_files(name);
+            cleanup_stale_files(name, true);
             continue;
         }
         let dest =
@@ -1275,7 +1287,7 @@ mod tests {
         let _dir = tempfile::tempdir().unwrap();
         // We can't easily override socket_dir(), so test that cleanup_stale_files
         // at least doesn't panic on nonexistent files
-        cleanup_stale_files("nonexistent-cleanup-test-xyz");
+        cleanup_stale_files("nonexistent-cleanup-test-xyz", true);
         // No panic = success
     }
 
