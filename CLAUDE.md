@@ -68,7 +68,7 @@ just quicktest                        # manual 3-pane tmux test
 
 Single-socket: all communication (control + session relay) through one Unix domain socket per server. Hello/HelloAck version handshake, then control frame declares intent, server routes accordingly.
 
-Eight modules behind a lib crate (`src/lib.rs` hosts `collect_env_vars()`, `spawn_channel_relay()`, `handshake()`) with thin binary entry (`src/main.rs`):
+Nine modules behind a lib crate (`src/lib.rs` hosts `collect_env_vars()`, `spawn_channel_relay()`, `handshake()`) with thin binary entry (`src/main.rs`):
 
 - **`security`** -- Socket/dir creation with 0700/0600 perms, ownership validation, symlink rejection, `SO_PEERCRED`. **All socket binding and dir creation MUST go through this module.**
 - **`config`** -- TOML config (`$XDG_CONFIG_HOME/gritty/config.toml`). `[defaults]` + `[host.<name>]`. Precedence: CLI > host > defaults > built-in.
@@ -76,6 +76,7 @@ Eight modules behind a lib crate (`src/lib.rs` hosts `collect_env_vars()`, `spaw
 - **`daemon`** -- Accept loop on `ctl.sock`. Handshake, control frame, route. `HashMap<u32, SessionState>`. Hands off `Framed<UnixStream>` to session tasks via `mpsc`.
 - **`server`** -- Per-session: PTY, client relay, ring buffer, forwarding (agent/URL/tunnel/port), file transfer, tail broadcast. Per-session sockets: `agent-{id}.sock` + `svc-{id}.sock`. Client-side forward socket: `fwd-{host}-{session}.sock` (created by the client, used by `gritty lf`/`gritty rf` to request port forwards).
 - **`connect`** (module, implements `tunnel-create` CLI) -- Self-backgrounding SSH tunnel. Monitor respawns on transient failure (backoff 1s to 60s, resets after 30s healthy). Per-tunnel files: `.sock`, `.pid`, `.lock`, `.dest`, `.log`, `.out`. `ConnectGuard` Drop cleans up.
+- **`alt_screen`** -- `AltScreenTracker`: byte-scanning state machine that detects alternate screen mode (`?1049`, `?1047`, `?47`). Used by server for smart reconnect.
 - **`table`** -- `print_table()` for tabular output.
 - **`client`** -- Raw mode, escape processor, heartbeat (5s ping / 15s timeout), auto-reconnect, forwarding relay. `tail()` is read-only variant.
 
@@ -107,6 +108,7 @@ File transfer manifest (svc socket, not Frame protocol): sender writes `[file_co
 - **AsyncFd + try_io**: PTY master and stdin are raw fds in `AsyncFd`. `guard.try_io()` with would-block continuation.
 - **Deferred shell spawn**: PTY allocated early (with initial window size from `NewSession` cols/rows when > 0), shell waits for first client's `Env` frame (TERM/LANG/COLORTERM). Spawns login shell with CWD from `NewSession` (or `$HOME` if empty). First client feeds directly into relay (no outer-loop re-wait).
 - **Ring buffer**: Client disconnect breaks inner relay; outer loop drains PTY into `VecDeque<Bytes>` (default 1MB). On reconnect, dropped-bytes marker if overflow, then flush.
+- **Smart reconnect**: Server tracks alternate screen mode (`\x1b[?1049h`/`l`, `?47`, `?1047`) via `AltScreenTracker` in `alt_screen.rs`. On reconnect: alternate screen gets Ctrl-L written to PTY for TUI redraw; main screen gets a `[gritty: reconnected]` separator line preserving scrollback.
 - **Client takeover**: `client_rx.recv()` in relay select. New client causes `Detached` to old, then switch. Capability check (500ms deadline) warns if reconnecting client is missing `-A`/`-O` that the session expects.
 - **Self-daemonizing**: Fork before tokio runtime. Parent waits on pipe for readiness. PID file at `socket_dir()/daemon.pid`.
 - **Lockfile-based liveness**: `flock()` on `connect-{name}.lock`. Non-blocking probe distinguishes live vs dead tunnels.
