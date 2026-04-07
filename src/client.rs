@@ -1440,6 +1440,19 @@ pub async fn run(
         fcntl(&stdout_fd, FcntlArg::F_SETFL(OFlag::from_bits_truncate(flags) | OFlag::O_NONBLOCK))?;
     }
     let async_stdout = AsyncFd::new(stdout_fd)?;
+
+    // PTY output (vim/htop/less) may leave the alt-screen active or the cursor
+    // hidden. RawModeGuard only restores termios, not in-band DEC private modes,
+    // so emit reset escapes on every exit path via Drop.
+    struct TerminalResetGuard;
+    impl Drop for TerminalResetGuard {
+        fn drop(&mut self) {
+            let _ = io::stdout().write_all(b"\x1b[?1049l\x1b[0m\x1b[?25h");
+            let _ = io::stdout().flush();
+        }
+    }
+    let _term_reset = TerminalResetGuard;
+
     let mut sigwinch = signal(SignalKind::window_change())?;
     // Hoisted so they stay live across the reconnect loop — tokio::signal() permanently
     // replaces the libc disposition, so dropping the stream would swallow the signal.
@@ -1771,11 +1784,11 @@ pub async fn tail(
         }
     };
 
-    // Reset terminal state: clear attributes and show cursor.
-    // PTY output may have left colors/bold set or cursor hidden.
+    // Reset terminal state: exit alt-screen, clear attributes, show cursor.
+    // PTY output may have left colors/bold set, cursor hidden, or alt-screen active.
     {
         use tokio::io::AsyncWriteExt;
-        let _ = stdout.write_all(b"\x1b[0m\x1b[?25h").await;
+        let _ = stdout.write_all(b"\x1b[?1049l\x1b[0m\x1b[?25h").await;
     }
     Ok(code)
 }
