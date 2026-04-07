@@ -51,9 +51,11 @@ pub(crate) async fn connect_session(
                 return Ok(());
             }
             eprintln!("\x1b[32m\u{25b8} attached {name}\x1b[0m");
+            let session_id = resolve_session_id(&ctl_path, &name).await?;
             let env_vars = vec![];
             let code = gritty::client::run(
                 &name,
+                session_id,
                 framed,
                 &ctl_path,
                 env_vars,
@@ -103,9 +105,11 @@ pub(crate) async fn connect_session(
                         return Ok(());
                     }
                     eprintln!("\x1b[32m\u{25b8} attached {name}\x1b[0m");
+                    let session_id = resolve_session_id(&ctl_path, &name).await?;
                     let env_vars = vec![];
                     let code = gritty::client::run(
                         &name,
+                        session_id,
                         framed,
                         &ctl_path,
                         env_vars,
@@ -169,9 +173,9 @@ pub(crate) async fn connect_session(
             // Alert about other detached sessions
             alert_detached_sessions(&name, &ctl_path).await;
 
-            let id_str = id.to_string();
             let code = gritty::client::run(
-                &id_str,
+                &name,
+                id,
                 framed,
                 &ctl_path,
                 vec![], // Env already sent above
@@ -753,6 +757,31 @@ async fn tui_pick_session(
     let _ = terminal::disable_raw_mode();
 
     result
+}
+
+/// Resolve a session name (or id string, or "-") to its numeric id via ListSessions.
+async fn resolve_session_id(ctl_path: &Path, session: &str) -> anyhow::Result<u32> {
+    use gritty::protocol::Frame;
+
+    if let Ok(id) = session.parse::<u32>() {
+        return Ok(id);
+    }
+    let resp = server_request(ctl_path, Frame::ListSessions).await?;
+    let Frame::SessionInfo { sessions } = resp else {
+        anyhow::bail!("unexpected response to ListSessions");
+    };
+    if session == "-" {
+        return sessions
+            .iter()
+            .max_by_key(|e| e.last_heartbeat)
+            .map(|e| e.id)
+            .ok_or_else(|| anyhow::anyhow!("no sessions (cannot resolve '-')"));
+    }
+    sessions
+        .iter()
+        .find(|e| e.name == session)
+        .map(|e| e.id)
+        .ok_or_else(|| anyhow::anyhow!("no such session: {session}"))
 }
 
 /// Extract a display-friendly host name from a ctl socket path.

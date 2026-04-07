@@ -844,11 +844,11 @@ async fn run(cli: Cli, config: gritty::config::ConfigFile) -> anyhow::Result<()>
         }
         Command::LocalForward { target, port } => {
             let (listen_port, target_port) = parse_port_spec(&port)?;
-            port_forward_client_command(&target, 0, listen_port, target_port).await
+            port_forward_client_command(cli.ctl_socket, &target, 0, listen_port, target_port).await
         }
         Command::RemoteForward { target, port } => {
             let (listen_port, target_port) = parse_port_spec(&port)?;
-            port_forward_client_command(&target, 1, listen_port, target_port).await
+            port_forward_client_command(cli.ctl_socket, &target, 1, listen_port, target_port).await
         }
         Command::Bootstrap { destination, install_dir, ssh_options } => {
             gritty::connect::bootstrap(&destination, &ssh_options, &install_dir).await

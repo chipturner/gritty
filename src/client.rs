@@ -17,7 +17,9 @@ use tokio::sync::mpsc;
 use tokio::time::Instant;
 
 /// Compute the path for the forward socket used by `gritty lf`/`gritty rf`.
-pub fn forward_socket_path(ctl_path: &Path, session: &str) -> PathBuf {
+/// Keyed on the immutable numeric session id so rename/`/`-in-name cannot
+/// desync the attached client and the `lf`/`rf` command.
+pub fn forward_socket_path(ctl_path: &Path, session_id: u32) -> PathBuf {
     let dir = ctl_path.parent().unwrap_or(Path::new("."));
     let host = ctl_path
         .file_stem()
@@ -30,7 +32,7 @@ pub fn forward_socket_path(ctl_path: &Path, session: &str) -> PathBuf {
             }
         })
         .unwrap_or_else(|| "unknown".to_string());
-    dir.join(format!("fwd-{host}-{session}.sock"))
+    dir.join(format!("fwd-{host}-{session_id}.sock"))
 }
 
 /// Outcome from a client relay loop iteration.
@@ -1407,6 +1409,7 @@ async fn relay(
 #[allow(clippy::too_many_arguments)]
 pub async fn run(
     session: &str,
+    session_id: u32,
     mut framed: Framed<UnixStream, FrameCodec>,
     ctl_path: &Path,
     env_vars: Vec<(String, String)>,
@@ -1464,21 +1467,20 @@ pub async fn run(
     let agent_socket = if forward_agent { std::env::var("SSH_AUTH_SOCK").ok() } else { None };
 
     // Forward socket: lets `gritty lf`/`gritty rf` request port forwards from this client.
-    let fwd_path = forward_socket_path(ctl_path, session);
-    let fwd_listener = match crate::security::bind_unix_listener(&fwd_path) {
-        Ok(listener) => Some(listener),
-        Err(e) => {
-            debug!("forward socket bind failed (non-fatal): {e}");
-            None
-        }
-    };
+    let fwd_path = forward_socket_path(ctl_path, session_id);
     struct FwdCleanup(PathBuf);
     impl Drop for FwdCleanup {
         fn drop(&mut self) {
             let _ = std::fs::remove_file(&self.0);
         }
     }
-    let _fwd_cleanup = FwdCleanup(fwd_path);
+    let (fwd_listener, _fwd_cleanup) = match crate::security::bind_unix_listener(&fwd_path) {
+        Ok(listener) => (Some(listener), Some(FwdCleanup(fwd_path))),
+        Err(e) => {
+            warn!("forward socket bind failed (lf/rf will be unavailable): {e}");
+            (None, None)
+        }
+    };
 
     let mut limiters = SecurityLimiters::new();
 

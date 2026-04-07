@@ -139,19 +139,46 @@ pub(crate) fn parse_port_spec(spec: &str) -> anyhow::Result<(u16, u16)> {
 }
 
 /// Run a port forward command via the client-side forward socket.
-/// Connects to fwd-{host}-{session}.sock, sends the request, and blocks.
+/// Resolves the session name to its numeric id via the daemon, then connects
+/// to fwd-{host}-{id}.sock, sends the request, and blocks.
 pub(crate) async fn port_forward_client_command(
+    ctl_socket: Option<PathBuf>,
     target: &str,
     direction: u8,
     listen_port: u16,
     target_port: u16,
 ) -> anyhow::Result<()> {
+    use gritty::protocol::Frame;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
     let (host, session) = parse_target(target);
     let session = session.unwrap_or_else(|| "default".to_string());
-    let ctl_path = resolve_ctl_path(None, Some(&host))?;
-    let fwd_path = gritty::client::forward_socket_path(&ctl_path, &session);
+    let ctl_path = resolve_ctl_path(ctl_socket, Some(&host))?;
+
+    let session_id = if let Ok(id) = session.parse::<u32>() {
+        id
+    } else {
+        let Frame::SessionInfo { sessions } =
+            server_request(&ctl_path, Frame::ListSessions).await?
+        else {
+            anyhow::bail!("unexpected response to ListSessions");
+        };
+        if session == "-" {
+            sessions
+                .iter()
+                .max_by_key(|e| e.last_heartbeat)
+                .map(|e| e.id)
+                .ok_or_else(|| anyhow::anyhow!("no sessions (cannot resolve '-')"))?
+        } else {
+            sessions
+                .iter()
+                .find(|e| e.name == session)
+                .map(|e| e.id)
+                .ok_or_else(|| anyhow::anyhow!("no such session: {host}:{session}"))?
+        }
+    };
+
+    let fwd_path = gritty::client::forward_socket_path(&ctl_path, session_id);
 
     let mut stream = tokio::net::UnixStream::connect(&fwd_path).await.map_err(|_| {
         anyhow::anyhow!(
