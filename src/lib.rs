@@ -4,6 +4,7 @@ pub mod config;
 pub mod connect;
 pub mod daemon;
 pub mod protocol;
+pub mod scrollback;
 pub mod security;
 pub mod server;
 pub mod table;
