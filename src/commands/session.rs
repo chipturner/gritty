@@ -355,9 +355,32 @@ async fn tui_pick_session(
     let mut mode = Mode::Pick;
     let mut prev_total_lines: usize = 0;
 
+    struct PickerTermGuard;
+    impl Drop for PickerTermGuard {
+        fn drop(&mut self) {
+            use std::io::Write;
+            let _ = write!(std::io::stderr(), "\x1b[?25h");
+            let _ = std::io::stderr().flush();
+            let _ = crossterm::terminal::disable_raw_mode();
+        }
+    }
     // Enter raw mode
     let _ = terminal::enable_raw_mode();
     let _ = write!(stderr, "\x1b[?25l"); // hide cursor
+    let _term_guard = PickerTermGuard;
+
+    fn prev_char_boundary(s: &str, mut pos: usize) -> usize {
+        while pos > 0 {
+            pos -= 1;
+            if s.is_char_boundary(pos) {
+                break;
+            }
+        }
+        pos
+    }
+    fn next_char_boundary(s: &str, pos: usize) -> usize {
+        s[pos..].chars().next().map_or(pos, |c| pos + c.len_utf8())
+    }
 
     let render = |stderr: &mut std::io::Stderr,
                   rows: &[Row],
@@ -699,8 +722,9 @@ async fn tui_pick_session(
                 // Backspace
                 Event::Key(KeyEvent { code: KeyCode::Backspace, .. }) => {
                     if *cursor_pos > 0 {
-                        buf.remove(*cursor_pos - 1);
-                        *cursor_pos -= 1;
+                        let prev = prev_char_boundary(buf, *cursor_pos);
+                        buf.remove(prev);
+                        *cursor_pos = prev;
                     }
                 }
                 // Delete
@@ -716,7 +740,7 @@ async fn tui_pick_session(
                     modifiers: KeyModifiers::CONTROL,
                     ..
                 }) => {
-                    *cursor_pos = cursor_pos.saturating_sub(1);
+                    *cursor_pos = prev_char_boundary(buf, *cursor_pos);
                 }
                 // Right arrow / Ctrl+F
                 Event::Key(KeyEvent { code: KeyCode::Right, .. })
@@ -725,9 +749,7 @@ async fn tui_pick_session(
                     modifiers: KeyModifiers::CONTROL,
                     ..
                 }) => {
-                    if *cursor_pos < buf.len() {
-                        *cursor_pos += 1;
-                    }
+                    *cursor_pos = next_char_boundary(buf, *cursor_pos);
                 }
                 // Typing
                 Event::Key(KeyEvent {
@@ -736,7 +758,7 @@ async fn tui_pick_session(
                     ..
                 }) => {
                     buf.insert(*cursor_pos, ch);
-                    *cursor_pos += 1;
+                    *cursor_pos += ch.len_utf8();
                 }
                 _ => continue,
             },
@@ -744,7 +766,7 @@ async fn tui_pick_session(
         prev_total_lines = render(&mut stderr, &rows, cursor, &mode, prev_total_lines);
     };
 
-    // Cleanup: erase picker lines, restore terminal
+    // Cleanup: erase picker lines (terminal restore handled by PickerTermGuard)
     if prev_total_lines > 0 {
         let _ = write!(stderr, "\x1b[{}A", prev_total_lines);
         for _ in 0..prev_total_lines {
@@ -752,9 +774,7 @@ async fn tui_pick_session(
         }
         let _ = write!(stderr, "\x1b[{}A", prev_total_lines);
     }
-    let _ = write!(stderr, "\x1b[?25h"); // show cursor
     let _ = stderr.flush();
-    let _ = terminal::disable_raw_mode();
 
     result
 }
