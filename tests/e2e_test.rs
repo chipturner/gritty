@@ -2422,16 +2422,16 @@ async fn reconnect_replays_scrollback_lines() {
         "scrollback should replay pre-disconnect output, got: {output_str}"
     );
 
-    // Separator should appear after scrollback
     assert!(
         output_str.contains("[gritty: reconnected]"),
-        "separator should appear after scrollback, got: {output_str}"
+        "reconnect banner should appear, got: {output_str}"
     );
 
-    // Scrollback should come BEFORE separator
+    // Banner precedes scrollback so replayed output ends with the cursor where
+    // the shell left it.
     let scrollback_pos = output_str.find("SCROLLBACK_LINE_2").unwrap();
     let separator_pos = output_str.find("[gritty: reconnected]").unwrap();
-    assert!(scrollback_pos < separator_pos, "scrollback should appear before separator");
+    assert!(separator_pos < scrollback_pos, "banner should appear before scrollback");
 
     let _ = framed.send(Frame::Data(Bytes::from("exit\n"))).await;
     let _ = timeout(Duration::from_secs(3), server).await;

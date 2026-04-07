@@ -1686,26 +1686,35 @@ pub async fn run(
         let is_reconnect = !first_client;
         first_client = false;
 
-        // Reconnect: replay scrollback, separator, then disconnect buffer.
+        // Reconnect: status banner first, then replay scrollback and the
+        // disconnect ring buffer. Banner-first means the last bytes written are
+        // real PTY output, so the cursor lands where the shell expects it.
         // A send failure here (client dropped mid-flush) must re-enter drain,
         // not kill the session.
         let mut flush_failed = false;
         if is_reconnect && !alt_screen.in_alternate_screen() {
-            // 1. Scrollback: last N lines from before disconnect
-            for line in scrollback.lines() {
-                if let Err(e) = framed.send(Frame::Data(line.clone())).await {
-                    warn!(error = %e, "client send failed during scrollback replay, detaching");
-                    flush_failed = true;
-                    break;
+            let msg = if ring_buf_dropped > 0 {
+                format!(
+                    "\r\n\x1b[2;33m[gritty: reconnected -- {} bytes of output dropped]\x1b[0m\r\n",
+                    ring_buf_dropped
+                )
+            } else {
+                "\r\n\x1b[2;33m[gritty: reconnected]\x1b[0m\r\n".to_string()
+            };
+            if let Err(e) = framed.send(Frame::Data(Bytes::from(msg))).await {
+                warn!(error = %e, "client send failed during reconnect banner, detaching");
+                flush_failed = true;
+            } else {
+                ring_buf_dropped = 0;
+                for line in scrollback.lines() {
+                    if let Err(e) = framed.send(Frame::Data(line.clone())).await {
+                        warn!(error = %e, "client send failed during scrollback replay, detaching");
+                        flush_failed = true;
+                        break;
+                    }
                 }
-            }
-            if !flush_failed {
-                scrollback.clear();
-                // 2. Separator
-                let msg = "\r\n\x1b[2;33m[gritty: reconnected]\x1b[0m\r\n";
-                if let Err(e) = framed.send(Frame::Data(Bytes::from(msg))).await {
-                    warn!(error = %e, "client send failed during scrollback replay, detaching");
-                    flush_failed = true;
+                if !flush_failed {
+                    scrollback.clear();
                 }
             }
         } else if is_reconnect {
@@ -1713,9 +1722,9 @@ pub async fn run(
             // Queue it so a backpressured PTY doesn't wedge reconnect.
             pending_input_bytes += 1;
             pending_input.push_back(Bytes::from_static(b"\x0c"));
+            ring_buf_dropped = 0;
         }
 
-        // 3. Flush disconnect ring buffer (output produced while disconnected)
         if !flush_failed && !ring_buf.is_empty() {
             debug!(
                 chunks = ring_buf.len(),
@@ -1723,18 +1732,6 @@ pub async fn run(
                 dropped = ring_buf_dropped,
                 "flushing ring buffer"
             );
-            if ring_buf_dropped > 0 {
-                let msg = format!(
-                    "\r\n\x1b[2;33m[gritty: {} bytes of output dropped]\x1b[0m\r\n",
-                    ring_buf_dropped
-                );
-                if let Err(e) = framed.send(Frame::Data(Bytes::from(msg))).await {
-                    warn!(error = %e, "client send failed during ring-buffer flush, detaching");
-                    flush_failed = true;
-                } else {
-                    ring_buf_dropped = 0;
-                }
-            }
             while !flush_failed {
                 let Some(chunk) = ring_buf.pop_front() else { break };
                 ring_buf_size -= chunk.len();
