@@ -233,7 +233,10 @@ impl PortForwardTable {
             forwards: HashMap::new(),
             channels: HashMap::new(),
             pending_remote: HashMap::new(),
-            next_channel_id: Arc::new(AtomicU32::new(0)),
+            // Server-allocated PF channel_ids are odd; client-allocated are even.
+            // Both sides insert into a single `channels` map keyed by channel_id,
+            // so partitioning the space prevents lf/rf collisions.
+            next_channel_id: Arc::new(AtomicU32::new(1)),
         }
     }
 
@@ -392,7 +395,7 @@ fn spawn_pf_tcp_acceptor(
                 }
             };
 
-            let channel_id = next_channel_id.fetch_add(1, Ordering::Relaxed);
+            let channel_id = next_channel_id.fetch_add(2, Ordering::Relaxed);
             let (read_half, write_half) = stream.into_split();
             let data_tx = event_tx.clone();
             let close_tx = event_tx.clone();

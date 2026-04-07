@@ -499,7 +499,11 @@ impl ClientPortForwardTable {
         Self {
             forwards: HashMap::new(),
             channels: HashMap::new(),
-            next_channel_id: std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0)),
+            // Client-allocated PF channel_ids (and forward_ids, which share this
+            // counter) are even; server-allocated channel_ids are odd. Both sides
+            // insert into a single `channels` map, so partitioning prevents lf/rf
+            // collisions.
+            next_channel_id: std::sync::Arc::new(std::sync::atomic::AtomicU32::new(2)),
         }
     }
 
@@ -995,7 +999,7 @@ impl ClientRelay<'_> {
         let listen_port = u16::from_be_bytes([header[1], header[2]]);
         let target_port = u16::from_be_bytes([header[3], header[4]]);
 
-        let forward_id = self.pf.next_channel_id.fetch_add(1, Ordering::Relaxed);
+        let forward_id = self.pf.next_channel_id.fetch_add(2, Ordering::Relaxed);
 
         if direction == 1 {
             // Remote-forward: client binds locally
@@ -1012,7 +1016,7 @@ impl ClientRelay<'_> {
                                 Ok(conn) => conn,
                                 Err(_) => break,
                             };
-                            let channel_id = nid.fetch_add(1, Ordering::Relaxed);
+                            let channel_id = nid.fetch_add(2, Ordering::Relaxed);
                             let (read_half, write_half) = stream.into_split();
                             let data_tx = tx.clone();
                             let close_tx = tx.clone();
