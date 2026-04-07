@@ -54,7 +54,6 @@ pub(crate) async fn connect_session(
             let code = gritty::client::run(
                 &name,
                 framed,
-                !settings.no_redraw,
                 &ctl_path,
                 env_vars,
                 settings.no_escape,
@@ -106,7 +105,6 @@ pub(crate) async fn connect_session(
                     let code = gritty::client::run(
                         &name,
                         framed,
-                        !settings.no_redraw,
                         &ctl_path,
                         env_vars,
                         settings.no_escape,
@@ -168,7 +166,6 @@ pub(crate) async fn connect_session(
             let code = gritty::client::run(
                 &id_str,
                 framed,
-                false, // no redraw on new session -- nothing to redraw
                 &ctl_path,
                 env_vars,
                 settings.no_escape,

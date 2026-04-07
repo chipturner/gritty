@@ -487,7 +487,7 @@ impl ClientPortForwardTable {
     }
 }
 
-/// Send session setup frames (env, agent/open forwarding, resize, redraw).
+/// Send session setup frames (env, agent/open forwarding, resize).
 /// Returns false if the connection dropped during setup.
 async fn send_init_frames(
     framed: &mut Framed<UnixStream, FrameCodec>,
@@ -495,7 +495,6 @@ async fn send_init_frames(
     forward_agent: bool,
     agent_socket: Option<&str>,
     forward_open: bool,
-    redraw: bool,
 ) -> bool {
     if !timed_send(framed, Frame::Env { vars: env_vars.to_vec() }).await {
         return false;
@@ -508,9 +507,6 @@ async fn send_init_frames(
     }
     let (cols, rows) = get_terminal_size();
     if !timed_send(framed, Frame::Resize { cols, rows }).await {
-        return false;
-    }
-    if redraw && !timed_send(framed, Frame::Data(Bytes::from_static(b"\x0c"))).await {
         return false;
     }
     true
@@ -1309,7 +1305,6 @@ async fn relay(
 pub async fn run(
     session: &str,
     mut framed: Framed<UnixStream, FrameCodec>,
-    redraw: bool,
     ctl_path: &Path,
     env_vars: Vec<(String, String)>,
     no_escape: bool,
@@ -1337,7 +1332,6 @@ pub async fn run(
     let async_stdout = AsyncFd::new(stdout_fd)?;
     let mut sigwinch = signal(SignalKind::window_change())?;
     let mut buf = vec![0u8; 4096];
-    let mut current_redraw = redraw;
     let mut current_env = env_vars;
     let mut escape = if no_escape { None } else { Some(EscapeProcessor::new()) };
     let agent_socket = if forward_agent { std::env::var("SSH_AUTH_SOCK").ok() } else { None };
@@ -1366,7 +1360,6 @@ pub async fn run(
             forward_agent,
             agent_socket.as_deref(),
             forward_open,
-            current_redraw,
         )
         .await
         {
@@ -1462,7 +1455,6 @@ pub async fn run(
                             )
                             .await?;
                             framed = new_framed;
-                            current_redraw = true;
                             break;
                         }
                         Some(Ok(Frame::Error { code: ErrorCode::AlreadyAttached, .. })) => {

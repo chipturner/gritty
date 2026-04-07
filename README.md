@@ -125,7 +125,6 @@ The `<host>` in `host:session` is a **connection name**, not an SSH destination.
 - `--pick`: always show session picker (interactive when in a terminal)
 - `--no-pick`: never show session list; always target `default`
 - `--no-create`: attach only, error if session doesn't exist
-- `--no-redraw`: don't send Ctrl-L after connecting
 - `--no-escape`: disable escape sequence processing
 - `--no-oauth-redirect`: disable OAuth callback tunneling (part of `-O`)
 - `--oauth-timeout <seconds>`: OAuth callback accept timeout (default: 180)
@@ -193,7 +192,6 @@ gritty works out of the box with no config file. Optionally, set persistent defa
 # forward-agent = false
 # forward-open = true
 # no-escape = false
-# no-redraw = false
 # oauth-redirect = true
 # oauth-timeout = 180
 # heartbeat-interval = 5

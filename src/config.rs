@@ -12,7 +12,6 @@ pub struct SessionSettings {
     pub forward_agent: bool,
     pub forward_open: bool,
     pub no_escape: bool,
-    pub no_redraw: bool,
     pub oauth_redirect: bool,
     pub oauth_timeout: u64,
     pub heartbeat_interval: u64,
@@ -32,7 +31,6 @@ impl Default for SessionSettings {
             forward_agent: false,
             forward_open: true,
             no_escape: false,
-            no_redraw: false,
             oauth_redirect: true,
             oauth_timeout: 180,
             heartbeat_interval: 5,
@@ -67,7 +65,6 @@ pub struct Defaults {
     pub forward_agent: Option<bool>,
     pub forward_open: Option<bool>,
     pub no_escape: Option<bool>,
-    pub no_redraw: Option<bool>,
     pub oauth_redirect: Option<bool>,
     pub oauth_timeout: Option<u64>,
     pub heartbeat_interval: Option<u64>,
@@ -93,7 +90,6 @@ pub struct HostConfig {
     pub forward_agent: Option<bool>,
     pub forward_open: Option<bool>,
     pub no_escape: Option<bool>,
-    pub no_redraw: Option<bool>,
     pub oauth_redirect: Option<bool>,
     pub oauth_timeout: Option<u64>,
     pub heartbeat_interval: Option<u64>,
@@ -146,7 +142,6 @@ impl ConfigFile {
             forward_agent: h.and_then(|h| h.forward_agent).or(d.forward_agent).unwrap_or(false),
             forward_open: h.and_then(|h| h.forward_open).or(d.forward_open).unwrap_or(true),
             no_escape: pick(h.and_then(|h| h.no_escape), d.no_escape),
-            no_redraw: pick(h.and_then(|h| h.no_redraw), d.no_redraw),
             oauth_redirect: h.and_then(|h| h.oauth_redirect).or(d.oauth_redirect).unwrap_or(true),
             oauth_timeout: h.and_then(|h| h.oauth_timeout).or(d.oauth_timeout).unwrap_or(180),
             heartbeat_interval: h
@@ -342,23 +337,6 @@ mod tests {
         // function returns a path ending in gritty/config.toml
         let p = config_path();
         assert!(p.ends_with("gritty/config.toml"), "got: {}", p.display());
-    }
-
-    #[test]
-    fn no_redraw_configurable() {
-        let cfg: ConfigFile = toml::from_str(
-            r#"
-            [defaults]
-            no-redraw = true
-
-            [host.devbox]
-            no-redraw = false
-            "#,
-        )
-        .unwrap();
-        assert!(cfg.resolve_session(None).no_redraw);
-        assert!(cfg.resolve_session(Some("unknown")).no_redraw);
-        assert!(!cfg.resolve_session(Some("devbox")).no_redraw);
     }
 
     #[test]

@@ -94,10 +94,6 @@ enum Command {
         #[arg(long)]
         no_create: bool,
 
-        /// Don't send Ctrl-L to redraw after attaching
-        #[arg(long)]
-        no_redraw: bool,
-
         /// Disable escape sequences (~. detach, ~? help, etc.)
         #[arg(long)]
         no_escape: bool,
@@ -673,7 +669,6 @@ async fn run(cli: Cli, config: gritty::config::ConfigFile) -> anyhow::Result<()>
             command,
             detach,
             no_create,
-            no_redraw,
             no_escape,
             forward_agent,
             forward_open,
@@ -702,7 +697,6 @@ async fn run(cli: Cli, config: gritty::config::ConfigFile) -> anyhow::Result<()>
             let ctl_path = resolve_ctl_path(cli.ctl_socket, host.as_deref())?;
             let resolved = config.resolve_session(host.as_deref());
             let settings = gritty::config::SessionSettings {
-                no_redraw: no_redraw || resolved.no_redraw,
                 no_escape: no_escape || resolved.no_escape,
                 forward_agent: if no_forward_agent {
                     false

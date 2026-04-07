@@ -9,7 +9,6 @@
 # forward-agent = false
 # forward-open = true
 # no-escape = false
-# no-redraw = false
 # oauth-redirect = true
 # oauth-timeout = 180
 # heartbeat-interval = 5
