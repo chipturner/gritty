@@ -245,9 +245,14 @@ pub(crate) fn clipboard_copy() {
     }
     match std::os::unix::net::UnixStream::connect(&sock_path) {
         Ok(mut stream) => {
-            let _ = stream.write_all(&[gritty::protocol::SvcRequest::Clipboard.to_byte()]);
-            let _ = stream.write_all(&[0x01]); // copy operation
-            let _ = stream.write_all(&data);
+            if let Err(e) = stream
+                .write_all(&[gritty::protocol::SvcRequest::Clipboard.to_byte()])
+                .and_then(|_| stream.write_all(&[0x01]))
+                .and_then(|_| stream.write_all(&data))
+            {
+                eprintln!("error: clipboard copy failed: {e}");
+                std::process::exit(1);
+            }
         }
         Err(e) => {
             eprintln!("error: could not connect to service socket ({sock_path}): {e}");

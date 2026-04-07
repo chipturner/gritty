@@ -598,9 +598,18 @@ fn spawn_svc_acceptor(
                         }
                         match op[0] {
                             0x01 => {
-                                // Copy: read all remaining data
+                                // Copy: read remaining data, capped so it fits in a single frame.
+                                const CLIPBOARD_MAX: usize = 512 * 1024;
                                 let mut data = Vec::new();
-                                let _ = stream.read_to_end(&mut data).await;
+                                let mut limited = stream.take((CLIPBOARD_MAX + 1) as u64);
+                                let _ = limited.read_to_end(&mut data).await;
+                                if data.len() > CLIPBOARD_MAX {
+                                    warn!(
+                                        size = data.len(),
+                                        "clipboard copy truncated to {CLIPBOARD_MAX} bytes"
+                                    );
+                                    data.truncate(CLIPBOARD_MAX);
+                                }
                                 if !data.is_empty() {
                                     let _ =
                                         ctx.send(ClipboardEvent::Copy { data: Bytes::from(data) });
@@ -1641,6 +1650,17 @@ pub async fn run(
                         }
                         continue;
                     }
+                    _ = open_event_rx.recv() => {
+                        debug!("discarding open event while detached");
+                        continue;
+                    }
+                    event = clipboard_event_rx.recv() => {
+                        if let Some(ClipboardEvent::Paste { reply }) = event {
+                            let _ = reply.send(None);
+                        }
+                        debug!("discarding clipboard event while detached");
+                        continue;
+                    }
                 }
             };
             if !got_client {
@@ -1980,6 +2000,9 @@ pub async fn run(
                 tunnel.teardown();
                 pf.teardown();
                 open_forward_enabled = false;
+                if let Some(reply) = pending_paste.take() {
+                    let _ = reply.send(None);
+                }
                 info!("client disconnected, waiting for reconnect");
                 continue;
             }
