@@ -78,7 +78,7 @@ Nine modules behind a lib crate (`src/lib.rs` hosts `collect_env_vars()`, `spawn
 - **`connect`** (module, implements `tunnel-create` CLI) -- Self-backgrounding SSH tunnel. Monitor respawns on transient failure (backoff 1s to 60s, resets after 30s healthy). Per-tunnel files: `.sock`, `.pid`, `.lock`, `.dest`, `.log`, `.out`. `ConnectGuard` Drop cleans up.
 - **`alt_screen`** -- `AltScreenTracker`: byte-scanning state machine that detects alternate screen mode (`?1049`, `?1047`, `?47`). Used by server for smart reconnect.
 - **`table`** -- `print_table()` for tabular output.
-- **`client`** -- Raw mode, escape processor, heartbeat (5s ping / 15s timeout), auto-reconnect, forwarding relay. `tail()` is read-only variant.
+- **`client`** -- Raw mode, escape processor, heartbeat (5s ping / 15s timeout, RTT-aware escalation), auto-reconnect (5s attempt timeout), forwarding relay. `tail()` is read-only variant.
 
 ### Wire format
 
