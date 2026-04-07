@@ -1,3 +1,4 @@
+use crate::alt_screen::AltScreenTracker;
 use crate::protocol::{Frame, FrameCodec};
 use bytes::Bytes;
 use futures_util::{SinkExt, StreamExt};
@@ -1399,6 +1400,7 @@ pub async fn run(
 
     // Outer loop: accept clients via channel. PTY persists across reconnects.
     // First iteration skips client-wait (first client already connected above).
+    let mut alt_screen = AltScreenTracker::new();
     let mut first_client = true;
     loop {
         if !first_client {
@@ -1448,6 +1450,7 @@ pub async fn run(
                             }
                             Ok(Ok(n)) => {
                                 let chunk = Bytes::copy_from_slice(&buf[..n]);
+                                alt_screen.scan(&chunk);
                                 if tail_tx.receiver_count() > 0 {
                                     let _ = tail_tx.send(TailEvent::Data(chunk.clone()));
                                 }
@@ -1486,6 +1489,7 @@ pub async fn run(
                 meta.attached.store(true, Ordering::Relaxed);
             }
         }
+        let is_reconnect = !first_client;
         first_client = false;
 
         // Flush any buffered PTY output to the new client
@@ -1508,6 +1512,27 @@ pub async fn run(
                 framed.send(Frame::Data(chunk)).await?;
             }
             ring_buf_size = 0;
+        }
+
+        // Smart redraw: alternate screen gets Ctrl-L, main screen gets separator
+        if is_reconnect {
+            if alt_screen.in_alternate_screen() {
+                let mut written = 0;
+                let ctrl_l = b"\x0c";
+                while written < ctrl_l.len() {
+                    let mut guard = async_master.writable().await?;
+                    match guard.try_io(|inner| {
+                        nix::unistd::write(inner, &ctrl_l[written..]).map_err(io::Error::from)
+                    }) {
+                        Ok(Ok(n)) => written += n,
+                        Ok(Err(e)) => return Err(e.into()),
+                        Err(_would_block) => continue,
+                    }
+                }
+            } else {
+                let msg = "\r\n\x1b[2;33m[gritty: reconnected]\x1b[0m\r\n";
+                framed.send(Frame::Data(Bytes::from(msg))).await?;
+            }
         }
 
         // Inner loop: relay between socket and PTY.
@@ -1559,6 +1584,7 @@ pub async fn run(
                             Ok(Ok(n)) => {
                                 debug!(len = n, "pty -> socket");
                                 let chunk = Bytes::copy_from_slice(&buf[..n]);
+                                alt_screen.scan(&chunk);
                                 if relay.tail_tx.receiver_count() > 0 {
                                     let _ = relay.tail_tx.send(TailEvent::Data(chunk.clone()));
                                 }

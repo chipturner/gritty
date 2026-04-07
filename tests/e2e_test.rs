@@ -2261,3 +2261,85 @@ async fn local_forward_different_listen_and_target_ports() {
     let _ = framed.send(Frame::Data(Bytes::from("exit\n"))).await;
     let _ = timeout(Duration::from_secs(3), server).await;
 }
+
+#[tokio::test]
+async fn reconnect_sends_separator_on_main_screen() {
+    let (client_tx, mut framed, server, _meta) = setup_session().await;
+    wait_for_shell(&mut framed).await;
+    read_available_data(&mut framed, Duration::from_secs(1)).await;
+
+    // Run a command so ring buffer has content
+    framed.send(Frame::Data(Bytes::from("echo MAIN_SCREEN_TEST\n"))).await.unwrap();
+    read_available_data(&mut framed, Duration::from_millis(500)).await;
+
+    // Disconnect
+    drop(framed);
+    tokio::time::sleep(Duration::from_millis(300)).await;
+
+    // Reconnect
+    let (server_stream, client_stream) = UnixStream::pair().unwrap();
+    client_tx
+        .send(ClientConn::Active {
+            framed: Framed::new(server_stream, FrameCodec),
+            client_name: String::new(),
+            capabilities: 0,
+        })
+        .unwrap();
+    let mut framed = Framed::new(client_stream, FrameCodec);
+    framed.send(Frame::Resize { cols: 80, rows: 24 }).await.unwrap();
+
+    let output = read_available_data(&mut framed, Duration::from_secs(2)).await;
+    let output_str = String::from_utf8_lossy(&output);
+    assert!(
+        output_str.contains("[gritty: reconnected]"),
+        "main screen reconnect should show separator, got: {output_str}"
+    );
+
+    let _ = framed.send(Frame::Data(Bytes::from("exit\n"))).await;
+    let _ = timeout(Duration::from_secs(3), server).await;
+}
+
+#[tokio::test]
+async fn reconnect_sends_ctrl_l_on_alternate_screen() {
+    let (client_tx, mut framed, server, _meta) = setup_session().await;
+    wait_for_shell(&mut framed).await;
+    read_available_data(&mut framed, Duration::from_secs(1)).await;
+
+    // Enter alternate screen mode by having the shell emit the sequence as output
+    // (what vim/htop would do). printf writes to stdout, the PTY carries it back
+    // to the server which scans it.
+    framed.send(Frame::Data(Bytes::from("printf '\\033[?1049h'\n"))).await.unwrap();
+    // Wait for the sequence to flow through the PTY and be scanned by the server
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    read_available_data(&mut framed, Duration::from_millis(300)).await;
+
+    // Disconnect
+    drop(framed);
+    tokio::time::sleep(Duration::from_millis(300)).await;
+
+    // Reconnect
+    let (server_stream, client_stream) = UnixStream::pair().unwrap();
+    client_tx
+        .send(ClientConn::Active {
+            framed: Framed::new(server_stream, FrameCodec),
+            client_name: String::new(),
+            capabilities: 0,
+        })
+        .unwrap();
+    let mut framed = Framed::new(client_stream, FrameCodec);
+    framed.send(Frame::Resize { cols: 80, rows: 24 }).await.unwrap();
+
+    let output = read_available_data(&mut framed, Duration::from_secs(2)).await;
+    let output_str = String::from_utf8_lossy(&output);
+    // Should NOT contain the separator
+    assert!(
+        !output_str.contains("[gritty: reconnected]"),
+        "alternate screen reconnect should not show separator, got: {output_str}"
+    );
+
+    // Leave alt screen and exit cleanly
+    framed.send(Frame::Data(Bytes::from("printf '\\033[?1049l'\n"))).await.unwrap();
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    let _ = framed.send(Frame::Data(Bytes::from("exit\n"))).await;
+    let _ = timeout(Duration::from_secs(3), server).await;
+}
