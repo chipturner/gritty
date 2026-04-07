@@ -130,7 +130,7 @@ File transfer manifest (svc socket, not Frame protocol): sender writes `[file_co
 ## Development Notes
 
 ### Critical invariants
-- **`security` module is load-bearing** -- never use `UnixListener::bind` or `create_dir_all` directly.
+- **`security` module is load-bearing** -- never use `UnixListener::bind` or `create_dir_all` directly. Client-side connects to ctl/daemon sockets MUST go through `security::connect_verified()` (connect + `SO_PEERCRED` check).
 - **Reap before lookup** -- `reap_sessions()` MUST precede Attach/KillSession/ListSessions. Stale sessions cause silent failures.
 - **Channel closed check** -- before `Frame::Ok` for Attach, check `client_tx.is_closed()` (session died between reap and lookup).
 - **`Stdio::from(OwnedFd)`** -- don't reintroduce `FromRawFd` in server.rs.

@@ -194,7 +194,7 @@ async fn pick_session(pick: bool, no_pick: bool, ctl_path: &Path) -> (String, bo
         return ("default".to_string(), false, false);
     }
 
-    let sessions = match server_request(&ctl_path.to_path_buf(), Frame::ListSessions).await {
+    let sessions = match server_request(ctl_path, Frame::ListSessions).await {
         Ok(Frame::SessionInfo { sessions }) => sessions,
         _ => return ("default".to_string(), false, false),
     };
@@ -794,10 +794,9 @@ async fn alert_detached_sessions(current_name: &str, ctl_path: &Path) {
 pub(crate) async fn tail_session(target: String, ctl_path: PathBuf) -> anyhow::Result<i32> {
     use futures_util::{SinkExt, StreamExt};
     use gritty::protocol::{Frame, FrameCodec};
-    use tokio::net::UnixStream;
     use tokio_util::codec::Framed;
 
-    let stream = UnixStream::connect(&ctl_path).await.map_err(|_| {
+    let stream = gritty::security::connect_verified(&ctl_path).await.map_err(|_| {
         anyhow::anyhow!("no server running (could not connect to {})", ctl_path.display())
     })?;
     let mut framed = Framed::new(stream, FrameCodec);
@@ -955,7 +954,7 @@ pub(crate) async fn list_all_sessions() -> anyhow::Result<()> {
         .into_iter()
         .map(|(host, path)| async move {
             let result = tokio::time::timeout(std::time::Duration::from_secs(2), async {
-                let stream = tokio::net::UnixStream::connect(&path).await.ok()?;
+                let stream = gritty::security::connect_verified(&path).await.ok()?;
                 let mut framed = tokio_util::codec::Framed::new(stream, FrameCodec);
                 gritty::handshake(&mut framed).await.ok()?;
                 futures_util::SinkExt::send(&mut framed, Frame::ListSessions).await.ok()?;

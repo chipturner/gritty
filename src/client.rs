@@ -1460,7 +1460,7 @@ pub async fn run(
                     }
 
                     let attempt = tokio::time::timeout(RECONNECT_ATTEMPT_TIMEOUT, async {
-                        let stream = match UnixStream::connect(ctl_path).await {
+                        let stream = match crate::security::connect_verified(ctl_path).await {
                             Ok(s) => s,
                             Err(_) => return Attempt::Retry,
                         };
@@ -1615,7 +1615,7 @@ pub async fn tail(
                         "\r\x1b[2;33m\u{25b8} reconnecting... {elapsed}s (Ctrl-C to abort)\x1b[0m\x1b[K"
                     );
 
-                    let stream = match UnixStream::connect(ctl_path).await {
+                    let stream = match crate::security::connect_verified(ctl_path).await {
                         Ok(s) => s,
                         Err(_) => continue,
                     };

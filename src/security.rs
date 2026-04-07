@@ -61,6 +61,14 @@ pub fn bind_unix_listener(path: &Path) -> io::Result<tokio::net::UnixListener> {
     }
 }
 
+/// Connect to a Unix socket and verify the peer's UID matches ours.
+/// All client-side connects to daemon/session sockets MUST go through this.
+pub async fn connect_verified(path: &Path) -> io::Result<tokio::net::UnixStream> {
+    let stream = tokio::net::UnixStream::connect(path).await?;
+    verify_peer_uid(&stream)?;
+    Ok(stream)
+}
+
 /// Verify that the peer on a Unix stream has the same UID as the current process.
 pub fn verify_peer_uid(stream: &tokio::net::UnixStream) -> io::Result<()> {
     let cred = stream.peer_cred()?;
@@ -152,6 +160,12 @@ fn validate_dir(path: &Path) -> io::Result<()> {
         ));
     }
 
+    // StrictModes: if group/other have any access, tighten to 0700. A writable
+    // socket directory lets another local user unlink and re-bind ctl.sock.
+    if meta.mode() & 0o077 != 0 {
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700))?;
+    }
+
     Ok(())
 }
 
@@ -208,6 +222,17 @@ mod tests {
         let dir = tmp.path().join("mydir");
         secure_create_dir_all(&dir).unwrap();
         secure_create_dir_all(&dir).unwrap(); // second call succeeds
+    }
+
+    #[test]
+    fn secure_create_dir_all_tightens_loose_mode() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join("loose");
+        std::fs::create_dir(&dir).unwrap();
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o777)).unwrap();
+        secure_create_dir_all(&dir).unwrap();
+        let mode = std::fs::metadata(&dir).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o700);
     }
 
     #[test]

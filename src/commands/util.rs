@@ -29,15 +29,14 @@ pub(crate) fn resolve_ctl_path(
 
 /// Send a control frame to the server and return the response.
 pub(crate) async fn server_request(
-    ctl_path: &PathBuf,
+    ctl_path: &Path,
     frame: gritty::protocol::Frame,
 ) -> anyhow::Result<gritty::protocol::Frame> {
     use futures_util::{SinkExt, StreamExt};
     use gritty::protocol::{Frame, FrameCodec};
-    use tokio::net::UnixStream;
     use tokio_util::codec::Framed;
 
-    let stream = UnixStream::connect(ctl_path).await.map_err(|_| {
+    let stream = gritty::security::connect_verified(ctl_path).await.map_err(|_| {
         anyhow::anyhow!("no server running (could not connect to {})", ctl_path.display())
     })?;
     let mut framed = Framed::new(stream, FrameCodec);
@@ -67,10 +66,10 @@ pub(crate) async fn connect_or_start(
     auto_start_mode: &AutoStart,
     wait: bool,
 ) -> anyhow::Result<(tokio::net::UnixStream, bool)> {
-    use tokio::net::UnixStream;
-
-    let auto_started = match UnixStream::connect(ctl_path).await {
-        Ok(s) => return Ok((s, false)),
+    let auto_started = match gritty::security::connect_verified(ctl_path).await {
+        Ok(s) => {
+            return Ok((s, false));
+        }
         Err(_) => match auto_start_mode {
             AutoStart::Server => {
                 eprintln!("\x1b[2;33m\u{25b8} starting server...\x1b[0m");
@@ -92,8 +91,10 @@ pub(crate) async fn connect_or_start(
     // Retry loop: bounded (10 retries, 500ms apart) or indefinite (--wait)
     let max_retries = if wait { u32::MAX } else { 10 };
     for _ in 0..max_retries {
-        match UnixStream::connect(ctl_path).await {
-            Ok(s) => return Ok((s, auto_started)),
+        match gritty::security::connect_verified(ctl_path).await {
+            Ok(s) => {
+                return Ok((s, auto_started));
+            }
             Err(_) => {
                 if wait {
                     eprintln!("\x1b[2;33m\u{25b8} waiting for server...\x1b[0m");

@@ -42,7 +42,7 @@ async fn probe_daemon_sessions(ctl_path: &Path) -> Vec<DiscoveredSession> {
     use gritty::protocol::{Frame, FrameCodec};
     use tokio_util::codec::Framed;
 
-    let stream = match tokio::net::UnixStream::connect(ctl_path).await {
+    let stream = match gritty::security::connect_verified(ctl_path).await {
         Ok(s) => s,
         Err(_) => return vec![],
     };
@@ -120,7 +120,7 @@ async fn send_file_handshake(
     use tokio::io::AsyncWriteExt;
     use tokio_util::codec::Framed;
 
-    let stream = tokio::net::UnixStream::connect(ctl_path).await.map_err(|_| {
+    let stream = gritty::security::connect_verified(ctl_path).await.map_err(|_| {
         anyhow::anyhow!("no server running (could not connect to {})", ctl_path.display())
     })?;
     let mut framed = Framed::new(stream, FrameCodec);
