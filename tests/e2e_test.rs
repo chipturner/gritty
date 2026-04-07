@@ -1003,14 +1003,18 @@ async fn agent_not_forwarded_without_flag() {
     wait_for_shell(&mut framed).await;
     read_available_data(&mut framed, Duration::from_secs(1)).await;
 
-    // Do NOT send AgentForward — agent socket file should not exist.
-    assert!(!agent_path.exists(), "agent socket should not exist without AgentForward");
+    // Do NOT send AgentForward. The agent socket is bound unconditionally so
+    // SSH_AUTH_SOCK always resolves, but connections are refused (immediately
+    // closed) when no -A client is attached.
+    assert!(agent_path.exists(), "agent socket should be bound unconditionally");
 
-    // Connecting should fail
-    assert!(
-        UnixStream::connect(&agent_path).await.is_err(),
-        "connect to agent socket should fail without AgentForward"
-    );
+    let mut conn = UnixStream::connect(&agent_path).await.expect("agent socket should accept");
+    let mut buf = [0u8; 1];
+    let n = timeout(Duration::from_secs(2), conn.read(&mut buf))
+        .await
+        .expect("agent connection should close promptly")
+        .expect("read on closed connection");
+    assert_eq!(n, 0, "agent connection should be closed immediately without AgentForward");
 
     let _ = framed.send(Frame::Data(Bytes::from("exit\n"))).await;
     let _ = timeout(Duration::from_secs(3), server).await;

@@ -137,7 +137,7 @@ struct PortForwardState {
 
 /// Grouped state for SSH agent forwarding within a session.
 struct AgentForwardState {
-    enabled: bool,
+    enabled: Arc<AtomicBool>,
     channels: HashMap<u32, mpsc::Sender<Bytes>>,
     acceptor: Option<tokio::task::JoinHandle<()>>,
     next_channel_id: Arc<AtomicU32>,
@@ -147,7 +147,7 @@ struct AgentForwardState {
 impl AgentForwardState {
     fn new(socket_path: PathBuf) -> Self {
         Self {
-            enabled: false,
+            enabled: Arc::new(AtomicBool::new(false)),
             channels: HashMap::new(),
             acceptor: None,
             next_channel_id: Arc::new(AtomicU32::new(0)),
@@ -155,9 +155,17 @@ impl AgentForwardState {
         }
     }
 
-    fn teardown(&mut self) {
+    /// Client detach/takeover: stop forwarding but keep the listener and socket
+    /// file alive so `SSH_AUTH_SOCK` remains a valid path for a future `-A`
+    /// reattach.
+    fn disable(&mut self) {
+        self.enabled.store(false, Ordering::Relaxed);
         self.channels.clear();
-        self.enabled = false;
+    }
+
+    /// Session end: disable, abort the acceptor, and remove the socket file.
+    fn teardown(&mut self) {
+        self.disable();
         if let Some(handle) = self.acceptor.take() {
             handle.abort();
         }
@@ -282,6 +290,7 @@ fn spawn_agent_acceptor(
     listener: UnixListener,
     event_tx: mpsc::UnboundedSender<AgentEvent>,
     next_channel_id: Arc<AtomicU32>,
+    enabled: Arc<AtomicBool>,
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
         loop {
@@ -295,6 +304,11 @@ fn spawn_agent_acceptor(
 
             if let Err(e) = crate::security::verify_peer_uid(&stream) {
                 warn!("agent socket: {e}");
+                continue;
+            }
+
+            if !enabled.load(Ordering::Relaxed) {
+                debug!("agent connection refused: no -A client attached");
                 continue;
             }
 
@@ -702,7 +716,6 @@ struct ServerRelay<'a> {
     open_forward_enabled: &'a mut bool,
     tail_tx: &'a broadcast::Sender<TailEvent>,
     metadata_slot: &'a Arc<OnceLock<SessionMetadata>>,
-    agent_event_tx: &'a mpsc::UnboundedSender<AgentEvent>,
     tunnel_event_tx: &'a mpsc::UnboundedSender<TunnelEvent>,
     pf_event_tx: &'a mpsc::UnboundedSender<PortForwardEvent>,
     send_notify_tx: &'a mpsc::UnboundedSender<Frame>,
@@ -718,7 +731,7 @@ impl ServerRelay<'_> {
         let Some(meta) = self.metadata_slot.get() else { return };
         let wants_agent = meta.wants_agent.load(Ordering::Relaxed);
         let wants_open = meta.wants_open.load(Ordering::Relaxed);
-        let missing_agent = wants_agent && !self.agent.enabled;
+        let missing_agent = wants_agent && !self.agent.enabled.load(Ordering::Relaxed);
         let missing_open = wants_open && !*self.open_forward_enabled;
         if !missing_agent && !missing_open {
             return;
@@ -780,18 +793,9 @@ impl ServerRelay<'_> {
             }
             Some(Ok(Frame::AgentForward)) => {
                 debug!("agent forwarding enabled by client");
-                self.agent.enabled = true;
+                self.agent.enabled.store(true, Ordering::Relaxed);
                 if let Some(meta) = self.metadata_slot.get() {
                     meta.wants_agent.store(true, Ordering::Relaxed);
-                }
-                if self.agent.acceptor.is_none()
-                    && let Some(listener) = bind_agent_listener(&self.agent.socket_path)
-                {
-                    self.agent.acceptor = Some(spawn_agent_acceptor(
-                        listener,
-                        self.agent_event_tx.clone(),
-                        self.agent.next_channel_id.clone(),
-                    ));
                 }
             }
             Some(Ok(Frame::AgentData { channel_id, data })) => {
@@ -973,14 +977,16 @@ impl ServerRelay<'_> {
     ) {
         match event {
             Some(AgentEvent::Accepted { channel_id, writer_tx }) => {
-                if self.agent.enabled {
+                if self.agent.enabled.load(Ordering::Relaxed) {
                     info!(channel_id, "relaying agent open");
                     self.agent.channels.insert(channel_id, writer_tx);
                     let _ = framed.send(Frame::AgentOpen { channel_id }).await;
                 }
             }
             Some(AgentEvent::Data { channel_id, data }) => {
-                if self.agent.enabled && self.agent.channels.contains_key(&channel_id) {
+                if self.agent.enabled.load(Ordering::Relaxed)
+                    && self.agent.channels.contains_key(&channel_id)
+                {
                     let _ = framed.send(Frame::AgentData { channel_id, data }).await;
                 }
             }
@@ -1235,9 +1241,19 @@ pub async fn run(
     let mut ring_buf_size: usize = 0;
     let mut ring_buf_dropped: usize = 0;
 
-    // Agent forwarding state
+    // Agent forwarding state. The listener is bound unconditionally so the
+    // shell's SSH_AUTH_SOCK always resolves; connections are refused at accept
+    // time when no `-A` client is attached.
     let mut agent = AgentForwardState::new(agent_socket_path);
     let (agent_event_tx, mut agent_event_rx) = mpsc::unbounded_channel::<AgentEvent>();
+    if let Some(listener) = bind_agent_listener(&agent.socket_path) {
+        agent.acceptor = Some(spawn_agent_acceptor(
+            listener,
+            agent_event_tx.clone(),
+            agent.next_channel_id.clone(),
+            agent.enabled.clone(),
+        ));
+    }
 
     // Open forwarding state (no acceptor -- svc_acceptor handles the socket)
     let mut open_forward_enabled = false;
@@ -1303,7 +1319,7 @@ pub async fn run(
                 }
                 None => {
                     info!("client channel closed before first client");
-                    cleanup_socket(&agent.socket_path);
+                    agent.teardown();
                     cleanup_socket(&svc_socket_path);
                     return Ok(());
                 }
@@ -1360,8 +1376,11 @@ pub async fn run(
     let _ = std::fs::remove_file(&open_link);
     let _ = std::os::unix::fs::symlink(&exe, &open_link);
     cmd.env("BROWSER", &open_link);
-    // Set SSH_AUTH_SOCK to the agent socket path
-    cmd.env("SSH_AUTH_SOCK", &agent.socket_path);
+    // Set SSH_AUTH_SOCK only when the agent listener bound successfully, so the
+    // path always resolves. Otherwise leave any inherited ambient agent intact.
+    if agent.acceptor.is_some() {
+        cmd.env("SSH_AUTH_SOCK", &agent.socket_path);
+    }
     // Set GRITTY_SOCK so `gritty open`/`gritty send`/`gritty receive` find the service socket
     cmd.env("GRITTY_SOCK", &svc_socket_path);
     // Session context env vars
@@ -1568,7 +1587,6 @@ pub async fn run(
                 open_forward_enabled: &mut open_forward_enabled,
                 tail_tx: &tail_tx,
                 metadata_slot: &metadata_slot,
-                agent_event_tx: &agent_event_tx,
                 tunnel_event_tx: &tunnel_event_tx,
                 pf_event_tx: &pf_event_tx,
                 send_notify_tx: &send_notify_tx,
@@ -1621,7 +1639,7 @@ pub async fn run(
                                 info!("new client via channel, detaching old client");
                                 relay.negotiated_caps.store(caps, std::sync::atomic::Ordering::Relaxed);
                                 let _ = framed.send(Frame::Detached).await;
-                                relay.agent.teardown();
+                                relay.agent.disable();
                                 relay.tunnel.teardown();
                                 relay.pf.teardown();
                                 *relay.open_forward_enabled = false;
@@ -1782,7 +1800,7 @@ pub async fn run(
                 if let Some(meta) = metadata_slot.get() {
                     meta.attached.store(false, Ordering::Relaxed);
                 }
-                agent.teardown();
+                agent.disable();
                 tunnel.teardown();
                 pf.teardown();
                 open_forward_enabled = false;
@@ -1809,7 +1827,7 @@ pub async fn run(
         }
     }
 
-    cleanup_socket(&agent.socket_path);
+    agent.teardown();
     cleanup_socket(&svc_socket_path);
     if let Some(handle) = svc_acceptor.take() {
         handle.abort();
