@@ -320,7 +320,7 @@ impl Drop for SuppressInputGuard {
 }
 
 /// Write all bytes to stdout asynchronously via AsyncFd.
-/// Used in relay mode where stdout is non-blocking (shares fd with stdin).
+/// Requires the fd to have O_NONBLOCK set (done in `run()`).
 async fn write_stdout_async(fd: &AsyncFd<std::os::fd::OwnedFd>, data: &[u8]) -> io::Result<()> {
     let mut written = 0;
     while written < data.len() {
@@ -625,8 +625,10 @@ impl ClientRelay<'_> {
                 }
             }
             Some(Ok(Frame::AgentData { channel_id, data })) => {
-                if let Some(tx) = self.agent.channels.get(&channel_id) {
-                    let _ = tx.send(data).await;
+                if self.agent.channels.get(&channel_id).is_some_and(|tx| tx.try_send(data).is_err())
+                {
+                    warn!(channel_id, "agent channel backpressured, closing");
+                    self.agent.channels.remove(&channel_id);
                 }
             }
             Some(Ok(Frame::AgentClose { channel_id })) => {
@@ -777,8 +779,14 @@ impl ClientRelay<'_> {
                 .await?;
             }
             Some(Ok(Frame::TunnelData { channel_id, data })) => {
-                if let Some(tx) = self.tunnel.channels.get(&channel_id) {
-                    let _ = tx.send(data).await;
+                if self
+                    .tunnel
+                    .channels
+                    .get(&channel_id)
+                    .is_some_and(|tx| tx.try_send(data).is_err())
+                {
+                    warn!(channel_id, "tunnel channel backpressured, closing");
+                    self.tunnel.channels.remove(&channel_id);
                 }
             }
             Some(Ok(Frame::TunnelClose { channel_id })) => {
@@ -831,8 +839,14 @@ impl ClientRelay<'_> {
             }
             // Port forward: channel data from server
             Some(Ok(Frame::PortForwardData { channel_id, data })) => {
-                if let Some((_, tx)) = self.pf.channels.get(&channel_id) {
-                    let _ = tx.send(data).await;
+                if self
+                    .pf
+                    .channels
+                    .get(&channel_id)
+                    .is_some_and(|(_, tx)| tx.try_send(data).is_err())
+                {
+                    warn!(channel_id, "pf channel backpressured, closing");
+                    self.pf.channels.remove(&channel_id);
                 }
             }
             // Port forward: channel closed by server
@@ -1383,7 +1397,14 @@ pub async fn run(
     let nb_guard = NonBlockGuard::set(stdin_borrowed)?;
     let async_stdin = AsyncFd::new(io::stdin())?;
     // dup() stdout so we get an independent fd for AsyncFd (stdin may share the same fd).
+    // Set O_NONBLOCK explicitly: when stdout is a separate OFD (pipe/redirect), stdin's
+    // NonBlockGuard doesn't cover it and write() would block the relay loop.
     let stdout_fd = crate::security::checked_dup(io::stdout().as_raw_fd())?;
+    {
+        use nix::fcntl::{FcntlArg, OFlag, fcntl};
+        let flags = fcntl(&stdout_fd, FcntlArg::F_GETFL)?;
+        fcntl(&stdout_fd, FcntlArg::F_SETFL(OFlag::from_bits_truncate(flags) | OFlag::O_NONBLOCK))?;
+    }
     let async_stdout = AsyncFd::new(stdout_fd)?;
     let mut sigwinch = signal(SignalKind::window_change())?;
     let mut buf = vec![0u8; 4096];

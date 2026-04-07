@@ -742,8 +742,38 @@ fn spawn_tail(
 /// Groups references needed by inner relay handler methods.
 /// `framed` is kept outside (passed to handlers) so `tokio::select!` can
 /// poll `framed.next()` independently without conflicting borrows.
+/// Cap on buffered client→PTY input while the shell isn't reading stdin.
+const PENDING_INPUT_CAP: usize = 1 << 20;
+
+/// Drain queued client→PTY input. Called from select! writable arms (attached
+/// and detached loops) so a full PTY input buffer never blocks the relay.
+fn drain_pending_input(
+    mut guard: tokio::io::unix::AsyncFdReadyGuard<'_, OwnedFd>,
+    pending: &mut VecDeque<Bytes>,
+    pending_bytes: &mut usize,
+) -> io::Result<()> {
+    loop {
+        let Some(front) = pending.front().cloned() else { break };
+        match guard.try_io(|inner| nix::unistd::write(inner, &front).map_err(io::Error::from)) {
+            Ok(Ok(n)) if n == front.len() => {
+                *pending_bytes -= n;
+                pending.pop_front();
+            }
+            Ok(Ok(n)) => {
+                *pending_bytes -= n;
+                *pending.front_mut().unwrap() = front.slice(n..);
+            }
+            Ok(Err(e)) => return Err(e),
+            Err(_would_block) => break,
+        }
+    }
+    Ok(())
+}
+
 struct ServerRelay<'a> {
     async_master: &'a AsyncFd<OwnedFd>,
+    pending_input: &'a mut VecDeque<Bytes>,
+    pending_input_bytes: &'a mut usize,
     agent: &'a mut AgentForwardState,
     tunnel: &'a mut TunnelRelayState,
     pf: &'a mut PortForwardTable,
@@ -792,17 +822,16 @@ impl ServerRelay<'_> {
     ) -> Result<ControlFlow<RelayExit>, anyhow::Error> {
         match frame {
             Some(Ok(Frame::Data(data))) => {
-                debug!(len = data.len(), "socket -> pty");
-                let mut written = 0;
-                while written < data.len() {
-                    let mut guard = self.async_master.writable().await?;
-                    match guard.try_io(|inner| {
-                        nix::unistd::write(inner, &data[written..]).map_err(io::Error::from)
-                    }) {
-                        Ok(Ok(n)) => written += n,
-                        Ok(Err(e)) => return Err(e.into()),
-                        Err(_would_block) => continue,
-                    }
+                debug!(len = data.len(), "socket -> pty (queued)");
+                if *self.pending_input_bytes + data.len() > PENDING_INPUT_CAP {
+                    warn!(
+                        queued = *self.pending_input_bytes,
+                        incoming = data.len(),
+                        "pending PTY input cap exceeded, dropping frame"
+                    );
+                } else {
+                    *self.pending_input_bytes += data.len();
+                    self.pending_input.push_back(data);
                 }
             }
             Some(Ok(Frame::Resize { cols, rows })) => {
@@ -834,8 +863,10 @@ impl ServerRelay<'_> {
                 }
             }
             Some(Ok(Frame::AgentData { channel_id, data })) => {
-                if let Some(tx) = self.agent.channels.get(&channel_id) {
-                    let _ = tx.send(data).await;
+                if self.agent.channels.get(&channel_id).is_some_and(|tx| tx.try_send(data).is_err())
+                {
+                    warn!(channel_id, "agent channel backpressured, closing");
+                    self.agent.channels.remove(&channel_id);
                 }
             }
             Some(Ok(Frame::AgentClose { channel_id })) => {
@@ -865,8 +896,14 @@ impl ServerRelay<'_> {
                 }
             }
             Some(Ok(Frame::TunnelData { channel_id, data })) => {
-                if let Some(tx) = self.tunnel.channels.get(&channel_id) {
-                    let _ = tx.send(data).await;
+                if self
+                    .tunnel
+                    .channels
+                    .get(&channel_id)
+                    .is_some_and(|tx| tx.try_send(data).is_err())
+                {
+                    warn!(channel_id, "tunnel channel backpressured, closing");
+                    self.tunnel.channels.remove(&channel_id);
                 }
             }
             Some(Ok(Frame::TunnelClose { channel_id })) => {
@@ -907,8 +944,14 @@ impl ServerRelay<'_> {
                 }
             }
             Some(Ok(Frame::PortForwardData { channel_id, data })) => {
-                if let Some((_, tx)) = self.pf.channels.get(&channel_id) {
-                    let _ = tx.send(data).await;
+                if self
+                    .pf
+                    .channels
+                    .get(&channel_id)
+                    .is_some_and(|(_, tx)| tx.try_send(data).is_err())
+                {
+                    warn!(channel_id, "pf channel backpressured, closing");
+                    self.pf.channels.remove(&channel_id);
                 }
             }
             Some(Ok(Frame::PortForwardClose { channel_id })) => {
@@ -1463,6 +1506,8 @@ pub async fn run(
     let mut alt_screen = AltScreenTracker::new();
     let mut scrollback = ScrollbackBuffer::new();
     let mut first_client = true;
+    let mut pending_input: VecDeque<Bytes> = VecDeque::new();
+    let mut pending_input_bytes: usize = 0;
     loop {
         if !first_client {
             let got_client = 'drain: loop {
@@ -1535,6 +1580,9 @@ pub async fn run(
                             Err(_would_block) => continue,
                         }
                     }
+                    ready = async_master.writable(), if !pending_input.is_empty() => {
+                        drain_pending_input(ready?, &mut pending_input, &mut pending_input_bytes)?;
+                    }
                     event = send_event_rx.recv() => {
                         if let Some(event) = event {
                             handle_send_event(event, &mut transfer_state, &send_notify_tx);
@@ -1577,19 +1625,10 @@ pub async fn run(
                 }
             }
         } else if is_reconnect {
-            // Alternate screen: Ctrl-L to PTY for TUI redraw
-            let mut written = 0;
-            let ctrl_l = b"\x0c";
-            while written < ctrl_l.len() {
-                let mut guard = async_master.writable().await?;
-                match guard.try_io(|inner| {
-                    nix::unistd::write(inner, &ctrl_l[written..]).map_err(io::Error::from)
-                }) {
-                    Ok(Ok(n)) => written += n,
-                    Ok(Err(e)) => return Err(e.into()),
-                    Err(_would_block) => continue,
-                }
-            }
+            // Alternate screen: Ctrl-L to PTY for TUI redraw.
+            // Queue it so a backpressured PTY doesn't wedge reconnect.
+            pending_input_bytes += 1;
+            pending_input.push_back(Bytes::from_static(b"\x0c"));
         }
 
         // 3. Flush disconnect ring buffer (output produced while disconnected)
@@ -1643,6 +1682,8 @@ pub async fn run(
             };
             let mut relay = ServerRelay {
                 async_master: &async_master,
+                pending_input: &mut pending_input,
+                pending_input_bytes: &mut pending_input_bytes,
                 agent: &mut agent,
                 tunnel: &mut tunnel,
                 pf: &mut pf,
@@ -1664,6 +1705,10 @@ pub async fn run(
                         if let ControlFlow::Break(exit) = relay.handle_client_frame(&mut framed, frame).await? {
                             break exit;
                         }
+                    }
+
+                    ready = relay.async_master.writable(), if !relay.pending_input.is_empty() => {
+                        drain_pending_input(ready?, relay.pending_input, relay.pending_input_bytes)?;
                     }
 
                     ready = relay.async_master.readable() => {
