@@ -718,7 +718,11 @@ async fn tail_relay(
                     let _ = framed.send(Frame::Exit { code }).await;
                     break;
                 }
-                Err(broadcast::error::RecvError::Lagged(_)) => continue,
+                Err(broadcast::error::RecvError::Lagged(n)) => {
+                    let marker = format!("\r\n\x1b[2;33m[tail: dropped {n} events]\x1b[0m\r\n");
+                    if framed.send(Frame::Data(Bytes::from(marker))).await.is_err() { break; }
+                    continue;
+                }
                 Err(broadcast::error::RecvError::Closed) => break,
             },
             frame = framed.next() => match frame {
@@ -1533,6 +1537,7 @@ pub async fn run(
     let mut pending_input_bytes: usize = 0;
     loop {
         if !first_client {
+            let mut detached_exit: Option<i32> = None;
             let got_client = 'drain: loop {
                 tokio::select! {
                     biased;
@@ -1571,6 +1576,7 @@ pub async fn run(
                         }) {
                             Ok(Ok(0)) => {
                                 debug!("pty EOF while disconnected");
+                                detached_exit = Some(0);
                                 break 'drain false;
                             }
                             Ok(Ok(n)) => {
@@ -1592,6 +1598,7 @@ pub async fn run(
                             Ok(Err(e)) => {
                                 if e.raw_os_error() == Some(libc::EIO) {
                                     debug!("pty EIO while disconnected");
+                                    detached_exit = Some(0);
                                     break 'drain false;
                                 }
                                 return Err(e.into());
@@ -1609,6 +1616,7 @@ pub async fn run(
                             ring_buf_size += chunk.len();
                             ring_buf.push_back(chunk);
                         }
+                        detached_exit = Some(code);
                         break 'drain false;
                     }
                     ready = async_master.writable(), if !pending_input.is_empty() => {
@@ -1623,6 +1631,18 @@ pub async fn run(
                 }
             };
             if !got_client {
+                if let Some(mut code) = detached_exit {
+                    // PTY EOF/EIO may fire before wait() resolves; capture real code.
+                    if let Ok(Ok(status)) = tokio::time::timeout(
+                        std::time::Duration::from_millis(500),
+                        managed.child.wait(),
+                    )
+                    .await
+                    {
+                        code = status.code().unwrap_or(code);
+                    }
+                    let _ = tail_tx.send(TailEvent::Exit { code });
+                }
                 break;
             }
 
