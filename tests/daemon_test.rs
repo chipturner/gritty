@@ -905,18 +905,27 @@ async fn reconnect_via_daemon_after_disconnect() {
     framed.send(Frame::Resize { cols: 80, rows: 24 }).await.unwrap();
     drain_data(&mut framed, Duration::from_millis(500)).await;
 
-    // Verify marker persists
-    framed.send(Frame::Data(Bytes::from("echo $RECONN_MARKER\n"))).await.unwrap();
+    // Verify marker persists. Poll until the expanded value appears — the shell is a
+    // separate process and may lag the kernel PTY echo under CPU contention, so a
+    // gap-based collect can exit holding only the line-discipline echo.
+    framed.send(Frame::Data(Bytes::from("echo MARK-$RECONN_MARKER-END\n"))).await.unwrap();
     let mut output = Vec::new();
-    while let Ok(Some(Ok(Frame::Data(data)))) = timeout(Duration::from_secs(2), framed.next()).await
-    {
-        output.extend_from_slice(&data);
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(15);
+    loop {
+        match timeout(Duration::from_secs(1), framed.next()).await {
+            Ok(Some(Ok(Frame::Data(data)))) => {
+                output.extend_from_slice(&data);
+                if String::from_utf8_lossy(&output).contains("MARK-persisted-END") {
+                    break;
+                }
+            }
+            _ if tokio::time::Instant::now() >= deadline => {
+                let output_str = String::from_utf8_lossy(&output);
+                panic!("env marker should persist across reconnect, got: {output_str}");
+            }
+            _ => {}
+        }
     }
-    let output_str = String::from_utf8_lossy(&output);
-    assert!(
-        output_str.contains("persisted"),
-        "env marker should persist across reconnect, got: {output_str}"
-    );
 
     kill_cleanup(&ctl_path, &id).await;
 }
