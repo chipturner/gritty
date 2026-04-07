@@ -237,6 +237,7 @@ fn roundtrip_session_info() {
                 created_at: 1700000000,
                 attached: true,
                 last_heartbeat: 1700000005,
+                agent_forwarding_active: true,
             },
             SessionEntry {
                 id: 1,
@@ -249,6 +250,7 @@ fn roundtrip_session_info() {
                 created_at: 1700000100,
                 attached: false,
                 last_heartbeat: 0,
+                agent_forwarding_active: false,
             },
         ],
     };
@@ -407,6 +409,7 @@ fn session_info_u32_id_roundtrip() {
             created_at: 1700000000,
             attached: true,
             last_heartbeat: 0,
+            agent_forwarding_active: false,
         }],
     };
     codec.encode(original.clone(), &mut buf).unwrap();
@@ -475,6 +478,7 @@ fn session_info_preserves_newline_in_name() {
             created_at: 1700000000,
             attached: true,
             last_heartbeat: 0,
+            agent_forwarding_active: false,
         }],
     };
     codec.encode(original.clone(), &mut buf).unwrap();

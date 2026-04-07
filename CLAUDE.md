@@ -28,7 +28,8 @@ Persistent TTY sessions over Unix domain sockets. Single binary, tmux-like CLI. 
 | `paste` | | Paste client clipboard to stdout |
 | `open <url>` | | Open a URL on the local machine (for use inside gritty sessions) |
 | `info` | | Show diagnostics |
-| `config-edit` | | Open config in `$VISUAL`/`$EDITOR`/vi |
+| `config` | | Open config in `$VISUAL`/`$EDITOR`/vi |
+| `doctor` | | Check for common issues |
 | `server` | `s` | Start the server (backgrounds by default, `-f` for foreground) |
 | `completions <shell>` | | Generate shell completions |
 | `socket-path` | `socket` | Print the default socket path |
@@ -95,7 +96,7 @@ Handshake: `0x01` Hello, `0x02` HelloAck. Relay: `0x10` Data, `0x11` Resize, `0x
 
 `Error`: `[code: u16][message: remaining bytes]`. `ErrorCode`: `NoSuchSession(1)`, `NameAlreadyExists(2)`, `InvalidName(3)`, `EmptyName(4)`, `VersionMismatch(5)`, `UnexpectedFrame(6)`, `AlreadyAttached(7)`, `Unknown(u16)`.
 
-`SessionInfo`: `[count: u32][per entry: [entry_len: u32][id: u32][name: u16-len + bytes][pty_path: u16-len + bytes][shell_pid: u32][created_at: u64][attached: u8][last_heartbeat: u64][foreground_cmd: u16-len + bytes][cwd: u16-len + bytes][client_name: u16-len + bytes]]`. Decoder skips unknown trailing bytes within each entry_len.
+`SessionInfo`: `[count: u32][per entry: [entry_len: u32][id: u32][name: u16-len + bytes][pty_path: u16-len + bytes][shell_pid: u32][created_at: u64][attached: u8][last_heartbeat: u64][foreground_cmd: u16-len + bytes][cwd: u16-len + bytes][client_name: u16-len + bytes][agent_forwarding_active: u8]]`. Decoder skips unknown trailing bytes within each entry_len; new fields default gracefully when absent (older servers).
 
 `SvcRequest`: `OpenUrl=1`, `Send=2`, `Receive=3`, `Clipboard=5` (1-byte discriminator). Clipboard sub-protocol: `[0x01][data]` = copy, `[0x02]` = paste (server responds with clipboard content).
 

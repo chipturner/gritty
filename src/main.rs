@@ -47,7 +47,8 @@ In-session (run inside a gritty session):
 
 Configuration:
   info                   Show diagnostics (paths, server, tunnels)
-  config-edit            Open config in $VISUAL/$EDITOR/vi
+  config                 Open config in $VISUAL/$EDITOR/vi
+  doctor                 Check for common issues
 
 Plumbing:
   server (s)             Start the server
@@ -314,7 +315,10 @@ enum Command {
     Info,
     /// Open config file in $VISUAL/$EDITOR/vi (creates from template if missing)
     #[command(display_order = 21)]
-    ConfigEdit,
+    Config,
+    /// Check for common issues (stale processes, orphaned sockets, config errors)
+    #[command(display_order = 22)]
+    Doctor,
     /// Generate shell completions
     #[command(display_order = 41)]
     Completions {
@@ -849,7 +853,8 @@ async fn run(cli: Cli, config: gritty::config::ConfigFile) -> anyhow::Result<()>
             Ok(())
         }
         Command::Info => info(&config).await,
-        Command::ConfigEdit => config_edit(),
+        Command::Config => config_edit(),
+        Command::Doctor => doctor().await,
         Command::ProtocolVersion => {
             println!("{}", gritty::protocol::PROTOCOL_VERSION);
             Ok(())

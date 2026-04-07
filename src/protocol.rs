@@ -155,6 +155,7 @@ pub struct SessionEntry {
     pub foreground_cmd: String,
     pub cwd: String,
     pub client_name: String,
+    pub agent_forwarding_active: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -410,6 +411,7 @@ fn encode_session_info(dst: &mut BytesMut, sessions: &[SessionEntry]) {
         dst.extend_from_slice(e.cwd.as_bytes());
         dst.put_u16(e.client_name.len() as u16);
         dst.extend_from_slice(e.client_name.as_bytes());
+        dst.put_u8(if e.agent_forwarding_active { 1 } else { 0 });
     }
 }
 
@@ -425,6 +427,7 @@ fn entry_encoded_len(e: &SessionEntry) -> usize {
     + 2 + e.foreground_cmd.len()
     + 2 + e.cwd.len()
     + 2 + e.client_name.len()
+    + 1 // agent_forwarding_active
 }
 
 fn decode_string(payload: BytesMut) -> Result<String, io::Error> {
@@ -639,7 +642,16 @@ fn decode_session_info(payload: BytesMut) -> Result<Option<Frame>, io::Error> {
         let foreground_cmd = read_entry_str(entry_slice, &mut eoff)?;
         let cwd = read_entry_str(entry_slice, &mut eoff)?;
         let client_name = read_entry_str(entry_slice, &mut eoff)?;
-        // Skip any unknown trailing bytes in this entry
+        // New field (added after client_name): agent_forwarding_active (1 byte).
+        // Older servers don't send it, so default to false if absent.
+        let agent_forwarding_active = if eoff < entry_slice.len() {
+            let v = entry_slice[eoff] != 0;
+            eoff += 1;
+            v
+        } else {
+            false
+        };
+        let _ = eoff; // remaining bytes skipped via entry_end
         sessions.push(SessionEntry {
             id,
             name,
@@ -651,6 +663,7 @@ fn decode_session_info(payload: BytesMut) -> Result<Option<Frame>, io::Error> {
             foreground_cmd,
             cwd,
             client_name,
+            agent_forwarding_active,
         });
         off = entry_end;
     }

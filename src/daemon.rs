@@ -201,6 +201,7 @@ fn build_session_entries(sessions: &HashMap<u32, SessionState>) -> Vec<SessionEn
                     foreground_cmd: foreground_process(meta.shell_pid),
                     cwd: foreground_cwd(meta.shell_pid),
                     client_name: meta.client_name.lock().map(|n| n.clone()).unwrap_or_default(),
+                    agent_forwarding_active: meta.wants_agent.load(Ordering::Relaxed),
                 }
             } else {
                 SessionEntry {
@@ -214,6 +215,7 @@ fn build_session_entries(sessions: &HashMap<u32, SessionState>) -> Vec<SessionEn
                     foreground_cmd: "-".to_string(),
                     cwd: String::new(),
                     client_name: String::new(),
+                    agent_forwarding_active: false,
                 }
             }
         })

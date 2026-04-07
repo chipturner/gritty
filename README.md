@@ -104,7 +104,8 @@ Local-only sessions (`gritty connect local:scratch`) are available for testing b
 | `gritty copy` | | Copy stdin to the client clipboard (for use inside gritty sessions) |
 | `gritty paste` | | Paste client clipboard to stdout (for use inside gritty sessions) |
 | `gritty info` | | Show diagnostics (paths, server status, tunnels) |
-| `gritty config-edit` | | Open config in `$VISUAL`/`$EDITOR`/vi (creates from template if missing) |
+| `gritty config` | | Open config in `$VISUAL`/`$EDITOR`/vi (creates from template if missing) |
+| `gritty doctor` | | Check for common issues (stale processes, orphaned sockets, config errors) |
 | `gritty server` | `s` | Start the server (backgrounds by default; `-f` for foreground) |
 | `gritty completions <shell>` | | Generate shell completions (bash, zsh, fish, elvish, powershell) |
 | `gritty socket-path` | `socket` | Print the default socket path |
@@ -184,7 +185,7 @@ gritty receive - | tar xzf -
 
 ## Configuration
 
-gritty works out of the box with no config file. Optionally, set persistent defaults in `$XDG_CONFIG_HOME/gritty/config.toml` (default: `~/.config/gritty/config.toml`). Run `gritty config-edit` to create and open the config file.
+gritty works out of the box with no config file. Optionally, set persistent defaults in `$XDG_CONFIG_HOME/gritty/config.toml` (default: `~/.config/gritty/config.toml`). Run `gritty config` to create and open the config file.
 
 ```toml
 # Global defaults for all sessions/connections.

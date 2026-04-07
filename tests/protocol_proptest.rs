@@ -36,6 +36,7 @@ fn arb_session_entry() -> impl Strategy<Value = SessionEntry> {
         arb_string(),
         arb_string(),
         arb_string(),
+        any::<bool>(),
     )
         .prop_map(
             |(
@@ -49,6 +50,7 @@ fn arb_session_entry() -> impl Strategy<Value = SessionEntry> {
                 foreground_cmd,
                 cwd,
                 client_name,
+                agent_forwarding_active,
             )| {
                 SessionEntry {
                     id,
@@ -61,6 +63,7 @@ fn arb_session_entry() -> impl Strategy<Value = SessionEntry> {
                     foreground_cmd,
                     cwd,
                     client_name,
+                    agent_forwarding_active,
                 }
             },
         )

@@ -545,7 +545,7 @@ pub enum TunnelStatus {
 }
 
 /// Probe a tunnel's status using lockfile + socket connectivity.
-fn probe_tunnel_status(name: &str) -> TunnelStatus {
+pub fn probe_tunnel_status(name: &str) -> TunnelStatus {
     let lock_path = connect_lock_path(name);
     if is_lock_held(&lock_path) {
         let sock_path = local_socket_path(name);
@@ -562,7 +562,7 @@ fn probe_tunnel_status(name: &str) -> TunnelStatus {
 /// Clean up files for a stale tunnel (process already dead).
 /// No signals sent — the process is confirmed dead (lockfile released).
 /// Orphaned SSH children self-terminate via ServerAliveInterval/ServerAliveCountMax.
-fn read_pid_hint(name: &str) -> Option<u32> {
+pub fn read_pid_hint(name: &str) -> Option<u32> {
     std::fs::read_to_string(connect_pid_path(name)).ok().and_then(|s| s.trim().parse().ok())
 }
 
@@ -575,7 +575,7 @@ fn cleanup_stale_files(name: &str) {
 }
 
 /// Extract tunnel connection names by globbing lock files in the socket dir.
-fn enumerate_tunnels() -> Vec<String> {
+pub fn enumerate_tunnels() -> Vec<String> {
     let dir = crate::daemon::socket_dir();
     let Ok(entries) = std::fs::read_dir(&dir) else {
         return Vec::new();
