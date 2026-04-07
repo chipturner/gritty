@@ -1102,6 +1102,8 @@ async fn relay(
     async_stdin: &AsyncFd<io::Stdin>,
     async_stdout: &AsyncFd<std::os::fd::OwnedFd>,
     sigwinch: &mut tokio::signal::unix::Signal,
+    sigterm: &mut tokio::signal::unix::Signal,
+    sighup: &mut tokio::signal::unix::Signal,
     buf: &mut [u8],
     mut escape: Option<&mut EscapeProcessor>,
     raw_guard: &RawModeGuard,
@@ -1116,9 +1118,6 @@ async fn relay(
     fwd_listener: &Option<tokio::net::UnixListener>,
     limiters: &mut SecurityLimiters,
 ) -> anyhow::Result<RelayExit> {
-    let mut sigterm = signal(SignalKind::terminate())?;
-    let mut sighup = signal(SignalKind::hangup())?;
-
     let mut heartbeat_interval = tokio::time::interval(hb_interval);
     heartbeat_interval.reset(); // first tick is immediate otherwise; delay it
     let mut last_pong = Instant::now();
@@ -1411,6 +1410,10 @@ pub async fn run(
     }
     let async_stdout = AsyncFd::new(stdout_fd)?;
     let mut sigwinch = signal(SignalKind::window_change())?;
+    // Hoisted so they stay live across the reconnect loop — tokio::signal() permanently
+    // replaces the libc disposition, so dropping the stream would swallow the signal.
+    let mut sigterm = signal(SignalKind::terminate())?;
+    let mut sighup = signal(SignalKind::hangup())?;
     let mut buf = vec![0u8; 4096];
     let mut current_env = env_vars;
     let mut escape = if no_escape { None } else { Some(EscapeProcessor::new()) };
@@ -1450,6 +1453,8 @@ pub async fn run(
                 &async_stdin,
                 &async_stdout,
                 &mut sigwinch,
+                &mut sigterm,
+                &mut sighup,
                 &mut buf,
                 escape.as_mut(),
                 &raw_guard,
@@ -1483,6 +1488,14 @@ pub async fn run(
                     // Race sleep against stdin so Ctrl-C is instant
                     tokio::select! {
                         _ = tokio::time::sleep(Duration::from_secs(1)) => {}
+                        _ = sigterm.recv() => {
+                            write_stdout_async(&async_stdout, b"\r\n").await?;
+                            return Ok(1);
+                        }
+                        _ = sighup.recv() => {
+                            write_stdout_async(&async_stdout, b"\r\n").await?;
+                            return Ok(1);
+                        }
                         ready = async_stdin.readable() => {
                             let mut guard = ready?;
                             let mut peek = [0u8; 1];
@@ -1665,7 +1678,12 @@ pub async fn tail(
                 let reconnect_started = Instant::now();
                 eprint!("\x1b[2;33m\u{25b8} reconnecting... (Ctrl-C to abort)\x1b[0m");
                 loop {
-                    tokio::time::sleep(Duration::from_secs(1)).await;
+                    tokio::select! {
+                        _ = tokio::time::sleep(Duration::from_secs(1)) => {}
+                        _ = sigint.recv() => { break 'outer 0; }
+                        _ = sigterm.recv() => { break 'outer 1; }
+                        _ = sighup.recv() => { break 'outer 1; }
+                    }
                     let elapsed = reconnect_started.elapsed().as_secs();
                     eprint!(
                         "\r\x1b[2;33m\u{25b8} reconnecting... {elapsed}s (Ctrl-C to abort)\x1b[0m\x1b[K"
