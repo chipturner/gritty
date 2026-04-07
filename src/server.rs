@@ -1209,7 +1209,11 @@ impl ServerRelay<'_> {
         notification: Option<Frame>,
     ) {
         if let Some(frame) = notification {
-            if matches!(frame, Frame::SendDone | Frame::SendCancel { .. }) {
+            // Only clear an Active transfer; a stale Done/Cancel must not
+            // clobber a newer WaitingForReceiver/Sender state.
+            if matches!(frame, Frame::SendDone | Frame::SendCancel { .. })
+                && matches!(*self.transfer_state, TransferState::Active { .. })
+            {
                 *self.transfer_state = TransferState::Idle;
             }
             let _ = framed.send(frame).await;
@@ -1625,6 +1629,15 @@ pub async fn run(
                     event = send_event_rx.recv() => {
                         if let Some(event) = event {
                             handle_send_event(event, &mut transfer_state, &send_notify_tx);
+                        }
+                        continue;
+                    }
+                    notification = send_notify_rx.recv() => {
+                        if let Some(frame) = notification
+                            && matches!(frame, Frame::SendDone | Frame::SendCancel { .. })
+                            && matches!(transfer_state, TransferState::Active { .. })
+                        {
+                            transfer_state = TransferState::Idle;
                         }
                         continue;
                     }
