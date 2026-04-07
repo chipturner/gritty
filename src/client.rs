@@ -445,6 +445,7 @@ enum ClientPortForwardEvent {
 /// Per-forward state on the client side.
 struct ClientPortForwardState {
     listener_handle: Option<tokio::task::JoinHandle<()>>,
+    keepalive_handle: Option<tokio::task::JoinHandle<()>>,
     target_port: u16,
 }
 
@@ -512,8 +513,17 @@ impl ClientPortForwardTable {
             if let Some(h) = fwd.listener_handle {
                 h.abort();
             }
+            if let Some(h) = fwd.keepalive_handle {
+                h.abort();
+            }
         }
         self.channels.clear();
+    }
+}
+
+impl Drop for ClientPortForwardTable {
+    fn drop(&mut self) {
+        self.teardown();
     }
 }
 
@@ -1048,7 +1058,11 @@ impl ClientRelay<'_> {
                     });
                     self.pf.forwards.insert(
                         forward_id,
-                        ClientPortForwardState { listener_handle: Some(handle), target_port },
+                        ClientPortForwardState {
+                            listener_handle: Some(handle),
+                            keepalive_handle: None,
+                            target_port,
+                        },
                     );
                     info!(
                         forward_id,
@@ -1087,11 +1101,22 @@ impl ClientRelay<'_> {
 
         // Keepalive: when the controlling process disconnects, tear down the forward.
         let pf_tx = self.pf_event_tx.clone();
-        tokio::spawn(async move {
+        let keepalive_handle = tokio::spawn(async move {
             let mut buf = [0u8; 1];
             let _ = fwd_stream.read(&mut buf).await;
             let _ = pf_tx.send(ClientPortForwardEvent::ForwardStopped { forward_id });
         });
+        // Track the keepalive task (and for lf, create the forwards entry) so teardown
+        // aborts it — dropping fwd_stream lets the `gritty lf`/`rf` process see EOF.
+        self.pf
+            .forwards
+            .entry(forward_id)
+            .or_insert(ClientPortForwardState {
+                listener_handle: None,
+                keepalive_handle: None,
+                target_port,
+            })
+            .keepalive_handle = Some(keepalive_handle);
     }
 }
 
