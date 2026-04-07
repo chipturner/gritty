@@ -582,6 +582,7 @@ fn main() {
                 std::process::exit(1);
             }
             let local_sock = gritty::connect::connection_socket_path(&connection_name);
+            let resolved = config.resolve_tunnel(&connection_name);
 
             let socket_dir = gritty::daemon::socket_dir();
             if let Err(e) = gritty::security::secure_create_dir_all(&socket_dir) {
@@ -593,7 +594,11 @@ fn main() {
 
             if !foreground
                 && !dry_run
-                && let Err(e) = gritty::connect::preflight_ssh(&destination, &ssh_options)
+                && let Err(e) = gritty::connect::preflight_ssh(
+                    &destination,
+                    &ssh_options,
+                    resolved.connect_timeout,
+                )
             {
                 eprintln!("error: {e}");
                 std::process::exit(1);
@@ -632,8 +637,6 @@ fn main() {
                 }
             };
 
-            let resolved = config.resolve_tunnel(&connection_name);
-
             let opts = gritty::connect::ConnectOpts {
                 destination,
                 no_server_start: no_server_start || resolved.no_server_start,
@@ -647,6 +650,7 @@ fn main() {
                 foreground,
                 ignore_version_mismatch,
                 isolate_control_path: resolved.isolate_control_path,
+                connect_timeout: resolved.connect_timeout,
             };
 
             let error_pipe = dup_ready_fd(&ready_fd);
@@ -852,7 +856,10 @@ async fn run(cli: Cli, config: gritty::config::ConfigFile) -> anyhow::Result<()>
             port_forward_client_command(cli.ctl_socket, &target, 1, listen_port, target_port).await
         }
         Command::Bootstrap { destination, install_dir, ssh_options } => {
-            gritty::connect::bootstrap(&destination, &ssh_options, &install_dir).await
+            let host = gritty::connect::parse_host(&destination)?;
+            let connect_timeout = config.resolve_tunnel(&host).connect_timeout;
+            gritty::connect::bootstrap(&destination, &ssh_options, &install_dir, connect_timeout)
+                .await
         }
         Command::TunnelDestroy { name } => gritty::connect::disconnect(&name).await,
         Command::Tunnels => {

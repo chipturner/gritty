@@ -123,15 +123,23 @@ const REMOTE_PATH_PREFIX: &str = "$HOME/bin:$HOME/.local/bin:$HOME/.cargo/bin:$H
 
 /// Build the common SSH args that precede the destination in every invocation:
 /// port, user-supplied options, ConnectTimeout, and BatchMode (background only).
-fn base_ssh_args(dest: &Destination, extra_ssh_opts: &[String], foreground: bool) -> Vec<String> {
+/// `connect_timeout == 0` means "don't pass ConnectTimeout" (defer to ssh_config).
+fn base_ssh_args(
+    dest: &Destination,
+    extra_ssh_opts: &[String],
+    foreground: bool,
+    connect_timeout: u64,
+) -> Vec<String> {
     let mut args = Vec::new();
     args.extend(dest.port_args());
     for opt in extra_ssh_opts {
         args.push("-o".into());
         args.push(opt.clone());
     }
-    args.push("-o".into());
-    args.push("ConnectTimeout=5".into());
+    if connect_timeout > 0 {
+        args.push("-o".into());
+        args.push(format!("ConnectTimeout={connect_timeout}"));
+    }
     if !foreground {
         args.push("-o".into());
         args.push("BatchMode=yes".into());
@@ -145,6 +153,7 @@ fn remote_exec_command(
     remote_cmd: &str,
     extra_ssh_opts: &[String],
     foreground: bool,
+    connect_timeout: u64,
 ) -> Command {
     let mut preamble = if let Ok(dir) = std::env::var("GRITTY_BIN_DIR") {
         format!("PATH=\"{dir}:{REMOTE_PATH_PREFIX}\"")
@@ -156,7 +165,7 @@ fn remote_exec_command(
     }
     let wrapped_cmd = format!("{preamble}; {remote_cmd}");
     let mut cmd = Command::new("ssh");
-    cmd.args(base_ssh_args(dest, extra_ssh_opts, foreground));
+    cmd.args(base_ssh_args(dest, extra_ssh_opts, foreground, connect_timeout));
     cmd.arg(dest.ssh_dest());
     cmd.arg(&wrapped_cmd);
     cmd
@@ -172,10 +181,12 @@ async fn remote_exec(
     remote_cmd: &str,
     extra_ssh_opts: &[String],
     foreground: bool,
+    connect_timeout: u64,
 ) -> anyhow::Result<String> {
     debug!("ssh {}: {remote_cmd}", dest.ssh_dest());
 
-    let mut cmd = remote_exec_command(dest, remote_cmd, extra_ssh_opts, foreground);
+    let mut cmd =
+        remote_exec_command(dest, remote_cmd, extra_ssh_opts, foreground, connect_timeout);
     cmd.stdout(Stdio::piped());
     cmd.stderr(Stdio::piped());
     cmd.stdin(Stdio::null());
@@ -195,7 +206,7 @@ async fn remote_exec(
                 dest.ssh_dest(),
             );
         }
-        let diag = format_ssh_diag(dest, extra_ssh_opts, foreground);
+        let diag = format_ssh_diag(dest, extra_ssh_opts, foreground, connect_timeout);
         if stderr.is_empty() {
             bail!("ssh command failed (exit {})\n  to diagnose: {diag}", output.status);
         }
@@ -209,9 +220,14 @@ async fn remote_exec(
 
 /// Format a diagnostic SSH command for display in error messages.
 /// Mirrors `base_ssh_args` so the suggestion matches what was actually run.
-fn format_ssh_diag(dest: &Destination, extra_ssh_opts: &[String], foreground: bool) -> String {
+fn format_ssh_diag(
+    dest: &Destination,
+    extra_ssh_opts: &[String],
+    foreground: bool,
+    connect_timeout: u64,
+) -> String {
     let mut parts = vec!["ssh".to_string()];
-    for arg in base_ssh_args(dest, extra_ssh_opts, foreground) {
+    for arg in base_ssh_args(dest, extra_ssh_opts, foreground, connect_timeout) {
         parts.push(shell_quote(&arg));
     }
     parts.push(dest.ssh_dest());
@@ -243,9 +259,10 @@ fn tunnel_command(
     extra_ssh_opts: &[String],
     foreground: bool,
     isolate_control_path: bool,
+    connect_timeout: u64,
 ) -> Command {
     let mut cmd = Command::new("ssh");
-    cmd.args(base_ssh_args(dest, extra_ssh_opts, foreground));
+    cmd.args(base_ssh_args(dest, extra_ssh_opts, foreground, connect_timeout));
     for opt in TUNNEL_SSH_OPTS {
         cmd.arg("-o").arg(opt);
     }
@@ -270,6 +287,7 @@ async fn spawn_tunnel(
     extra_ssh_opts: &[String],
     foreground: bool,
     isolate_control_path: bool,
+    connect_timeout: u64,
 ) -> anyhow::Result<Child> {
     debug!("tunnel: {} -> {}:{}", local_sock.display(), dest.ssh_dest(), remote_sock,);
     // When riding a ControlMaster mux we don't control, StreamLocalBindUnlink
@@ -282,11 +300,18 @@ async fn spawn_tunnel(
         extra_ssh_opts,
         foreground,
         isolate_control_path,
+        connect_timeout,
     );
     cmd.kill_on_drop(true);
     let child = cmd.spawn().context("failed to spawn ssh tunnel")?;
     debug!("ssh tunnel pid: {:?}", child.id());
     Ok(child)
+}
+
+/// How long to wait for the tunnel socket to appear, given the ssh
+/// ConnectTimeout. Leaves headroom for ProxyCommand startup and forward setup.
+fn socket_wait_deadline(connect_timeout: u64) -> Duration {
+    Duration::from_secs(if connect_timeout == 0 { 60 } else { connect_timeout.max(5) + 10 })
 }
 
 /// Poll until the local socket is connectable (200ms interval).
@@ -316,6 +341,7 @@ fn drain_stderr(child: &mut Child) {
 
 /// Background task: monitor SSH child, respawn on transient failure.
 /// Uses exponential backoff (1s..60s) and never gives up on transient errors.
+#[allow(clippy::too_many_arguments)]
 async fn tunnel_monitor(
     mut child: Child,
     dest: Destination,
@@ -323,6 +349,7 @@ async fn tunnel_monitor(
     remote_sock: String,
     extra_ssh_opts: Vec<String>,
     isolate_control_path: bool,
+    connect_timeout: u64,
     stop: tokio_util::sync::CancellationToken,
 ) {
     let mut backoff = Duration::from_secs(1);
@@ -379,7 +406,7 @@ async fn tunnel_monitor(
 
                 backoff = (backoff * 2).min(MAX_BACKOFF);
 
-                match spawn_tunnel(&dest, &local_sock, &remote_sock, &extra_ssh_opts, false, isolate_control_path).await {
+                match spawn_tunnel(&dest, &local_sock, &remote_sock, &extra_ssh_opts, false, isolate_control_path, connect_timeout).await {
                     Ok(new_child) => {
                         info!("ssh tunnel respawned");
                         child = new_child;
@@ -414,11 +441,12 @@ async fn ensure_remote_ready(
     no_server_start: bool,
     extra_ssh_opts: &[String],
     foreground: bool,
+    connect_timeout: u64,
 ) -> anyhow::Result<(String, Option<u16>)> {
     let remote_cmd = if no_server_start { "gritty socket-path" } else { REMOTE_ENSURE_CMD };
     debug!("ensuring remote server (no_server_start={no_server_start})");
 
-    let output = remote_exec(dest, remote_cmd, extra_ssh_opts, foreground).await?;
+    let output = remote_exec(dest, remote_cmd, extra_ssh_opts, foreground, connect_timeout).await?;
 
     // Output is "socket_path\nversion" (version line may be absent for old remotes)
     let mut lines = output.lines();
@@ -470,7 +498,11 @@ pub fn parse_host(destination: &str) -> anyhow::Result<String> {
 
 /// Synchronous SSH connectivity check -- call before daemonizing to catch
 /// host-key prompts and password prompts while the terminal is still attached.
-pub fn preflight_ssh(dest_str: &str, ssh_options: &[String]) -> anyhow::Result<()> {
+pub fn preflight_ssh(
+    dest_str: &str,
+    ssh_options: &[String],
+    connect_timeout: u64,
+) -> anyhow::Result<()> {
     let dest = Destination::parse(dest_str)?;
     let mut cmd = std::process::Command::new("ssh");
     cmd.args(dest.port_args());
@@ -478,7 +510,10 @@ pub fn preflight_ssh(dest_str: &str, ssh_options: &[String]) -> anyhow::Result<(
         cmd.arg("-o");
         cmd.arg(opt);
     }
-    cmd.args(["-o", "BatchMode=yes", "-o", "ConnectTimeout=5"]);
+    cmd.args(["-o", "BatchMode=yes"]);
+    if connect_timeout > 0 {
+        cmd.args(["-o", &format!("ConnectTimeout={connect_timeout}")]);
+    }
     cmd.arg(dest.ssh_dest());
     cmd.arg("true");
     cmd.stdin(std::process::Stdio::null());
@@ -508,6 +543,7 @@ pub async fn bootstrap(
     dest_str: &str,
     ssh_options: &[String],
     install_dir: &str,
+    connect_timeout: u64,
 ) -> anyhow::Result<()> {
     let dest = Destination::parse(dest_str)?;
 
@@ -519,7 +555,7 @@ pub async fn bootstrap(
     // Run interactively (foreground=true) so SSH can prompt if needed,
     // and pipe stdout/stderr through so the user sees install progress.
     let mut cmd = Command::new("ssh");
-    cmd.args(base_ssh_args(&dest, ssh_options, true));
+    cmd.args(base_ssh_args(&dest, ssh_options, true, connect_timeout));
     cmd.arg(dest.ssh_dest());
     cmd.arg(&install_cmd);
 
@@ -671,6 +707,7 @@ pub struct ConnectOpts {
     pub foreground: bool,
     pub ignore_version_mismatch: bool,
     pub isolate_control_path: bool,
+    pub connect_timeout: u64,
 }
 
 pub async fn run(opts: ConnectOpts, ready_fd: Option<OwnedFd>) -> anyhow::Result<i32> {
@@ -686,7 +723,8 @@ pub async fn run(opts: ConnectOpts, ready_fd: Option<OwnedFd>) -> anyhow::Result
     if opts.dry_run {
         let remote_cmd =
             if opts.no_server_start { "gritty socket-path" } else { REMOTE_ENSURE_CMD };
-        let ensure_cmd = remote_exec_command(&dest, remote_cmd, &opts.ssh_options, true);
+        let ensure_cmd =
+            remote_exec_command(&dest, remote_cmd, &opts.ssh_options, true, opts.connect_timeout);
         let tunnel_cmd = tunnel_command(
             &dest,
             &local_sock,
@@ -694,6 +732,7 @@ pub async fn run(opts: ConnectOpts, ready_fd: Option<OwnedFd>) -> anyhow::Result
             &opts.ssh_options,
             true,
             opts.isolate_control_path,
+            opts.connect_timeout,
         );
 
         println!(
@@ -755,9 +794,14 @@ pub async fn run(opts: ConnectOpts, ready_fd: Option<OwnedFd>) -> anyhow::Result
     };
 
     // 4. Ensure remote server is running and get socket path
-    let (remote_sock, remote_version) =
-        ensure_remote_ready(&dest, opts.no_server_start, &opts.ssh_options, opts.foreground)
-            .await?;
+    let (remote_sock, remote_version) = ensure_remote_ready(
+        &dest,
+        opts.no_server_start,
+        &opts.ssh_options,
+        opts.foreground,
+        opts.connect_timeout,
+    )
+    .await?;
     debug!(remote_sock, ?remote_version, "remote socket path");
 
     // Check protocol version compatibility
@@ -784,6 +828,7 @@ pub async fn run(opts: ConnectOpts, ready_fd: Option<OwnedFd>) -> anyhow::Result
         &opts.ssh_options,
         opts.foreground,
         opts.isolate_control_path,
+        opts.connect_timeout,
     )
     .await?;
     let stop = tokio_util::sync::CancellationToken::new();
@@ -801,13 +846,13 @@ pub async fn run(opts: ConnectOpts, ready_fd: Option<OwnedFd>) -> anyhow::Result
     // 6. Wait for local socket to become connectable (race against child exit)
     let mut child = guard.child.take().unwrap();
     tokio::select! {
-        result = wait_for_socket(&local_sock, Duration::from_secs(15)) => {
+        result = wait_for_socket(&local_sock, socket_wait_deadline(opts.connect_timeout)) => {
             result?;
             guard.child = Some(child);
         }
         status = child.wait() => {
             let status = status.context("failed to wait on ssh tunnel")?;
-            let diag = format_ssh_diag(&dest, &opts.ssh_options, opts.foreground);
+            let diag = format_ssh_diag(&dest, &opts.ssh_options, opts.foreground, opts.connect_timeout);
             let msg = if let Some(mut stderr) = child.stderr.take() {
                 use tokio::io::AsyncReadExt;
                 let mut buf = String::new();
@@ -846,6 +891,7 @@ pub async fn run(opts: ConnectOpts, ready_fd: Option<OwnedFd>) -> anyhow::Result
         remote_sock,
         opts.ssh_options,
         opts.isolate_control_path,
+        opts.connect_timeout,
         stop.clone(),
     ));
 
@@ -1106,11 +1152,12 @@ mod tests {
             &[],
             false,
             false,
+            30,
         );
         let args: Vec<_> =
             cmd.as_std().get_args().map(|a| a.to_string_lossy().to_string()).collect();
         // From base_ssh_args
-        assert!(args.contains(&"ConnectTimeout=5".to_string()));
+        assert!(args.contains(&"ConnectTimeout=30".to_string()));
         assert!(args.contains(&"BatchMode=yes".to_string()));
         // From TUNNEL_SSH_OPTS
         assert!(args.contains(&"ServerAliveInterval=3".to_string()));
@@ -1136,6 +1183,7 @@ mod tests {
             &["ProxyJump=bastion".to_string()],
             false,
             false,
+            30,
         );
         let args: Vec<_> =
             cmd.as_std().get_args().map(|a| a.to_string_lossy().to_string()).collect();
@@ -1154,6 +1202,7 @@ mod tests {
             &[],
             false,
             true,
+            30,
         );
         let args: Vec<_> =
             cmd.as_std().get_args().map(|a| a.to_string_lossy().to_string()).collect();
@@ -1242,8 +1291,15 @@ mod tests {
     #[test]
     fn format_command_tunnel() {
         let dest = Destination::parse("user@host").unwrap();
-        let cmd =
-            tunnel_command(&dest, Path::new("/tmp/local.sock"), "$REMOTE_SOCK", &[], true, false);
+        let cmd = tunnel_command(
+            &dest,
+            Path::new("/tmp/local.sock"),
+            "$REMOTE_SOCK",
+            &[],
+            true,
+            false,
+            30,
+        );
         let formatted = format_command(&cmd);
         assert!(formatted.contains("ServerAliveInterval=3"));
         assert!(!formatted.contains("ControlPath=none"));
@@ -1258,11 +1314,11 @@ mod tests {
     #[test]
     fn format_command_remote_exec() {
         let dest = Destination::parse("user@host:2222").unwrap();
-        let cmd = remote_exec_command(&dest, "gritty socket-path", &[], true);
+        let cmd = remote_exec_command(&dest, "gritty socket-path", &[], true, 30);
         let formatted = format_command(&cmd);
         assert!(formatted.starts_with("ssh "));
         assert!(formatted.contains("-p 2222"));
-        assert!(formatted.contains("ConnectTimeout=5"));
+        assert!(formatted.contains("ConnectTimeout=30"));
         assert!(formatted.contains("user@host"));
         // The wrapped command should be single-quoted (contains spaces)
         assert!(formatted.contains(&format!("PATH=\"{REMOTE_PATH_PREFIX}\"")));
@@ -1271,8 +1327,13 @@ mod tests {
     #[test]
     fn format_command_remote_exec_with_extra_opts() {
         let dest = Destination::parse("user@host").unwrap();
-        let cmd =
-            remote_exec_command(&dest, REMOTE_ENSURE_CMD, &["ProxyJump=bastion".to_string()], true);
+        let cmd = remote_exec_command(
+            &dest,
+            REMOTE_ENSURE_CMD,
+            &["ProxyJump=bastion".to_string()],
+            true,
+            30,
+        );
         let formatted = format_command(&cmd);
         assert!(formatted.contains("ProxyJump=bastion"));
         assert!(formatted.contains("gritty socket-path"));
@@ -1282,21 +1343,36 @@ mod tests {
     #[test]
     fn base_ssh_args_foreground() {
         let dest = Destination::parse("user@host:2222").unwrap();
-        let args = base_ssh_args(&dest, &["ProxyJump=bastion".into()], true);
+        let args = base_ssh_args(&dest, &["ProxyJump=bastion".into()], true, 30);
         assert!(args.contains(&"-p".to_string()));
         assert!(args.contains(&"2222".to_string()));
         assert!(args.contains(&"ProxyJump=bastion".to_string()));
-        assert!(args.contains(&"ConnectTimeout=5".to_string()));
+        assert!(args.contains(&"ConnectTimeout=30".to_string()));
         assert!(!args.contains(&"BatchMode=yes".to_string()));
     }
 
     #[test]
     fn base_ssh_args_background() {
         let dest = Destination::parse("host").unwrap();
-        let args = base_ssh_args(&dest, &[], false);
-        assert!(args.contains(&"ConnectTimeout=5".to_string()));
+        let args = base_ssh_args(&dest, &[], false, 30);
+        assert!(args.contains(&"ConnectTimeout=30".to_string()));
         assert!(args.contains(&"BatchMode=yes".to_string()));
         assert!(!args.contains(&"-p".to_string()));
+    }
+
+    #[test]
+    fn base_ssh_args_zero_timeout() {
+        let dest = Destination::parse("host").unwrap();
+        let args = base_ssh_args(&dest, &[], false, 0);
+        assert!(!args.iter().any(|a| a.starts_with("ConnectTimeout")));
+        assert!(args.contains(&"BatchMode=yes".to_string()));
+    }
+
+    #[test]
+    fn socket_wait_deadline_values() {
+        assert_eq!(socket_wait_deadline(0), Duration::from_secs(60));
+        assert_eq!(socket_wait_deadline(30), Duration::from_secs(40));
+        assert_eq!(socket_wait_deadline(3), Duration::from_secs(15));
     }
 
     // -----------------------------------------------------------------------
@@ -1388,6 +1464,7 @@ mod tests {
                 "/tmp/remote.sock".into(),
                 vec![],
                 false,
+                30,
                 stop,
             ),
         )
@@ -1417,6 +1494,7 @@ mod tests {
                 "/tmp/remote.sock".into(),
                 vec![],
                 false,
+                30,
                 stop,
             ),
         )
@@ -1448,6 +1526,7 @@ mod tests {
                 "/tmp/remote.sock".into(),
                 vec![],
                 false,
+                30,
                 stop,
             ),
         )

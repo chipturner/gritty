@@ -205,6 +205,7 @@ gritty works out of the box with no config file. Optionally, set persistent defa
 # ssh-options = []
 # no-server-start = false
 # isolate-control-path = false  # force ControlPath=none on the tunnel ssh (disables ControlMaster sharing)
+# connect-timeout = 30          # ssh -o ConnectTimeout (seconds); 0 = defer to ssh_config
 
 # Per-host overrides, keyed by connection name.
 # Connection name = hostname from destination, or -n override.

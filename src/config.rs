@@ -49,6 +49,7 @@ pub struct TunnelSettings {
     pub ssh_options: Vec<String>,
     pub no_server_start: bool,
     pub isolate_control_path: bool,
+    pub connect_timeout: u64,
 }
 
 /// Top-level config file structure.
@@ -83,6 +84,7 @@ pub struct TunnelDefaults {
     pub ssh_options: Option<Vec<String>>,
     pub no_server_start: Option<bool>,
     pub isolate_control_path: Option<bool>,
+    pub connect_timeout: Option<u64>,
 }
 
 /// Per-host override section.
@@ -212,6 +214,10 @@ impl ConfigFile {
                 hc.and_then(|c| c.isolate_control_path),
                 dc.and_then(|c| c.isolate_control_path),
             ),
+            connect_timeout: hc
+                .and_then(|c| c.connect_timeout)
+                .or(dc.and_then(|c| c.connect_timeout))
+                .unwrap_or(30),
         }
     }
 }
@@ -358,6 +364,19 @@ mod tests {
         .unwrap();
         assert!(cfg.resolve_tunnel("prod").isolate_control_path);
         assert!(!cfg.resolve_tunnel("devbox").isolate_control_path);
+    }
+
+    #[test]
+    fn tunnel_connect_timeout() {
+        let cfg: ConfigFile = toml::from_str(
+            r#"
+            [host.prod.tunnel]
+            connect-timeout = 10
+            "#,
+        )
+        .unwrap();
+        assert_eq!(cfg.resolve_tunnel("prod").connect_timeout, 10);
+        assert_eq!(cfg.resolve_tunnel("devbox").connect_timeout, 30);
     }
 
     #[test]
