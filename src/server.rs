@@ -753,6 +753,21 @@ fn spawn_tail(
 /// Cap on buffered client→PTY input while the shell isn't reading stdin.
 const PENDING_INPUT_CAP: usize = 1 << 20;
 
+/// Non-blocking drain of any remaining PTY output after `child.wait()` fires,
+/// capturing final write(s) that raced with the exit. The master fd is
+/// O_NONBLOCK, so a raw read returns EAGAIN when the buffer is empty.
+fn drain_pty_final(master: &AsyncFd<OwnedFd>, buf: &mut [u8]) -> Vec<Bytes> {
+    let mut chunks = Vec::new();
+    loop {
+        match nix::unistd::read(master.get_ref(), buf) {
+            Ok(0) => break,
+            Ok(n) => chunks.push(Bytes::copy_from_slice(&buf[..n])),
+            Err(_) => break,
+        }
+    }
+    chunks
+}
+
 /// Drain queued client→PTY input. Called from select! writable arms (attached
 /// and detached loops) so a full PTY input buffer never blocks the relay.
 fn drain_pending_input(
@@ -1520,6 +1535,7 @@ pub async fn run(
         if !first_client {
             let got_client = 'drain: loop {
                 tokio::select! {
+                    biased;
                     client = client_rx.recv() => {
                         match client {
                             Some(ClientConn::Active { framed: f, client_name: cn, capabilities: caps }) => {
@@ -1547,11 +1563,6 @@ pub async fn run(
                                 break 'drain false;
                             }
                         }
-                    }
-                    status = managed.child.wait() => {
-                        let code = status?.code().unwrap_or(1);
-                        info!(code, "shell exited while awaiting client");
-                        break 'drain false;
                     }
                     ready = async_master.readable() => {
                         let mut guard = ready?;
@@ -1587,6 +1598,18 @@ pub async fn run(
                             }
                             Err(_would_block) => continue,
                         }
+                    }
+                    status = managed.child.wait() => {
+                        let code = status?.code().unwrap_or(1);
+                        info!(code, "shell exited while awaiting client");
+                        for chunk in drain_pty_final(&async_master, &mut buf) {
+                            if tail_tx.receiver_count() > 0 {
+                                let _ = tail_tx.send(TailEvent::Data(chunk.clone()));
+                            }
+                            ring_buf_size += chunk.len();
+                            ring_buf.push_back(chunk);
+                        }
+                        break 'drain false;
                     }
                     ready = async_master.writable(), if !pending_input.is_empty() => {
                         drain_pending_input(ready?, &mut pending_input, &mut pending_input_bytes)?;
@@ -1709,6 +1732,7 @@ pub async fn run(
             };
             loop {
                 tokio::select! {
+                    biased;
                     frame = framed.next() => {
                         if let ControlFlow::Break(exit) = relay.handle_client_frame(&mut framed, frame).await? {
                             break exit;
@@ -1937,6 +1961,12 @@ pub async fn run(
                 .await
                 {
                     code = status.code().unwrap_or(code);
+                }
+                for chunk in drain_pty_final(&async_master, &mut buf) {
+                    if tail_tx.receiver_count() > 0 {
+                        let _ = tail_tx.send(TailEvent::Data(chunk.clone()));
+                    }
+                    let _ = framed.send(Frame::Data(chunk)).await;
                 }
                 let _ = tail_tx.send(TailEvent::Exit { code });
                 let _ = framed.send(Frame::Exit { code }).await;
