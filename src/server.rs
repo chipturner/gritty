@@ -282,16 +282,21 @@ enum TransferState {
     Active { relay_handle: tokio::task::JoinHandle<()> },
 }
 
-/// Sanitize a filename: strip path separators, reject ".." and empty names.
+/// Sanitize a file path from the sender manifest: reject absolute paths, `..`
+/// traversal, `.`, and embedded NUL/backslash. Nested relative paths (from
+/// `send -r`) are preserved so the receiver can recreate directory structure.
 fn sanitize_filename(name: &str) -> Option<String> {
-    let basename = std::path::Path::new(name).file_name().and_then(|n| n.to_str()).unwrap_or(name);
-    if basename.is_empty() || basename == ".." || basename == "." {
+    if name.is_empty() || name.contains('\0') || name.contains('\\') {
         return None;
     }
-    if basename.contains('\0') || basename.contains('\\') {
-        return None;
+    let mut has_normal = false;
+    for component in std::path::Path::new(name).components() {
+        match component {
+            std::path::Component::Normal(_) => has_normal = true,
+            _ => return None,
+        }
     }
-    Some(basename.to_string())
+    has_normal.then(|| name.to_string())
 }
 
 /// Extract redirect port from a URL's redirect_uri/redirect_url query parameter.
@@ -2116,5 +2121,21 @@ mod tests {
     fn extract_redirect_url_variant() {
         let url = "https://auth.example.com/authorize?redirect_url=http://localhost:5000/cb";
         assert_eq!(extract_redirect_port(url), Some(5000));
+    }
+
+    #[test]
+    fn sanitize_filename_preserves_nested() {
+        assert_eq!(sanitize_filename("dir/sub/file.txt"), Some("dir/sub/file.txt".into()));
+        assert_eq!(sanitize_filename("file.txt"), Some("file.txt".into()));
+    }
+
+    #[test]
+    fn sanitize_filename_rejects_traversal() {
+        assert_eq!(sanitize_filename("../../etc/passwd"), None);
+        assert_eq!(sanitize_filename("a/../b"), None);
+        assert_eq!(sanitize_filename("/etc/passwd"), None);
+        assert_eq!(sanitize_filename("."), None);
+        assert_eq!(sanitize_filename(""), None);
+        assert_eq!(sanitize_filename("a\0b"), None);
     }
 }

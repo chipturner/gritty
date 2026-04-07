@@ -1718,7 +1718,7 @@ async fn send_cancel_on_sender_disconnect() {
 }
 
 #[tokio::test]
-async fn send_filename_sanitized() {
+async fn send_nested_path_preserved() {
     let (_client_tx, mut framed, server, _meta, svc_path) = setup_session_with_svc_path().await;
     wait_for_shell(&mut framed).await;
 
@@ -1729,15 +1729,15 @@ async fn send_filename_sanitized() {
         tokio::time::sleep(Duration::from_millis(100)).await;
     }
 
-    // Send a file with a path separator in the name -- server should sanitize to basename
-    let file_data = b"sanitized";
+    // Nested relative path (as from `send -r`) must pass through unchanged.
+    let file_data = b"nested";
 
     let sp = svc_path.clone();
     let sender = tokio::spawn(async move {
         let mut stream = UnixStream::connect(&sp).await.unwrap();
         stream.write_all(&[gritty::protocol::SvcRequest::Send.to_byte()]).await.unwrap();
         stream.write_all(&1u32.to_be_bytes()).await.unwrap();
-        let name = b"../../etc/passwd";
+        let name = b"dir/sub/file.txt";
         stream.write_all(&(name.len() as u16).to_be_bytes()).await.unwrap();
         stream.write_all(name).await.unwrap();
         stream.write_all(&(file_data.len() as u64).to_be_bytes()).await.unwrap();
@@ -1755,9 +1755,44 @@ async fn send_filename_sanitized() {
     let files = r.unwrap();
 
     assert_eq!(files.len(), 1);
-    // Should be sanitized to just "passwd"
-    assert_eq!(files[0].0, "passwd");
-    assert_eq!(files[0].1, b"sanitized");
+    assert_eq!(files[0].0, "dir/sub/file.txt");
+    assert_eq!(files[0].1, b"nested");
+
+    let _ = framed.send(Frame::Data(Bytes::from("exit\n"))).await;
+    let _ = timeout(Duration::from_secs(3), server).await;
+}
+
+#[tokio::test]
+async fn send_traversal_path_rejected() {
+    let (_client_tx, mut framed, server, _meta, svc_path) = setup_session_with_svc_path().await;
+    wait_for_shell(&mut framed).await;
+
+    for _ in 0..50 {
+        if svc_path.exists() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+
+    // A traversal path is rejected: the server drops the sender stream, so the
+    // sender's wait-for-go read sees EOF.
+    let mut stream = UnixStream::connect(&svc_path).await.unwrap();
+    stream.write_all(&[gritty::protocol::SvcRequest::Send.to_byte()]).await.unwrap();
+    stream.write_all(&1u32.to_be_bytes()).await.unwrap();
+    let name = b"../../etc/passwd";
+    stream.write_all(&(name.len() as u16).to_be_bytes()).await.unwrap();
+    stream.write_all(name).await.unwrap();
+    stream.write_all(&9u64.to_be_bytes()).await.unwrap();
+    stream.write_all(&0o644u32.to_be_bytes()).await.unwrap();
+    let mut go = [0u8; 1];
+    // Server drops the stream with unread bytes (size/mode) still buffered, so
+    // read() may yield either EOF or ECONNRESET — both mean rejection.
+    let res = timeout(Duration::from_secs(3), stream.read(&mut go)).await.unwrap();
+    match res {
+        Ok(0) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::ConnectionReset => {}
+        other => panic!("expected EOF/reset after rejected manifest, got {other:?}"),
+    }
 
     let _ = framed.send(Frame::Data(Bytes::from("exit\n"))).await;
     let _ = timeout(Duration::from_secs(3), server).await;
