@@ -2343,3 +2343,59 @@ async fn reconnect_sends_ctrl_l_on_alternate_screen() {
     let _ = framed.send(Frame::Data(Bytes::from("exit\n"))).await;
     let _ = timeout(Duration::from_secs(3), server).await;
 }
+
+#[tokio::test]
+async fn reconnect_replays_scrollback_lines() {
+    let (client_tx, mut framed, server, _meta) = setup_session().await;
+    wait_for_shell(&mut framed).await;
+    read_available_data(&mut framed, Duration::from_secs(1)).await;
+
+    // Produce some distinctive output
+    framed.send(Frame::Data(Bytes::from("echo SCROLLBACK_LINE_1\n"))).await.unwrap();
+    read_available_data(&mut framed, Duration::from_millis(500)).await;
+    framed.send(Frame::Data(Bytes::from("echo SCROLLBACK_LINE_2\n"))).await.unwrap();
+    read_available_data(&mut framed, Duration::from_millis(500)).await;
+
+    // Disconnect
+    drop(framed);
+    tokio::time::sleep(Duration::from_millis(300)).await;
+
+    // Reconnect
+    let (server_stream, client_stream) = UnixStream::pair().unwrap();
+    client_tx
+        .send(ClientConn::Active {
+            framed: Framed::new(server_stream, FrameCodec),
+            client_name: String::new(),
+            capabilities: 0,
+        })
+        .unwrap();
+    let mut framed = Framed::new(client_stream, FrameCodec);
+    framed.send(Frame::Resize { cols: 80, rows: 24 }).await.unwrap();
+
+    let output = read_available_data(&mut framed, Duration::from_secs(2)).await;
+    let output_str = String::from_utf8_lossy(&output);
+
+    // Scrollback should contain our output lines
+    assert!(
+        output_str.contains("SCROLLBACK_LINE_1"),
+        "scrollback should replay pre-disconnect output, got: {output_str}"
+    );
+    assert!(
+        output_str.contains("SCROLLBACK_LINE_2"),
+        "scrollback should replay pre-disconnect output, got: {output_str}"
+    );
+
+    // Separator should appear after scrollback
+    assert!(
+        output_str.contains("[gritty: reconnected]"),
+        "separator should appear after scrollback, got: {output_str}"
+    );
+
+    // Scrollback should come BEFORE separator
+    let scrollback_pos = output_str.find("SCROLLBACK_LINE_2").unwrap();
+    let separator_pos = output_str.find("[gritty: reconnected]").unwrap();
+    assert!(scrollback_pos < separator_pos, "scrollback should appear before separator");
+
+    let _ = framed.send(Frame::Data(Bytes::from("exit\n"))).await;
+    let _ = timeout(Duration::from_secs(3), server).await;
+}
