@@ -390,7 +390,7 @@ const REMOTE_ENSURE_CMD: &str = "\
     (gritty ls local >/dev/null 2>&1 || \
      { gritty server && sleep 0.3; }) && \
     echo \"$SOCK\" && \
-    gritty protocol-version 2>/dev/null || true";
+    { gritty protocol-version 2>/dev/null || true; }";
 
 /// Get the remote socket path and optionally auto-start the server.
 /// Returns (socket_path, remote_protocol_version).
