@@ -72,6 +72,26 @@ impl Drop for ManagedChild {
     }
 }
 
+/// Aborts the wrapped tokio task on drop. Tokio's `JoinHandle` drop *detaches*,
+/// which leaks acceptor tasks when `server::run` is aborted by kill-session.
+struct AbortOnDrop(tokio::task::JoinHandle<()>);
+
+impl Drop for AbortOnDrop {
+    fn drop(&mut self) {
+        self.0.abort();
+    }
+}
+
+/// Removes a socket file on drop so per-session sockets are cleaned up on
+/// abort / early `?`-return, not just on normal loop exit.
+struct SocketCleanup(PathBuf);
+
+impl Drop for SocketCleanup {
+    fn drop(&mut self) {
+        cleanup_socket(&self.0);
+    }
+}
+
 /// Why the relay loop exited.
 enum RelayExit {
     /// Client disconnected — re-accept.
@@ -173,6 +193,12 @@ impl AgentForwardState {
     }
 }
 
+impl Drop for AgentForwardState {
+    fn drop(&mut self) {
+        self.teardown();
+    }
+}
+
 /// Grouped state for the OAuth callback reverse tunnel (multi-channel).
 struct TunnelRelayState {
     port: Option<u16>,
@@ -222,6 +248,12 @@ impl PortForwardTable {
         }
         self.channels.clear();
         self.pending_remote.clear();
+    }
+}
+
+impl Drop for PortForwardTable {
+    fn drop(&mut self) {
+        self.teardown();
     }
 }
 
@@ -1276,7 +1308,6 @@ pub async fn run(
     let (send_event_tx, mut send_event_rx) = mpsc::unbounded_channel::<SendEvent>();
     let (send_notify_tx, mut send_notify_rx) = mpsc::unbounded_channel::<Frame>();
     let mut transfer_state = TransferState::Idle;
-    let mut svc_acceptor: Option<tokio::task::JoinHandle<()>> = None;
 
     // Port forward event channel and state
     let (pf_event_tx, mut pf_event_rx) = mpsc::unbounded_channel::<PortForwardEvent>();
@@ -1289,16 +1320,19 @@ pub async fn run(
     // Negotiated capabilities (shared with svc acceptor)
     let negotiated_caps = Arc::new(std::sync::atomic::AtomicU32::new(0));
 
-    // Bind unified service socket immediately (always available)
-    if let Some(listener) = bind_agent_listener(&svc_socket_path) {
-        svc_acceptor = Some(spawn_svc_acceptor(
-            listener,
-            open_event_tx.clone(),
-            send_event_tx.clone(),
-            clipboard_event_tx.clone(),
-            Arc::clone(&negotiated_caps),
-        ));
-    }
+    // Bind unified service socket immediately (always available).
+    // Drop guards handle cleanup on abort / early return.
+    let _svc_cleanup = SocketCleanup(svc_socket_path.clone());
+    let _svc_acceptor: Option<AbortOnDrop> =
+        bind_agent_listener(&svc_socket_path).map(|listener| {
+            AbortOnDrop(spawn_svc_acceptor(
+                listener,
+                open_event_tx.clone(),
+                send_event_tx.clone(),
+                clipboard_event_tx.clone(),
+                Arc::clone(&negotiated_caps),
+            ))
+        });
 
     // Wait for first active client before spawning shell (so we can read Env frame).
     // Tail and send clients that arrive before the first active client get handled
@@ -1325,8 +1359,6 @@ pub async fn run(
                 }
                 None => {
                     info!("client channel closed before first client");
-                    agent.teardown();
-                    cleanup_socket(&svc_socket_path);
                     return Ok(());
                 }
             },
@@ -1861,11 +1893,6 @@ pub async fn run(
         }
     }
 
-    agent.teardown();
-    cleanup_socket(&svc_socket_path);
-    if let Some(handle) = svc_acceptor.take() {
-        handle.abort();
-    }
     Ok(())
 }
 
