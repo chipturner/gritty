@@ -646,6 +646,7 @@ fn main() {
                 dry_run,
                 foreground,
                 ignore_version_mismatch,
+                isolate_control_path: resolved.isolate_control_path,
             };
 
             let error_pipe = dup_ready_fd(&ready_fd);

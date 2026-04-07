@@ -48,6 +48,7 @@ pub struct TunnelSettings {
     pub session: SessionSettings,
     pub ssh_options: Vec<String>,
     pub no_server_start: bool,
+    pub isolate_control_path: bool,
 }
 
 /// Top-level config file structure.
@@ -81,6 +82,7 @@ pub struct Defaults {
 pub struct TunnelDefaults {
     pub ssh_options: Option<Vec<String>>,
     pub no_server_start: Option<bool>,
+    pub isolate_control_path: Option<bool>,
 }
 
 /// Per-host override section.
@@ -205,6 +207,10 @@ impl ConfigFile {
             no_server_start: pick(
                 hc.and_then(|c| c.no_server_start),
                 dc.and_then(|c| c.no_server_start),
+            ),
+            isolate_control_path: pick(
+                hc.and_then(|c| c.isolate_control_path),
+                dc.and_then(|c| c.isolate_control_path),
             ),
         }
     }
@@ -339,6 +345,19 @@ mod tests {
         let c = cfg.resolve_tunnel("prod");
         assert!(c.no_server_start);
         assert!(!cfg.resolve_tunnel("devbox").no_server_start);
+    }
+
+    #[test]
+    fn tunnel_isolate_control_path() {
+        let cfg: ConfigFile = toml::from_str(
+            r#"
+            [host.prod.tunnel]
+            isolate-control-path = true
+            "#,
+        )
+        .unwrap();
+        assert!(cfg.resolve_tunnel("prod").isolate_control_path);
+        assert!(!cfg.resolve_tunnel("devbox").isolate_control_path);
     }
 
     #[test]

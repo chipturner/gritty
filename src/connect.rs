@@ -111,9 +111,8 @@ const TUNNEL_SSH_OPTS: &[&str] = &[
     "ServerAliveCountMax=2",
     "StreamLocalBindUnlink=yes",
     "ExitOnForwardFailure=yes",
-    // Prevent user config from leaking forwarding or connection sharing
-    // into the tunnel (gritty handles agent forwarding separately).
-    "ControlPath=none",
+    // Prevent user config from leaking forwarding into the tunnel
+    // (gritty handles agent forwarding separately).
     "ForwardAgent=no",
     "ForwardX11=no",
 ];
@@ -243,11 +242,15 @@ fn tunnel_command(
     remote_sock: &str,
     extra_ssh_opts: &[String],
     foreground: bool,
+    isolate_control_path: bool,
 ) -> Command {
     let mut cmd = Command::new("ssh");
     cmd.args(base_ssh_args(dest, extra_ssh_opts, foreground));
     for opt in TUNNEL_SSH_OPTS {
         cmd.arg("-o").arg(opt);
+    }
+    if isolate_control_path {
+        cmd.arg("-o").arg("ControlPath=none");
     }
     cmd.args(["-N", "-T"]);
     let forward = format!("{}:{}", local_sock.display(), remote_sock);
@@ -266,9 +269,20 @@ async fn spawn_tunnel(
     remote_sock: &str,
     extra_ssh_opts: &[String],
     foreground: bool,
+    isolate_control_path: bool,
 ) -> anyhow::Result<Child> {
     debug!("tunnel: {} -> {}:{}", local_sock.display(), dest.ssh_dest(), remote_sock,);
-    let mut cmd = tunnel_command(dest, local_sock, remote_sock, extra_ssh_opts, foreground);
+    // When riding a ControlMaster mux we don't control, StreamLocalBindUnlink
+    // may not be set on the master, so unlink ourselves before binding.
+    let _ = std::fs::remove_file(local_sock);
+    let mut cmd = tunnel_command(
+        dest,
+        local_sock,
+        remote_sock,
+        extra_ssh_opts,
+        foreground,
+        isolate_control_path,
+    );
     cmd.kill_on_drop(true);
     let child = cmd.spawn().context("failed to spawn ssh tunnel")?;
     debug!("ssh tunnel pid: {:?}", child.id());
@@ -308,6 +322,7 @@ async fn tunnel_monitor(
     local_sock: PathBuf,
     remote_sock: String,
     extra_ssh_opts: Vec<String>,
+    isolate_control_path: bool,
     stop: tokio_util::sync::CancellationToken,
 ) {
     let mut backoff = Duration::from_secs(1);
@@ -364,7 +379,7 @@ async fn tunnel_monitor(
 
                 backoff = (backoff * 2).min(MAX_BACKOFF);
 
-                match spawn_tunnel(&dest, &local_sock, &remote_sock, &extra_ssh_opts, false).await {
+                match spawn_tunnel(&dest, &local_sock, &remote_sock, &extra_ssh_opts, false, isolate_control_path).await {
                     Ok(new_child) => {
                         info!("ssh tunnel respawned");
                         child = new_child;
@@ -655,6 +670,7 @@ pub struct ConnectOpts {
     pub dry_run: bool,
     pub foreground: bool,
     pub ignore_version_mismatch: bool,
+    pub isolate_control_path: bool,
 }
 
 pub async fn run(opts: ConnectOpts, ready_fd: Option<OwnedFd>) -> anyhow::Result<i32> {
@@ -671,8 +687,14 @@ pub async fn run(opts: ConnectOpts, ready_fd: Option<OwnedFd>) -> anyhow::Result
         let remote_cmd =
             if opts.no_server_start { "gritty socket-path" } else { REMOTE_ENSURE_CMD };
         let ensure_cmd = remote_exec_command(&dest, remote_cmd, &opts.ssh_options, true);
-        let tunnel_cmd =
-            tunnel_command(&dest, &local_sock, "$REMOTE_SOCK", &opts.ssh_options, true);
+        let tunnel_cmd = tunnel_command(
+            &dest,
+            &local_sock,
+            "$REMOTE_SOCK",
+            &opts.ssh_options,
+            true,
+            opts.isolate_control_path,
+        );
 
         println!(
             "# Get remote socket path{}",
@@ -755,8 +777,15 @@ pub async fn run(opts: ConnectOpts, ready_fd: Option<OwnedFd>) -> anyhow::Result
     }
 
     // 5. Spawn SSH tunnel
-    let child =
-        spawn_tunnel(&dest, &local_sock, &remote_sock, &opts.ssh_options, opts.foreground).await?;
+    let child = spawn_tunnel(
+        &dest,
+        &local_sock,
+        &remote_sock,
+        &opts.ssh_options,
+        opts.foreground,
+        opts.isolate_control_path,
+    )
+    .await?;
     let stop = tokio_util::sync::CancellationToken::new();
 
     let mut guard = ConnectGuard {
@@ -816,6 +845,7 @@ pub async fn run(opts: ConnectOpts, ready_fd: Option<OwnedFd>) -> anyhow::Result
         local_sock.clone(),
         remote_sock,
         opts.ssh_options,
+        opts.isolate_control_path,
         stop.clone(),
     ));
 
@@ -1075,6 +1105,7 @@ mod tests {
             "/run/user/1000/gritty/ctl.sock",
             &[],
             false,
+            false,
         );
         let args: Vec<_> =
             cmd.as_std().get_args().map(|a| a.to_string_lossy().to_string()).collect();
@@ -1085,7 +1116,7 @@ mod tests {
         assert!(args.contains(&"ServerAliveInterval=3".to_string()));
         assert!(args.contains(&"StreamLocalBindUnlink=yes".to_string()));
         assert!(args.contains(&"ExitOnForwardFailure=yes".to_string()));
-        assert!(args.contains(&"ControlPath=none".to_string()));
+        assert!(!args.contains(&"ControlPath=none".to_string()));
         assert!(args.contains(&"ForwardAgent=no".to_string()));
         assert!(args.contains(&"ForwardX11=no".to_string()));
         // Tunnel flags and forward
@@ -1104,12 +1135,29 @@ mod tests {
             "/tmp/remote.sock",
             &["ProxyJump=bastion".to_string()],
             false,
+            false,
         );
         let args: Vec<_> =
             cmd.as_std().get_args().map(|a| a.to_string_lossy().to_string()).collect();
         assert!(args.contains(&"ProxyJump=bastion".to_string()));
         assert!(args.contains(&"-p".to_string()));
         assert!(args.contains(&"2222".to_string()));
+    }
+
+    #[test]
+    fn tunnel_command_isolate_control_path() {
+        let dest = Destination::parse("host").unwrap();
+        let cmd = tunnel_command(
+            &dest,
+            Path::new("/tmp/local.sock"),
+            "/tmp/remote.sock",
+            &[],
+            false,
+            true,
+        );
+        let args: Vec<_> =
+            cmd.as_std().get_args().map(|a| a.to_string_lossy().to_string()).collect();
+        assert!(args.contains(&"ControlPath=none".to_string()));
     }
 
     #[test]
@@ -1194,10 +1242,11 @@ mod tests {
     #[test]
     fn format_command_tunnel() {
         let dest = Destination::parse("user@host").unwrap();
-        let cmd = tunnel_command(&dest, Path::new("/tmp/local.sock"), "$REMOTE_SOCK", &[], true);
+        let cmd =
+            tunnel_command(&dest, Path::new("/tmp/local.sock"), "$REMOTE_SOCK", &[], true, false);
         let formatted = format_command(&cmd);
         assert!(formatted.contains("ServerAliveInterval=3"));
-        assert!(formatted.contains("ControlPath=none"));
+        assert!(!formatted.contains("ControlPath=none"));
         assert!(formatted.contains("ForwardAgent=no"));
         assert!(formatted.contains("-N"));
         assert!(formatted.contains("-T"));
@@ -1338,6 +1387,7 @@ mod tests {
                 PathBuf::from("/tmp/nonexistent.sock"),
                 "/tmp/remote.sock".into(),
                 vec![],
+                false,
                 stop,
             ),
         )
@@ -1366,6 +1416,7 @@ mod tests {
                 PathBuf::from("/tmp/nonexistent.sock"),
                 "/tmp/remote.sock".into(),
                 vec![],
+                false,
                 stop,
             ),
         )
@@ -1396,6 +1447,7 @@ mod tests {
                 PathBuf::from("/tmp/nonexistent.sock"),
                 "/tmp/remote.sock".into(),
                 vec![],
+                false,
                 stop,
             ),
         )
