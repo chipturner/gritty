@@ -1192,6 +1192,12 @@ async fn relay(
                                     }
                                     EscapeAction::Suspend => {
                                         suspend(raw_guard, nb_guard)?;
+                                        // CLOCK_MONOTONIC kept advancing while stopped; avoid a
+                                        // spurious heartbeat-timeout disconnect on resume.
+                                        heartbeat_fast = false;
+                                        heartbeat_interval = tokio::time::interval(hb_interval);
+                                        heartbeat_interval.reset();
+                                        *relay.last_pong = Instant::now();
                                         // Re-sync terminal size after resume
                                         let (cols, rows) = get_terminal_size();
                                         if !timed_send(framed, Frame::Resize { cols, rows }).await {

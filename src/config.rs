@@ -144,14 +144,30 @@ impl ConfigFile {
             no_escape: pick(h.and_then(|h| h.no_escape), d.no_escape),
             oauth_redirect: h.and_then(|h| h.oauth_redirect).or(d.oauth_redirect).unwrap_or(true),
             oauth_timeout: h.and_then(|h| h.oauth_timeout).or(d.oauth_timeout).unwrap_or(180),
-            heartbeat_interval: h
-                .and_then(|h| h.heartbeat_interval)
-                .or(d.heartbeat_interval)
-                .unwrap_or(5),
-            heartbeat_timeout: h
-                .and_then(|h| h.heartbeat_timeout)
-                .or(d.heartbeat_timeout)
-                .unwrap_or(15),
+            heartbeat_interval: {
+                let v = h.and_then(|h| h.heartbeat_interval).or(d.heartbeat_interval).unwrap_or(5);
+                if v < 1 {
+                    eprintln!("warning: heartbeat_interval clamped to 1s (was {v})");
+                }
+                v.max(1)
+            },
+            heartbeat_timeout: {
+                let iv = h
+                    .and_then(|h| h.heartbeat_interval)
+                    .or(d.heartbeat_interval)
+                    .unwrap_or(5)
+                    .max(1);
+                let v = h.and_then(|h| h.heartbeat_timeout).or(d.heartbeat_timeout).unwrap_or(15);
+                if v <= iv {
+                    eprintln!(
+                        "warning: heartbeat_timeout ({v}s) must exceed heartbeat_interval ({iv}s); clamped to {}s",
+                        iv + 1
+                    );
+                    iv + 1
+                } else {
+                    v
+                }
+            },
             ring_buffer_size: h
                 .and_then(|h| h.ring_buffer_size)
                 .or(d.ring_buffer_size)
