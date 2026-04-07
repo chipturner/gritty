@@ -367,12 +367,19 @@ pub async fn run(ctl_path: &Path, ready_fd: Option<OwnedFd>) -> anyhow::Result<(
 
         let should_break = tokio::select! {
             result = listener.accept() => {
-                let (stream, _addr) = result?;
-                if let Err(e) = crate::security::verify_peer_uid(&stream) {
-                    warn!("{e}");
-                } else {
-                    let tx = conn_tx.clone();
-                    tokio::spawn(connection_handshake(stream, tx));
+                match result {
+                    Ok((stream, _addr)) => {
+                        if let Err(e) = crate::security::verify_peer_uid(&stream) {
+                            warn!("{e}");
+                        } else {
+                            let tx = conn_tx.clone();
+                            tokio::spawn(connection_handshake(stream, tx));
+                        }
+                    }
+                    Err(e) => {
+                        warn!("ctl accept error: {e}; retrying");
+                        tokio::time::sleep(Duration::from_millis(100)).await;
+                    }
                 }
                 false
             }

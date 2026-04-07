@@ -297,8 +297,9 @@ fn spawn_agent_acceptor(
             let (stream, _) = match listener.accept().await {
                 Ok(conn) => conn,
                 Err(e) => {
-                    debug!("agent listener accept error: {e}");
-                    break;
+                    warn!("agent listener accept error: {e}; retrying");
+                    tokio::time::sleep(Duration::from_millis(100)).await;
+                    continue;
                 }
             };
 
@@ -348,8 +349,9 @@ fn spawn_pf_tcp_acceptor(
             let (stream, _) = match listener.accept().await {
                 Ok(conn) => conn,
                 Err(e) => {
-                    debug!(forward_id, "pf tcp listener accept error: {e}");
-                    break;
+                    warn!(forward_id, "pf tcp listener accept error: {e}; retrying");
+                    tokio::time::sleep(Duration::from_millis(100)).await;
+                    continue;
                 }
             };
 
@@ -473,8 +475,9 @@ fn spawn_svc_acceptor(
             let (mut stream, _) = match listener.accept().await {
                 Ok(conn) => conn,
                 Err(e) => {
-                    debug!("svc listener accept error: {e}");
-                    break;
+                    warn!("svc listener accept error: {e}; retrying");
+                    tokio::time::sleep(Duration::from_millis(100)).await;
+                    continue;
                 }
             };
 
