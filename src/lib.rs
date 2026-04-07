@@ -23,7 +23,10 @@ pub async fn handshake(
             capabilities: protocol::CAP_CLIPBOARD,
         })
         .await?;
-    match protocol::Frame::expect_from(framed.next().await)? {
+    let reply = tokio::time::timeout(std::time::Duration::from_secs(5), framed.next())
+        .await
+        .map_err(|_| anyhow::anyhow!("handshake timed out after 5s"))?;
+    match protocol::Frame::expect_from(reply)? {
         protocol::Frame::HelloAck { version, capabilities } => {
             Ok((version, protocol::CAP_CLIPBOARD & capabilities))
         }

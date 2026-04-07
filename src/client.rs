@@ -1525,6 +1525,7 @@ pub async fn run(
                     enum Attempt {
                         Connected(Framed<UnixStream, FrameCodec>),
                         SessionGone(String),
+                        HandshakeErr(String),
                         Retry,
                     }
 
@@ -1534,8 +1535,8 @@ pub async fn run(
                             Err(_) => return Attempt::Retry,
                         };
                         let mut new_framed = Framed::new(stream, FrameCodec);
-                        if crate::handshake(&mut new_framed).await.is_err() {
-                            return Attempt::Retry;
+                        if let Err(e) = crate::handshake(&mut new_framed).await {
+                            return Attempt::HandshakeErr(e.to_string());
                         }
                         if new_framed
                             .send(Frame::Attach {
@@ -1579,6 +1580,18 @@ pub async fn run(
                             )
                             .await?;
                             return Ok(1);
+                        }
+                        Ok(Attempt::HandshakeErr(msg)) => {
+                            write_stdout_async(
+                                &async_stdout,
+                                format!("\r\x1b[31m\u{25b8} {msg}\x1b[0m\x1b[K\r\n").as_bytes(),
+                            )
+                            .await?;
+                            // A server-side rejection (version mismatch etc.) is permanent.
+                            if msg.starts_with("handshake rejected") {
+                                return Ok(1);
+                            }
+                            continue;
                         }
                         Ok(Attempt::Retry) | Err(_) => continue,
                     }
@@ -1695,7 +1708,12 @@ pub async fn tail(
                     };
 
                     let mut new_framed = Framed::new(stream, FrameCodec);
-                    if crate::handshake(&mut new_framed).await.is_err() {
+                    if let Err(e) = crate::handshake(&mut new_framed).await {
+                        let msg = e.to_string();
+                        eprintln!("\r\x1b[31m\u{25b8} {msg}\x1b[0m\x1b[K");
+                        if msg.starts_with("handshake rejected") {
+                            break 'outer 1;
+                        }
                         continue;
                     }
                     if new_framed.send(Frame::Tail { session: session.to_string() }).await.is_err()
