@@ -1472,7 +1472,7 @@ pub async fn run(
                             .send(Frame::Attach {
                                 session: session.to_string(),
                                 client_name: client_name.clone(),
-                                force: false,
+                                force: true,
                             })
                             .await
                             .is_err()
