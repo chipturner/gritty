@@ -269,10 +269,14 @@ fn tunnel_command(
     if isolate_control_path {
         cmd.arg("-o").arg("ControlPath=none");
     }
-    cmd.args(["-N", "-T"]);
+    cmd.arg("-T");
     let forward = format!("{}:{}", local_sock.display(), remote_sock);
     cmd.arg("-L").arg(forward);
     cmd.arg(dest.ssh_dest());
+    // Not -N: a mux client with -N exits 0 immediately after the master accepts
+    // the forward. A blocking remote command keeps a session channel open so the
+    // child's lifetime tracks the forward in both mux and standalone modes.
+    cmd.arg("exec sleep 2147483647");
     cmd.stdout(Stdio::null());
     cmd.stderr(Stdio::piped());
     cmd.stdin(Stdio::null());
@@ -1167,10 +1171,11 @@ mod tests {
         assert!(args.contains(&"ForwardAgent=no".to_string()));
         assert!(args.contains(&"ForwardX11=no".to_string()));
         // Tunnel flags and forward
-        assert!(args.contains(&"-N".to_string()));
+        assert!(!args.contains(&"-N".to_string()));
         assert!(args.contains(&"-T".to_string()));
         assert!(args.contains(&"/tmp/local.sock:/run/user/1000/gritty/ctl.sock".to_string()));
         assert!(args.contains(&"user@host".to_string()));
+        assert!(args.contains(&"exec sleep 2147483647".to_string()));
     }
 
     #[test]
@@ -1304,8 +1309,8 @@ mod tests {
         assert!(formatted.contains("ServerAliveInterval=3"));
         assert!(!formatted.contains("ControlPath=none"));
         assert!(formatted.contains("ForwardAgent=no"));
-        assert!(formatted.contains("-N"));
         assert!(formatted.contains("-T"));
+        assert!(formatted.contains("sleep 2147483647"));
         // Forward arg references $REMOTE_SOCK unquoted (no spaces, $ is safe)
         assert!(formatted.contains("/tmp/local.sock:$REMOTE_SOCK"));
         assert!(formatted.contains("user@host"));
