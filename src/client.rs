@@ -382,6 +382,9 @@ async fn timed_send(framed: &mut Framed<UnixStream, FrameCodec>, frame: Frame) -
 
 const DEFAULT_HEARTBEAT_INTERVAL: Duration = Duration::from_secs(5);
 const DEFAULT_HEARTBEAT_TIMEOUT: Duration = Duration::from_secs(15);
+const FAST_HEARTBEAT_INTERVAL: Duration = Duration::from_millis(500);
+const FAST_HEARTBEAT_TIMEOUT: Duration = Duration::from_secs(3);
+const PONG_LATE_THRESHOLD: Duration = Duration::from_secs(2);
 
 /// Events from local agent connection tasks to the relay loop.
 enum AgentEvent {
@@ -1070,6 +1073,7 @@ async fn relay(
     let mut last_pong = Instant::now();
     let mut last_ping_sent = Instant::now();
     let mut last_rtt: Option<Duration> = None;
+    let mut heartbeat_fast = false;
 
     // Agent channel management
     let mut agent = ClientAgentState::new();
@@ -1238,6 +1242,13 @@ async fn relay(
                 if let ControlFlow::Break(exit) = relay.handle_server_frame(framed, frame).await? {
                     return Ok(exit);
                 }
+                // Reset heartbeat escalation when a Pong arrives
+                if heartbeat_fast && relay.last_pong.elapsed() < Duration::from_millis(100) {
+                    debug!("pong received, de-escalating heartbeat");
+                    heartbeat_fast = false;
+                    heartbeat_interval = tokio::time::interval(hb_interval);
+                    heartbeat_interval.reset();
+                }
             }
 
             event = agent_event_rx.recv() => {
@@ -1279,9 +1290,24 @@ async fn relay(
             }
 
             _ = heartbeat_interval.tick() => {
-                if relay.last_pong.elapsed() > hb_timeout {
-                    debug!("heartbeat timeout");
+                let effective_timeout = if heartbeat_fast { FAST_HEARTBEAT_TIMEOUT } else { hb_timeout };
+                if relay.last_pong.elapsed() > effective_timeout {
+                    debug!(fast = heartbeat_fast, "heartbeat timeout");
                     return Ok(RelayExit::Disconnected);
+                }
+                // Escalate if Pong is late relative to known RTT
+                if !heartbeat_fast {
+                    let pong_wait = relay.last_ping_sent.elapsed();
+                    let late_threshold = match *relay.last_rtt {
+                        Some(rtt) => PONG_LATE_THRESHOLD.max(rtt * 5),
+                        None => hb_timeout, // no RTT data -> don't escalate
+                    };
+                    if pong_wait > late_threshold {
+                        debug!(wait_ms = pong_wait.as_millis(), "pong late, escalating heartbeat");
+                        heartbeat_fast = true;
+                        heartbeat_interval = tokio::time::interval(FAST_HEARTBEAT_INTERVAL);
+                        heartbeat_interval.reset();
+                    }
                 }
                 *relay.last_ping_sent = Instant::now();
                 if !timed_send(framed, Frame::Ping).await {
