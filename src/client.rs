@@ -72,6 +72,28 @@ impl RateLimiter {
     }
 }
 
+/// Rate limiters for server-initiated actions. Owned by `run()` so budgets
+/// persist across auto-reconnect and a rogue server cannot reset them by
+/// dropping the connection.
+struct SecurityLimiters {
+    url: RateLimiter,
+    clipboard_set: RateLimiter,
+    tunnel_listen: RateLimiter,
+    agent_open: RateLimiter,
+}
+
+impl SecurityLimiters {
+    fn new() -> Self {
+        let window = Duration::from_secs(30);
+        Self {
+            url: RateLimiter::new(2, window),
+            clipboard_set: RateLimiter::new(5, window),
+            tunnel_listen: RateLimiter::new(2, window),
+            agent_open: RateLimiter::new(10, window),
+        }
+    }
+}
+
 // --- Escape sequence processing (SSH-style ~. detach, ~^Z suspend, ~? help) ---
 
 const ESCAPE_HELP: &[u8] = b"\r\nSupported escape sequences:\r\n\
@@ -530,7 +552,7 @@ struct ClientRelay<'a> {
     forward_open: bool,
     pf: &'a mut ClientPortForwardTable,
     pf_event_tx: &'a mpsc::UnboundedSender<ClientPortForwardEvent>,
-    client_initiated_forwards: &'a mut std::collections::HashSet<u32>,
+    client_initiated_forwards: &'a mut std::collections::HashMap<u32, u16>,
     last_pong: &'a mut Instant,
     last_ping_sent: &'a mut Instant,
     last_rtt: &'a mut Option<Duration>,
@@ -769,36 +791,41 @@ impl ClientRelay<'_> {
             }
             // Port forward: new TCP connection from server side (only accept client-initiated)
             Some(Ok(Frame::PortForwardOpen { forward_id, channel_id, target_port })) => {
-                if !self.client_initiated_forwards.contains(&forward_id) {
+                let Some(&expected_port) = self.client_initiated_forwards.get(&forward_id) else {
                     warn!(forward_id, target_port, "rejected unsolicited port forward open");
                     let _ = timed_send(framed, Frame::PortForwardClose { channel_id }).await;
-                } else {
-                    match tokio::net::TcpStream::connect(("127.0.0.1", target_port)).await {
-                        Ok(stream) => {
-                            let (read_half, write_half) = stream.into_split();
-                            let data_tx = self.pf_event_tx.clone();
-                            let close_tx = self.pf_event_tx.clone();
-                            let writer_tx = crate::spawn_channel_relay(
-                                channel_id,
-                                read_half,
-                                write_half,
-                                move |id, data| {
-                                    data_tx
-                                        .send(ClientPortForwardEvent::Data { channel_id: id, data })
-                                        .is_ok()
-                                },
-                                move |id| {
-                                    let _ = close_tx
-                                        .send(ClientPortForwardEvent::Closed { channel_id: id });
-                                },
-                            );
-                            self.pf.channels.insert(channel_id, (forward_id, writer_tx));
-                        }
-                        Err(e) => {
-                            debug!(channel_id, target_port, "pf connect failed: {e}");
-                            let _ =
-                                timed_send(framed, Frame::PortForwardClose { channel_id }).await;
-                        }
+                    return Ok(ControlFlow::Continue(()));
+                };
+                if target_port != expected_port {
+                    warn!(
+                        forward_id,
+                        target_port, expected_port, "server-supplied port mismatch; using expected"
+                    );
+                }
+                match tokio::net::TcpStream::connect(("127.0.0.1", expected_port)).await {
+                    Ok(stream) => {
+                        let (read_half, write_half) = stream.into_split();
+                        let data_tx = self.pf_event_tx.clone();
+                        let close_tx = self.pf_event_tx.clone();
+                        let writer_tx = crate::spawn_channel_relay(
+                            channel_id,
+                            read_half,
+                            write_half,
+                            move |id, data| {
+                                data_tx
+                                    .send(ClientPortForwardEvent::Data { channel_id: id, data })
+                                    .is_ok()
+                            },
+                            move |id| {
+                                let _ = close_tx
+                                    .send(ClientPortForwardEvent::Closed { channel_id: id });
+                            },
+                        );
+                        self.pf.channels.insert(channel_id, (forward_id, writer_tx));
+                    }
+                    Err(e) => {
+                        debug!(channel_id, expected_port, "pf connect failed: {e}");
+                        let _ = timed_send(framed, Frame::PortForwardClose { channel_id }).await;
                     }
                 }
             }
@@ -1019,8 +1046,13 @@ impl ClientRelay<'_> {
             }
         }
 
+        // Track the client-intended target port for lf so PortForwardOpen cannot
+        // pivot to a server-chosen port. rf forwards never receive PFOpen from the
+        // server, so they are intentionally not registered here.
+        if direction == 0 {
+            self.client_initiated_forwards.insert(forward_id, target_port);
+        }
         // Send PortForwardRequest to server
-        self.client_initiated_forwards.insert(forward_id);
         if !timed_send(
             framed,
             Frame::PortForwardRequest { forward_id, direction, listen_port, target_port },
@@ -1064,6 +1096,7 @@ async fn relay(
     hb_interval: Duration,
     hb_timeout: Duration,
     fwd_listener: &Option<tokio::net::UnixListener>,
+    limiters: &mut SecurityLimiters,
 ) -> anyhow::Result<RelayExit> {
     let mut sigterm = signal(SignalKind::terminate())?;
     let mut sighup = signal(SignalKind::hangup())?;
@@ -1088,12 +1121,7 @@ async fn relay(
     let mut pf = ClientPortForwardTable::new();
 
     let mut bytes_relayed = 0u64;
-    let mut client_initiated_forwards = std::collections::HashSet::new();
-    let rate_window = Duration::from_secs(30);
-    let mut url_limiter = RateLimiter::new(2, rate_window);
-    let mut clipboard_set_limiter = RateLimiter::new(5, rate_window);
-    let mut tunnel_listen_limiter = RateLimiter::new(2, rate_window);
-    let mut agent_open_limiter = RateLimiter::new(10, rate_window);
+    let mut client_initiated_forwards = std::collections::HashMap::new();
     let mut relay = ClientRelay {
         async_stdout,
         agent: &mut agent,
@@ -1112,10 +1140,10 @@ async fn relay(
         last_rtt: &mut last_rtt,
         connected_at: Instant::now(),
         bytes_relayed: &mut bytes_relayed,
-        url_limiter: &mut url_limiter,
-        clipboard_set_limiter: &mut clipboard_set_limiter,
-        tunnel_listen_limiter: &mut tunnel_listen_limiter,
-        agent_open_limiter: &mut agent_open_limiter,
+        url_limiter: &mut limiters.url,
+        clipboard_set_limiter: &mut limiters.clipboard_set,
+        tunnel_listen_limiter: &mut limiters.tunnel_listen,
+        agent_open_limiter: &mut limiters.agent_open,
     };
 
     loop {
@@ -1380,6 +1408,8 @@ pub async fn run(
     }
     let _fwd_cleanup = FwdCleanup(fwd_path);
 
+    let mut limiters = SecurityLimiters::new();
+
     loop {
         let result = if send_init_frames(
             &mut framed,
@@ -1407,6 +1437,7 @@ pub async fn run(
                 Duration::from_secs(heartbeat_interval),
                 Duration::from_secs(heartbeat_timeout),
                 &fwd_listener,
+                &mut limiters,
             )
             .await?
         } else {
