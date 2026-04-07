@@ -223,6 +223,7 @@ fn suspend(raw_guard: &RawModeGuard, nb_guard: &NonBlockGuard) -> anyhow::Result
 }
 
 const SEND_TIMEOUT: Duration = Duration::from_secs(5);
+const RECONNECT_ATTEMPT_TIMEOUT: Duration = Duration::from_secs(5);
 
 struct NonBlockGuard {
     fd: BorrowedFd<'static>,
@@ -1426,29 +1427,45 @@ pub async fn run(
                     )
                     .await?;
 
-                    let stream = match UnixStream::connect(ctl_path).await {
-                        Ok(s) => s,
-                        Err(_) => continue,
-                    };
-
-                    let mut new_framed = Framed::new(stream, FrameCodec);
-                    if crate::handshake(&mut new_framed).await.is_err() {
-                        continue;
-                    }
-                    if new_framed
-                        .send(Frame::Attach {
-                            session: session.to_string(),
-                            client_name: client_name.clone(),
-                            force: false,
-                        })
-                        .await
-                        .is_err()
-                    {
-                        continue;
+                    enum Attempt {
+                        Connected(Framed<UnixStream, FrameCodec>),
+                        SessionGone(String),
+                        Retry,
                     }
 
-                    match new_framed.next().await {
-                        Some(Ok(Frame::Ok)) => {
+                    let attempt = tokio::time::timeout(RECONNECT_ATTEMPT_TIMEOUT, async {
+                        let stream = match UnixStream::connect(ctl_path).await {
+                            Ok(s) => s,
+                            Err(_) => return Attempt::Retry,
+                        };
+                        let mut new_framed = Framed::new(stream, FrameCodec);
+                        if crate::handshake(&mut new_framed).await.is_err() {
+                            return Attempt::Retry;
+                        }
+                        if new_framed
+                            .send(Frame::Attach {
+                                session: session.to_string(),
+                                client_name: client_name.clone(),
+                                force: false,
+                            })
+                            .await
+                            .is_err()
+                        {
+                            return Attempt::Retry;
+                        }
+                        match new_framed.next().await {
+                            Some(Ok(Frame::Ok)) => Attempt::Connected(new_framed),
+                            Some(Ok(Frame::Error { code: ErrorCode::AlreadyAttached, .. })) => {
+                                Attempt::Retry
+                            }
+                            Some(Ok(Frame::Error { message, .. })) => Attempt::SessionGone(message),
+                            _ => Attempt::Retry,
+                        }
+                    })
+                    .await;
+
+                    match attempt {
+                        Ok(Attempt::Connected(new_framed)) => {
                             write_stdout_async(
                                 &async_stdout,
                                 b"\r\x1b[32m\xe2\x96\xb8 reconnected\x1b[0m\x1b[K\r\n",
@@ -1457,19 +1474,7 @@ pub async fn run(
                             framed = new_framed;
                             break;
                         }
-                        Some(Ok(Frame::Error { code: ErrorCode::AlreadyAttached, .. })) => {
-                            let elapsed = reconnect_started.elapsed().as_secs();
-                            write_stdout_async(
-                                &async_stdout,
-                                format!(
-                                    "\r\x1b[2;33m\u{25b8} session attached to another client, waiting... {elapsed}s (Ctrl-C to abort)\x1b[0m\x1b[K"
-                                )
-                                .as_bytes(),
-                            )
-                            .await?;
-                            continue;
-                        }
-                        Some(Ok(Frame::Error { message, .. })) => {
+                        Ok(Attempt::SessionGone(message)) => {
                             write_stdout_async(
                                 &async_stdout,
                                 format!(
@@ -1480,7 +1485,7 @@ pub async fn run(
                             .await?;
                             return Ok(1);
                         }
-                        _ => continue,
+                        Ok(Attempt::Retry) | Err(_) => continue,
                     }
                 }
             }
