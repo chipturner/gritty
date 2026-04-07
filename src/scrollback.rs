@@ -2,6 +2,10 @@ use bytes::Bytes;
 use std::collections::VecDeque;
 
 const DEFAULT_MAX_LINES: usize = 50;
+/// Hard-wrap lines wider than this. Replay sends one Data frame per line, and
+/// the protocol decoder rejects payloads > 1 MiB, so an unbounded partial (e.g.
+/// `base64` on BSD emits a single multi-MB line) would break reconnect.
+const MAX_LINE_BYTES: usize = 4096;
 
 pub struct ScrollbackBuffer {
     lines: VecDeque<Bytes>,
@@ -18,13 +22,17 @@ impl ScrollbackBuffer {
     pub fn push(&mut self, data: &[u8]) {
         for &b in data {
             self.partial.push(b);
-            if b == b'\n' {
-                let line = Bytes::from(std::mem::take(&mut self.partial));
-                self.lines.push_back(line);
-                if self.lines.len() > self.max_lines {
-                    self.lines.pop_front();
-                }
+            if b == b'\n' || self.partial.len() >= MAX_LINE_BYTES {
+                self.flush_partial();
             }
+        }
+    }
+
+    fn flush_partial(&mut self) {
+        let line = Bytes::from(std::mem::take(&mut self.partial));
+        self.lines.push_back(line);
+        if self.lines.len() > self.max_lines {
+            self.lines.pop_front();
         }
     }
 
@@ -122,6 +130,18 @@ mod tests {
         assert_eq!(sb.lines().len(), 4);
         assert_eq!(sb.lines()[2].as_ref(), b"partial3\n");
         assert_eq!(sb.lines()[3].as_ref(), b"line4\n");
+    }
+
+    #[test]
+    fn long_line_hard_wrapped() {
+        let mut sb = ScrollbackBuffer::new();
+        sb.push(&vec![b'A'; MAX_LINE_BYTES * 3]);
+        sb.push(b"tail\n");
+        assert_eq!(sb.lines().len(), 4);
+        assert_eq!(sb.lines()[0].len(), MAX_LINE_BYTES);
+        assert_eq!(sb.lines()[2].len(), MAX_LINE_BYTES);
+        assert_eq!(sb.lines()[3].as_ref(), b"tail\n");
+        assert!(sb.lines().iter().all(|l| l.len() <= MAX_LINE_BYTES));
     }
 
     #[test]
