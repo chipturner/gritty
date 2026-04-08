@@ -1,3 +1,4 @@
+use crate::alt_screen::AltScreenTracker;
 use crate::protocol::{ErrorCode, Frame, FrameCodec};
 use bytes::Bytes;
 use futures_util::{SinkExt, StreamExt};
@@ -558,6 +559,7 @@ async fn send_init_frames(
 /// poll `framed.next()` independently without conflicting borrows.
 struct ClientRelay<'a> {
     async_stdout: &'a AsyncFd<std::os::fd::OwnedFd>,
+    alt_screen: &'a mut AltScreenTracker,
     agent: &'a mut ClientAgentState,
     agent_event_tx: &'a mpsc::UnboundedSender<AgentEvent>,
     agent_socket: Option<&'a str>,
@@ -590,6 +592,7 @@ impl ClientRelay<'_> {
             Some(Ok(Frame::Data(data))) => {
                 debug!(len = data.len(), "socket → stdout");
                 *self.bytes_relayed += data.len() as u64;
+                self.alt_screen.scan(&data);
                 write_stdout_async(self.async_stdout, &data).await?;
             }
             Some(Ok(Frame::Pong)) => {
@@ -1144,6 +1147,7 @@ async fn relay(
     hb_timeout: Duration,
     fwd_listener: &Option<tokio::net::UnixListener>,
     limiters: &mut SecurityLimiters,
+    alt_screen: &mut AltScreenTracker,
 ) -> anyhow::Result<RelayExit> {
     let mut heartbeat_interval = tokio::time::interval(hb_interval);
     heartbeat_interval.reset(); // first tick is immediate otherwise; delay it
@@ -1168,6 +1172,7 @@ async fn relay(
     let mut client_initiated_forwards = std::collections::HashMap::new();
     let mut relay = ClientRelay {
         async_stdout,
+        alt_screen,
         agent: &mut agent,
         agent_event_tx: &agent_event_tx,
         agent_socket,
@@ -1483,6 +1488,11 @@ pub async fn run(
     };
 
     let mut limiters = SecurityLimiters::new();
+    // Mirrors the server's alt-screen tracker so we can suppress our own
+    // reconnect chrome (▸ reconnecting..., ▸ reconnected) when a TUI is
+    // running -- those writes would otherwise land directly in the alt
+    // screen buffer and corrupt it.
+    let mut alt_screen = AltScreenTracker::new();
 
     loop {
         let result = if send_init_frames(
@@ -1514,6 +1524,7 @@ pub async fn run(
                 Duration::from_secs(heartbeat_timeout),
                 &fwd_listener,
                 &mut limiters,
+                &mut alt_screen,
             )
             .await?
         } else {
@@ -1523,12 +1534,20 @@ pub async fn run(
             RelayExit::Exit(code) => return Ok(code),
             RelayExit::Disconnected => {
                 current_env.clear();
+                // Snapshot alt-screen state once: during a disconnect we're
+                // not receiving bytes, so the TUI can't change mode under us.
+                // Skip our reconnect chrome when a TUI owns the screen so we
+                // don't corrupt its buffer; the server's post-reconnect
+                // force_tui_redraw will visibly repaint the TUI for the user.
+                let show_chrome = !alt_screen.in_alternate_screen();
                 let reconnect_started = Instant::now();
-                write_stdout_async(
-                    &async_stdout,
-                    b"\r\n\x1b[2;33m\xe2\x96\xb8 reconnecting... (Ctrl-C to abort)\x1b[0m",
-                )
-                .await?;
+                if show_chrome {
+                    write_stdout_async(
+                        &async_stdout,
+                        b"\r\n\x1b[2;33m\xe2\x96\xb8 reconnecting... (Ctrl-C to abort)\x1b[0m",
+                    )
+                    .await?;
+                }
 
                 loop {
                     // Race sleep against stdin so Ctrl-C is instant
@@ -1561,12 +1580,14 @@ pub async fn run(
                     }
 
                     let elapsed = reconnect_started.elapsed().as_secs();
-                    write_stdout_async(
-                        &async_stdout,
-                        format!("\r\x1b[2;33m\u{25b8} reconnecting... {elapsed}s (Ctrl-C to abort)\x1b[0m\x1b[K")
-                            .as_bytes(),
-                    )
-                    .await?;
+                    if show_chrome {
+                        write_stdout_async(
+                            &async_stdout,
+                            format!("\r\x1b[2;33m\u{25b8} reconnecting... {elapsed}s (Ctrl-C to abort)\x1b[0m\x1b[K")
+                                .as_bytes(),
+                        )
+                        .await?;
+                    }
 
                     enum Attempt {
                         Connected(Framed<UnixStream, FrameCodec>),
@@ -1612,11 +1633,13 @@ pub async fn run(
 
                     match attempt {
                         Ok(Attempt::Connected(new_framed)) => {
-                            write_stdout_async(
-                                &async_stdout,
-                                b"\r\x1b[32m\xe2\x96\xb8 reconnected\x1b[0m\x1b[K\r\n",
-                            )
-                            .await?;
+                            if show_chrome {
+                                write_stdout_async(
+                                    &async_stdout,
+                                    b"\r\x1b[32m\xe2\x96\xb8 reconnected\x1b[0m\x1b[K\r\n",
+                                )
+                                .await?;
+                            }
                             framed = new_framed;
                             break;
                         }
@@ -1687,6 +1710,9 @@ pub async fn tail(
     let mut sigterm = signal(SignalKind::terminate())?;
     let mut sighup = signal(SignalKind::hangup())?;
     let mut stdout = tokio::io::stdout();
+    // Track the PTY's alt-screen mode so we can suppress reconnect chrome
+    // when tailing a session where a TUI is running.
+    let mut alt_screen = AltScreenTracker::new();
 
     let code = 'outer: loop {
         let result = 'relay: loop {
@@ -1695,6 +1721,7 @@ pub async fn tail(
                     match frame {
                         Some(Ok(Frame::Data(data))) => {
                             use tokio::io::AsyncWriteExt;
+                            alt_screen.scan(&data);
                             stdout.write_all(&data).await?;
                         }
                         Some(Ok(Frame::Pong)) => {
@@ -1738,8 +1765,11 @@ pub async fn tail(
         match result {
             Some(code) => break code,
             None => {
+                let show_chrome = !alt_screen.in_alternate_screen();
                 let reconnect_started = Instant::now();
-                eprint!("\x1b[2;33m\u{25b8} reconnecting... (Ctrl-C to abort)\x1b[0m");
+                if show_chrome {
+                    eprint!("\x1b[2;33m\u{25b8} reconnecting... (Ctrl-C to abort)\x1b[0m");
+                }
                 loop {
                     tokio::select! {
                         _ = tokio::time::sleep(Duration::from_secs(1)) => {}
@@ -1748,9 +1778,11 @@ pub async fn tail(
                         _ = sighup.recv() => { break 'outer 1; }
                     }
                     let elapsed = reconnect_started.elapsed().as_secs();
-                    eprint!(
-                        "\r\x1b[2;33m\u{25b8} reconnecting... {elapsed}s (Ctrl-C to abort)\x1b[0m\x1b[K"
-                    );
+                    if show_chrome {
+                        eprint!(
+                            "\r\x1b[2;33m\u{25b8} reconnecting... {elapsed}s (Ctrl-C to abort)\x1b[0m\x1b[K"
+                        );
+                    }
 
                     let stream = match crate::security::connect_verified(ctl_path).await {
                         Ok(s) => s,
@@ -1773,7 +1805,9 @@ pub async fn tail(
 
                     match new_framed.next().await {
                         Some(Ok(Frame::Ok)) => {
-                            eprintln!("\r\x1b[32m\u{25b8} reconnected\x1b[0m\x1b[K");
+                            if show_chrome {
+                                eprintln!("\r\x1b[32m\u{25b8} reconnected\x1b[0m\x1b[K");
+                            }
                             framed = new_framed;
                             heartbeat_interval.reset();
                             last_pong = Instant::now();

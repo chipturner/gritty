@@ -1331,9 +1331,19 @@ fn apply_winsize(master: &tokio::io::unix::AsyncFd<std::os::fd::OwnedFd>, cols: 
 /// size, so a straight `apply_winsize` with an unchanged size does nothing.
 /// Nudging rows down by one then restoring guarantees a change-of-size event
 /// and a full repaint.
-fn force_tui_redraw(master: &tokio::io::unix::AsyncFd<std::os::fd::OwnedFd>, cols: u16, rows: u16) {
+async fn force_tui_redraw(
+    master: &tokio::io::unix::AsyncFd<std::os::fd::OwnedFd>,
+    cols: u16,
+    rows: u16,
+) {
     let nudge_rows = rows.saturating_sub(1).max(1);
     apply_winsize(master, cols, nudge_rows);
+    // Pause so the child process actually observes the intermediate size
+    // before we restore the original. Without this, both TIOCSWINSZ ioctls
+    // land before the TUI runs its SIGWINCH handler once; ncurses apps then
+    // see only the final (unchanged) size and no-op the repaint, leaving
+    // stale content on the client.
+    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
     apply_winsize(master, cols, rows);
 }
 
@@ -1744,7 +1754,7 @@ pub async fn run(
         // prompt redraw, so a single apply is enough.
         if is_reconnect && attach_cols > 0 && attach_rows > 0 {
             if alt_screen.in_alternate_screen() {
-                force_tui_redraw(&async_master, attach_cols, attach_rows);
+                force_tui_redraw(&async_master, attach_cols, attach_rows).await;
             } else {
                 apply_winsize(&async_master, attach_cols, attach_rows);
             }
@@ -1916,7 +1926,7 @@ pub async fn run(
                                 // the SIGWINCH toggle to force a TUI repaint.
                                 if new_cols > 0 && new_rows > 0 {
                                     if alt_screen.in_alternate_screen() {
-                                        force_tui_redraw(&async_master, new_cols, new_rows);
+                                        force_tui_redraw(&async_master, new_cols, new_rows).await;
                                     } else {
                                         apply_winsize(&async_master, new_cols, new_rows);
                                     }
@@ -1926,7 +1936,7 @@ pub async fn run(
                                     .map(|m| m.attached.load(Ordering::Relaxed))
                                     .unwrap_or(false);
                                 framed = new_framed;
-                                if was_attached {
+                                if was_attached && !alt_screen.in_alternate_screen() {
                                     let hb_age = relay.metadata_slot.get()
                                         .and_then(|m| {
                                             let hb = m.last_heartbeat.load(Ordering::Relaxed);
