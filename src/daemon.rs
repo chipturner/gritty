@@ -513,12 +513,20 @@ async fn dispatch_control(
                 return false;
             }
 
-            // Hand off connection to session for auto-attach
+            // Hand off connection to session for auto-attach. The session was
+            // just created with the requested cols/rows, so no Attach-side
+            // winsize override is needed on this path.
             *last_attached = Some(id);
-            let _ = client_tx.send(ClientConn::Active { framed, client_name, capabilities });
+            let _ = client_tx.send(ClientConn::Active {
+                framed,
+                client_name,
+                capabilities,
+                cols: 0,
+                rows: 0,
+            });
             false
         }
-        Frame::Attach { session, client_name, force, no_replay } => {
+        Frame::Attach { session, client_name, force, no_replay, cols, rows } => {
             reap_sessions(sessions);
             if let Some(id) = resolve_session(sessions, &session, *last_attached) {
                 let state = &sessions[&id];
@@ -559,6 +567,8 @@ async fn dispatch_control(
                             framed,
                             client_name,
                             capabilities,
+                            cols,
+                            rows,
                         });
                     }
                 }

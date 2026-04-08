@@ -147,14 +147,15 @@ fn arb_frame() -> impl Strategy<Value = Frame> {
                 rows,
                 client_name,
             }),
-        (arb_string(), arb_string(), any::<bool>(), any::<bool>()).prop_map(
-            |(session, client_name, force, no_replay)| Frame::Attach {
+        (arb_string(), arb_string(), any::<bool>(), any::<bool>(), any::<u16>(), any::<u16>(),)
+            .prop_map(|(session, client_name, force, no_replay, cols, rows)| Frame::Attach {
                 session,
                 client_name,
                 force,
                 no_replay,
-            },
-        ),
+                cols,
+                rows,
+            }),
         (arb_error_code(), arb_string()).prop_map(|(code, message)| Frame::Error { code, message }),
         arb_env_vars().prop_map(|vars| Frame::Env { vars }),
         prop::collection::vec(arb_session_entry(), 0..4)

@@ -90,7 +90,7 @@ Handshake: `0x01` Hello, `0x02` HelloAck. Relay: `0x10` Data, `0x11` Resize, `0x
 
 `NewSession`: `[name_len: u16][name][cmd_len: u16][cmd][cwd_len: u16][cwd][cols: u16][rows: u16][client_name_len: u16][client_name]`. Empty cwd = `$HOME`. Zero cols/rows = default 80x24. `client_name` propagated to session metadata.
 
-`Attach`: `[session_len: u16][session][client_name_len: u16][client_name][force: u8][no_replay: u8]`. Server enforces: if attached and `!force`, returns `AlreadyAttached` error. `no_replay` = existence probe only (daemon replies `Ok` without session handoff).
+`Attach`: `[session_len: u16][session][client_name_len: u16][client_name][force: u8][no_replay: u8][cols: u16][rows: u16]`. Server enforces: if attached and `!force`, returns `AlreadyAttached` error. `no_replay` = existence probe only (daemon replies `Ok` without session handoff). `cols`/`rows` are the client's current terminal size, applied to the PTY before reconnect replay so regenerated prompts and TUI repaints use the right winsize (0 = unknown).
 
 `SessionCreated`: `[id: u32]`.
 
@@ -110,7 +110,7 @@ File transfer manifest (svc socket, not Frame protocol): sender writes `[file_co
 - **AsyncFd + try_io**: PTY master and stdin are raw fds in `AsyncFd`. `guard.try_io()` with would-block continuation.
 - **Deferred shell spawn**: PTY allocated early (with initial window size from `NewSession` cols/rows when > 0), shell waits for first client's `Env` frame (TERM/LANG/COLORTERM). Spawns login shell with CWD from `NewSession` (or `$HOME` if empty). First client feeds directly into relay (no outer-loop re-wait).
 - **Ring buffer**: Client disconnect breaks inner relay; outer loop drains PTY into `VecDeque<Bytes>` (default 1MB). On reconnect, dropped-bytes marker if overflow, then flush.
-- **Smart reconnect**: Server tracks alternate screen mode (`\x1b[?1049h`/`l`, `?47`, `?1047`) via `AltScreenTracker` in `alt_screen.rs`. On reconnect: alternate screen gets Ctrl-L written to PTY for TUI redraw; main screen replays last 50 lines from `ScrollbackBuffer` then shows `[gritty: reconnected]` separator, followed by any output produced while disconnected.
+- **Smart reconnect**: Server tracks alternate screen mode (`\x1b[?1049h`/`l`, `?47`, `?1047`) via `AltScreenTracker` in `alt_screen.rs`. The `Attach` frame carries the client's current `cols`/`rows`, which the server applies to the PTY (via `TIOCSWINSZ` + `SIGWINCH`) BEFORE any replay, so bytes are regenerated at the right winsize. On reconnect: alternate screen gets a SIGWINCH toggle (rows-1 then rows, each signaled) via `force_tui_redraw()` to guarantee a repaint even when the reported size is unchanged (ncurses apps no-op same-size SIGWINCH). Main screen shows `[gritty: reconnected]` then replays the last 50 lines from `ScrollbackBuffer` via `lines_and_partial()` (which includes the in-progress partial line so the current prompt shows up), followed by any output produced while disconnected.
 - **Client takeover**: `client_rx.recv()` in relay select. New client causes `Detached` to old, then switch. Capability check (500ms deadline) warns if reconnecting client is missing `-A`/`-O` that the session expects.
 - **Self-daemonizing**: Fork before tokio runtime. Parent waits on pipe for readiness. PID file at `socket_dir()/daemon.pid`.
 - **Lockfile-based liveness**: `flock()` on `connect-{name}.lock`. Non-blocking probe distinguishes live vs dead tunnels.
@@ -137,12 +137,12 @@ File transfer manifest (svc socket, not Frame protocol): sender writes `[file_co
 - **Fork before tokio** -- `daemonize()` MUST fork before creating the tokio runtime. `main()` is sync (no `#[tokio::main]`).
 
 ### Changing protocol/signatures
-- **`PROTOCOL_VERSION`** -- bump whenever frame types, encoding, or `SessionEntry` fields change. Version mismatch is a hard gate: daemon rejects clients, `tunnel-create` aborts tunnel setup. Currently v11.
+- **`PROTOCOL_VERSION`** -- bump whenever frame types, encoding, or `SessionEntry` fields change. Version mismatch is a hard gate: daemon rejects clients, `tunnel-create` aborts tunnel setup. Currently v12.
 - **`expect_min_len`** -- all fixed-field decoders use `expect_min_len` (not exact length checks), so trailing bytes are tolerated for forward extensibility.
 - **`Frame` enum** -- update: encoder, decoder, protocol tests, all `match frame` in server.rs, client.rs, daemon.rs, main.rs.
 - **`SessionInfo`** -- entry count `u32`. Changing `SessionEntry` fields requires updating both encoder and decoder in protocol.rs.
 - **`server::run()`** -- takes `(client_rx, metadata, agent_path, svc_path, session_id, session_name, command, ring_buffer_cap, oauth_tunnel_idle_timeout, initial_cols, initial_rows, cwd)`. Called by e2e tests + daemon; update both.
-- **`ClientConn::Active`** -- struct variant `Active { framed, client_name, capabilities }`. `client_name` propagated from `Attach`/`NewSession` frame to session metadata. `capabilities` is the negotiated bitfield from handshake.
+- **`ClientConn::Active`** -- struct variant `Active { framed, client_name, capabilities, cols, rows }`. `client_name` propagated from `Attach`/`NewSession` frame to session metadata. `capabilities` is the negotiated bitfield from handshake. `cols`/`rows` carry the reconnecting client's current terminal size (0 = unknown, used for probe-only attaches and NewSession auto-attach) and are applied to the PTY before reconnect replay.
 - **`ErrorCode`** -- `Frame::Error` carries a `code: ErrorCode` enum + `message: String`. Match on code for programmatic error handling, display message for humans.
 
 ### Testing

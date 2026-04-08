@@ -183,6 +183,8 @@ fn roundtrip_attach() {
         client_name: String::new(),
         force: false,
         no_replay: false,
+        cols: 80,
+        rows: 24,
     };
     codec.encode(original.clone(), &mut buf).unwrap();
     let decoded = codec.decode(&mut buf).unwrap().unwrap();
@@ -198,6 +200,8 @@ fn roundtrip_attach_by_name() {
         client_name: String::new(),
         force: false,
         no_replay: true,
+        cols: 0,
+        rows: 0,
     };
     codec.encode(original.clone(), &mut buf).unwrap();
     let decoded = codec.decode(&mut buf).unwrap().unwrap();

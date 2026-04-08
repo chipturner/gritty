@@ -54,13 +54,13 @@ sequenceDiagram
     C--xT: connect (tunnel down)
     Note over T: Monitor detects exit,<br/>respawns SSH
     C->>T: connect (tunnel back)
-    C->>S: Attach
+    C->>S: Attach (cols, rows)
+    Note over S: Apply winsize +<br/>SIGWINCH (toggle if alt-screen)
     S->>C: Ok
     end
 
     Note over C: [reconnected]
-    C->>S: Resize + Ctrl-L redraw
-    Note over S: Buffer drains,<br/>shell resumes
+    Note over S: Replay scrollback<br/>+ partial line,<br/>then buffer drains
 ```
 
 The client pings every 5 seconds; no pong within 15 seconds means dead connection. The client enters a reconnect loop (retry every 1s, Ctrl-C to abort). Meanwhile, the tunnel monitor detects the SSH process exit and respawns it. The client reconnects through the restored tunnel transparently.

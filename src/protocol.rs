@@ -70,7 +70,7 @@ const HEADER_LEN: usize = 5; // type(1) + length(4)
 const MAX_FRAME_SIZE: usize = 1 << 20; // 1 MB
 
 /// Protocol version for handshake negotiation.
-pub const PROTOCOL_VERSION: u16 = 11;
+pub const PROTOCOL_VERSION: u16 = 12;
 
 /// Capability bit: client/server supports clipboard forwarding.
 pub const CAP_CLIPBOARD: u32 = 0x01;
@@ -304,6 +304,11 @@ pub enum Frame {
         /// Existence probe only: daemon replies `Ok` without handing the
         /// connection to the session task (no ring-buffer flush, no takeover).
         no_replay: bool,
+        /// Client's current terminal size. The server applies these before
+        /// replaying scrollback/ring buffer so replayed bytes are produced at
+        /// the right winsize. Zero = unknown (probe-only clients).
+        cols: u16,
+        rows: u16,
     },
     /// Read-only tail of a session's PTY output (client → server).
     Tail {
@@ -932,7 +937,13 @@ impl Decoder for FrameCodec {
                 let force = p[off] != 0;
                 off += 1;
                 let no_replay = p.get(off).copied().unwrap_or(0) != 0;
-                Ok(Some(Frame::Attach { session, client_name, force, no_replay }))
+                off += 1;
+                // cols/rows appended in protocol v12; default to 0 when absent
+                // so a truncated frame from a buggy client still decodes cleanly.
+                let cols = if off + 2 <= p.len() { read_u16(p, off) } else { 0 };
+                off += 2;
+                let rows = if off + 2 <= p.len() { read_u16(p, off) } else { 0 };
+                Ok(Some(Frame::Attach { session, client_name, force, no_replay, cols, rows }))
             }
             TYPE_RENAME_SESSION => {
                 if payload.len() < 2 {
@@ -1101,10 +1112,10 @@ impl Encoder<Frame> for FrameCodec {
                 dst.put_u16(cnb.len() as u16);
                 dst.extend_from_slice(cnb);
             }
-            Frame::Attach { session, client_name, force, no_replay } => {
+            Frame::Attach { session, client_name, force, no_replay, cols, rows } => {
                 let sb = session.as_bytes();
                 let cnb = client_name.as_bytes();
-                let payload_len = 2 + sb.len() + 2 + cnb.len() + 2;
+                let payload_len = 2 + sb.len() + 2 + cnb.len() + 2 + 4;
                 dst.put_u8(TYPE_ATTACH);
                 dst.put_u32(payload_len as u32);
                 dst.put_u16(sb.len() as u16);
@@ -1113,6 +1124,8 @@ impl Encoder<Frame> for FrameCodec {
                 dst.extend_from_slice(cnb);
                 dst.put_u8(if force { 1 } else { 0 });
                 dst.put_u8(if no_replay { 1 } else { 0 });
+                dst.put_u16(cols);
+                dst.put_u16(rows);
             }
             Frame::Error { code, message } => {
                 let mb = message.as_bytes();

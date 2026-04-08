@@ -93,6 +93,8 @@ async fn attach_session(
             client_name: String::new(),
             force: true,
             no_replay: false,
+            cols: 0,
+            rows: 0,
         })
         .await
         .unwrap();
@@ -716,6 +718,8 @@ async fn attach_nonexistent_returns_error() {
             client_name: String::new(),
             force: false,
             no_replay: false,
+            cols: 0,
+            rows: 0,
         },
     )
     .await;
@@ -769,6 +773,8 @@ async fn attach_dead_session_returns_error() {
             client_name: String::new(),
             force: false,
             no_replay: false,
+            cols: 0,
+            rows: 0,
         },
     )
     .await;
@@ -893,6 +899,8 @@ async fn reconnect_via_daemon_after_disconnect() {
             client_name: String::new(),
             force: false,
             no_replay: false,
+            cols: 0,
+            rows: 0,
         })
         .await
         .unwrap();
@@ -961,6 +969,8 @@ async fn reconnect_after_session_killed_returns_error() {
             client_name: String::new(),
             force: false,
             no_replay: false,
+            cols: 0,
+            rows: 0,
         },
     )
     .await;
@@ -1178,6 +1188,8 @@ async fn attach_dash_resolves_to_last_session() {
             client_name: String::new(),
             force: false,
             no_replay: false,
+            cols: 0,
+            rows: 0,
         },
     )
     .await;
@@ -1192,6 +1204,8 @@ async fn attach_dash_resolves_to_last_session() {
             client_name: String::new(),
             force: false,
             no_replay: false,
+            cols: 0,
+            rows: 0,
         },
     )
     .await;
@@ -1217,6 +1231,8 @@ async fn attach_dash_no_previous_session() {
             client_name: String::new(),
             force: false,
             no_replay: false,
+            cols: 0,
+            rows: 0,
         },
     )
     .await;

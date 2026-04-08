@@ -358,7 +358,7 @@ fn error_msg(text: &str) -> String {
     format!("\r\n\x1b[31m\u{25b8} {text}\x1b[0m\r\n")
 }
 
-fn get_terminal_size() -> (u16, u16) {
+pub fn get_terminal_size() -> (u16, u16) {
     terminal_size::terminal_size().map(|(w, h)| (w.0, h.0)).unwrap_or((80, 24))
 }
 
@@ -1584,12 +1584,15 @@ pub async fn run(
                         if let Err(e) = crate::handshake(&mut new_framed).await {
                             return Attempt::HandshakeErr(e.to_string());
                         }
+                        let (cols, rows) = get_terminal_size();
                         if new_framed
                             .send(Frame::Attach {
                                 session: session.to_string(),
                                 client_name: client_name.clone(),
                                 force: true,
                                 no_replay: false,
+                                cols,
+                                rows,
                             })
                             .await
                             .is_err()

@@ -33,6 +33,11 @@ pub(crate) async fn connect_session(
     let mut framed = Framed::new(stream, FrameCodec);
     gritty::handshake(&mut framed).await?;
 
+    // Carry current terminal size so the server can resize the PTY before
+    // replaying scrollback/ring buffer on reconnect. Zero for probe-only.
+    let (attach_cols, attach_rows) =
+        if detach { (0, 0) } else { gritty::client::get_terminal_size() };
+
     // Try attach first
     framed
         .send(Frame::Attach {
@@ -40,6 +45,8 @@ pub(crate) async fn connect_session(
             client_name: settings.client_name.clone(),
             force,
             no_replay: detach,
+            cols: attach_cols,
+            rows: attach_rows,
         })
         .await?;
 
@@ -94,6 +101,8 @@ pub(crate) async fn connect_session(
                     client_name: settings.client_name.clone(),
                     force: true,
                     no_replay: detach,
+                    cols: attach_cols,
+                    rows: attach_rows,
                 })
                 .await?;
             match Frame::expect_from(framed.next().await)? {

@@ -27,6 +27,11 @@ pub enum ClientConn {
         framed: Framed<UnixStream, FrameCodec>,
         client_name: String,
         capabilities: u32,
+        /// Client's current terminal size from its Attach frame (0 = unknown).
+        /// The session applies this before replaying scrollback on reconnect so
+        /// the shell regenerates its last line at the right winsize.
+        cols: u16,
+        rows: u16,
     },
     Tail(Framed<UnixStream, FrameCodec>),
     /// Raw stream for file transfer (local-side commands routed through daemon).
@@ -1306,6 +1311,32 @@ impl ServerRelay<'_> {
     }
 }
 
+/// Apply a new PTY window size and signal the foreground process group.
+/// Centralized so reconnect flows and the `Resize` frame handler share one path.
+fn apply_winsize(master: &tokio::io::unix::AsyncFd<std::os::fd::OwnedFd>, cols: u16, rows: u16) {
+    let (cols, rows) = crate::security::clamp_winsize(cols, rows);
+    let ws = libc::winsize { ws_row: rows, ws_col: cols, ws_xpixel: 0, ws_ypixel: 0 };
+    // SAFETY: master is a valid PTY master fd; TIOCSWINSZ takes a winsize*.
+    unsafe {
+        libc::ioctl(master.as_raw_fd(), libc::TIOCSWINSZ, &ws as *const _);
+    }
+    if let Ok(pgid) = nix::unistd::tcgetpgrp(master) {
+        let _ = nix::sys::signal::killpg(pgid, nix::sys::signal::Signal::SIGWINCH);
+    }
+}
+
+/// Force a TUI to fully repaint by toggling the reported window size and
+/// signaling SIGWINCH twice. Many ncurses-based apps (htop, btop, nvim in
+/// some modes) no-op a SIGWINCH when the reported size matches their cached
+/// size, so a straight `apply_winsize` with an unchanged size does nothing.
+/// Nudging rows down by one then restoring guarantees a change-of-size event
+/// and a full repaint.
+fn force_tui_redraw(master: &tokio::io::unix::AsyncFd<std::os::fd::OwnedFd>, cols: u16, rows: u16) {
+    let nudge_rows = rows.saturating_sub(1).max(1);
+    apply_winsize(master, cols, nudge_rows);
+    apply_winsize(master, cols, rows);
+}
+
 #[allow(clippy::too_many_arguments)]
 pub async fn run(
     mut client_rx: mpsc::UnboundedReceiver<ClientConn>,
@@ -1424,10 +1455,14 @@ pub async fn run(
     let mut framed = loop {
         tokio::select! {
             client = client_rx.recv() => match client {
-                Some(ClientConn::Active { framed: f, client_name: cn, capabilities: caps }) => {
+                Some(ClientConn::Active {
+                    framed: f, client_name: cn, capabilities: caps, cols: _, rows: _
+                }) => {
                     info!("first client connected via channel");
                     negotiated_caps.store(caps, std::sync::atomic::Ordering::Relaxed);
-                    // Stash client_name so it's available before Env frame
+                    // Stash client_name so it's available before Env frame.
+                    // The Attach cols/rows are ignored on first-client: session
+                    // creation already sized the PTY via NewSession.
                     initial_client_name = cn;
                     break f;
                 }
@@ -1549,6 +1584,11 @@ pub async fn run(
     let mut pending_input: VecDeque<Bytes> = VecDeque::new();
     let mut pending_input_bytes: usize = 0;
     loop {
+        // Winsize hint from the Attach frame of the client we're about to
+        // serve. Applied before replay so regenerated prompts / TUI repaints
+        // use the current terminal dimensions. 0 = unknown / first client.
+        let mut attach_cols: u16 = 0;
+        let mut attach_rows: u16 = 0;
         if !first_client {
             let mut detached_exit: Option<i32> = None;
             let got_client = 'drain: loop {
@@ -1556,10 +1596,15 @@ pub async fn run(
                     biased;
                     client = client_rx.recv() => {
                         match client {
-                            Some(ClientConn::Active { framed: f, client_name: cn, capabilities: caps }) => {
+                            Some(ClientConn::Active {
+                                framed: f, client_name: cn, capabilities: caps,
+                                cols: new_cols, rows: new_rows,
+                            }) => {
                                 info!("client connected via channel");
                                 negotiated_caps.store(caps, std::sync::atomic::Ordering::Relaxed);
                                 framed = f;
+                                attach_cols = new_cols;
+                                attach_rows = new_rows;
                                 if let Some(meta) = metadata_slot.get()
                                     && let Ok(mut n) = meta.client_name.lock()
                                 {
@@ -1686,11 +1731,31 @@ pub async fn run(
         let is_reconnect = !first_client;
         first_client = false;
 
-        // Reconnect: status banner first, then replay scrollback and the
-        // disconnect ring buffer. Banner-first means the last bytes written are
-        // real PTY output, so the cursor lands where the shell expects it.
-        // A send failure here (client dropped mid-flush) must re-enter drain,
-        // not kill the session.
+        // Apply the new client's terminal size BEFORE any replay. The shell
+        // (or TUI) will regenerate its last line / full screen at the correct
+        // winsize. If we waited for the inline `Resize` frame from the
+        // relay loop, replayed bytes would be produced at the stale size and
+        // wrap/cursor positioning would be wrong on the client.
+        //
+        // Alternate-screen path does a SIGWINCH toggle (nudge rows-1 then
+        // restore) because many ncurses apps no-op a same-size SIGWINCH and
+        // would otherwise not repaint at all after a same-size reconnect.
+        // Main-screen path just needs the size right for the shell's next
+        // prompt redraw, so a single apply is enough.
+        if is_reconnect && attach_cols > 0 && attach_rows > 0 {
+            if alt_screen.in_alternate_screen() {
+                force_tui_redraw(&async_master, attach_cols, attach_rows);
+            } else {
+                apply_winsize(&async_master, attach_cols, attach_rows);
+            }
+        }
+
+        // Reconnect: status banner first, then replay scrollback (including
+        // the in-progress partial line so the current prompt shows up) and
+        // the disconnect ring buffer. Banner-first means the last bytes
+        // written are real PTY output, so the cursor lands where the shell
+        // expects it. A send failure here (client dropped mid-flush) must
+        // re-enter drain, not kill the session.
         let mut flush_failed = false;
         if is_reconnect && !alt_screen.in_alternate_screen() {
             let msg = if ring_buf_dropped > 0 {
@@ -1706,8 +1771,8 @@ pub async fn run(
                 flush_failed = true;
             } else {
                 ring_buf_dropped = 0;
-                for line in scrollback.lines() {
-                    if let Err(e) = framed.send(Frame::Data(line.clone())).await {
+                for line in scrollback.lines_and_partial() {
+                    if let Err(e) = framed.send(Frame::Data(line)).await {
                         warn!(error = %e, "client send failed during scrollback replay, detaching");
                         flush_failed = true;
                         break;
@@ -1718,10 +1783,7 @@ pub async fn run(
                 }
             }
         } else if is_reconnect {
-            // Alternate screen: Ctrl-L to PTY for TUI redraw.
-            // Queue it so a backpressured PTY doesn't wedge reconnect.
-            pending_input_bytes += 1;
-            pending_input.push_back(Bytes::from_static(b"\x0c"));
+            // Alternate screen: redraw already nudged via SIGWINCH above.
             ring_buf_dropped = 0;
         }
 
@@ -1828,7 +1890,10 @@ pub async fn run(
 
                     new_client = client_rx.recv() => {
                         match new_client {
-                            Some(ClientConn::Active { framed: new_framed, client_name: cn, capabilities: caps }) => {
+                            Some(ClientConn::Active {
+                                framed: new_framed, client_name: cn, capabilities: caps,
+                                cols: new_cols, rows: new_rows,
+                            }) => {
                                 info!("new client via channel, detaching old client");
                                 relay.negotiated_caps.store(caps, std::sync::atomic::Ordering::Relaxed);
                                 let _ = framed.send(Frame::Detached).await;
@@ -1845,6 +1910,16 @@ pub async fn run(
                                     && let Ok(mut n) = meta.client_name.lock()
                                 {
                                     *n = cn;
+                                }
+                                // Apply new client's winsize before any further
+                                // output reaches their terminal. Alt-screen gets
+                                // the SIGWINCH toggle to force a TUI repaint.
+                                if new_cols > 0 && new_rows > 0 {
+                                    if alt_screen.in_alternate_screen() {
+                                        force_tui_redraw(&async_master, new_cols, new_rows);
+                                    } else {
+                                        apply_winsize(&async_master, new_cols, new_rows);
+                                    }
                                 }
                                 // Inform the new client about the takeover
                                 let was_attached = relay.metadata_slot.get()

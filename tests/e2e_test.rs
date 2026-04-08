@@ -67,6 +67,8 @@ async fn setup_session() -> (
             framed: Framed::new(server_stream, FrameCodec),
             client_name: String::new(),
             capabilities: 0,
+            cols: 0,
+            rows: 0,
         })
         .unwrap();
 
@@ -115,6 +117,8 @@ async fn setup_session_with_svc_path() -> (
             framed: Framed::new(server_stream, FrameCodec),
             client_name: String::new(),
             capabilities: 0,
+            cols: 0,
+            rows: 0,
         })
         .unwrap();
 
@@ -163,6 +167,8 @@ async fn setup_session_with_env(
             framed: Framed::new(server_stream, FrameCodec),
             client_name: String::new(),
             capabilities: 0,
+            cols: 0,
+            rows: 0,
         })
         .unwrap();
 
@@ -279,6 +285,8 @@ async fn reconnect_preserves_shell_session() {
             framed: Framed::new(server_stream, FrameCodec),
             client_name: String::new(),
             capabilities: 0,
+            cols: 0,
+            rows: 0,
         })
         .unwrap();
     let mut framed = Framed::new(client_stream, FrameCodec);
@@ -330,6 +338,8 @@ async fn second_client_detaches_first() {
             framed: Framed::new(server_stream2, FrameCodec),
             client_name: String::new(),
             capabilities: 0,
+            cols: 0,
+            rows: 0,
         })
         .unwrap();
     let mut client2 = Framed::new(client_stream2, FrameCodec);
@@ -416,6 +426,8 @@ async fn rapid_reconnect_cycles() {
                 framed: Framed::new(server_stream, FrameCodec),
                 client_name: String::new(),
                 capabilities: 0,
+                cols: 0,
+                rows: 0,
             })
             .unwrap();
         framed = Framed::new(client_stream, FrameCodec);
@@ -496,6 +508,8 @@ async fn pty_buffer_saturation_and_resume() {
             framed: Framed::new(server_stream, FrameCodec),
             client_name: String::new(),
             capabilities: 0,
+            cols: 0,
+            rows: 0,
         })
         .unwrap();
     let mut framed = Framed::new(client_stream, FrameCodec);
@@ -540,6 +554,8 @@ async fn pty_ring_buffer_drains_during_disconnect() {
             framed: Framed::new(server_stream, FrameCodec),
             client_name: String::new(),
             capabilities: 0,
+            cols: 0,
+            rows: 0,
         })
         .unwrap();
     let mut framed = Framed::new(client_stream, FrameCodec);
@@ -582,6 +598,8 @@ async fn pty_ring_buffer_caps_at_limit() {
             framed: Framed::new(server_stream, FrameCodec),
             client_name: String::new(),
             capabilities: 0,
+            cols: 0,
+            rows: 0,
         })
         .unwrap();
     let mut framed = Framed::new(client_stream, FrameCodec);
@@ -654,6 +672,8 @@ async fn metadata_reflects_attached_state() {
             framed: Framed::new(server_stream, FrameCodec),
             client_name: String::new(),
             capabilities: 0,
+            cols: 0,
+            rows: 0,
         })
         .unwrap();
     let mut framed = Framed::new(client_stream, FrameCodec);
@@ -682,6 +702,8 @@ async fn client_explicit_exit_frame() {
             framed: Framed::new(server_stream, FrameCodec),
             client_name: String::new(),
             capabilities: 0,
+            cols: 0,
+            rows: 0,
         })
         .unwrap();
     let mut framed = Framed::new(client_stream, FrameCodec);
@@ -883,6 +905,8 @@ async fn setup_session_with_agent_path() -> (
             framed: Framed::new(server_stream, FrameCodec),
             client_name: String::new(),
             capabilities: 0,
+            cols: 0,
+            rows: 0,
         })
         .unwrap();
 
@@ -1166,6 +1190,8 @@ async fn ring_buffer_overflow_shows_truncation_marker() {
             framed: Framed::new(server_stream, FrameCodec),
             client_name: String::new(),
             capabilities: 0,
+            cols: 0,
+            rows: 0,
         })
         .unwrap();
     let mut framed = Framed::new(client_stream, FrameCodec);
@@ -2135,6 +2161,8 @@ async fn port_forward_client_disconnect_cleanup() {
             framed: Framed::new(server_stream2, FrameCodec),
             client_name: String::new(),
             capabilities: 0,
+            cols: 0,
+            rows: 0,
         })
         .unwrap();
     let mut framed2 = Framed::new(client_stream2, FrameCodec);
@@ -2320,6 +2348,8 @@ async fn reconnect_sends_separator_on_main_screen() {
             framed: Framed::new(server_stream, FrameCodec),
             client_name: String::new(),
             capabilities: 0,
+            cols: 0,
+            rows: 0,
         })
         .unwrap();
     let mut framed = Framed::new(client_stream, FrameCodec);
@@ -2361,6 +2391,8 @@ async fn reconnect_sends_ctrl_l_on_alternate_screen() {
             framed: Framed::new(server_stream, FrameCodec),
             client_name: String::new(),
             capabilities: 0,
+            cols: 0,
+            rows: 0,
         })
         .unwrap();
     let mut framed = Framed::new(client_stream, FrameCodec);
@@ -2404,6 +2436,8 @@ async fn reconnect_replays_scrollback_lines() {
             framed: Framed::new(server_stream, FrameCodec),
             client_name: String::new(),
             capabilities: 0,
+            cols: 0,
+            rows: 0,
         })
         .unwrap();
     let mut framed = Framed::new(client_stream, FrameCodec);

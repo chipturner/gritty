@@ -40,6 +40,19 @@ impl ScrollbackBuffer {
         &self.lines
     }
 
+    /// Iterator over the stored complete lines followed by the in-progress
+    /// partial line (if any, without adding a trailing newline).
+    ///
+    /// Used for reconnect replay: a shell prompt is a line without `\n` and
+    /// therefore lives forever in `partial`, never in `lines`. Replaying only
+    /// `lines` would drop the current prompt from the new client's view.
+    pub fn lines_and_partial(&self) -> impl Iterator<Item = Bytes> + '_ {
+        self.lines
+            .iter()
+            .cloned()
+            .chain((!self.partial.is_empty()).then(|| Bytes::copy_from_slice(&self.partial)))
+    }
+
     /// Clear stored lines (keeps partial accumulator intact).
     pub fn clear(&mut self) {
         self.lines.clear();
@@ -150,5 +163,34 @@ mod tests {
         sb.push(b"\n\n\n");
         assert_eq!(sb.lines().len(), 3);
         assert_eq!(sb.lines()[0].as_ref(), b"\n");
+    }
+
+    #[test]
+    fn lines_and_partial_yields_prompt() {
+        let mut sb = ScrollbackBuffer::new();
+        sb.push(b"line1\nline2\n$ ");
+        let replayed: Vec<_> = sb.lines_and_partial().collect();
+        assert_eq!(replayed.len(), 3);
+        assert_eq!(replayed[0].as_ref(), b"line1\n");
+        assert_eq!(replayed[1].as_ref(), b"line2\n");
+        assert_eq!(replayed[2].as_ref(), b"$ ");
+    }
+
+    #[test]
+    fn lines_and_partial_empty_partial() {
+        let mut sb = ScrollbackBuffer::new();
+        sb.push(b"only\n");
+        let replayed: Vec<_> = sb.lines_and_partial().collect();
+        assert_eq!(replayed.len(), 1);
+        assert_eq!(replayed[0].as_ref(), b"only\n");
+    }
+
+    #[test]
+    fn lines_and_partial_only_partial() {
+        let mut sb = ScrollbackBuffer::new();
+        sb.push(b"typing...");
+        let replayed: Vec<_> = sb.lines_and_partial().collect();
+        assert_eq!(replayed.len(), 1);
+        assert_eq!(replayed[0].as_ref(), b"typing...");
     }
 }
