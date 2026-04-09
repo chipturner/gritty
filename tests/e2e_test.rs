@@ -2414,6 +2414,91 @@ async fn reconnect_sends_ctrl_l_on_alternate_screen() {
 }
 
 #[tokio::test]
+async fn reconnect_alt_screen_primes_client_and_discards_ring_buf() {
+    // Spawn a session whose "TUI" enters alt-screen immediately, then emits
+    // a recognizable marker after a short delay so it lands in the ring
+    // buffer while the client is detached.
+    let (client_tx, client_rx) = mpsc::unbounded_channel();
+    let meta: Arc<OnceLock<gritty::server::SessionMetadata>> = Arc::new(OnceLock::new());
+    let meta_clone = Arc::clone(&meta);
+    let agent_path = unique_agent_socket_path();
+    let svc_path = unique_svc_socket_path();
+    let cmd = r"printf '\033[?1049h'; sleep 0.5; printf STALE_DELTA; sleep 10".to_string();
+    let server = tokio::spawn(async move {
+        gritty::server::run(
+            client_rx,
+            meta_clone,
+            agent_path,
+            svc_path,
+            0,
+            None,
+            Some(cmd),
+            1 << 20,
+            5,
+            0,
+            0,
+            None,
+        )
+        .await
+    });
+
+    let (server_stream, client_stream) = UnixStream::pair().unwrap();
+    client_tx
+        .send(ClientConn::Active {
+            framed: Framed::new(server_stream, FrameCodec),
+            client_name: String::new(),
+            capabilities: 0,
+            cols: 0,
+            rows: 0,
+        })
+        .unwrap();
+    let mut framed = Framed::new(client_stream, FrameCodec);
+    framed.send(Frame::Env { vars: vec![] }).await.unwrap();
+    framed.send(Frame::Resize { cols: 80, rows: 24 }).await.unwrap();
+
+    // First client sees the alt-screen entry (confirms tracker will flip).
+    let initial = read_available_data(&mut framed, Duration::from_millis(300)).await;
+    assert!(
+        initial.windows(8).any(|w| w == b"\x1b[?1049h"),
+        "shell should enter alt-screen, got: {:?}",
+        String::from_utf8_lossy(&initial)
+    );
+
+    // Disconnect before STALE_DELTA is emitted.
+    drop(framed);
+    // Give the detached-drain loop time to read STALE_DELTA into ring_buf.
+    tokio::time::sleep(Duration::from_millis(800)).await;
+
+    // Reconnect with a known winsize so the alt-screen redraw path runs.
+    let (server_stream, client_stream) = UnixStream::pair().unwrap();
+    client_tx
+        .send(ClientConn::Active {
+            framed: Framed::new(server_stream, FrameCodec),
+            client_name: String::new(),
+            capabilities: 0,
+            cols: 80,
+            rows: 24,
+        })
+        .unwrap();
+    let mut framed = Framed::new(client_stream, FrameCodec);
+
+    let output = read_available_data(&mut framed, Duration::from_secs(1)).await;
+    let output_str = String::from_utf8_lossy(&output);
+    let priming = b"\x1b[?1049h\x1b[H\x1b[2J";
+    assert!(
+        output.windows(priming.len()).any(|w| w == priming),
+        "new client should be primed into alt-screen, got: {output_str:?}"
+    );
+    assert!(
+        !output_str.contains("STALE_DELTA"),
+        "stale ring-buffered alt-screen output should be discarded, got: {output_str:?}"
+    );
+
+    drop(framed);
+    server.abort();
+}
+
+#[tokio::test]
 async fn reconnect_replays_scrollback_lines() {
     let (client_tx, mut framed, server, _meta) = setup_session().await;
     wait_for_shell(&mut framed).await;

@@ -1331,20 +1331,58 @@ fn apply_winsize(master: &tokio::io::unix::AsyncFd<std::os::fd::OwnedFd>, cols: 
 /// size, so a straight `apply_winsize` with an unchanged size does nothing.
 /// Nudging rows down by one then restoring guarantees a change-of-size event
 /// and a full repaint.
+///
+/// Between the two ioctls we actively drain the PTY master and forward what
+/// we read to the client. A bare sleep here is insufficient: the TUI's
+/// rows-1 repaint is typically larger than the PTY's kernel buffer, so the
+/// TUI blocks in `write()` before it ever reaches the point where it would
+/// re-query `TIOCGWINSZ`. With nothing reading, the second SIGWINCH finds
+/// the TUI mid-write; it observes only the final (unchanged) size and
+/// no-ops. Draining while we wait keeps the TUI unblocked so it actually
+/// sees the intermediate size.
+///
+/// Returns `Err` if the client socket rejects a send, so callers can fall
+/// back into the detached-drain path.
 async fn force_tui_redraw(
-    master: &tokio::io::unix::AsyncFd<std::os::fd::OwnedFd>,
+    master: &AsyncFd<OwnedFd>,
+    framed: &mut Framed<UnixStream, FrameCodec>,
+    tail_tx: &broadcast::Sender<TailEvent>,
+    alt_screen: &mut AltScreenTracker,
+    scrollback: &mut ScrollbackBuffer,
     cols: u16,
     rows: u16,
-) {
+) -> anyhow::Result<()> {
     let nudge_rows = rows.saturating_sub(1).max(1);
     apply_winsize(master, cols, nudge_rows);
-    // Pause so the child process actually observes the intermediate size
-    // before we restore the original. Without this, both TIOCSWINSZ ioctls
-    // land before the TUI runs its SIGWINCH handler once; ncurses apps then
-    // see only the final (unchanged) size and no-op the repaint, leaving
-    // stale content on the client.
-    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+    let deadline = tokio::time::Instant::now() + Duration::from_millis(50);
+    let mut buf = vec![0u8; 4096];
+    loop {
+        tokio::select! {
+            _ = tokio::time::sleep_until(deadline) => break,
+            ready = master.readable() => {
+                let Ok(mut guard) = ready else { break };
+                match guard.try_io(|inner| {
+                    nix::unistd::read(inner, &mut buf).map_err(io::Error::from)
+                }) {
+                    Ok(Ok(0)) | Ok(Err(_)) => break,
+                    Ok(Ok(n)) => {
+                        let chunk = Bytes::copy_from_slice(&buf[..n]);
+                        alt_screen.scan(&chunk);
+                        scrollback.push(&chunk);
+                        if tail_tx.receiver_count() > 0 {
+                            let _ = tail_tx.send(TailEvent::Data(chunk.clone()));
+                        }
+                        framed.send(Frame::Data(chunk)).await?;
+                    }
+                    Err(_would_block) => continue,
+                }
+            }
+        }
+    }
+
     apply_winsize(master, cols, rows);
+    Ok(())
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1747,27 +1785,49 @@ pub async fn run(
         // relay loop, replayed bytes would be produced at the stale size and
         // wrap/cursor positioning would be wrong on the client.
         //
-        // Alternate-screen path does a SIGWINCH toggle (nudge rows-1 then
-        // restore) because many ncurses apps no-op a same-size SIGWINCH and
-        // would otherwise not repaint at all after a same-size reconnect.
-        // Main-screen path just needs the size right for the shell's next
-        // prompt redraw, so a single apply is enough.
-        if is_reconnect && attach_cols > 0 && attach_rows > 0 {
-            if alt_screen.in_alternate_screen() {
-                force_tui_redraw(&async_master, attach_cols, attach_rows).await;
-            } else {
+        // A send failure anywhere in this block (client dropped mid-flush)
+        // must re-enter drain, not kill the session.
+        let mut flush_failed = false;
+        if is_reconnect && alt_screen.in_alternate_screen() {
+            // A full repaint is coming via SIGWINCH; stale alt-screen deltas
+            // captured while detached would paint garbage onto the freshly
+            // cleared client terminal, so drop them.
+            ring_buf.clear();
+            ring_buf_size = 0;
+            ring_buf_dropped = 0;
+            // Prime the client's terminal into alt-screen and clear it. For
+            // an auto-reconnect this is idempotent; for a fresh `connect`
+            // it's required -- the new terminal has never seen `?1049h`, so
+            // without this the repaint would land on the main screen.
+            if let Err(e) =
+                framed.send(Frame::Data(Bytes::from_static(b"\x1b[?1049h\x1b[H\x1b[2J"))).await
+            {
+                warn!(error = %e, "client send failed during alt-screen priming, detaching");
+                flush_failed = true;
+            } else if attach_cols > 0
+                && attach_rows > 0
+                && let Err(e) = force_tui_redraw(
+                    &async_master,
+                    &mut framed,
+                    &tail_tx,
+                    &mut alt_screen,
+                    &mut scrollback,
+                    attach_cols,
+                    attach_rows,
+                )
+                .await
+            {
+                warn!(error = %e, "client send failed during redraw drain, detaching");
+                flush_failed = true;
+            }
+        } else if is_reconnect {
+            // Main screen: single winsize apply (no toggle needed), then a
+            // status banner and scrollback replay. Banner-first means the
+            // last bytes written are real PTY output, so the cursor lands
+            // where the shell expects it.
+            if attach_cols > 0 && attach_rows > 0 {
                 apply_winsize(&async_master, attach_cols, attach_rows);
             }
-        }
-
-        // Reconnect: status banner first, then replay scrollback (including
-        // the in-progress partial line so the current prompt shows up) and
-        // the disconnect ring buffer. Banner-first means the last bytes
-        // written are real PTY output, so the cursor lands where the shell
-        // expects it. A send failure here (client dropped mid-flush) must
-        // re-enter drain, not kill the session.
-        let mut flush_failed = false;
-        if is_reconnect && !alt_screen.in_alternate_screen() {
             let msg = if ring_buf_dropped > 0 {
                 format!(
                     "\r\n\x1b[2;33m[gritty: reconnected -- {} bytes of output dropped]\x1b[0m\r\n",
@@ -1792,9 +1852,6 @@ pub async fn run(
                     scrollback.clear();
                 }
             }
-        } else if is_reconnect {
-            // Alternate screen: redraw already nudged via SIGWINCH above.
-            ring_buf_dropped = 0;
         }
 
         if !flush_failed && !ring_buf.is_empty() {
@@ -1921,21 +1978,39 @@ pub async fn run(
                                 {
                                     *n = cn;
                                 }
-                                // Apply new client's winsize before any further
-                                // output reaches their terminal. Alt-screen gets
-                                // the SIGWINCH toggle to force a TUI repaint.
-                                if new_cols > 0 && new_rows > 0 {
-                                    if alt_screen.in_alternate_screen() {
-                                        force_tui_redraw(&async_master, new_cols, new_rows).await;
-                                    } else {
-                                        apply_winsize(&async_master, new_cols, new_rows);
-                                    }
-                                }
                                 // Inform the new client about the takeover
                                 let was_attached = relay.metadata_slot.get()
                                     .map(|m| m.attached.load(Ordering::Relaxed))
                                     .unwrap_or(false);
                                 framed = new_framed;
+                                // Apply new client's winsize before any further
+                                // output reaches their terminal. Alt-screen gets
+                                // primed (?1049h + clear) then a SIGWINCH toggle
+                                // to force a TUI repaint; drained bytes go to the
+                                // new client. Send failures are swallowed -- the
+                                // relay loop will detect the dead socket on the
+                                // next iteration.
+                                if alt_screen.in_alternate_screen() {
+                                    let _ = framed
+                                        .send(Frame::Data(Bytes::from_static(
+                                            b"\x1b[?1049h\x1b[H\x1b[2J",
+                                        )))
+                                        .await;
+                                    if new_cols > 0 && new_rows > 0 {
+                                        let _ = force_tui_redraw(
+                                            &async_master,
+                                            &mut framed,
+                                            relay.tail_tx,
+                                            &mut alt_screen,
+                                            &mut scrollback,
+                                            new_cols,
+                                            new_rows,
+                                        )
+                                        .await;
+                                    }
+                                } else if new_cols > 0 && new_rows > 0 {
+                                    apply_winsize(&async_master, new_cols, new_rows);
+                                }
                                 if was_attached && !alt_screen.in_alternate_screen() {
                                     let hb_age = relay.metadata_slot.get()
                                         .and_then(|m| {
