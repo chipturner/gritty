@@ -195,8 +195,8 @@ gritty works out of the box with no config file. Optionally, set persistent defa
 # no-escape = false
 # oauth-redirect = true
 # oauth-timeout = 180
-# heartbeat-interval = 5
-# heartbeat-timeout = 15
+# heartbeat-interval = 10
+# heartbeat-timeout = 60
 # ring-buffer-size = 1048576
 # oauth-tunnel-idle-timeout = 5
 

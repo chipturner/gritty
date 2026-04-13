@@ -80,7 +80,7 @@ Nine modules behind a lib crate (`src/lib.rs` hosts `collect_env_vars()`, `spawn
 - **`alt_screen`** -- `AltScreenTracker`: byte-scanning state machine that detects alternate screen mode (`?1049`, `?1047`, `?47`). Used by server for smart reconnect.
 - **`scrollback`** -- `ScrollbackBuffer`: tracks last 50 lines of PTY output for replay on main-screen reconnect.
 - **`table`** -- `print_table()` for tabular output.
-- **`client`** -- Raw mode, escape processor, heartbeat (5s ping / 15s timeout, RTT-aware escalation), auto-reconnect (5s attempt timeout), forwarding relay. `tail()` is read-only variant.
+- **`client`** -- Raw mode, escape processor, idle heartbeat (10s idle-probe / 60s idle-timeout, any received frame counts as liveness), clock-skew suspend detection with 5s post-resume probe deadline, auto-reconnect (5s attempt timeout), forwarding relay. `tail()` is read-only variant.
 
 ### Wire format
 

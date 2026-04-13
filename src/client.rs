@@ -247,7 +247,7 @@ fn suspend(raw_guard: &RawModeGuard, nb_guard: &NonBlockGuard) -> anyhow::Result
     Ok(())
 }
 
-const SEND_TIMEOUT: Duration = Duration::from_secs(5);
+const SEND_TIMEOUT: Duration = Duration::from_secs(10);
 const RECONNECT_ATTEMPT_TIMEOUT: Duration = Duration::from_secs(5);
 
 struct NonBlockGuard {
@@ -405,11 +405,13 @@ async fn timed_send(framed: &mut Framed<UnixStream, FrameCodec>, frame: Frame) -
     }
 }
 
-const DEFAULT_HEARTBEAT_INTERVAL: Duration = Duration::from_secs(5);
-const DEFAULT_HEARTBEAT_TIMEOUT: Duration = Duration::from_secs(15);
-const FAST_HEARTBEAT_INTERVAL: Duration = Duration::from_millis(500);
-const FAST_HEARTBEAT_TIMEOUT: Duration = Duration::from_secs(3);
-const PONG_LATE_THRESHOLD: Duration = Duration::from_secs(2);
+const DEFAULT_HEARTBEAT_INTERVAL: Duration = Duration::from_secs(10);
+const DEFAULT_HEARTBEAT_TIMEOUT: Duration = Duration::from_secs(60);
+/// If wall-clock advances much faster than monotonic between heartbeat ticks,
+/// the host likely slept. Force a liveness probe on resume.
+const SUSPEND_SKEW_THRESHOLD: Duration = Duration::from_secs(5);
+/// Deadline for the post-suspend probe reply before declaring the link dead.
+const SUSPEND_PROBE_DEADLINE: Duration = Duration::from_secs(5);
 
 /// Events from local agent connection tasks to the relay loop.
 enum AgentEvent {
@@ -571,7 +573,7 @@ struct ClientRelay<'a> {
     pf: &'a mut ClientPortForwardTable,
     pf_event_tx: &'a mpsc::UnboundedSender<ClientPortForwardEvent>,
     client_initiated_forwards: &'a mut std::collections::HashMap<u32, u16>,
-    last_pong: &'a mut Instant,
+    last_activity: &'a mut Instant,
     last_ping_sent: &'a mut Instant,
     last_rtt: &'a mut Option<Duration>,
     connected_at: Instant,
@@ -588,6 +590,10 @@ impl ClientRelay<'_> {
         framed: &mut Framed<UnixStream, FrameCodec>,
         frame: Option<Result<Frame, io::Error>>,
     ) -> Result<ControlFlow<RelayExit>, anyhow::Error> {
+        // Any frame received from the server is proof-of-life; reset the idle timer.
+        if matches!(frame, Some(Ok(_))) {
+            *self.last_activity = Instant::now();
+        }
         match frame {
             Some(Ok(Frame::Data(data))) => {
                 debug!(len = data.len(), "socket → stdout");
@@ -598,7 +604,6 @@ impl ClientRelay<'_> {
             Some(Ok(Frame::Pong)) => {
                 *self.last_rtt = Some(self.last_ping_sent.elapsed());
                 debug!(rtt_ms = self.last_rtt.unwrap().as_secs_f64() * 1000.0, "pong received");
-                *self.last_pong = Instant::now();
             }
             Some(Ok(Frame::Exit { code })) => {
                 debug!(code, "server sent exit");
@@ -1151,10 +1156,15 @@ async fn relay(
 ) -> anyhow::Result<RelayExit> {
     let mut heartbeat_interval = tokio::time::interval(hb_interval);
     heartbeat_interval.reset(); // first tick is immediate otherwise; delay it
-    let mut last_pong = Instant::now();
+    let mut last_activity = Instant::now();
     let mut last_ping_sent = Instant::now();
     let mut last_rtt: Option<Duration> = None;
-    let mut heartbeat_fast = false;
+    let mut last_tick_mono = Instant::now();
+    let mut last_tick_wall = std::time::SystemTime::now();
+    // When set, a post-suspend probe is outstanding; if no server frame arrives
+    // by this deadline we treat the connection as dead and reconnect.
+    let mut suspend_probe_deadline: Option<Instant> = None;
+    let mut suspend_probe_baseline: Option<Instant> = None;
 
     // Agent channel management
     let mut agent = ClientAgentState::new();
@@ -1184,7 +1194,7 @@ async fn relay(
         pf: &mut pf,
         pf_event_tx: &pf_event_tx,
         client_initiated_forwards: &mut client_initiated_forwards,
-        last_pong: &mut last_pong,
+        last_activity: &mut last_activity,
         last_ping_sent: &mut last_ping_sent,
         last_rtt: &mut last_rtt,
         connected_at: Instant::now(),
@@ -1224,12 +1234,15 @@ async fn relay(
                                     }
                                     EscapeAction::Suspend => {
                                         suspend(raw_guard, nb_guard)?;
-                                        // CLOCK_MONOTONIC kept advancing while stopped; avoid a
-                                        // spurious heartbeat-timeout disconnect on resume.
-                                        heartbeat_fast = false;
+                                        // Avoid a spurious idle-timeout or suspend-probe after
+                                        // returning from SIGTSTP.
                                         heartbeat_interval = tokio::time::interval(hb_interval);
                                         heartbeat_interval.reset();
-                                        *relay.last_pong = Instant::now();
+                                        *relay.last_activity = Instant::now();
+                                        last_tick_mono = Instant::now();
+                                        last_tick_wall = std::time::SystemTime::now();
+                                        suspend_probe_deadline = None;
+                                        suspend_probe_baseline = None;
                                         // Re-sync terminal size after resume
                                         let (cols, rows) = get_terminal_size();
                                         if !timed_send(framed, Frame::Resize { cols, rows }).await {
@@ -1325,12 +1338,13 @@ async fn relay(
                 if let ControlFlow::Break(exit) = relay.handle_server_frame(framed, frame).await? {
                     return Ok(exit);
                 }
-                // Reset heartbeat escalation when a Pong arrives
-                if heartbeat_fast && relay.last_pong.elapsed() < Duration::from_millis(100) {
-                    debug!("pong received, de-escalating heartbeat");
-                    heartbeat_fast = false;
-                    heartbeat_interval = tokio::time::interval(hb_interval);
-                    heartbeat_interval.reset();
+                // Any server frame satisfies an outstanding post-suspend probe.
+                if let Some(baseline) = suspend_probe_baseline
+                    && *relay.last_activity > baseline
+                {
+                    debug!("post-suspend probe satisfied");
+                    suspend_probe_deadline = None;
+                    suspend_probe_baseline = None;
                 }
             }
 
@@ -1373,29 +1387,61 @@ async fn relay(
             }
 
             _ = heartbeat_interval.tick() => {
-                let effective_timeout = if heartbeat_fast { FAST_HEARTBEAT_TIMEOUT } else { hb_timeout };
-                if relay.last_pong.elapsed() > effective_timeout {
-                    debug!(fast = heartbeat_fast, "heartbeat timeout");
+                // Detect suspend/resume by comparing wall-clock and monotonic deltas.
+                // Both Instant and SystemTime tick together while the process runs; during
+                // a full suspend Instant pauses but SystemTime doesn't, so wall >> mono on
+                // the first tick after resume.
+                let mono_now = Instant::now();
+                let wall_now = std::time::SystemTime::now();
+                let mono_delta = mono_now.saturating_duration_since(last_tick_mono);
+                let wall_delta = wall_now
+                    .duration_since(last_tick_wall)
+                    .unwrap_or(Duration::ZERO);
+                last_tick_mono = mono_now;
+                last_tick_wall = wall_now;
+                let suspended = wall_delta > mono_delta + SUSPEND_SKEW_THRESHOLD;
+
+                if relay.last_activity.elapsed() > hb_timeout {
+                    debug!("idle timeout");
                     return Ok(RelayExit::Disconnected);
                 }
-                // Escalate if Pong is late relative to known RTT
-                if !heartbeat_fast {
-                    let pong_wait = relay.last_ping_sent.elapsed();
-                    let late_threshold = match *relay.last_rtt {
-                        Some(rtt) => PONG_LATE_THRESHOLD.max(rtt * 5),
-                        None => hb_timeout, // no RTT data -> don't escalate
-                    };
-                    if pong_wait > late_threshold {
-                        debug!(wait_ms = pong_wait.as_millis(), "pong late, escalating heartbeat");
-                        heartbeat_fast = true;
-                        heartbeat_interval = tokio::time::interval(FAST_HEARTBEAT_INTERVAL);
-                        heartbeat_interval.reset();
+
+                // Fire a probe if idle long enough OR we just came back from suspend.
+                let should_probe = suspended
+                    || relay.last_activity.elapsed() >= hb_interval;
+                if should_probe {
+                    if suspended {
+                        debug!(
+                            wall_ms = wall_delta.as_millis(),
+                            mono_ms = mono_delta.as_millis(),
+                            "suspend detected, probing link",
+                        );
+                        suspend_probe_baseline = Some(*relay.last_activity);
+                        suspend_probe_deadline =
+                            Some(Instant::now() + SUSPEND_PROBE_DEADLINE);
+                    }
+                    *relay.last_ping_sent = Instant::now();
+                    if !timed_send(framed, Frame::Ping).await {
+                        return Ok(RelayExit::Disconnected);
                     }
                 }
-                *relay.last_ping_sent = Instant::now();
-                if !timed_send(framed, Frame::Ping).await {
+            }
+
+            _ = async {
+                match suspend_probe_deadline {
+                    Some(d) => tokio::time::sleep_until(d).await,
+                    None => std::future::pending().await,
+                }
+            } => {
+                // Deadline fired with no activity past baseline -> link is dead.
+                if let Some(baseline) = suspend_probe_baseline
+                    && *relay.last_activity <= baseline
+                {
+                    debug!("post-suspend probe timed out");
                     return Ok(RelayExit::Disconnected);
                 }
+                suspend_probe_deadline = None;
+                suspend_probe_baseline = None;
             }
 
             _ = sigterm.recv() => {
@@ -1705,7 +1751,11 @@ pub async fn tail(
 
     let mut heartbeat_interval = tokio::time::interval(DEFAULT_HEARTBEAT_INTERVAL);
     heartbeat_interval.reset();
-    let mut last_pong = Instant::now();
+    let mut last_activity = Instant::now();
+    let mut last_tick_mono = Instant::now();
+    let mut last_tick_wall = std::time::SystemTime::now();
+    let mut suspend_probe_deadline: Option<Instant> = None;
+    let mut suspend_probe_baseline: Option<Instant> = None;
     let mut sigint = signal(SignalKind::interrupt())?;
     let mut sigterm = signal(SignalKind::terminate())?;
     let mut sighup = signal(SignalKind::hangup())?;
@@ -1718,15 +1768,22 @@ pub async fn tail(
         let result = 'relay: loop {
             tokio::select! {
                 frame = framed.next() => {
+                    if matches!(frame, Some(Ok(_))) {
+                        last_activity = Instant::now();
+                        if let Some(baseline) = suspend_probe_baseline
+                            && last_activity > baseline
+                        {
+                            suspend_probe_deadline = None;
+                            suspend_probe_baseline = None;
+                        }
+                    }
                     match frame {
                         Some(Ok(Frame::Data(data))) => {
                             use tokio::io::AsyncWriteExt;
                             alt_screen.scan(&data);
                             stdout.write_all(&data).await?;
                         }
-                        Some(Ok(Frame::Pong)) => {
-                            last_pong = Instant::now();
-                        }
+                        Some(Ok(Frame::Pong)) => {}
                         Some(Ok(Frame::Exit { code })) => {
                             break 'relay Some(code);
                         }
@@ -1742,13 +1799,48 @@ pub async fn tail(
                     }
                 }
                 _ = heartbeat_interval.tick() => {
-                    if last_pong.elapsed() > DEFAULT_HEARTBEAT_TIMEOUT {
-                        debug!("tail heartbeat timeout");
+                    let mono_now = Instant::now();
+                    let wall_now = std::time::SystemTime::now();
+                    let mono_delta = mono_now.saturating_duration_since(last_tick_mono);
+                    let wall_delta = wall_now
+                        .duration_since(last_tick_wall)
+                        .unwrap_or(Duration::ZERO);
+                    last_tick_mono = mono_now;
+                    last_tick_wall = wall_now;
+                    let suspended = wall_delta > mono_delta + SUSPEND_SKEW_THRESHOLD;
+
+                    if last_activity.elapsed() > DEFAULT_HEARTBEAT_TIMEOUT {
+                        debug!("tail idle timeout");
                         break 'relay None;
                     }
-                    if framed.send(Frame::Ping).await.is_err() {
+
+                    let should_probe = suspended
+                        || last_activity.elapsed() >= DEFAULT_HEARTBEAT_INTERVAL;
+                    if should_probe {
+                        if suspended {
+                            suspend_probe_baseline = Some(last_activity);
+                            suspend_probe_deadline =
+                                Some(Instant::now() + SUSPEND_PROBE_DEADLINE);
+                        }
+                        if framed.send(Frame::Ping).await.is_err() {
+                            break 'relay None;
+                        }
+                    }
+                }
+                _ = async {
+                    match suspend_probe_deadline {
+                        Some(d) => tokio::time::sleep_until(d).await,
+                        None => std::future::pending().await,
+                    }
+                } => {
+                    if let Some(baseline) = suspend_probe_baseline
+                        && last_activity <= baseline
+                    {
+                        debug!("tail post-suspend probe timed out");
                         break 'relay None;
                     }
+                    suspend_probe_deadline = None;
+                    suspend_probe_baseline = None;
                 }
                 _ = sigint.recv() => {
                     break 'outer 0;
@@ -1810,7 +1902,11 @@ pub async fn tail(
                             }
                             framed = new_framed;
                             heartbeat_interval.reset();
-                            last_pong = Instant::now();
+                            last_activity = Instant::now();
+                            last_tick_mono = Instant::now();
+                            last_tick_wall = std::time::SystemTime::now();
+                            suspend_probe_deadline = None;
+                            suspend_probe_baseline = None;
                             break;
                         }
                         Some(Ok(Frame::Error { message, .. })) => {

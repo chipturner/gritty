@@ -33,8 +33,8 @@ impl Default for SessionSettings {
             no_escape: false,
             oauth_redirect: true,
             oauth_timeout: 180,
-            heartbeat_interval: 5,
-            heartbeat_timeout: 15,
+            heartbeat_interval: 10,
+            heartbeat_timeout: 60,
             ring_buffer_size: 1 << 20, // 1 MB
             oauth_tunnel_idle_timeout: 5,
             client_name: default_client_name(),
@@ -149,7 +149,7 @@ impl ConfigFile {
             oauth_redirect: h.and_then(|h| h.oauth_redirect).or(d.oauth_redirect).unwrap_or(true),
             oauth_timeout: h.and_then(|h| h.oauth_timeout).or(d.oauth_timeout).unwrap_or(180),
             heartbeat_interval: {
-                let v = h.and_then(|h| h.heartbeat_interval).or(d.heartbeat_interval).unwrap_or(5);
+                let v = h.and_then(|h| h.heartbeat_interval).or(d.heartbeat_interval).unwrap_or(10);
                 if v < 1 {
                     eprintln!("warning: heartbeat_interval clamped to 1s (was {v})");
                 }
@@ -159,9 +159,9 @@ impl ConfigFile {
                 let iv = h
                     .and_then(|h| h.heartbeat_interval)
                     .or(d.heartbeat_interval)
-                    .unwrap_or(5)
+                    .unwrap_or(10)
                     .max(1);
-                let v = h.and_then(|h| h.heartbeat_timeout).or(d.heartbeat_timeout).unwrap_or(15);
+                let v = h.and_then(|h| h.heartbeat_timeout).or(d.heartbeat_timeout).unwrap_or(60);
                 if v <= iv {
                     eprintln!(
                         "warning: heartbeat_timeout ({v}s) must exceed heartbeat_interval ({iv}s); clamped to {}s",
