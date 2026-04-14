@@ -12,6 +12,7 @@ pub(crate) async fn connect_session(
     force: bool,
     pick: bool,
     no_pick: bool,
+    new_session: bool,
     settings: gritty::config::SessionSettings,
     ctl_path: PathBuf,
     auto_start_mode: AutoStart,
@@ -23,6 +24,7 @@ pub(crate) async fn connect_session(
 
     let (name, _picked, picker_force) = match session {
         Some(name) => (name, false, false),
+        None if new_session => (auto_new_session_name(&ctl_path).await, false, false),
         None => pick_session(pick, no_pick, &ctl_path).await,
     };
     let force = force || picker_force;
@@ -210,6 +212,20 @@ pub(crate) async fn connect_session(
 
 /// Resolve session name when none was explicitly given.
 /// Returns `(name, picked)` where `picked` is true if the user chose interactively.
+/// Resolve `-n`/`--new` to the next auto-named session slot. Uses the same
+/// rule the picker applies: `default` if unused, otherwise the first free
+/// `session-N`. Falls back to `default` if the server can't be reached --
+/// the connect flow auto-starts the daemon and will re-attempt anyway.
+async fn auto_new_session_name(ctl_path: &Path) -> String {
+    use gritty::protocol::Frame;
+
+    let sessions = match server_request(ctl_path, Frame::ListSessions).await {
+        Ok(Frame::SessionInfo { sessions }) => sessions,
+        _ => return "default".to_string(),
+    };
+    suggest_name(&build_rows(&sessions))
+}
+
 async fn pick_session(pick: bool, no_pick: bool, ctl_path: &Path) -> (String, bool, bool) {
     use gritty::protocol::Frame;
 

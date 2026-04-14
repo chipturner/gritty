@@ -138,6 +138,11 @@ enum Command {
         /// Never show session picker; always target "default"
         #[arg(long, conflicts_with = "pick")]
         no_pick: bool,
+
+        /// Skip the picker and create a new session with the next auto-named
+        /// slot (`default` if unused, else `session-N`).
+        #[arg(short = 'n', long = "new", conflicts_with_all = ["pick", "no_pick"])]
+        new_session: bool,
     },
     /// Tail a session's output (read-only, like tail -f)
     #[command(display_order = 2, visible_alias = "t")]
@@ -695,6 +700,7 @@ async fn run(cli: Cli, config: gritty::config::ConfigFile) -> anyhow::Result<()>
             force,
             pick,
             no_pick,
+            new_session,
         } => {
             let (host, session) = match &target {
                 Some(t) => {
@@ -739,6 +745,7 @@ async fn run(cli: Cli, config: gritty::config::ConfigFile) -> anyhow::Result<()>
                 force,
                 pick,
                 no_pick,
+                new_session,
                 settings,
                 ctl_path,
                 auto_start_mode,

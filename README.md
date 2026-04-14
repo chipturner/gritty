@@ -125,6 +125,7 @@ The `<host>` in `host:session` is a **connection name**, not an SSH destination.
 - `--force`: take over an already-attached session without prompting
 - `--pick`: always show session picker (interactive when in a terminal)
 - `--no-pick`: never show session list; always target `default`
+- `-n` / `--new`: skip the picker and create the next auto-named session (`default` or `session-N`)
 - `--no-create`: attach only, error if session doesn't exist
 - `--no-escape`: disable escape sequence processing
 - `--no-oauth-redirect`: disable OAuth callback tunneling (part of `-O`)
