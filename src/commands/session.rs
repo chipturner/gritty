@@ -1009,9 +1009,11 @@ pub(crate) async fn list_all_sessions() -> anyhow::Result<()> {
         probes.push(("local".to_string(), local));
     }
     for info in gritty::connect::get_tunnel_info() {
-        if info.status == "healthy" {
-            probes.push((info.name.clone(), gritty::connect::connection_socket_path(&info.name)));
-        }
+        // Probe every non-stale tunnel, including "reconnecting" ones. A
+        // reconnecting tunnel may already have a live socket; if not, the
+        // connect will fail and surface as a per-host error below instead of
+        // silently disappearing from the list.
+        probes.push((info.name.clone(), gritty::connect::connection_socket_path(&info.name)));
     }
 
     if probes.is_empty() {
