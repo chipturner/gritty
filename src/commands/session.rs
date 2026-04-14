@@ -31,7 +31,7 @@ pub(crate) async fn connect_session(
     let (stream, auto_started) =
         super::util::connect_or_start(&ctl_path, &auto_start_mode, wait).await?;
     let mut framed = Framed::new(stream, FrameCodec);
-    gritty::handshake(&mut framed).await?;
+    let server_id = gritty::handshake(&mut framed).await?.server_id;
 
     // Carry current terminal size so the server can resize the PTY before
     // replaying scrollback/ring buffer on reconnect. Zero for probe-only.
@@ -74,6 +74,7 @@ pub(crate) async fn connect_session(
                 settings.heartbeat_interval,
                 settings.heartbeat_timeout,
                 settings.client_name.clone(),
+                server_id,
             )
             .await?;
             std::process::exit(code);
@@ -94,7 +95,7 @@ pub(crate) async fn connect_session(
             let (stream, _) =
                 super::util::connect_or_start(&ctl_path, &auto_start_mode, wait).await?;
             let mut framed = Framed::new(stream, FrameCodec);
-            gritty::handshake(&mut framed).await?;
+            let server_id = gritty::handshake(&mut framed).await?.server_id;
             framed
                 .send(Frame::Attach {
                     session: name.clone(),
@@ -130,6 +131,7 @@ pub(crate) async fn connect_session(
                         settings.heartbeat_interval,
                         settings.heartbeat_timeout,
                         settings.client_name.clone(),
+                        server_id,
                     )
                     .await?;
                     std::process::exit(code);
@@ -152,7 +154,7 @@ pub(crate) async fn connect_session(
     // was consumed by the failed attach
     let (stream, _) = super::util::connect_or_start(&ctl_path, &auto_start_mode, wait).await?;
     let mut framed = Framed::new(stream, FrameCodec);
-    gritty::handshake(&mut framed).await?;
+    let server_id = gritty::handshake(&mut framed).await?.server_id;
     // Get terminal size for initial PTY dimensions
     let (cols, rows) = crossterm::terminal::size().unwrap_or((0, 0));
     framed
@@ -196,6 +198,7 @@ pub(crate) async fn connect_session(
                 settings.heartbeat_interval,
                 settings.heartbeat_timeout,
                 settings.client_name.clone(),
+                server_id,
             )
             .await?;
             std::process::exit(code);
@@ -865,13 +868,13 @@ pub(crate) async fn tail_session(target: String, ctl_path: PathBuf) -> anyhow::R
         anyhow::anyhow!("no server running (could not connect to {})", ctl_path.display())
     })?;
     let mut framed = Framed::new(stream, FrameCodec);
-    gritty::handshake(&mut framed).await?;
+    let server_id = gritty::handshake(&mut framed).await?.server_id;
     framed.send(Frame::Tail { session: target.clone() }).await?;
 
     match Frame::expect_from(framed.next().await)? {
         Frame::Ok => {
             eprintln!("\x1b[2;33m\u{25b8} tailing {target}\x1b[0m");
-            gritty::client::tail(&target, framed, &ctl_path).await
+            gritty::client::tail(&target, framed, &ctl_path, server_id).await
         }
         Frame::Error { message, .. } => anyhow::bail!("{message}"),
         other => anyhow::bail!("unexpected response from server: {other:?}"),

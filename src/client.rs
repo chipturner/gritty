@@ -1472,6 +1472,7 @@ pub async fn run(
     heartbeat_interval: u64,
     heartbeat_timeout: u64,
     client_name: String,
+    expected_server_id: u64,
 ) -> anyhow::Result<i32> {
     let stdin = io::stdin();
     let stdin_fd = stdin.as_fd();
@@ -1638,6 +1639,7 @@ pub async fn run(
                     enum Attempt {
                         Connected(Framed<UnixStream, FrameCodec>),
                         SessionGone(String),
+                        ServerRestarted,
                         HandshakeErr(String),
                         Retry,
                     }
@@ -1648,8 +1650,12 @@ pub async fn run(
                             Err(_) => return Attempt::Retry,
                         };
                         let mut new_framed = Framed::new(stream, FrameCodec);
-                        if let Err(e) = crate::handshake(&mut new_framed).await {
-                            return Attempt::HandshakeErr(e.to_string());
+                        let info = match crate::handshake(&mut new_framed).await {
+                            Ok(info) => info,
+                            Err(e) => return Attempt::HandshakeErr(e.to_string()),
+                        };
+                        if info.server_id != expected_server_id {
+                            return Attempt::ServerRestarted;
                         }
                         let (cols, rows) = get_terminal_size();
                         if new_framed
@@ -1700,6 +1706,14 @@ pub async fn run(
                             .await?;
                             return Ok(1);
                         }
+                        Ok(Attempt::ServerRestarted) => {
+                            write_stdout_async(
+                                &async_stdout,
+                                b"\r\x1b[31m\xe2\x96\xb8 server restarted -- session is gone; reconnect manually\x1b[0m\x1b[K\r\n",
+                            )
+                            .await?;
+                            return Ok(1);
+                        }
                         Ok(Attempt::HandshakeErr(msg)) => {
                             write_stdout_async(
                                 &async_stdout,
@@ -1727,6 +1741,7 @@ pub async fn tail(
     session: &str,
     mut framed: Framed<UnixStream, FrameCodec>,
     ctl_path: &Path,
+    expected_server_id: u64,
 ) -> anyhow::Result<i32> {
     // Suppress stdin echo — tail is read-only. Guard restores on drop.
     let stdin_fd = unsafe { BorrowedFd::borrow_raw(libc::STDIN_FILENO) };
@@ -1882,13 +1897,22 @@ pub async fn tail(
                     };
 
                     let mut new_framed = Framed::new(stream, FrameCodec);
-                    if let Err(e) = crate::handshake(&mut new_framed).await {
-                        let msg = e.to_string();
-                        eprintln!("\r\x1b[31m\u{25b8} {msg}\x1b[0m\x1b[K");
-                        if msg.starts_with("handshake rejected") {
-                            break 'outer 1;
+                    let info = match crate::handshake(&mut new_framed).await {
+                        Ok(info) => info,
+                        Err(e) => {
+                            let msg = e.to_string();
+                            eprintln!("\r\x1b[31m\u{25b8} {msg}\x1b[0m\x1b[K");
+                            if msg.starts_with("handshake rejected") {
+                                break 'outer 1;
+                            }
+                            continue;
                         }
-                        continue;
+                    };
+                    if info.server_id != expected_server_id {
+                        eprintln!(
+                            "\r\x1b[31m\u{25b8} server restarted -- session is gone; reconnect manually\x1b[0m\x1b[K"
+                        );
+                        break 'outer 1;
                     }
                     if new_framed.send(Frame::Tail { session: session.to_string() }).await.is_err()
                     {

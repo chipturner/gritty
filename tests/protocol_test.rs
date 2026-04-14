@@ -772,10 +772,10 @@ fn roundtrip_hello() {
 fn roundtrip_hello_ack() {
     let mut codec = FrameCodec;
     let mut buf = BytesMut::new();
-    let original = Frame::HelloAck { version: PROTOCOL_VERSION, capabilities: 0 };
+    let original = Frame::HelloAck { version: PROTOCOL_VERSION, capabilities: 0, server_id: 0 };
     codec.encode(original.clone(), &mut buf).unwrap();
-    // type(1) + len(4) + version(2) + capabilities(4) = 11
-    assert_eq!(buf.len(), 11);
+    // type(1) + len(4) + version(2) + capabilities(4) + server_id(8) = 19
+    assert_eq!(buf.len(), 19);
     assert_eq!(buf[0], 0x02);
     let decoded = codec.decode(&mut buf).unwrap().unwrap();
     assert_eq!(original, decoded);

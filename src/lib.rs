@@ -9,13 +9,24 @@ pub mod security;
 pub mod server;
 pub mod table;
 
+/// Result of a successful handshake.
+#[derive(Debug, Clone, Copy)]
+pub struct HandshakeInfo {
+    pub version: u16,
+    pub capabilities: u32,
+    /// Ephemeral server identifier. Compared across reconnects to detect a
+    /// daemon that crashed and was respawned (in which case the original
+    /// session is gone forever).
+    pub server_id: u64,
+}
+
 /// Perform a protocol version handshake with the server.
 ///
 /// Sends Hello with our PROTOCOL_VERSION, expects HelloAck with the
 /// negotiated version (min of client and server).
 pub async fn handshake(
     framed: &mut tokio_util::codec::Framed<tokio::net::UnixStream, protocol::FrameCodec>,
-) -> anyhow::Result<(u16, u32)> {
+) -> anyhow::Result<HandshakeInfo> {
     use futures_util::{SinkExt, StreamExt};
     framed
         .send(protocol::Frame::Hello {
@@ -27,9 +38,11 @@ pub async fn handshake(
         .await
         .map_err(|_| anyhow::anyhow!("handshake timed out after 5s"))?;
     match protocol::Frame::expect_from(reply)? {
-        protocol::Frame::HelloAck { version, capabilities } => {
-            Ok((version, protocol::CAP_CLIPBOARD & capabilities))
-        }
+        protocol::Frame::HelloAck { version, capabilities, server_id } => Ok(HandshakeInfo {
+            version,
+            capabilities: protocol::CAP_CLIPBOARD & capabilities,
+            server_id,
+        }),
         protocol::Frame::Error { message, .. } => anyhow::bail!("handshake rejected: {message}"),
         other => anyhow::bail!("expected HelloAck, got {other:?}"),
     }

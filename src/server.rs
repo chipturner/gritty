@@ -825,37 +825,12 @@ struct ServerRelay<'a> {
     tunnel_event_tx: &'a mpsc::UnboundedSender<TunnelEvent>,
     pf_event_tx: &'a mpsc::UnboundedSender<PortForwardEvent>,
     send_notify_tx: &'a mpsc::UnboundedSender<Frame>,
-    capability_warn_deadline: Option<tokio::time::Instant>,
     paste_deadline: Option<tokio::time::Instant>,
     pending_paste: &'a mut Option<tokio::sync::oneshot::Sender<Option<Bytes>>>,
     negotiated_caps: &'a Arc<std::sync::atomic::AtomicU32>,
 }
 
 impl ServerRelay<'_> {
-    async fn check_capability_warning(&mut self, framed: &mut Framed<UnixStream, FrameCodec>) {
-        self.capability_warn_deadline = None;
-        let Some(meta) = self.metadata_slot.get() else { return };
-        let wants_agent = meta.wants_agent.load(Ordering::Relaxed);
-        let wants_open = meta.wants_open.load(Ordering::Relaxed);
-        let missing_agent = wants_agent && !self.agent.enabled.load(Ordering::Relaxed);
-        let missing_open = wants_open && !*self.open_forward_enabled;
-        if !missing_agent && !missing_open {
-            return;
-        }
-        let mut missing = Vec::new();
-        if missing_agent {
-            missing.push("-A");
-        }
-        if missing_open {
-            missing.push("-O");
-        }
-        let flags = missing.join(" ");
-        let msg = format!(
-            "\r\n\x1b[2;33m[gritty: session expects {flags} but current client is missing it]\x1b[0m\r\n"
-        );
-        let _ = framed.send(Frame::Data(Bytes::from(msg))).await;
-    }
-
     async fn handle_client_frame(
         &mut self,
         framed: &mut Framed<UnixStream, FrameCodec>,
@@ -1883,13 +1858,6 @@ pub async fn run(
         // Scoped block so ServerRelay borrows are released before
         // the post-loop code accesses the underlying state directly.
         let exit = {
-            // On reconnect (not first client), schedule a capability check after
-            // init frames (Env, AgentForward, OpenForward) have had time to arrive.
-            let cap_deadline = if !first_client {
-                Some(tokio::time::Instant::now() + std::time::Duration::from_millis(500))
-            } else {
-                None
-            };
             let mut relay = ServerRelay {
                 async_master: &async_master,
                 pending_input: &mut pending_input,
@@ -1904,7 +1872,6 @@ pub async fn run(
                 tunnel_event_tx: &tunnel_event_tx,
                 pf_event_tx: &pf_event_tx,
                 send_notify_tx: &send_notify_tx,
-                capability_warn_deadline: cap_deadline,
                 paste_deadline: None,
                 pending_paste: &mut pending_paste,
                 negotiated_caps: &negotiated_caps,
@@ -2031,10 +1998,6 @@ pub async fn run(
                                     );
                                     let _ = framed.send(Frame::Data(Bytes::from(msg))).await;
                                 }
-                                // Schedule capability check after init frames arrive
-                                relay.capability_warn_deadline = Some(
-                                    tokio::time::Instant::now() + std::time::Duration::from_millis(500)
-                                );
                             }
                             Some(ClientConn::Tail(f)) => {
                                 info!("tail client connected while active");
@@ -2115,15 +2078,6 @@ pub async fn run(
                                 }
                             }
                         }
-                    }
-
-                    _ = async {
-                        match relay.capability_warn_deadline {
-                            Some(deadline) => tokio::time::sleep_until(deadline).await,
-                            None => std::future::pending().await,
-                        }
-                    } => {
-                        relay.check_capability_warning(&mut framed).await;
                     }
 
                     _ = async {

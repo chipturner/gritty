@@ -70,7 +70,7 @@ const HEADER_LEN: usize = 5; // type(1) + length(4)
 const MAX_FRAME_SIZE: usize = 1 << 20; // 1 MB
 
 /// Protocol version for handshake negotiation.
-pub const PROTOCOL_VERSION: u16 = 12;
+pub const PROTOCOL_VERSION: u16 = 13;
 
 /// Capability bit: client/server supports clipboard forwarding.
 pub const CAP_CLIPBOARD: u32 = 0x01;
@@ -280,9 +280,15 @@ pub enum Frame {
         capabilities: u32,
     },
     /// Protocol version acknowledgement (server → client).
+    ///
+    /// `server_id` is an ephemeral identifier picked by the daemon at startup
+    /// so reconnecting clients can detect a crashed-and-restarted server:
+    /// if the ID differs from the one seen on the initial handshake, the
+    /// session is gone forever.
     HelloAck {
         version: u16,
         capabilities: u32,
+        server_id: u64,
     },
     // Control requests
     /// Local-side file transfer routing (client → daemon).
@@ -730,9 +736,13 @@ impl Decoder for FrameCodec {
                 Ok(Some(Frame::Hello { version: r.u16(), capabilities: r.u32() }))
             }
             TYPE_HELLO_ACK => {
-                expect_min_len(&payload, 6, "hello ack")?;
+                expect_min_len(&payload, 14, "hello ack")?;
                 let mut r = PayloadReader::new(&payload);
-                Ok(Some(Frame::HelloAck { version: r.u16(), capabilities: r.u32() }))
+                Ok(Some(Frame::HelloAck {
+                    version: r.u16(),
+                    capabilities: r.u32(),
+                    server_id: r.u64(),
+                }))
             }
             TYPE_AGENT_OPEN => {
                 expect_min_len(&payload, 4, "agent open")?;
@@ -1005,8 +1015,14 @@ impl Encoder<Frame> for FrameCodec {
             Frame::Hello { version, capabilities } => {
                 encode_fields!(dst, TYPE_HELLO, version => put_u16, capabilities => put_u32);
             }
-            Frame::HelloAck { version, capabilities } => {
-                encode_fields!(dst, TYPE_HELLO_ACK, version => put_u16, capabilities => put_u32);
+            Frame::HelloAck { version, capabilities, server_id } => {
+                encode_fields!(
+                    dst,
+                    TYPE_HELLO_ACK,
+                    version => put_u16,
+                    capabilities => put_u32,
+                    server_id => put_u64
+                );
             }
             Frame::AgentOpen { channel_id } => {
                 encode_fields!(dst, TYPE_AGENT_OPEN, channel_id => put_u32);

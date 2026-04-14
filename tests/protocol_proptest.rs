@@ -84,8 +84,13 @@ fn arb_frame() -> impl Strategy<Value = Frame> {
         any::<i32>().prop_map(|code| Frame::Exit { code }),
         (any::<u16>(), any::<u32>())
             .prop_map(|(version, capabilities)| Frame::Hello { version, capabilities }),
-        (any::<u16>(), any::<u32>())
-            .prop_map(|(version, capabilities)| Frame::HelloAck { version, capabilities }),
+        (any::<u16>(), any::<u32>(), any::<u64>()).prop_map(
+            |(version, capabilities, server_id)| Frame::HelloAck {
+                version,
+                capabilities,
+                server_id,
+            },
+        ),
         any::<u32>().prop_map(|channel_id| Frame::AgentOpen { channel_id }),
         any::<u32>().prop_map(|channel_id| Frame::AgentClose { channel_id }),
         any::<u16>().prop_map(|port| Frame::TunnelListen { port }),

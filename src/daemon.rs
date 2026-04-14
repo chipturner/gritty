@@ -238,6 +238,7 @@ fn shutdown(sessions: &mut HashMap<u32, SessionState>, ctl_path: &Path) {
 async fn connection_handshake(
     stream: UnixStream,
     tx: mpsc::Sender<(Frame, Framed<UnixStream, FrameCodec>, u32)>,
+    server_id: u64,
 ) {
     let mut framed = Framed::new(stream, FrameCodec);
 
@@ -286,7 +287,7 @@ async fn connection_handshake(
     let server_caps = CAP_CLIPBOARD;
     if timed_send(
         &mut framed,
-        Frame::HelloAck { version: PROTOCOL_VERSION, capabilities: server_caps },
+        Frame::HelloAck { version: PROTOCOL_VERSION, capabilities: server_caps, server_id },
     )
     .await
     .is_err()
@@ -330,7 +331,15 @@ pub async fn run(ctl_path: &Path, ready_fd: Option<OwnedFd>) -> anyhow::Result<(
     }
 
     let listener = crate::security::bind_unix_listener(ctl_path)?;
-    info!(path = %ctl_path.display(), "daemon listening");
+    // Ephemeral identifier included in every HelloAck; a reconnecting client
+    // that sees a different value knows this is a different daemon and its
+    // session is gone. Nanos XOR pid is unique enough in practice.
+    let server_id: u64 = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos() as u64)
+        .unwrap_or(0)
+        ^ (std::process::id() as u64);
+    info!(path = %ctl_path.display(), server_id, "daemon listening");
 
     // Signal readiness to parent (daemonize pipe): [0x01][pid: u32 LE]
     if let Some(fd) = ready_fd {
@@ -373,7 +382,7 @@ pub async fn run(ctl_path: &Path, ready_fd: Option<OwnedFd>) -> anyhow::Result<(
                             warn!("{e}");
                         } else {
                             let tx = conn_tx.clone();
-                            tokio::spawn(connection_handshake(stream, tx));
+                            tokio::spawn(connection_handshake(stream, tx, server_id));
                         }
                     }
                     Err(e) => {
