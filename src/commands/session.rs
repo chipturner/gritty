@@ -1008,12 +1008,27 @@ pub(crate) async fn list_all_sessions() -> anyhow::Result<()> {
     if local.exists() {
         probes.push(("local".to_string(), local));
     }
+    // Union of (a) tunnels with live supervisor locks and (b) bare socket
+    // files. Either alone misses real cases: a supervisor can be in backoff
+    // with no socket yet (caught by the lock enumeration); a socket can be
+    // live while its supervisor lock is stale or gone (caught by the socket
+    // scan). Both paths surface as probes; connect failures become per-host
+    // warnings instead of silent drops.
+    let mut seen = std::collections::HashSet::new();
     for info in gritty::connect::get_tunnel_info() {
-        // Probe every non-stale tunnel, including "reconnecting" ones. A
-        // reconnecting tunnel may already have a live socket; if not, the
-        // connect will fail and surface as a per-host error below instead of
-        // silently disappearing from the list.
-        probes.push((info.name.clone(), gritty::connect::connection_socket_path(&info.name)));
+        if seen.insert(info.name.clone()) {
+            probes.push((info.name.clone(), gritty::connect::connection_socket_path(&info.name)));
+        }
+    }
+    if let Ok(entries) = std::fs::read_dir(gritty::daemon::socket_dir()) {
+        for entry in entries.flatten() {
+            let name = entry.file_name().to_string_lossy().to_string();
+            if let Some(stem) = name.strip_prefix("connect-").and_then(|s| s.strip_suffix(".sock"))
+                && seen.insert(stem.to_string())
+            {
+                probes.push((stem.to_string(), entry.path()));
+            }
+        }
     }
 
     if probes.is_empty() {
