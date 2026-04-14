@@ -1588,6 +1588,13 @@ pub async fn run(
                 // force_tui_redraw will visibly repaint the TUI for the user.
                 let show_chrome = !alt_screen.in_alternate_screen();
                 let reconnect_started = Instant::now();
+                // Timestamp of the most recent observation that ctl_path did
+                // NOT exist. Cleared whenever the socket reappears or a probe
+                // succeeds. If it persists past SOCKET_GONE_GRACE we treat
+                // the tunnel/server as torn down (e.g. `gritty tunnel-destroy`
+                // removed the socket file) and exit instead of looping.
+                let mut socket_missing_since: Option<Instant> = None;
+                const SOCKET_GONE_GRACE: Duration = Duration::from_secs(3);
                 if show_chrome {
                     write_stdout_async(
                         &async_stdout,
@@ -1634,6 +1641,21 @@ pub async fn run(
                                 .as_bytes(),
                         )
                         .await?;
+                    }
+
+                    if !ctl_path.exists() {
+                        let first_seen = *socket_missing_since.get_or_insert_with(Instant::now);
+                        if first_seen.elapsed() >= SOCKET_GONE_GRACE {
+                            write_stdout_async(
+                                &async_stdout,
+                                b"\r\x1b[31m\xe2\x96\xb8 server socket gone -- session is unreachable; reconnect manually\x1b[0m\x1b[K\r\n",
+                            )
+                            .await?;
+                            return Ok(1);
+                        }
+                        continue;
+                    } else {
+                        socket_missing_since = None;
                     }
 
                     enum Attempt {
@@ -1874,6 +1896,8 @@ pub async fn tail(
             None => {
                 let show_chrome = !alt_screen.in_alternate_screen();
                 let reconnect_started = Instant::now();
+                let mut socket_missing_since: Option<Instant> = None;
+                const SOCKET_GONE_GRACE: Duration = Duration::from_secs(3);
                 if show_chrome {
                     eprint!("\x1b[2;33m\u{25b8} reconnecting... (Ctrl-C to abort)\x1b[0m");
                 }
@@ -1889,6 +1913,19 @@ pub async fn tail(
                         eprint!(
                             "\r\x1b[2;33m\u{25b8} reconnecting... {elapsed}s (Ctrl-C to abort)\x1b[0m\x1b[K"
                         );
+                    }
+
+                    if !ctl_path.exists() {
+                        let first_seen = *socket_missing_since.get_or_insert_with(Instant::now);
+                        if first_seen.elapsed() >= SOCKET_GONE_GRACE {
+                            eprintln!(
+                                "\r\x1b[31m\u{25b8} server socket gone -- session is unreachable; reconnect manually\x1b[0m\x1b[K"
+                            );
+                            break 'outer 1;
+                        }
+                        continue;
+                    } else {
+                        socket_missing_since = None;
                     }
 
                     let stream = match crate::security::connect_verified(ctl_path).await {
