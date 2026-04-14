@@ -485,7 +485,7 @@ async fn tui_pick_session(
         // Hint line
         let hints = match mode {
             Mode::Pick => {
-                "1-9 jump  enter select  f force  c/n new (named)  d default  r rename  x kill  esc quit"
+                "1-9 jump  enter select  f force  n new  c/+ new (named)  d default  r rename  x kill  esc quit"
                     .to_string()
             }
             Mode::Input { rename_of: Some(_), .. } => "enter rename  esc back".to_string(),
@@ -553,9 +553,17 @@ async fn tui_pick_session(
                 }) => {
                     break Some(("default".to_string(), false));
                 }
-                // 'c' or 'n' or '+' -> new session input with suggested name
+                // 'n' -> create new session immediately with the suggested name
                 Event::Key(KeyEvent {
-                    code: KeyCode::Char('c') | KeyCode::Char('n') | KeyCode::Char('+'),
+                    code: KeyCode::Char('n'),
+                    modifiers: KeyModifiers::NONE,
+                    ..
+                }) => {
+                    break Some((suggest_name(&rows), false));
+                }
+                // 'c' or '+' -> new session input, prompting to edit the name
+                Event::Key(KeyEvent {
+                    code: KeyCode::Char('c') | KeyCode::Char('+'),
                     modifiers: KeyModifiers::NONE,
                     ..
                 }) => {
