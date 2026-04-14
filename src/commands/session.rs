@@ -1022,26 +1022,47 @@ pub(crate) async fn list_all_sessions() -> anyhow::Result<()> {
         .into_iter()
         .map(|(host, path)| async move {
             let result = tokio::time::timeout(std::time::Duration::from_secs(2), async {
-                let stream = gritty::security::connect_verified(&path).await.ok()?;
+                let stream = gritty::security::connect_verified(&path)
+                    .await
+                    .map_err(|e| format!("connect: {e}"))?;
                 let mut framed = tokio_util::codec::Framed::new(stream, FrameCodec);
-                gritty::handshake(&mut framed).await.ok()?;
-                futures_util::SinkExt::send(&mut framed, Frame::ListSessions).await.ok()?;
+                gritty::handshake(&mut framed).await.map_err(|e| e.to_string())?;
+                futures_util::SinkExt::send(&mut framed, Frame::ListSessions)
+                    .await
+                    .map_err(|e| format!("send ListSessions: {e}"))?;
                 match Frame::expect_from(futures_util::StreamExt::next(&mut framed).await) {
-                    Ok(Frame::SessionInfo { sessions }) => Some(sessions),
-                    _ => None,
+                    Ok(Frame::SessionInfo { sessions }) => Ok(sessions),
+                    Ok(Frame::Error { message, .. }) => Err(message),
+                    Ok(other) => Err(format!("unexpected response: {other:?}")),
+                    Err(e) => Err(e.to_string()),
                 }
             })
             .await;
-            let sessions: Vec<SessionEntry> = result.ok().flatten().unwrap_or_default();
-            (host, sessions)
+            let outcome: Result<Vec<SessionEntry>, String> = match result {
+                Ok(inner) => inner,
+                Err(_) => Err("probe timed out after 2s".to_string()),
+            };
+            (host, outcome)
         })
         .collect();
 
-    let results: Vec<(String, Vec<SessionEntry>)> = futures_util::future::join_all(futures).await;
+    let results: Vec<(String, Result<Vec<SessionEntry>, String>)> =
+        futures_util::future::join_all(futures).await;
 
-    let all_empty = results.iter().all(|(_, s)| s.is_empty());
-    if all_empty {
-        println!("no active sessions");
+    let errors: Vec<(&String, &String)> =
+        results.iter().filter_map(|(h, r)| r.as_ref().err().map(|e| (h, e))).collect();
+    let has_sessions =
+        results.iter().any(|(_, r)| r.as_ref().map(|s| !s.is_empty()).unwrap_or(false));
+
+    if !has_sessions {
+        if errors.is_empty() {
+            println!("no active sessions");
+        } else {
+            println!("no active sessions");
+            for (host, err) in &errors {
+                eprintln!("\x1b[2;33m\u{26a0} {host}: {err}\x1b[0m");
+            }
+        }
         return Ok(());
     }
 
@@ -1050,10 +1071,17 @@ pub(crate) async fn list_all_sessions() -> anyhow::Result<()> {
         .unwrap_or_default()
         .as_secs();
 
-    let multi_host = results.iter().filter(|(_, s)| !s.is_empty()).count() > 1;
+    let ok_hosts: Vec<(&String, &Vec<SessionEntry>)> = results
+        .iter()
+        .filter_map(|(h, r)| match r {
+            Ok(s) if !s.is_empty() => Some((h, s)),
+            _ => None,
+        })
+        .collect();
+    let multi_host = ok_hosts.len() > 1;
 
     // Build row data: [host, id, name, pty, pid, created, status]
-    let rows: Vec<Vec<String>> = results
+    let rows: Vec<Vec<String>> = ok_hosts
         .iter()
         .flat_map(|(host, sessions)| {
             sessions.iter().map(move |s| {
@@ -1079,7 +1107,7 @@ pub(crate) async fn list_all_sessions() -> anyhow::Result<()> {
                     )
                 };
                 vec![
-                    host.clone(),
+                    (*host).clone(),
                     s.id.to_string(),
                     name,
                     s.foreground_cmd.clone(),
@@ -1107,6 +1135,9 @@ pub(crate) async fn list_all_sessions() -> anyhow::Result<()> {
             &["ID", "Name", "Cmd", "CWD", "Client", "PTY", "PID", "Created", "Status"],
             &trimmed,
         );
+    }
+    for (host, err) in &errors {
+        eprintln!("\x1b[2;33m\u{26a0} {host}: {err}\x1b[0m");
     }
     Ok(())
 }
