@@ -776,6 +776,14 @@ fn spawn_tail(
 /// Cap on buffered client→PTY input while the shell isn't reading stdin.
 const PENDING_INPUT_CAP: usize = 1 << 20;
 
+/// Upper bound on a single `framed.send` to the attached client. A half-open
+/// UDS (client laptop closed / network wedged) can otherwise park the send
+/// indefinitely; while the relay task is parked inside an `.await`, the
+/// `client_rx.recv()` branch never re-polls, so a concurrent force-takeover
+/// (`connect -F`) silently stalls. Breaking to `ClientGone` on timeout lets
+/// takeover proceed and keeps the session unwedged.
+const CLIENT_SEND_TIMEOUT: Duration = Duration::from_secs(30);
+
 /// Non-blocking drain of any remaining PTY output after `child.wait()` fires,
 /// capturing final write(s) that raced with the exit. The master fd is
 /// O_NONBLOCK, so a raw read returns EAGAIN when the buffer is empty.
@@ -1913,9 +1921,19 @@ pub async fn run(
                                 if relay.tail_tx.receiver_count() > 0 {
                                     let _ = relay.tail_tx.send(TailEvent::Data(chunk.clone()));
                                 }
-                                if let Err(e) = framed.send(Frame::Data(chunk)).await {
-                                    warn!(error = %e, "client send failed, detaching");
-                                    break RelayExit::ClientGone;
+                                match tokio::time::timeout(
+                                    CLIENT_SEND_TIMEOUT,
+                                    framed.send(Frame::Data(chunk)),
+                                ).await {
+                                    Ok(Ok(())) => {}
+                                    Ok(Err(e)) => {
+                                        warn!(error = %e, "client send failed, detaching");
+                                        break RelayExit::ClientGone;
+                                    }
+                                    Err(_) => {
+                                        warn!("client send timed out, detaching");
+                                        break RelayExit::ClientGone;
+                                    }
                                 }
                             }
                             Ok(Err(e)) => {
