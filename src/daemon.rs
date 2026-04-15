@@ -358,19 +358,11 @@ pub async fn run(ctl_path: &Path, ready_fd: Option<OwnedFd>) -> anyhow::Result<(
         ^ (std::process::id() as u64);
     info!(path = %ctl_path.display(), server_id, "daemon listening");
 
-    // Signal readiness to parent (daemonize pipe): [0x01][pid: u32 LE]
-    if let Some(fd) = ready_fd {
-        use std::io::Write;
-        let mut f = std::fs::File::from(fd);
-        let pid = std::process::id();
-        let mut buf = [0u8; 5];
-        buf[0] = 0x01;
-        buf[1..5].copy_from_slice(&pid.to_le_bytes());
-        let _ = f.write_all(&buf);
-        // f drops here, closing the pipe
-    }
-
-    // Write PID file
+    // Complete initialization BEFORE signaling readiness. If PID-file write
+    // or signal-handler setup fails after the readiness byte is sent, the
+    // parent has already reported success and exited; the daemon then
+    // returns Err into a closed pipe and the user sees no failure. Only a
+    // fully-initialized daemon should report ready.
     let pid_path = pid_file_path(ctl_path);
     std::fs::write(&pid_path, std::process::id().to_string())?;
 
@@ -384,6 +376,19 @@ pub async fn run(ctl_path: &Path, ready_fd: Option<OwnedFd>) -> anyhow::Result<(
     // Signal handlers
     let mut sigterm = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
     let mut sigint = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::interrupt())?;
+
+    // Now fully initialized -- signal readiness to parent (daemonize pipe):
+    // [0x01][pid: u32 LE]
+    if let Some(fd) = ready_fd {
+        use std::io::Write;
+        let mut f = std::fs::File::from(fd);
+        let pid = std::process::id();
+        let mut buf = [0u8; 5];
+        buf[0] = 0x01;
+        buf[1..5].copy_from_slice(&pid.to_le_bytes());
+        let _ = f.write_all(&buf);
+        // f drops here, closing the pipe
+    }
 
     // Channel for handshake results -- spawned tasks send completed handshakes here
     let (conn_tx, mut conn_rx) =
