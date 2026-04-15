@@ -79,14 +79,32 @@ pub fn pid_file_path(ctl_path: &Path) -> PathBuf {
 }
 
 fn reap_sessions(sessions: &mut HashMap<u32, SessionState>) {
-    sessions.retain(|id, state| {
-        if state.handle.is_finished() {
-            info!(id, "session ended");
-            false
-        } else {
-            true
+    use futures_util::future::FutureExt;
+    let finished: Vec<u32> = sessions
+        .iter()
+        .filter_map(|(&id, state)| state.handle.is_finished().then_some(id))
+        .collect();
+    for id in finished {
+        if let Some(state) = sessions.remove(&id) {
+            // Handle is already finished, so `now_or_never` completes
+            // synchronously. Log panics / inner errors so operators
+            // aren't left wondering why a session vanished.
+            match state.handle.now_or_never() {
+                Some(Ok(Ok(()))) => info!(id, "session ended"),
+                Some(Ok(Err(e))) => {
+                    tracing::error!(id, error = %e, "session task returned error");
+                }
+                Some(Err(join_err)) => {
+                    if join_err.is_panic() {
+                        tracing::error!(id, "session task panicked: {join_err}");
+                    } else {
+                        tracing::warn!(id, "session task cancelled: {join_err}");
+                    }
+                }
+                None => tracing::warn!(id, "session task finished but join pending"),
+            }
         }
-    });
+    }
 }
 
 /// Resolve a session identifier (name, id string, or "-" for last attached) to a session id.
