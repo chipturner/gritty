@@ -97,7 +97,16 @@ pub(crate) async fn connect_or_start(
         Err(_) => match auto_start_mode {
             AutoStart::Server => {
                 eprintln!("\x1b[2;33m\u{25b8} starting server...\x1b[0m");
-                auto_start(&["server"])?;
+                // A concurrent `gritty connect` can race with us here: both
+                // spawn `gritty server`, and one child exits nonzero because
+                // the winner already bound ctl.sock. Don't bail on that
+                // failure -- drop into the retry loop so we attach to the
+                // racer's daemon if one came up.
+                if let Err(e) = auto_start(&["server"]) {
+                    eprintln!(
+                        "\x1b[2;33m\u{25b8} auto-start failed ({e}); retrying connect in case another process started one\x1b[0m"
+                    );
+                }
                 true
             }
             AutoStart::Tunnel(host) => {
@@ -116,7 +125,15 @@ pub(crate) async fn connect_or_start(
                     })
                     .unwrap_or_else(|| host.clone());
                 eprintln!("\x1b[2;33m\u{25b8} starting tunnel {host}...\x1b[0m");
-                auto_start(&["tunnel-create", "--name", host, &destination])?;
+                // Same rationale: `connect::run` returns Ok(0) when another
+                // instance already holds the lock, so a tunnel-create race
+                // is usually fine -- but if auto_start errors for any other
+                // reason, still try to connect before giving up.
+                if let Err(e) = auto_start(&["tunnel-create", "--name", host, &destination]) {
+                    eprintln!(
+                        "\x1b[2;33m\u{25b8} auto-start failed ({e}); retrying connect in case another process started one\x1b[0m"
+                    );
+                }
                 true
             }
             AutoStart::None if wait => false,
