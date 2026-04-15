@@ -601,13 +601,20 @@ async fn dispatch_control(
 
             info!(id, name = ?name_opt, "session created");
 
-            if timed_send(&mut framed, Frame::SessionCreated { id }).await.is_err() {
-                return false;
-            }
-            if timed_send(&mut framed, Frame::AttachAck { token: owner_token, session_id: id })
-                .await
-                .is_err()
-            {
+            // If the creator vanishes before we can hand off, the session
+            // task blocks forever awaiting its first ClientConn::Active
+            // -- the shell never spawns, but the name/id remain
+            // reserved. Abort the task and drop the entry so future
+            // NewSession for the same name succeeds.
+            let send_ok = timed_send(&mut framed, Frame::SessionCreated { id }).await.is_ok()
+                && timed_send(&mut framed, Frame::AttachAck { token: owner_token, session_id: id })
+                    .await
+                    .is_ok();
+            if !send_ok {
+                if let Some(state) = sessions.remove(&id) {
+                    state.handle.abort();
+                }
+                info!(id, "NewSession creator gone before hand-off; rolled back");
                 return false;
             }
 
