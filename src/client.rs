@@ -1629,10 +1629,17 @@ pub async fn run(
                 }
 
                 loop {
-                    backoff = next_reconnect_delay(backoff);
+                    // Only advance the backoff when we actually slept+tried
+                    // (or the backoff was interrupted by something other
+                    // than a non-Ctrl-C keystroke). Previously this ran at
+                    // the top of the loop, so every impatient keystroke
+                    // while "reconnecting..." was displayed re-entered via
+                    // `continue` below and doubled the backoff without ever
+                    // attempting to connect.
+                    let sleep_for = next_reconnect_delay(backoff);
                     // Race sleep against stdin so Ctrl-C is instant
                     tokio::select! {
-                        _ = tokio::time::sleep(backoff) => {}
+                        _ = tokio::time::sleep(sleep_for) => {}
                         _ = sigterm.recv() => {
                             write_stdout_async(&async_stdout, b"\r\n").await?;
                             return Ok(1);
@@ -1658,6 +1665,7 @@ pub async fn run(
                             continue;
                         }
                     }
+                    backoff = sleep_for;
 
                     let elapsed = reconnect_started.elapsed().as_secs();
                     if show_chrome {
