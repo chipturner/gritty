@@ -37,7 +37,14 @@ pub fn secure_create_dir_all(path: &Path) -> io::Result<()> {
 ///
 /// On `AddrInUse`, probes the existing socket: if it responds to a connect, returns
 /// an error (socket is alive). Otherwise, removes the stale socket and retries.
+///
+/// The whole probe/remove/bind sequence is serialized against concurrent callers via
+/// an exclusive flock on a companion `<path>.bindlock` file. Without the lock, two
+/// racers that both observe a dead socket can each `remove_file` + `bind`: the second
+/// unlinks the first racer's just-bound live socket, orphaning its listener.
 pub fn bind_unix_listener(path: &Path) -> io::Result<tokio::net::UnixListener> {
+    let lock_path = bind_lock_path(path);
+    let _guard = acquire_bind_lock(&lock_path)?;
     match tokio::net::UnixListener::bind(path) {
         Ok(listener) => {
             set_socket_permissions(path)?;
@@ -59,6 +66,45 @@ pub fn bind_unix_listener(path: &Path) -> io::Result<tokio::net::UnixListener> {
         }
         Err(e) => Err(e),
     }
+}
+
+fn bind_lock_path(socket_path: &Path) -> std::path::PathBuf {
+    let mut os = socket_path.as_os_str().to_owned();
+    os.push(".bindlock");
+    std::path::PathBuf::from(os)
+}
+
+/// Open (creating if needed) the bind-lock file with 0600 and acquire an exclusive
+/// flock, retrying briefly if another process is racing us through bind_unix_listener.
+fn acquire_bind_lock(lock_path: &Path) -> io::Result<BindLockGuard> {
+    use std::fs::OpenOptions;
+    use std::os::unix::fs::OpenOptionsExt;
+    let file =
+        OpenOptions::new().create(true).truncate(false).write(true).mode(0o600).open(lock_path)?;
+    // Up to ~2s total: one racer's probe/remove/bind is a handful of syscalls.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+    loop {
+        match nix::fcntl::Flock::lock(
+            file.try_clone()?,
+            nix::fcntl::FlockArg::LockExclusiveNonblock,
+        ) {
+            Ok(flock) => return Ok(BindLockGuard { _flock: flock }),
+            Err((_, nix::errno::Errno::EWOULDBLOCK)) if std::time::Instant::now() < deadline => {
+                std::thread::sleep(std::time::Duration::from_millis(25));
+                continue;
+            }
+            Err((_, e)) => {
+                return Err(io::Error::other(format!(
+                    "could not acquire bind lock {}: {e}",
+                    lock_path.display()
+                )));
+            }
+        }
+    }
+}
+
+struct BindLockGuard {
+    _flock: nix::fcntl::Flock<std::fs::File>,
 }
 
 /// Connect to a Unix socket and verify the peer's UID matches ours.
