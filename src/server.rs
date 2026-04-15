@@ -1360,34 +1360,40 @@ async fn force_tui_redraw(
     let nudge_rows = rows.saturating_sub(1).max(1);
     apply_winsize(master, cols, nudge_rows);
 
-    let deadline = tokio::time::Instant::now() + Duration::from_millis(50);
-    let mut buf = vec![0u8; 4096];
-    loop {
-        tokio::select! {
-            _ = tokio::time::sleep_until(deadline) => break,
-            ready = master.readable() => {
-                let Ok(mut guard) = ready else { break };
-                match guard.try_io(|inner| {
-                    nix::unistd::read(inner, &mut buf).map_err(io::Error::from)
-                }) {
-                    Ok(Ok(0)) | Ok(Err(_)) => break,
-                    Ok(Ok(n)) => {
-                        let chunk = Bytes::copy_from_slice(&buf[..n]);
-                        alt_screen.scan(&chunk);
-                        scrollback.push(&chunk);
-                        if tail_tx.receiver_count() > 0 {
-                            let _ = tail_tx.send(TailEvent::Data(chunk.clone()));
+    // Must restore original (cols, rows) before returning, even on a send
+    // failure -- otherwise the PTY stays at the intermediate nudge size.
+    let result = async {
+        let deadline = tokio::time::Instant::now() + Duration::from_millis(50);
+        let mut buf = vec![0u8; 4096];
+        loop {
+            tokio::select! {
+                _ = tokio::time::sleep_until(deadline) => break,
+                ready = master.readable() => {
+                    let Ok(mut guard) = ready else { break };
+                    match guard.try_io(|inner| {
+                        nix::unistd::read(inner, &mut buf).map_err(io::Error::from)
+                    }) {
+                        Ok(Ok(0)) | Ok(Err(_)) => break,
+                        Ok(Ok(n)) => {
+                            let chunk = Bytes::copy_from_slice(&buf[..n]);
+                            alt_screen.scan(&chunk);
+                            scrollback.push(&chunk);
+                            if tail_tx.receiver_count() > 0 {
+                                let _ = tail_tx.send(TailEvent::Data(chunk.clone()));
+                            }
+                            send_framed_timed(framed, Frame::Data(chunk)).await?;
                         }
-                        send_framed_timed(framed, Frame::Data(chunk)).await?;
+                        Err(_would_block) => continue,
                     }
-                    Err(_would_block) => continue,
                 }
             }
         }
+        Ok::<(), anyhow::Error>(())
     }
+    .await;
 
     apply_winsize(master, cols, rows);
-    Ok(())
+    result
 }
 
 #[allow(clippy::too_many_arguments)]
