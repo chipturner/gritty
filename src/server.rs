@@ -1331,6 +1331,16 @@ fn apply_winsize(master: &tokio::io::unix::AsyncFd<std::os::fd::OwnedFd>, cols: 
 ///
 /// Returns `Err` if the client socket rejects a send, so callers can fall
 /// back into the detached-drain path.
+async fn send_framed_timed(
+    framed: &mut Framed<UnixStream, FrameCodec>,
+    frame: Frame,
+) -> io::Result<()> {
+    match tokio::time::timeout(CLIENT_SEND_TIMEOUT, framed.send(frame)).await {
+        Ok(r) => r,
+        Err(_) => Err(io::Error::new(io::ErrorKind::TimedOut, "client send timed out")),
+    }
+}
+
 async fn force_tui_redraw(
     master: &AsyncFd<OwnedFd>,
     framed: &mut Framed<UnixStream, FrameCodec>,
@@ -1361,7 +1371,7 @@ async fn force_tui_redraw(
                         if tail_tx.receiver_count() > 0 {
                             let _ = tail_tx.send(TailEvent::Data(chunk.clone()));
                         }
-                        framed.send(Frame::Data(chunk)).await?;
+                        send_framed_timed(framed, Frame::Data(chunk)).await?;
                     }
                     Err(_would_block) => continue,
                 }
@@ -1789,8 +1799,11 @@ pub async fn run(
             // an auto-reconnect this is idempotent; for a fresh `connect`
             // it's required -- the new terminal has never seen `?1049h`, so
             // without this the repaint would land on the main screen.
-            if let Err(e) =
-                framed.send(Frame::Data(Bytes::from_static(b"\x1b[?1049h\x1b[H\x1b[2J"))).await
+            if let Err(e) = send_framed_timed(
+                &mut framed,
+                Frame::Data(Bytes::from_static(b"\x1b[?1049h\x1b[H\x1b[2J")),
+            )
+            .await
             {
                 warn!(error = %e, "client send failed during alt-screen priming, detaching");
                 flush_failed = true;
@@ -1826,13 +1839,13 @@ pub async fn run(
             } else {
                 "\r\n\x1b[2;33m[gritty: reconnected]\x1b[0m\r\n".to_string()
             };
-            if let Err(e) = framed.send(Frame::Data(Bytes::from(msg))).await {
+            if let Err(e) = send_framed_timed(&mut framed, Frame::Data(Bytes::from(msg))).await {
                 warn!(error = %e, "client send failed during reconnect banner, detaching");
                 flush_failed = true;
             } else {
                 ring_buf_dropped = 0;
                 for line in scrollback.lines_and_partial() {
-                    if let Err(e) = framed.send(Frame::Data(line)).await {
+                    if let Err(e) = send_framed_timed(&mut framed, Frame::Data(line)).await {
                         warn!(error = %e, "client send failed during scrollback replay, detaching");
                         flush_failed = true;
                         break;
@@ -1854,7 +1867,7 @@ pub async fn run(
             while !flush_failed {
                 let Some(chunk) = ring_buf.pop_front() else { break };
                 ring_buf_size -= chunk.len();
-                if let Err(e) = framed.send(Frame::Data(chunk.clone())).await {
+                if let Err(e) = send_framed_timed(&mut framed, Frame::Data(chunk.clone())).await {
                     warn!(error = %e, "client send failed during ring-buffer flush, detaching");
                     ring_buf_size += chunk.len();
                     ring_buf.push_front(chunk);
