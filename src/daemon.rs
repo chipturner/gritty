@@ -681,11 +681,16 @@ async fn dispatch_control(
                         } else {
                             mint_attach_token()
                         };
-                        meta.attach_token.store(new_token, Ordering::Relaxed);
+                        // Only rotate the stored owner token after the new
+                        // client has ACK'd receipt. If the AttachAck send
+                        // fails, the previous owner should keep their token
+                        // so their next reconnect doesn't get OwnerChanged
+                        // on a takeover that never actually landed.
                         if timed_send(&mut framed, Frame::AttachAck { token: new_token })
                             .await
                             .is_ok()
                         {
+                            meta.attach_token.store(new_token, Ordering::Relaxed);
                             *last_attached = Some(id);
                             let _ = state.client_tx.send(ClientConn::Active {
                                 framed,
