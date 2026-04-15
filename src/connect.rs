@@ -350,13 +350,19 @@ async fn tunnel_monitor(
     mut child: Child,
     dest: Destination,
     local_sock: PathBuf,
-    remote_sock: String,
     extra_ssh_opts: Vec<String>,
     foreground: bool,
+    no_server_start: bool,
     isolate_control_path: bool,
     connect_timeout: u64,
     stop: tokio_util::sync::CancellationToken,
 ) {
+    // The initial remote_sock was used by the caller to spawn the first
+    // child; on every respawn we re-derive it from ensure_remote_ready so
+    // a reboot / daemon upgrade / remote relocation is handled. The local
+    // state below is populated before the first respawn's spawn_tunnel.
+    #[allow(unused_assignments)]
+    let mut remote_sock = String::new();
     let mut backoff = Duration::from_secs(1);
     const MAX_BACKOFF: Duration = Duration::from_secs(60);
     /// If the tunnel stays alive for this long, reset the backoff.
@@ -410,6 +416,33 @@ async fn tunnel_monitor(
                 }
 
                 backoff = (backoff * 2).min(MAX_BACKOFF);
+
+                // Re-run ensure_remote_ready so a remote that rebooted,
+                // crashed, or was upgraded gets its gritty server started
+                // again before we point SSH at its ctl socket. Without
+                // this, spawn_tunnel succeeds (connects SSH + forwards)
+                // but the next client hits EOF on every handshake because
+                // no daemon is listening on the other side.
+                match ensure_remote_ready(
+                    &dest,
+                    no_server_start,
+                    &extra_ssh_opts,
+                    foreground,
+                    connect_timeout,
+                )
+                .await
+                {
+                    Ok((sock, _ver)) => {
+                        remote_sock = sock;
+                    }
+                    Err(e) => {
+                        warn!("ensure_remote_ready failed on respawn: {e}");
+                        // Treat like a spawn failure: back off and retry
+                        // from the top instead of racing SSH against a
+                        // stale remote_sock.
+                        continue;
+                    }
+                }
 
                 match spawn_tunnel(&dest, &local_sock, &remote_sock, &extra_ssh_opts, foreground, isolate_control_path, connect_timeout).await {
                     Ok(new_child) => {
@@ -932,9 +965,9 @@ pub async fn run(opts: ConnectOpts, ready_fd: Option<OwnedFd>) -> anyhow::Result
         original_child,
         dest,
         local_sock.clone(),
-        remote_sock,
         opts.ssh_options,
         opts.foreground,
+        opts.no_server_start,
         opts.isolate_control_path,
         opts.connect_timeout,
         stop.clone(),
@@ -1507,9 +1540,9 @@ mod tests {
                 child,
                 dest,
                 PathBuf::from("/tmp/nonexistent.sock"),
-                "/tmp/remote.sock".into(),
                 vec![],
                 false,
+                true,
                 false,
                 30,
                 stop,
@@ -1538,9 +1571,9 @@ mod tests {
                 child,
                 dest,
                 PathBuf::from("/tmp/nonexistent.sock"),
-                "/tmp/remote.sock".into(),
                 vec![],
                 false,
+                true,
                 false,
                 30,
                 stop,
@@ -1571,9 +1604,9 @@ mod tests {
                 child,
                 dest,
                 PathBuf::from("/tmp/nonexistent.sock"),
-                "/tmp/remote.sock".into(),
                 vec![],
                 false,
+                true,
                 false,
                 30,
                 stop,
