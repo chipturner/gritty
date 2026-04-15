@@ -2165,7 +2165,10 @@ pub async fn run(
                     status = managed.child.wait() => {
                         let code = status?.code().unwrap_or(1);
                         info!(code, "shell exited");
-                        let _ = relay.tail_tx.send(TailEvent::Exit { code });
+                        // Don't broadcast TailEvent::Exit here -- the
+                        // RelayExit::ShellExited match below does it after
+                        // drain_pty_final so tail clients don't exit their
+                        // recv loop before the final bytes arrive.
                         break RelayExit::ShellExited(code);
                     }
                 }
