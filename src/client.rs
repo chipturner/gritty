@@ -260,6 +260,17 @@ const RECONNECT_BACKOFF_INITIAL: Duration = Duration::from_secs(1);
 /// reattaches quickly.
 const RECONNECT_BACKOFF_MAX: Duration = Duration::from_secs(10);
 
+/// Treat these handshake-error prefixes as permanent: the server rejected
+/// us, or the endpoint accepted the connection but EOF'd before/during
+/// reply (typical of a tunnel forwarding to a daemon that's been
+/// kill-server'd). No amount of client-side retry recovers -- the user
+/// has to run `gritty restart`.
+fn is_terminal_handshake_err(msg: &str) -> bool {
+    msg.starts_with("handshake rejected")
+        || msg.starts_with("daemon closed connection")
+        || msg.starts_with("daemon protocol error")
+}
+
 /// Compute the next reconnect sleep given the previous one. Pure function so the
 /// schedule is unit-testable.
 fn next_reconnect_delay(prev: Duration) -> Duration {
@@ -1826,8 +1837,14 @@ pub async fn run(
                                     .as_bytes(),
                             )
                             .await?;
-                            // A server-side rejection (version mismatch etc.) is permanent.
-                            if msg.starts_with("handshake rejected") {
+                            // Server-side rejection (version mismatch, etc.)
+                            // is permanent. "daemon closed connection" is
+                            // also terminal: the UDS endpoint accepts but
+                            // EOFs during handshake -- typically the tunnel
+                            // is forwarding to a dead/killed daemon. No
+                            // number of client-side retries fixes this;
+                            // user has to run `gritty restart`.
+                            if is_terminal_handshake_err(&msg) {
                                 return Ok(1);
                             }
                             continue;
@@ -2037,7 +2054,7 @@ pub async fn tail(
                             Ok(info) => info,
                             Err(e) => {
                                 let msg = e.to_string();
-                                if msg.starts_with("handshake rejected") {
+                                if is_terminal_handshake_err(&msg) {
                                     return Outcome::HandshakeRejected(msg);
                                 }
                                 return Outcome::Retry;
