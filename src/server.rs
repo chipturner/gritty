@@ -1754,6 +1754,20 @@ pub async fn run(
                         debug!("discarding clipboard event while detached");
                         continue;
                     }
+                    _ = agent_event_rx.recv() => {
+                        // Drain agent events from still-open reader tasks
+                        // left over from the detached client. Without this
+                        // arm the channel fills and the reader tasks
+                        // block -- an unbounded pump toward a vanished
+                        // client.
+                        continue;
+                    }
+                    _ = tunnel_event_rx.recv() => {
+                        continue;
+                    }
+                    _ = pf_event_rx.recv() => {
+                        continue;
+                    }
                 }
             };
             if !got_client {
