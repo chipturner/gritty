@@ -1191,14 +1191,21 @@ impl ServerRelay<'_> {
                 let _ = framed.send(Frame::TunnelClose { channel_id }).await;
             }
             Some(TunnelEvent::Data { channel_id, data }) => {
-                let _ = framed.send(Frame::TunnelData { channel_id, data }).await;
+                // Gate on channels map membership, mirroring agent/pf
+                // siblings. Without this, a stale reader task from a
+                // previous client forwards bytes to the new client on a
+                // channel_id the new client never opened.
+                if self.tunnel.channels.contains_key(&channel_id) {
+                    let _ = framed.send(Frame::TunnelData { channel_id, data }).await;
+                }
             }
             Some(TunnelEvent::Closed { channel_id }) => {
-                self.tunnel.channels.remove(&channel_id);
-                let _ = framed.send(Frame::TunnelClose { channel_id }).await;
-                if self.tunnel.channels.is_empty() && self.tunnel.port.is_some() {
-                    self.tunnel.idle_deadline =
-                        Some(tokio::time::Instant::now() + self.tunnel.idle_timeout);
+                if self.tunnel.channels.remove(&channel_id).is_some() {
+                    let _ = framed.send(Frame::TunnelClose { channel_id }).await;
+                    if self.tunnel.channels.is_empty() && self.tunnel.port.is_some() {
+                        self.tunnel.idle_deadline =
+                            Some(tokio::time::Instant::now() + self.tunnel.idle_timeout);
+                    }
                 }
             }
             None => {}
