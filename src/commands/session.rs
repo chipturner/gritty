@@ -30,7 +30,7 @@ pub(crate) async fn connect_session(
     let force = force || picker_force;
     let session_command = command.unwrap_or_default();
 
-    let (stream, auto_started) =
+    let (stream, _auto_started) =
         super::util::connect_or_start(&ctl_path, &auto_start_mode, wait).await?;
     let mut framed = Framed::new(stream, FrameCodec);
     let info = gritty::handshake(&mut framed).await?;
@@ -90,63 +90,6 @@ pub(crate) async fn connect_session(
                 anyhow::bail!("no such session: {name}");
             }
             // Fall through to create
-        }
-        Frame::Error { code: gritty::protocol::ErrorCode::AlreadyAttached, .. }
-            if auto_started && !force =>
-        {
-            // Tunnel was just (re)started -- the old client is dead, so the
-            // "attached" state is stale.  Reconnect with force.
-            eprintln!("\x1b[2;33m\u{25b8} reconnecting...\x1b[0m");
-            drop(framed);
-            let (stream, _) =
-                super::util::connect_or_start(&ctl_path, &auto_start_mode, wait).await?;
-            let mut framed = Framed::new(stream, FrameCodec);
-            let info = gritty::handshake(&mut framed).await?;
-            gritty::require_matched_version(&info)?;
-            let server_id = info.server_id;
-            framed
-                .send(Frame::Attach {
-                    session: name.clone(),
-                    client_name: settings.client_name.clone(),
-                    force: true,
-                    no_replay: detach,
-                    cols: attach_cols,
-                    rows: attach_rows,
-                    attach_token: 0,
-                })
-                .await?;
-            match Frame::expect_from(framed.next().await)? {
-                Frame::Ok if detach => {
-                    eprintln!("\x1b[32m\u{25b8} session {name} exists (not attaching, -d)\x1b[0m");
-                    return Ok(());
-                }
-                Frame::AttachAck { token } => {
-                    eprintln!("\x1b[32m\u{25b8} attached {name}\x1b[0m");
-                    let session_id = resolve_session_id(&ctl_path, &name).await?;
-                    let env_vars = vec![];
-                    let code = gritty::client::run(
-                        &name,
-                        session_id,
-                        framed,
-                        &ctl_path,
-                        env_vars,
-                        settings.no_escape,
-                        settings.forward_agent,
-                        settings.forward_open,
-                        settings.oauth_redirect,
-                        settings.oauth_timeout,
-                        settings.heartbeat_interval,
-                        settings.heartbeat_timeout,
-                        settings.client_name.clone(),
-                        server_id,
-                        token,
-                    )
-                    .await?;
-                    std::process::exit(code);
-                }
-                Frame::Error { message, .. } => anyhow::bail!("{message}"),
-                other => anyhow::bail!("unexpected response from server: {other:?}"),
-            }
         }
         Frame::Error { code: gritty::protocol::ErrorCode::AlreadyAttached, message, .. } => {
             let host = host_from_ctl_path(&ctl_path);
