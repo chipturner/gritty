@@ -566,6 +566,12 @@ impl Drop for ClientPortForwardTable {
     }
 }
 
+impl Drop for ClientTunnelState {
+    fn drop(&mut self) {
+        self.teardown();
+    }
+}
+
 /// Send session setup frames (env, agent/open forwarding, resize).
 /// Returns false if the connection dropped during setup.
 async fn send_init_frames(
