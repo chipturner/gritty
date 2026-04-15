@@ -226,9 +226,7 @@ fn build_session_entries(sessions: &HashMap<u32, SessionState>) -> Vec<SessionEn
                     created_at: meta.created_at,
                     attached: meta.attached.load(Ordering::Relaxed),
                     last_heartbeat: meta.last_heartbeat.load(Ordering::Relaxed),
-                    foreground_cmd: foreground_process(
-                        meta.shell_pid.load(Ordering::Relaxed),
-                    ),
+                    foreground_cmd: foreground_process(meta.shell_pid.load(Ordering::Relaxed)),
                     cwd: foreground_cwd(meta.shell_pid.load(Ordering::Relaxed)),
                     client_name: meta.client_name.lock().map(|n| n.clone()).unwrap_or_default(),
                     agent_forwarding_active: meta.wants_agent.load(Ordering::Relaxed),
@@ -719,8 +717,8 @@ async fn dispatch_control(
                         // after `gritty connect host:name` create doesn't
                         // race.
                         let meta = {
-                            let deadline = std::time::Instant::now()
-                                + std::time::Duration::from_secs(3);
+                            let deadline =
+                                std::time::Instant::now() + std::time::Duration::from_secs(3);
                             loop {
                                 if let Some(m) = state.metadata.get() {
                                     break Some(m);

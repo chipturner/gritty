@@ -398,10 +398,8 @@ async fn exit_code_signal_death() {
 
     // Wait for metadata
     tokio::time::sleep(Duration::from_millis(100)).await;
-    let shell_pid = meta
-        .get()
-        .map(|m| m.shell_pid.load(std::sync::atomic::Ordering::Relaxed))
-        .unwrap_or(0);
+    let shell_pid =
+        meta.get().map(|m| m.shell_pid.load(std::sync::atomic::Ordering::Relaxed)).unwrap_or(0);
     assert!(shell_pid > 0, "should have shell PID in metadata");
 
     unsafe {

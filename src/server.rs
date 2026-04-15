@@ -1580,32 +1580,31 @@ pub async fn run(
         }
     };
 
-    let env_vars =
-        match tokio::time::timeout(std::time::Duration::from_secs(2), framed.next()).await {
-            Ok(Some(Ok(Frame::Env { vars }))) => {
-                debug!(count = vars.len(), "received env vars from client");
-                vars
-            }
-            Ok(None) | Ok(Some(Err(_))) => {
-                // Control-only callers (tests, tooling that creates but
-                // doesn't attach) drop the stream immediately after
-                // SessionCreated; spawning with empty env lets those cases
-                // proceed. A real attached user who disconnected before
-                // sending Env can force the richer env by reattaching.
-                warn!("first client disconnected before sending Env frame; spawning with empty env");
-                Vec::new()
-            }
-            Err(_) => {
-                warn!("first client did not send Env frame within 2s; spawning with empty env");
-                Vec::new()
-            }
-            Ok(Some(Ok(_other))) => {
-                warn!(
-                    "first client sent unexpected frame instead of Env; spawning with empty env"
-                );
-                Vec::new()
-            }
-        };
+    let env_vars = match tokio::time::timeout(std::time::Duration::from_secs(2), framed.next())
+        .await
+    {
+        Ok(Some(Ok(Frame::Env { vars }))) => {
+            debug!(count = vars.len(), "received env vars from client");
+            vars
+        }
+        Ok(None) | Ok(Some(Err(_))) => {
+            // Control-only callers (tests, tooling that creates but
+            // doesn't attach) drop the stream immediately after
+            // SessionCreated; spawning with empty env lets those cases
+            // proceed. A real attached user who disconnected before
+            // sending Env can force the richer env by reattaching.
+            warn!("first client disconnected before sending Env frame; spawning with empty env");
+            Vec::new()
+        }
+        Err(_) => {
+            warn!("first client did not send Env frame within 2s; spawning with empty env");
+            Vec::new()
+        }
+        Ok(Some(Ok(_other))) => {
+            warn!("first client sent unexpected frame instead of Env; spawning with empty env");
+            Vec::new()
+        }
+    };
 
     // Spawn shell (or custom command) on slave PTY
     let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/sh".to_string());
