@@ -1567,11 +1567,26 @@ pub async fn run(
             let _ = std::fs::remove_file(&self.0);
         }
     }
-    let (fwd_listener, _fwd_cleanup) = match crate::security::bind_unix_listener(&fwd_path) {
-        Ok(listener) => (Some(listener), Some(FwdCleanup(fwd_path))),
-        Err(e) => {
-            warn!("forward socket bind failed (lf/rf will be unavailable): {e}");
-            (None, None)
+    // On same-host force-takeover the old client's fwd socket may still
+    // be bound for a brief window before its Drop releases it. Retry
+    // briefly instead of giving up on first AddrInUse so lf/rf survives a
+    // local takeover. Any other bind error is reported immediately.
+    let (fwd_listener, _fwd_cleanup) = {
+        let mut attempts = 0u32;
+        loop {
+            match crate::security::bind_unix_listener(&fwd_path) {
+                Ok(listener) => break (Some(listener), Some(FwdCleanup(fwd_path))),
+                Err(e) if attempts < 20 => {
+                    attempts += 1;
+                    tokio::time::sleep(Duration::from_millis(100)).await;
+                    if attempts == 20 {
+                        warn!(
+                            "forward socket bind failed after retries (lf/rf will be unavailable): {e}"
+                        );
+                    }
+                }
+                Err(_) => break (None, None),
+            }
         }
     };
 
