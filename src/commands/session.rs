@@ -822,6 +822,11 @@ pub(crate) async fn tail_session(target: String, ctl_path: PathBuf) -> anyhow::R
     use gritty::protocol::{Frame, FrameCodec};
     use tokio_util::codec::Framed;
 
+    // Resolve the target to a numeric id before opening the tail stream so
+    // reconnect can reuse that id (the original target string may be `-`
+    // or a name that can shift while we're tailing).
+    let session_id = resolve_tail_target(&ctl_path, &target).await?;
+
     let stream = gritty::security::connect_verified(&ctl_path).await.map_err(|_| {
         anyhow::anyhow!("no server running (could not connect to {})", ctl_path.display())
     })?;
@@ -829,16 +834,40 @@ pub(crate) async fn tail_session(target: String, ctl_path: PathBuf) -> anyhow::R
     let info = gritty::handshake(&mut framed).await?;
     gritty::require_matched_version(&info)?;
     let server_id = info.server_id;
-    framed.send(Frame::Tail { session: target.clone() }).await?;
+    framed.send(Frame::Tail { session: session_id.to_string() }).await?;
 
     match Frame::expect_from(framed.next().await)? {
         Frame::Ok => {
             eprintln!("\x1b[2;33m\u{25b8} tailing {target}\x1b[0m");
-            gritty::client::tail(&target, framed, &ctl_path, server_id).await
+            gritty::client::tail(session_id, framed, &ctl_path, server_id).await
         }
         Frame::Error { message, .. } => anyhow::bail!("{message}"),
         other => anyhow::bail!("unexpected response from server: {other:?}"),
     }
+}
+
+async fn resolve_tail_target(ctl_path: &Path, target: &str) -> anyhow::Result<u32> {
+    use gritty::protocol::Frame;
+
+    if let Ok(id) = target.parse::<u32>() {
+        return Ok(id);
+    }
+    let resp = server_request(ctl_path, Frame::ListSessions).await?;
+    let Frame::SessionInfo { sessions } = resp else {
+        anyhow::bail!("unexpected response to ListSessions");
+    };
+    if target == "-" {
+        return sessions
+            .iter()
+            .max_by_key(|e| e.last_heartbeat)
+            .map(|e| e.id)
+            .ok_or_else(|| anyhow::anyhow!("no sessions (cannot resolve '-')"));
+    }
+    sessions
+        .iter()
+        .find(|e| e.name == target)
+        .map(|e| e.id)
+        .ok_or_else(|| anyhow::anyhow!("no such session: {target}"))
 }
 
 pub(crate) async fn rename_session(

@@ -1819,7 +1819,7 @@ pub async fn run(
 /// No raw mode, no stdin, no escape processing, no forwarding.
 /// Ctrl-C triggers clean exit with terminal reset.
 pub async fn tail(
-    session: &str,
+    session_id: u32,
     mut framed: Framed<UnixStream, FrameCodec>,
     ctl_path: &Path,
     expected_server_id: u64,
@@ -2018,7 +2018,14 @@ pub async fn tail(
                         );
                         break 'outer 1;
                     }
-                    if new_framed.send(Frame::Tail { session: session.to_string() }).await.is_err()
+                    // Reconnect by numeric id -- the original target string
+                    // may have been `-` (which would re-resolve to a
+                    // different session) or a name that's since been taken
+                    // over by a different session.
+                    if new_framed
+                        .send(Frame::Tail { session: session_id.to_string() })
+                        .await
+                        .is_err()
                     {
                         continue;
                     }
