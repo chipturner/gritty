@@ -1995,51 +1995,64 @@ pub async fn tail(
                         socket_missing_since = None;
                     }
 
-                    let stream = match crate::security::connect_verified(ctl_path).await {
-                        Ok(s) => s,
-                        Err(_) => continue,
-                    };
-
-                    let mut new_framed = Framed::new(stream, FrameCodec);
-                    let info = match crate::handshake(&mut new_framed).await {
-                        Ok(info) => info,
-                        Err(e) => {
-                            let msg = e.to_string();
-                            eprintln!("\r\x1b[31m\u{25b8} {msg}\x1b[0m\x1b[K");
-                            if msg.starts_with("handshake rejected") {
-                                break 'outer 1;
+                    // Bound a single attempt (connect + handshake + Tail
+                    // request + Ok wait) so a wedged server/tunnel can't
+                    // strand the reconnect loop inside one .await while
+                    // Ctrl-C is unreachable.
+                    enum Outcome {
+                        Connected(Framed<UnixStream, FrameCodec>),
+                        ServerRestarted,
+                        VersionMismatch { local: u16, remote: u16 },
+                        HandshakeRejected(String),
+                        SessionGone(String),
+                        Retry,
+                    }
+                    let outcome = tokio::time::timeout(RECONNECT_ATTEMPT_TIMEOUT, async {
+                        let stream = match crate::security::connect_verified(ctl_path).await {
+                            Ok(s) => s,
+                            Err(_) => return Outcome::Retry,
+                        };
+                        let mut new_framed = Framed::new(stream, FrameCodec);
+                        let info = match crate::handshake(&mut new_framed).await {
+                            Ok(info) => info,
+                            Err(e) => {
+                                let msg = e.to_string();
+                                if msg.starts_with("handshake rejected") {
+                                    return Outcome::HandshakeRejected(msg);
+                                }
+                                return Outcome::Retry;
                             }
-                            continue;
+                        };
+                        if info.server_id != expected_server_id {
+                            return Outcome::ServerRestarted;
                         }
-                    };
-                    if info.server_id != expected_server_id {
-                        eprintln!(
-                            "\r\x1b[31m\u{25b8} server restarted -- session is gone; reconnect manually\x1b[0m\x1b[K"
-                        );
-                        break 'outer 1;
-                    }
-                    if info.version != crate::protocol::PROTOCOL_VERSION {
-                        eprintln!(
-                            "\r\x1b[31m\u{25b8} protocol version mismatch (local={} remote={}) -- run `gritty restart` to upgrade\x1b[0m\x1b[K",
-                            crate::protocol::PROTOCOL_VERSION,
-                            info.version,
-                        );
-                        break 'outer 1;
-                    }
-                    // Reconnect by numeric id -- the original target string
-                    // may have been `-` (which would re-resolve to a
-                    // different session) or a name that's since been taken
-                    // over by a different session.
-                    if new_framed
-                        .send(Frame::Tail { session: session_id.to_string() })
-                        .await
-                        .is_err()
-                    {
-                        continue;
-                    }
+                        if info.version != crate::protocol::PROTOCOL_VERSION {
+                            return Outcome::VersionMismatch {
+                                local: crate::protocol::PROTOCOL_VERSION,
+                                remote: info.version,
+                            };
+                        }
+                        // Reconnect by numeric id -- the original target
+                        // string may have been `-` (which would re-resolve
+                        // to a different session) or a name that's since
+                        // been taken over by a different session.
+                        if new_framed
+                            .send(Frame::Tail { session: session_id.to_string() })
+                            .await
+                            .is_err()
+                        {
+                            return Outcome::Retry;
+                        }
+                        match new_framed.next().await {
+                            Some(Ok(Frame::Ok)) => Outcome::Connected(new_framed),
+                            Some(Ok(Frame::Error { message, .. })) => Outcome::SessionGone(message),
+                            _ => Outcome::Retry,
+                        }
+                    })
+                    .await;
 
-                    match new_framed.next().await {
-                        Some(Ok(Frame::Ok)) => {
+                    match outcome {
+                        Ok(Outcome::Connected(new_framed)) => {
                             if show_chrome {
                                 eprintln!("\r\x1b[32m\u{25b8} reconnected\x1b[0m\x1b[K");
                             }
@@ -2052,11 +2065,27 @@ pub async fn tail(
                             suspend_probe_baseline = None;
                             break;
                         }
-                        Some(Ok(Frame::Error { message, .. })) => {
+                        Ok(Outcome::ServerRestarted) => {
+                            eprintln!(
+                                "\r\x1b[31m\u{25b8} server restarted -- session is gone; reconnect manually\x1b[0m\x1b[K"
+                            );
+                            break 'outer 1;
+                        }
+                        Ok(Outcome::VersionMismatch { local, remote }) => {
+                            eprintln!(
+                                "\r\x1b[31m\u{25b8} protocol version mismatch (local={local} remote={remote}) -- run `gritty restart` to upgrade\x1b[0m\x1b[K"
+                            );
+                            break 'outer 1;
+                        }
+                        Ok(Outcome::HandshakeRejected(msg)) => {
+                            eprintln!("\r\x1b[31m\u{25b8} {msg}\x1b[0m\x1b[K");
+                            break 'outer 1;
+                        }
+                        Ok(Outcome::SessionGone(message)) => {
                             eprintln!("\r\x1b[31m\u{25b8} session gone: {message}\x1b[0m\x1b[K");
                             break 'outer 1;
                         }
-                        _ => continue,
+                        Ok(Outcome::Retry) | Err(_) => continue,
                     }
                 }
             }
