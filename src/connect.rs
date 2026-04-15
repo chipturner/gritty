@@ -485,7 +485,7 @@ fn connect_lock_path(connection_name: &str) -> PathBuf {
     crate::daemon::socket_dir().join(format!("connect-{connection_name}.lock"))
 }
 
-fn connect_dest_path(connection_name: &str) -> PathBuf {
+pub fn connect_dest_path(connection_name: &str) -> PathBuf {
     crate::daemon::socket_dir().join(format!("connect-{connection_name}.dest"))
 }
 
