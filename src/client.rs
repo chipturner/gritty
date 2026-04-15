@@ -1677,7 +1677,18 @@ pub async fn run(
                         .await?;
                     }
 
-                    if !ctl_path.exists() {
+                    // For tunnels, the supervisor holds an flock on a
+                    // companion `.lock` even while it's respawning the SSH
+                    // child; the ctl socket can vanish for several seconds
+                    // during respawn (backoff is 1-60s). Treat a held lock
+                    // as "tunnel still live, keep retrying" so the short
+                    // SOCKET_GONE_GRACE can't kill us mid-respawn. Only a
+                    // genuinely destroyed tunnel or a dead local daemon
+                    // should trip the grace window.
+                    let tunnel_supervisor_alive = crate::connect::ctl_socket_lock_path(ctl_path)
+                        .as_deref()
+                        .is_some_and(crate::connect::is_lock_held);
+                    if !ctl_path.exists() && !tunnel_supervisor_alive {
                         let first_seen = *socket_missing_since.get_or_insert_with(Instant::now);
                         if first_seen.elapsed() >= SOCKET_GONE_GRACE {
                             write_stdout_async(
@@ -1982,7 +1993,10 @@ pub async fn tail(
                         );
                     }
 
-                    if !ctl_path.exists() {
+                    let tunnel_supervisor_alive = crate::connect::ctl_socket_lock_path(ctl_path)
+                        .as_deref()
+                        .is_some_and(crate::connect::is_lock_held);
+                    if !ctl_path.exists() && !tunnel_supervisor_alive {
                         let first_seen = *socket_missing_since.get_or_insert_with(Instant::now);
                         if first_seen.elapsed() >= SOCKET_GONE_GRACE {
                             eprintln!(

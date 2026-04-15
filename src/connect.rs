@@ -495,6 +495,18 @@ pub fn connection_socket_path(connection_name: &str) -> PathBuf {
     local_socket_path(connection_name)
 }
 
+/// Return the tunnel lock path corresponding to a ctl socket path, if the
+/// ctl path looks like one produced by `tunnel-create` (i.e. a
+/// `connect-<name>.sock` file in the gritty socket dir). Returns `None`
+/// for a plain local daemon ctl socket or any unrecognized path -- the
+/// client uses this to distinguish a tunnel respawning (socket temporarily
+/// gone but supervisor still holding the lock) from a tunnel destroyed.
+pub fn ctl_socket_lock_path(ctl_path: &Path) -> Option<PathBuf> {
+    let file = ctl_path.file_name()?.to_str()?;
+    let name = file.strip_prefix("connect-")?.strip_suffix(".sock")?;
+    Some(connect_lock_path(name))
+}
+
 /// Extract the host component from a destination string (`[user@]host[:port]`).
 pub fn parse_host(destination: &str) -> anyhow::Result<String> {
     Ok(Destination::parse(destination)?.host)
@@ -592,7 +604,7 @@ fn try_acquire_lock(
 
 /// Probe whether a lockfile is held by a live process.
 /// Returns true if the lock is held (process alive), false if free (process dead).
-fn is_lock_held(lock_path: &Path) -> bool {
+pub fn is_lock_held(lock_path: &Path) -> bool {
     use std::fs::OpenOptions;
     let file = match OpenOptions::new().read(true).open(lock_path) {
         Ok(f) => f,
