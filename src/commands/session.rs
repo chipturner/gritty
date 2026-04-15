@@ -962,12 +962,23 @@ pub(crate) async fn restart(
         super::util::auto_start(&["server"])?;
         eprintln!("\x1b[32m\u{25b8} server restarted\x1b[0m");
     } else {
-        // Remote: tear down the tunnel (the supervisor may already be
-        // exiting because the ctl socket vanished when the daemon died,
-        // but `disconnect` is idempotent for the "already stopped" case).
+        // Remote: capture the original destination from the .dest sidecar
+        // before disconnect wipes it. Using just `host` here would collapse
+        // `user@server.example.com:2222` down to the friendly connection
+        // name and break SSH.
+        let destination = std::fs::read_to_string(gritty::connect::connect_dest_path(&host))
+            .ok()
+            .and_then(|s| {
+                let trimmed = s.trim();
+                if trimmed.is_empty() { None } else { Some(trimmed.to_string()) }
+            })
+            .unwrap_or_else(|| host.clone());
+        // Tear down the tunnel (the supervisor may already be exiting
+        // because the ctl socket vanished when the daemon died, but
+        // `disconnect` is idempotent for the "already stopped" case).
         gritty::connect::disconnect(&host).await?;
         eprintln!("\x1b[2;33m\u{25b8} starting tunnel {host}...\x1b[0m");
-        super::util::auto_start(&["tunnel-create", &host])?;
+        super::util::auto_start(&["tunnel-create", "--name", &host, &destination])?;
         eprintln!("\x1b[32m\u{25b8} {host} restarted\x1b[0m");
     }
     Ok(())
