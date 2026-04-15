@@ -61,9 +61,8 @@ pub(crate) async fn connect_session(
             eprintln!("\x1b[32m\u{25b8} session {name} exists (not attaching, -d)\x1b[0m");
             return Ok(());
         }
-        Frame::AttachAck { token } => {
+        Frame::AttachAck { token, session_id } => {
             eprintln!("\x1b[32m\u{25b8} attached {name}\x1b[0m");
-            let session_id = resolve_session_id(&ctl_path, &name).await?;
             let env_vars = vec![];
             let code = gritty::client::run(
                 &name,
@@ -129,7 +128,7 @@ pub(crate) async fn connect_session(
             // with the session's owner token. The client stores the token so
             // reconnects can be distinguished from third-party takeovers.
             let token = match Frame::expect_from(framed.next().await)? {
-                Frame::AttachAck { token } => token,
+                Frame::AttachAck { token, session_id: _ } => token,
                 other => anyhow::bail!("unexpected response from server: {other:?}"),
             };
 
@@ -773,31 +772,6 @@ async fn tui_pick_session(
     let _ = stderr.flush();
 
     result
-}
-
-/// Resolve a session name (or id string, or "-") to its numeric id via ListSessions.
-async fn resolve_session_id(ctl_path: &Path, session: &str) -> anyhow::Result<u32> {
-    use gritty::protocol::Frame;
-
-    if let Ok(id) = session.parse::<u32>() {
-        return Ok(id);
-    }
-    let resp = server_request(ctl_path, Frame::ListSessions).await?;
-    let Frame::SessionInfo { sessions } = resp else {
-        anyhow::bail!("unexpected response to ListSessions");
-    };
-    if session == "-" {
-        return sessions
-            .iter()
-            .max_by_key(|e| e.last_heartbeat)
-            .map(|e| e.id)
-            .ok_or_else(|| anyhow::anyhow!("no sessions (cannot resolve '-')"));
-    }
-    sessions
-        .iter()
-        .find(|e| e.name == session)
-        .map(|e| e.id)
-        .ok_or_else(|| anyhow::anyhow!("no such session: {session}"))
 }
 
 /// Extract a display-friendly host name from a ctl socket path.

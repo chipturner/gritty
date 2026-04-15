@@ -565,7 +565,10 @@ async fn dispatch_control(
             if timed_send(&mut framed, Frame::SessionCreated { id }).await.is_err() {
                 return false;
             }
-            if timed_send(&mut framed, Frame::AttachAck { token: owner_token }).await.is_err() {
+            if timed_send(&mut framed, Frame::AttachAck { token: owner_token, session_id: id })
+                .await
+                .is_err()
+            {
                 return false;
             }
 
@@ -686,9 +689,12 @@ async fn dispatch_control(
                         // fails, the previous owner should keep their token
                         // so their next reconnect doesn't get OwnerChanged
                         // on a takeover that never actually landed.
-                        if timed_send(&mut framed, Frame::AttachAck { token: new_token })
-                            .await
-                            .is_ok()
+                        if timed_send(
+                            &mut framed,
+                            Frame::AttachAck { token: new_token, session_id: id },
+                        )
+                        .await
+                        .is_ok()
                         {
                             meta.attach_token.store(new_token, Ordering::Relaxed);
                             *last_attached = Some(id);

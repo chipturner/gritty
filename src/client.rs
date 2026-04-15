@@ -1727,7 +1727,7 @@ pub async fn run(
                             return Attempt::Retry;
                         }
                         match new_framed.next().await {
-                            Some(Ok(Frame::AttachAck { token })) => {
+                            Some(Ok(Frame::AttachAck { token, session_id: _ })) => {
                                 Attempt::Connected(new_framed, token)
                             }
                             Some(Ok(Frame::Error { code: ErrorCode::AlreadyAttached, .. })) => {

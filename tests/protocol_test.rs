@@ -232,7 +232,7 @@ fn roundtrip_attach_with_token() {
 fn roundtrip_attach_ack() {
     let mut codec = FrameCodec;
     let mut buf = BytesMut::new();
-    let original = Frame::AttachAck { token: 0x0123_4567_89ab_cdef };
+    let original = Frame::AttachAck { token: 0x0123_4567_89ab_cdef, session_id: 7 };
     codec.encode(original.clone(), &mut buf).unwrap();
     let decoded = codec.decode(&mut buf).unwrap().unwrap();
     assert_eq!(original, decoded);

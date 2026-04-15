@@ -71,7 +71,7 @@ const HEADER_LEN: usize = 5; // type(1) + length(4)
 const MAX_FRAME_SIZE: usize = 1 << 20; // 1 MB
 
 /// Protocol version for handshake negotiation.
-pub const PROTOCOL_VERSION: u16 = 15;
+pub const PROTOCOL_VERSION: u16 = 16;
 
 /// Capability bit: client/server supports clipboard forwarding.
 pub const CAP_CLIPBOARD: u32 = 0x01;
@@ -352,9 +352,12 @@ pub enum Frame {
     Ok,
     /// Response to a successful `Attach` or auto-attach following `NewSession`.
     /// Carries the owner token the client must present on any subsequent
-    /// reconnect so the server can tell it apart from a stealing client.
+    /// reconnect, plus the resolved numeric session id so the client can
+    /// use it for reconnect/forward-socket paths without re-resolving a
+    /// name like `-` (which races against other attached sessions).
     AttachAck {
         token: u64,
+        session_id: u32,
     },
     Error {
         code: ErrorCode,
@@ -991,10 +994,14 @@ impl Decoder for FrameCodec {
                 }))
             }
             TYPE_ATTACH_ACK => {
-                expect_min_len(&payload, 8, "attach_ack")?;
+                expect_min_len(&payload, 12, "attach_ack")?;
                 let mut b = [0u8; 8];
                 b.copy_from_slice(&payload[0..8]);
-                Ok(Some(Frame::AttachAck { token: u64::from_be_bytes(b) }))
+                let token = u64::from_be_bytes(b);
+                let mut sid = [0u8; 4];
+                sid.copy_from_slice(&payload[8..12]);
+                let session_id = u32::from_be_bytes(sid);
+                Ok(Some(Frame::AttachAck { token, session_id }))
             }
             TYPE_RENAME_SESSION => {
                 if payload.len() < 2 {
@@ -1185,10 +1192,11 @@ impl Encoder<Frame> for FrameCodec {
                 dst.put_u16(rows);
                 dst.put_u64(attach_token);
             }
-            Frame::AttachAck { token } => {
+            Frame::AttachAck { token, session_id } => {
                 dst.put_u8(TYPE_ATTACH_ACK);
-                dst.put_u32(8);
+                dst.put_u32(12);
                 dst.put_u64(token);
+                dst.put_u32(session_id);
             }
             Frame::Error { code, message } => {
                 let mb = message.as_bytes();

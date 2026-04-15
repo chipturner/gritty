@@ -1334,7 +1334,7 @@ async fn new_session_for_test(
     }
     let token =
         match timeout(Duration::from_secs(3), framed.next()).await.unwrap().unwrap().unwrap() {
-            Frame::AttachAck { token } => token,
+            Frame::AttachAck { token, session_id: _ } => token,
             other => panic!("expected AttachAck, got {other:?}"),
         };
     framed
@@ -1387,7 +1387,7 @@ async fn stale_attach_token_rejected_with_owner_changed() {
     )
     .await;
     let token_b = match resp {
-        Frame::AttachAck { token } => token,
+        Frame::AttachAck { token, session_id: _ } => token,
         other => panic!("expected AttachAck for force takeover, got {other:?}"),
     };
     assert_ne!(token_b, token_a, "takeover must rotate the owner token");
@@ -1447,7 +1447,7 @@ async fn matching_attach_token_is_silent_reconnect() {
     )
     .await;
     match resp {
-        Frame::AttachAck { token } => {
+        Frame::AttachAck { token, session_id: _ } => {
             assert_eq!(token, token_a, "silent reconnect must return the same token");
         }
         other => panic!("expected AttachAck for silent reconnect, got {other:?}"),
