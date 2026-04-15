@@ -605,11 +605,22 @@ fn main() {
             let out_path = socket_dir.join(format!("connect-{connection_name}.out"));
             let log_path = socket_dir.join(format!("connect-{connection_name}.log"));
 
+            // Merge CLI -o options with config-layer options so preflight
+            // sees the same SSH option set the real tunnel will use.
+            // Running preflight against only the CLI options produced
+            // false-negative "cannot connect non-interactively" when the
+            // config supplied IdentityFile / ProxyJump / etc.
+            let merged_ssh_options = {
+                let mut opts = ssh_options.clone();
+                opts.extend(resolved.ssh_options.clone());
+                opts
+            };
+
             if !foreground
                 && !dry_run
                 && let Err(e) = gritty::connect::preflight_ssh(
                     &destination,
-                    &ssh_options,
+                    &merged_ssh_options,
                     resolved.connect_timeout,
                 )
             {
