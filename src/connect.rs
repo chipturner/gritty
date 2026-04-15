@@ -791,7 +791,36 @@ pub async fn run(opts: ConnectOpts, ready_fd: Option<OwnedFd>) -> anyhow::Result
             // Another process holds the lock -- tunnel is alive or starting.
             let sock_exists = std::os::unix::net::UnixStream::connect(&local_sock).is_ok();
             let pid_hint = read_pid_hint(&connection_name);
-            if sock_exists {
+            // If someone else holds the lock but the socket isn't up yet,
+            // wait for it before claiming success. auto_start() relies on
+            // "tunnel-create returned 0 ==> socket is ready to connect"
+            // (util.rs:connect_or_start). Previously we signaled ready
+            // immediately, so parallel invocations could race: one bound
+            // the lock, the other saw the lock held and returned 0 before
+            // the socket existed, causing connect_or_start to bail.
+            if !sock_exists {
+                match pid_hint {
+                    Some(pid) => eprintln!(
+                        "\x1b[2;33m\u{25b8} tunnel {connection_name} starting (pid {pid})\x1b[0m"
+                    ),
+                    None => {
+                        eprintln!("\x1b[2;33m\u{25b8} tunnel {connection_name} starting\x1b[0m")
+                    }
+                }
+                let deadline = socket_wait_deadline(opts.connect_timeout);
+                if let Err(e) = wait_for_socket(&local_sock, deadline).await {
+                    bail!(
+                        "another tunnel-create for {connection_name} is in progress but its socket never came up: {e}"
+                    );
+                }
+                println!("{}", local_sock.display());
+                match pid_hint {
+                    Some(pid) => eprintln!(
+                        "\x1b[32m\u{25b8} tunnel {connection_name} ready (pid {pid})\x1b[0m"
+                    ),
+                    None => eprintln!("\x1b[32m\u{25b8} tunnel {connection_name} ready\x1b[0m"),
+                }
+            } else {
                 println!("{}", local_sock.display());
                 match pid_hint {
                     Some(pid) => eprintln!(
@@ -800,15 +829,6 @@ pub async fn run(opts: ConnectOpts, ready_fd: Option<OwnedFd>) -> anyhow::Result
                     None => eprintln!(
                         "\x1b[32m\u{25b8} tunnel {connection_name} already running\x1b[0m"
                     ),
-                }
-            } else {
-                match pid_hint {
-                    Some(pid) => eprintln!(
-                        "\x1b[2;33m\u{25b8} tunnel {connection_name} starting (pid {pid})\x1b[0m"
-                    ),
-                    None => {
-                        eprintln!("\x1b[2;33m\u{25b8} tunnel {connection_name} starting\x1b[0m")
-                    }
                 }
             }
             signal_ready(&ready_fd);
