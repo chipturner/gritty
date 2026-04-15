@@ -15,7 +15,8 @@ Persistent TTY sessions over Unix domain sockets. Single binary, tmux-like CLI. 
 | `tail [host:session]` | `t` | Read-only stream of session output |
 | `kill-session [host:session]` | | Kill a session |
 | `rename <host:session> <name>` | | Rename a session |
-| `kill-server [host]` | | Kill the server and all sessions |
+| `kill-server [host]` | | Kill the server and all sessions (tolerates version mismatch) |
+| `restart [host]` | | Kill + restart server (and tunnel, for remote hosts) -- upgrade recovery |
 | `tunnels` | `tun` | List active SSH tunnels |
 | `tunnel-create <destination>` | | SSH tunnel to remote host |
 | `tunnel-destroy <name>` | | Tear down SSH tunnel |
@@ -86,7 +87,7 @@ Nine modules behind a lib crate (`src/lib.rs` hosts `collect_env_vars()`, `spawn
 
 Handshake: `0x01` Hello, `0x02` HelloAck. Relay: `0x10` Data, `0x11` Resize, `0x12` Exit, `0x13` Detached, `0x14` Ping, `0x15` Pong, `0x16` Env. Agent: `0x20` AgentForward, `0x21` AgentOpen, `0x22` AgentData, `0x23` AgentClose. URL/clipboard: `0x28` OpenForward, `0x29` OpenUrl, `0x2A` ClipboardSet, `0x2B` ClipboardGet, `0x2C` ClipboardData. Tunnel: `0x30` TunnelListen, `0x31` TunnelOpen, `0x32` TunnelData, `0x33` TunnelClose. Transfer: `0x38` SendOffer, `0x39` SendDone, `0x3A` SendCancel, `0x3B` SendFile. Port forward: `0x40` PFListen, `0x41` PFReady, `0x42` PFOpen, `0x43` PFData, `0x44` PFClose, `0x45` PFStop, `0x46` PortForwardRequest. Control: `0x50` NewSession, `0x51` Attach, `0x52` ListSessions, `0x53` KillSession, `0x54` KillServer, `0x55` Tail, `0x56` RenameSession. Responses: `0x60` SessionCreated, `0x61` SessionInfo, `0x62` Ok, `0x63` Error, `0x64` AttachAck. Reserved: `0x80-0xFF`.
 
-`Hello`: `[version: u16][capabilities: u32]`. `HelloAck`: `[version: u16][capabilities: u32][server_id: u64]`. Capabilities bitfield, negotiated = client & server (bitwise AND). Defined bits: `CAP_CLIPBOARD (0x01)` -- gates clipboard frame forwarding and svc socket clipboard requests. `server_id` is an ephemeral daemon identifier picked at startup; a reconnecting client that observes a different value exits with "server restarted -- session is gone" instead of looping.
+`Hello`: `[version: u16][capabilities: u32]`. `HelloAck`: `[version: u16][capabilities: u32][server_id: u64]`. Capabilities bitfield, negotiated = client & server (bitwise AND). Defined bits: `CAP_CLIPBOARD (0x01)` -- gates clipboard frame forwarding and svc socket clipboard requests. `server_id` is an ephemeral daemon identifier picked at startup; a reconnecting client that observes a different value exits with "server restarted -- session is gone" instead of looping. **Version mismatch is NOT a handshake error:** since v15, the daemon always replies with `HelloAck` carrying its own version even when the client's version differs, and the client decides via `require_matched_version()` whether to proceed. Under a mismatch the daemon gates the next control frame so only `KillServer` is honored (returning `Frame::Ok`); anything else gets `ErrorCode::VersionMismatch` with a message pointing at `gritty restart`. This is the recovery path for upgrading one side -- `kill-server` and `restart` both use `server_request_any_version` while every normal command uses `server_request` which bails on mismatch.
 
 `NewSession`: `[name_len: u16][name][cmd_len: u16][cmd][cwd_len: u16][cwd][cols: u16][rows: u16][client_name_len: u16][client_name]`. Empty cwd = `$HOME`. Zero cols/rows = default 80x24. `client_name` propagated to session metadata.
 
@@ -141,7 +142,7 @@ File transfer manifest (svc socket, not Frame protocol): sender writes `[file_co
 - **Fork before tokio** -- `daemonize()` MUST fork before creating the tokio runtime. `main()` is sync (no `#[tokio::main]`).
 
 ### Changing protocol/signatures
-- **`PROTOCOL_VERSION`** -- bump whenever frame types, encoding, or `SessionEntry` fields change. Version mismatch is a hard gate: daemon rejects clients, `tunnel-create` aborts tunnel setup. Currently v14.
+- **`PROTOCOL_VERSION`** -- bump whenever frame types, encoding, or `SessionEntry` fields change. Currently v15. Version mismatch is **not** a hard gate at the handshake layer: the daemon always sends `HelloAck` with its own version so the client can see it, then rejects any non-`KillServer` follow-up frame with `ErrorCode::VersionMismatch`. This is deliberate -- `kill-server` and `restart` need to work across a mismatched handshake so users can recover without SSH. `tunnel-create --ignore-version-mismatch` still exists for the SSH-level pre-check but its value is mostly superseded by the in-band recovery flow.
 - **`expect_min_len`** -- all fixed-field decoders use `expect_min_len` (not exact length checks), so trailing bytes are tolerated for forward extensibility.
 - **`Frame` enum** -- update: encoder, decoder, protocol tests, all `match frame` in server.rs, client.rs, daemon.rs, main.rs.
 - **`SessionInfo`** -- entry count `u32`. Changing `SessionEntry` fields requires updating both encoder and decoder in protocol.rs.

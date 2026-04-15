@@ -47,7 +47,11 @@ async fn probe_daemon_sessions(ctl_path: &Path) -> Vec<DiscoveredSession> {
         Err(_) => return vec![],
     };
     let mut framed = Framed::new(stream, FrameCodec);
-    if gritty::handshake(&mut framed).await.is_err() {
+    let info = match gritty::handshake(&mut framed).await {
+        Ok(i) => i,
+        Err(_) => return vec![],
+    };
+    if gritty::require_matched_version(&info).is_err() {
         return vec![];
     }
     if framed.send(Frame::ListSessions).await.is_err() {
@@ -124,7 +128,8 @@ async fn send_file_handshake(
         anyhow::anyhow!("no server running (could not connect to {})", ctl_path.display())
     })?;
     let mut framed = Framed::new(stream, FrameCodec);
-    gritty::handshake(&mut framed).await?;
+    let info = gritty::handshake(&mut framed).await?;
+    gritty::require_matched_version(&info)?;
     framed.send(Frame::SendFile { session: session.to_string() }).await?;
 
     match Frame::expect_from(framed.next().await)? {

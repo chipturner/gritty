@@ -243,11 +243,21 @@ fn shutdown(sessions: &mut HashMap<u32, SessionState>, ctl_path: &Path) {
     let _ = std::fs::remove_file(pid_file_path(ctl_path));
 }
 
+/// Outcome of the version check during `connection_handshake`. A mismatched
+/// client is still handed to the main loop so it can ask for `KillServer`
+/// (the recovery path during upgrades), but all other frames are rejected
+/// with `VersionMismatch` before they touch session state.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum VersionCheck {
+    Matched,
+    Mismatched { client_version: u16 },
+}
+
 /// Perform Hello/HelloAck handshake and read control frame for a single connection.
 /// Spawned as a per-connection task so slow clients don't block the accept loop.
 async fn connection_handshake(
     stream: UnixStream,
-    tx: mpsc::Sender<(Frame, Framed<UnixStream, FrameCodec>, u32)>,
+    tx: mpsc::Sender<(Frame, Framed<UnixStream, FrameCodec>, u32, VersionCheck)>,
     server_id: u64,
 ) {
     let mut framed = Framed::new(stream, FrameCodec);
@@ -278,22 +288,10 @@ async fn connection_handshake(
             }
         };
 
-    // Reject version mismatch
-    if version != PROTOCOL_VERSION {
-        let _ = timed_send(
-            &mut framed,
-            Frame::Error {
-                code: ErrorCode::VersionMismatch,
-                message: format!(
-                    "protocol version mismatch: client={version} server={PROTOCOL_VERSION}; \
-                     both sides must run the same version"
-                ),
-            },
-        )
-        .await;
-        return;
-    }
-
+    // Always send HelloAck, even on version mismatch, so the client sees the
+    // server's version and can either bail with an actionable error or proceed
+    // with a KillServer recovery request. Per-frame version gating in the main
+    // loop keeps session operations safe.
     let server_caps = CAP_CLIPBOARD;
     if timed_send(
         &mut framed,
@@ -305,7 +303,16 @@ async fn connection_handshake(
         return;
     }
 
-    let negotiated = client_caps & server_caps;
+    let (check, negotiated) = if version == PROTOCOL_VERSION {
+        (VersionCheck::Matched, client_caps & server_caps)
+    } else {
+        warn!(
+            client_version = version,
+            server_version = PROTOCOL_VERSION,
+            "version mismatch -- connection restricted to KillServer"
+        );
+        (VersionCheck::Mismatched { client_version: version }, 0u32)
+    };
 
     // Read control frame (5s timeout)
     let frame = match tokio::time::timeout(Duration::from_secs(5), framed.next()).await {
@@ -321,7 +328,7 @@ async fn connection_handshake(
         }
     };
 
-    let _ = tx.send((frame, framed, negotiated)).await;
+    let _ = tx.send((frame, framed, negotiated, check)).await;
 }
 
 /// Run the daemon, listening on its socket.
@@ -379,7 +386,8 @@ pub async fn run(ctl_path: &Path, ready_fd: Option<OwnedFd>) -> anyhow::Result<(
     let mut sigint = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::interrupt())?;
 
     // Channel for handshake results -- spawned tasks send completed handshakes here
-    let (conn_tx, mut conn_rx) = mpsc::channel::<(Frame, Framed<UnixStream, FrameCodec>, u32)>(64);
+    let (conn_tx, mut conn_rx) =
+        mpsc::channel::<(Frame, Framed<UnixStream, FrameCodec>, u32, VersionCheck)>(64);
 
     loop {
         reap_sessions(&mut sessions);
@@ -402,11 +410,33 @@ pub async fn run(ctl_path: &Path, ready_fd: Option<OwnedFd>) -> anyhow::Result<(
                 }
                 false
             }
-            Some((frame, framed, capabilities)) = conn_rx.recv() => {
-                dispatch_control(
-                    frame, framed, &mut sessions, &mut next_id, ctl_path, &mut last_attached,
-                    ring_buffer_cap, oauth_tunnel_idle_timeout, capabilities,
-                ).await
+            Some((frame, mut framed, capabilities, check)) = conn_rx.recv() => {
+                // Under a version mismatch the only frame we honor is
+                // KillServer -- it's the escape hatch for recovering from a
+                // half-upgraded deployment. Any other request would touch
+                // session state we can't safely interpret across a version
+                // boundary, so reject it with an actionable error.
+                if let VersionCheck::Mismatched { client_version } = check
+                    && !matches!(frame, Frame::KillServer)
+                {
+                    let _ = timed_send(
+                        &mut framed,
+                        Frame::Error {
+                            code: ErrorCode::VersionMismatch,
+                            message: format!(
+                                "protocol version mismatch: client={client_version} server={PROTOCOL_VERSION}; \
+                                 only KillServer is accepted -- run `gritty restart` to upgrade"
+                            ),
+                        },
+                    )
+                    .await;
+                    false
+                } else {
+                    dispatch_control(
+                        frame, framed, &mut sessions, &mut next_id, ctl_path, &mut last_attached,
+                        ring_buffer_cap, oauth_tunnel_idle_timeout, capabilities,
+                    ).await
+                }
             }
             _ = sigterm.recv() => {
                 info!("SIGTERM received, shutting down");

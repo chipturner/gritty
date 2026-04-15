@@ -9,7 +9,12 @@ pub mod security;
 pub mod server;
 pub mod table;
 
-/// Result of a successful handshake.
+/// Result of a successful handshake. The `version` field carries what the
+/// server advertised, which may differ from `PROTOCOL_VERSION` -- callers
+/// that need session-level compatibility must verify via
+/// [`require_matched_version`]. The only caller that legitimately ignores
+/// this is `kill-server`, which is the recovery path for upgrading across
+/// a mismatch.
 #[derive(Debug, Clone, Copy)]
 pub struct HandshakeInfo {
     pub version: u16,
@@ -22,8 +27,12 @@ pub struct HandshakeInfo {
 
 /// Perform a protocol version handshake with the server.
 ///
-/// Sends Hello with our PROTOCOL_VERSION, expects HelloAck with the
-/// negotiated version (min of client and server).
+/// Sends Hello with our `PROTOCOL_VERSION` and returns whatever `HelloAck`
+/// the server replied with. A mismatched version is *not* a handshake error:
+/// the server always sends `HelloAck` (since protocol v15) and gates
+/// non-`KillServer` frames on its side, while the client decides whether to
+/// proceed by calling `require_matched_version`. Returning the server's
+/// version unconditionally lets recovery commands act across the mismatch.
 pub async fn handshake(
     framed: &mut tokio_util::codec::Framed<tokio::net::UnixStream, protocol::FrameCodec>,
 ) -> anyhow::Result<HandshakeInfo> {
@@ -43,9 +52,27 @@ pub async fn handshake(
             capabilities: protocol::CAP_CLIPBOARD & capabilities,
             server_id,
         }),
+        // Legacy: a pre-v15 server may still reject the handshake with
+        // `Error { VersionMismatch, .. }` before sending HelloAck. Surface
+        // it as a normal handshake error so the reconnect loop treats it
+        // as terminal.
         protocol::Frame::Error { message, .. } => anyhow::bail!("handshake rejected: {message}"),
         other => anyhow::bail!("expected HelloAck, got {other:?}"),
     }
+}
+
+/// Bail with an actionable error if the remote's protocol version does not
+/// match ours. Every caller except `kill-server` (the upgrade recovery path)
+/// should invoke this right after `handshake()`.
+pub fn require_matched_version(info: &HandshakeInfo) -> anyhow::Result<()> {
+    if info.version != protocol::PROTOCOL_VERSION {
+        anyhow::bail!(
+            "protocol version mismatch: local={} remote={}; run `gritty restart <host>` to upgrade",
+            protocol::PROTOCOL_VERSION,
+            info.version,
+        );
+    }
+    Ok(())
 }
 
 /// Collect TERM/LANG/COLORTERM from the environment for forwarding to remote sessions.

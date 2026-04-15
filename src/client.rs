@@ -1689,6 +1689,7 @@ pub async fn run(
                         SessionGone(String),
                         ServerRestarted,
                         OwnerChanged,
+                        VersionMismatch { server_version: u16 },
                         HandshakeErr(String),
                         Retry,
                     }
@@ -1705,6 +1706,9 @@ pub async fn run(
                         };
                         if info.server_id != expected_server_id {
                             return Attempt::ServerRestarted;
+                        }
+                        if info.version != crate::protocol::PROTOCOL_VERSION {
+                            return Attempt::VersionMismatch { server_version: info.version };
                         }
                         let (cols, rows) = get_terminal_size();
                         if new_framed
@@ -1776,6 +1780,14 @@ pub async fn run(
                                 b"\r\x1b[31m\xe2\x96\xb8 session taken over by another client\x1b[0m\x1b[K\r\n",
                             )
                             .await?;
+                            return Ok(1);
+                        }
+                        Ok(Attempt::VersionMismatch { server_version }) => {
+                            let local = crate::protocol::PROTOCOL_VERSION;
+                            let msg = format!(
+                                "\r\x1b[31m\u{25b8} protocol version mismatch (local={local} remote={server_version}) -- run `gritty restart` to upgrade\x1b[0m\x1b[K\r\n"
+                            );
+                            write_stdout_async(&async_stdout, msg.as_bytes()).await?;
                             return Ok(1);
                         }
                         Ok(Attempt::HandshakeErr(msg)) => {
@@ -1990,6 +2002,14 @@ pub async fn tail(
                     if info.server_id != expected_server_id {
                         eprintln!(
                             "\r\x1b[31m\u{25b8} server restarted -- session is gone; reconnect manually\x1b[0m\x1b[K"
+                        );
+                        break 'outer 1;
+                    }
+                    if info.version != crate::protocol::PROTOCOL_VERSION {
+                        eprintln!(
+                            "\r\x1b[31m\u{25b8} protocol version mismatch (local={} remote={}) -- run `gritty restart` to upgrade\x1b[0m\x1b[K",
+                            crate::protocol::PROTOCOL_VERSION,
+                            info.version,
                         );
                         break 'outer 1;
                     }

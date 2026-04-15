@@ -27,7 +27,10 @@ pub(crate) fn resolve_ctl_path(
     }
 }
 
-/// Send a control frame to the server and return the response.
+/// Send a control frame to the server and return the response. Bails with an
+/// actionable error if the peer's `PROTOCOL_VERSION` differs from ours --
+/// every normal command wants matched versions. Use [`server_request_any_version`]
+/// for the `kill-server` recovery path.
 pub(crate) async fn server_request(
     ctl_path: &Path,
     frame: gritty::protocol::Frame,
@@ -40,7 +43,28 @@ pub(crate) async fn server_request(
         anyhow::anyhow!("no server running (could not connect to {})", ctl_path.display())
     })?;
     let mut framed = Framed::new(stream, FrameCodec);
-    gritty::handshake(&mut framed).await?;
+    let info = gritty::handshake(&mut framed).await?;
+    gritty::require_matched_version(&info)?;
+    framed.send(frame).await?;
+    Frame::expect_from(framed.next().await)
+}
+
+/// Like `server_request`, but tolerates a protocol-version mismatch -- used
+/// by `kill-server` and `restart` so a user upgrading one side can still
+/// tear down the old daemon without falling back to SSH.
+pub(crate) async fn server_request_any_version(
+    ctl_path: &Path,
+    frame: gritty::protocol::Frame,
+) -> anyhow::Result<gritty::protocol::Frame> {
+    use futures_util::{SinkExt, StreamExt};
+    use gritty::protocol::{Frame, FrameCodec};
+    use tokio_util::codec::Framed;
+
+    let stream = gritty::security::connect_verified(ctl_path).await.map_err(|_| {
+        anyhow::anyhow!("no server running (could not connect to {})", ctl_path.display())
+    })?;
+    let mut framed = Framed::new(stream, FrameCodec);
+    let _ = gritty::handshake(&mut framed).await?;
     framed.send(frame).await?;
     Frame::expect_from(framed.next().await)
 }

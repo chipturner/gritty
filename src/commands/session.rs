@@ -33,7 +33,9 @@ pub(crate) async fn connect_session(
     let (stream, auto_started) =
         super::util::connect_or_start(&ctl_path, &auto_start_mode, wait).await?;
     let mut framed = Framed::new(stream, FrameCodec);
-    let server_id = gritty::handshake(&mut framed).await?.server_id;
+    let info = gritty::handshake(&mut framed).await?;
+    gritty::require_matched_version(&info)?;
+    let server_id = info.server_id;
 
     // Carry current terminal size so the server can resize the PTY before
     // replaying scrollback/ring buffer on reconnect. Zero for probe-only.
@@ -99,7 +101,9 @@ pub(crate) async fn connect_session(
             let (stream, _) =
                 super::util::connect_or_start(&ctl_path, &auto_start_mode, wait).await?;
             let mut framed = Framed::new(stream, FrameCodec);
-            let server_id = gritty::handshake(&mut framed).await?.server_id;
+            let info = gritty::handshake(&mut framed).await?;
+            gritty::require_matched_version(&info)?;
+            let server_id = info.server_id;
             framed
                 .send(Frame::Attach {
                     session: name.clone(),
@@ -158,7 +162,9 @@ pub(crate) async fn connect_session(
     // was consumed by the failed attach
     let (stream, _) = super::util::connect_or_start(&ctl_path, &auto_start_mode, wait).await?;
     let mut framed = Framed::new(stream, FrameCodec);
-    let server_id = gritty::handshake(&mut framed).await?.server_id;
+    let info = gritty::handshake(&mut framed).await?;
+    gritty::require_matched_version(&info)?;
+    let server_id = info.server_id;
     // Get terminal size for initial PTY dimensions
     let (cols, rows) = crossterm::terminal::size().unwrap_or((0, 0));
     framed
@@ -903,7 +909,9 @@ pub(crate) async fn tail_session(target: String, ctl_path: PathBuf) -> anyhow::R
         anyhow::anyhow!("no server running (could not connect to {})", ctl_path.display())
     })?;
     let mut framed = Framed::new(stream, FrameCodec);
-    let server_id = gritty::handshake(&mut framed).await?.server_id;
+    let info = gritty::handshake(&mut framed).await?;
+    gritty::require_matched_version(&info)?;
+    let server_id = info.server_id;
     framed.send(Frame::Tail { session: target.clone() }).await?;
 
     match Frame::expect_from(framed.next().await)? {
@@ -954,7 +962,10 @@ pub(crate) async fn kill_session(target: String, ctl_path: PathBuf) -> anyhow::R
 pub(crate) async fn kill_server(ctl_path: PathBuf) -> anyhow::Result<()> {
     use gritty::protocol::Frame;
 
-    match server_request(&ctl_path, Frame::KillServer).await? {
+    // Deliberately tolerant of protocol version mismatch: killing the server
+    // is the first step of the upgrade recovery ritual, so it MUST work
+    // across a mismatched handshake.
+    match super::util::server_request_any_version(&ctl_path, Frame::KillServer).await? {
         Frame::Ok => {
             eprintln!("\x1b[32m\u{25b8} server killed\x1b[0m");
             Ok(())
@@ -962,6 +973,58 @@ pub(crate) async fn kill_server(ctl_path: PathBuf) -> anyhow::Result<()> {
         Frame::Error { message, .. } => anyhow::bail!("{message}"),
         other => anyhow::bail!("unexpected response from server: {other:?}"),
     }
+}
+
+/// Orchestrate a full daemon (+ tunnel, for remote hosts) restart. The
+/// canonical recovery ritual after upgrading the `gritty` binary on one or
+/// both sides: old daemon gets killed across the version mismatch, tunnel
+/// is torn down and respawned (which bootstraps the remote daemon with the
+/// new binary), and the local server is started if we targeted `local`.
+pub(crate) async fn restart(
+    host: Option<String>,
+    ctl_socket: Option<PathBuf>,
+) -> anyhow::Result<()> {
+    use gritty::protocol::Frame;
+
+    let host = host.unwrap_or_else(|| "local".to_string());
+    let ctl_path = super::util::resolve_ctl_path(ctl_socket, Some(&host))?;
+
+    // Step 1: kill-server, tolerant of both "nothing running" and
+    // protocol-version mismatch. We don't want to fail the whole restart
+    // just because the daemon was already gone.
+    match super::util::server_request_any_version(&ctl_path, Frame::KillServer).await {
+        Ok(Frame::Ok) => {
+            eprintln!("\x1b[32m\u{25b8} server killed\x1b[0m");
+        }
+        Ok(Frame::Error { message, .. }) => {
+            eprintln!("\x1b[2;33m\u{25b8} kill-server: {message} (continuing)\x1b[0m");
+        }
+        Ok(other) => {
+            eprintln!(
+                "\x1b[2;33m\u{25b8} kill-server: unexpected response {other:?} (continuing)\x1b[0m"
+            );
+        }
+        Err(_) => {
+            // Connect failed -- no daemon to kill, that's fine.
+            eprintln!("\x1b[2;33m\u{25b8} no server running\x1b[0m");
+        }
+    }
+
+    if host == "local" {
+        // For local, kick off a fresh `gritty server`.
+        eprintln!("\x1b[2;33m\u{25b8} starting server...\x1b[0m");
+        super::util::auto_start(&["server"])?;
+        eprintln!("\x1b[32m\u{25b8} server restarted\x1b[0m");
+    } else {
+        // Remote: tear down the tunnel (the supervisor may already be
+        // exiting because the ctl socket vanished when the daemon died,
+        // but `disconnect` is idempotent for the "already stopped" case).
+        gritty::connect::disconnect(&host).await?;
+        eprintln!("\x1b[2;33m\u{25b8} starting tunnel {host}...\x1b[0m");
+        super::util::auto_start(&["tunnel-create", &host])?;
+        eprintln!("\x1b[32m\u{25b8} {host} restarted\x1b[0m");
+    }
+    Ok(())
 }
 
 pub(crate) async fn list_sessions(ctl_path: PathBuf) -> anyhow::Result<()> {
@@ -1078,7 +1141,8 @@ pub(crate) async fn list_all_sessions() -> anyhow::Result<()> {
                     .await
                     .map_err(|e| format!("connect: {e}"))?;
                 let mut framed = tokio_util::codec::Framed::new(stream, FrameCodec);
-                gritty::handshake(&mut framed).await.map_err(|e| e.to_string())?;
+                let info = gritty::handshake(&mut framed).await.map_err(|e| e.to_string())?;
+                gritty::require_matched_version(&info).map_err(|e| e.to_string())?;
                 futures_util::SinkExt::send(&mut framed, Frame::ListSessions)
                     .await
                     .map_err(|e| format!("send ListSessions: {e}"))?;

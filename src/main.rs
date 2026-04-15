@@ -168,6 +168,14 @@ enum Command {
         /// Target host
         target: Option<String>,
     },
+    /// Restart the server (and tunnel, for remote hosts). One-shot recovery
+    /// for protocol version upgrades: kills the daemon (tolerant of a
+    /// mismatched handshake), tears down the tunnel, and starts both back up.
+    #[command(display_order = 6)]
+    Restart {
+        /// Target host (defaults to `local`)
+        target: Option<String>,
+    },
     /// Rename a session
     #[command(display_order = 4)]
     Rename {
@@ -822,6 +830,10 @@ async fn run(cli: Cli, config: gritty::config::ConfigFile) -> anyhow::Result<()>
                 gritty::connect::disconnect(h).await?;
             }
             Ok(())
+        }
+        Command::Restart { target } => {
+            let host = target.as_deref().map(|t| parse_target(t).0);
+            restart(host, cli.ctl_socket).await
         }
         Command::SocketPath => {
             let ctl_path = cli.ctl_socket.unwrap_or_else(gritty::daemon::control_socket_path);

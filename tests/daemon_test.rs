@@ -128,7 +128,11 @@ async fn kill_cleanup(ctl_path: &std::path::Path, session: &str) {
 }
 
 #[tokio::test]
-async fn daemon_rejects_version_mismatch() {
+async fn daemon_hello_ack_carries_server_version_on_mismatch() {
+    // New semantics: the daemon never hard-rejects the handshake on version
+    // mismatch. It replies with HelloAck carrying its own version so the
+    // client can see what it's talking to, and per-frame gating below keeps
+    // session operations safe.
     let (_tmp, ctl_path) = test_ctl();
 
     let ctl = ctl_path.clone();
@@ -144,10 +148,84 @@ async fn daemon_rejects_version_mismatch() {
         .expect("stream ended")
         .expect("decode error");
     match resp {
-        Frame::Error { message, .. } => {
-            assert!(message.contains("protocol version mismatch"), "unexpected error: {message}");
+        Frame::HelloAck { version, .. } => {
+            assert_eq!(version, PROTOCOL_VERSION, "server should advertise its own version");
         }
-        other => panic!("expected Error, got {other:?}"),
+        other => panic!("expected HelloAck, got {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn daemon_accepts_killserver_under_version_mismatch() {
+    // Recovery path for users who upgraded one side: a client with a
+    // mismatched PROTOCOL_VERSION must still be able to kill the daemon so
+    // they can restart it with the matching binary.
+    let (_tmp, ctl_path) = test_ctl();
+
+    let ctl = ctl_path.clone();
+    let daemon = tokio::spawn(async move { gritty::daemon::run(&ctl, None).await });
+    wait_for_daemon(&ctl_path).await;
+
+    let stream = UnixStream::connect(&ctl_path).await.unwrap();
+    let mut framed = Framed::new(stream, FrameCodec);
+    // Pretend to be a newer client.
+    framed.send(Frame::Hello { version: PROTOCOL_VERSION + 7, capabilities: 0 }).await.unwrap();
+    let resp = timeout(Duration::from_secs(3), framed.next())
+        .await
+        .expect("timed out")
+        .expect("stream ended")
+        .expect("decode error");
+    assert!(matches!(resp, Frame::HelloAck { .. }), "expected HelloAck, got {resp:?}");
+
+    framed.send(Frame::KillServer).await.unwrap();
+    let resp = timeout(Duration::from_secs(3), framed.next())
+        .await
+        .expect("timed out")
+        .expect("stream ended")
+        .expect("decode error");
+    assert_eq!(resp, Frame::Ok, "KillServer should succeed under version mismatch");
+
+    // Daemon should have exited.
+    let _ = timeout(Duration::from_secs(3), daemon).await;
+    assert!(!ctl_path.exists(), "ctl socket should be cleaned up after kill-server");
+}
+
+#[tokio::test]
+async fn daemon_rejects_non_killserver_frames_under_version_mismatch() {
+    // Under a version mismatch the daemon still refuses anything that could
+    // touch session state: new-session, attach, list, etc. all return
+    // VersionMismatch so the user gets an actionable error instead of a
+    // half-working control plane.
+    let (_tmp, ctl_path) = test_ctl();
+
+    let ctl = ctl_path.clone();
+    let _daemon = tokio::spawn(async move { gritty::daemon::run(&ctl, None).await });
+    wait_for_daemon(&ctl_path).await;
+
+    let stream = UnixStream::connect(&ctl_path).await.unwrap();
+    let mut framed = Framed::new(stream, FrameCodec);
+    framed.send(Frame::Hello { version: PROTOCOL_VERSION + 3, capabilities: 0 }).await.unwrap();
+    let resp = timeout(Duration::from_secs(3), framed.next())
+        .await
+        .expect("timed out")
+        .expect("stream ended")
+        .expect("decode error");
+    assert!(matches!(resp, Frame::HelloAck { .. }));
+
+    framed.send(Frame::ListSessions).await.unwrap();
+    let resp = timeout(Duration::from_secs(3), framed.next())
+        .await
+        .expect("timed out")
+        .expect("stream ended")
+        .expect("decode error");
+    match resp {
+        Frame::Error { code: ErrorCode::VersionMismatch, message } => {
+            assert!(
+                message.contains("version"),
+                "expected message mentioning version, got: {message}"
+            );
+        }
+        other => panic!("expected VersionMismatch error, got {other:?}"),
     }
 }
 

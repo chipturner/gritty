@@ -91,7 +91,8 @@ Local-only sessions (`gritty connect local:scratch`) are available for testing b
 | `gritty tail [host:session]` | `t` | Read-only stream of session output |
 | `gritty kill-session [host:session]` | | Kill a session |
 | `gritty rename <host:session> <name>` | | Rename a session |
-| `gritty kill-server [host]` | | Kill the server and all sessions |
+| `gritty kill-server [host]` | | Kill the server and all sessions (works across a protocol version mismatch) |
+| `gritty restart [host]` | | Kill + restart server (and tunnel, for remote hosts). One-shot upgrade recovery |
 | `gritty tunnels` | `tun` | List active SSH tunnels |
 | `gritty tunnel-create <destination>` | | Set up SSH tunnel to remote host |
 | `gritty tunnel-destroy <name>` | | Tear down an SSH tunnel |
@@ -263,7 +264,7 @@ gritty completions fish > ~/.config/fish/completions/gritty.fish
 
 **"[reconnecting...]" forever** -- the SSH tunnel is down and not coming back. Check `gritty tunnels` for tunnel status. If the tunnel shows as stale, `gritty tunnel-destroy <name>` to clean it up and `gritty tunnel-create <dest>` to re-establish. Check `gritty info` for log file paths if you need to dig deeper.
 
-**Protocol version mismatch after upgrade** -- if you upgrade gritty on one side but not the other, connections will be rejected with a version mismatch error. Upgrade both sides to the same version. `gritty protocol-version` shows the local version. If you need to connect temporarily before upgrading, use `gritty tunnel-create --ignore-version-mismatch`.
+**Protocol version mismatch after upgrade** -- after upgrading gritty on one side the other side's daemon still speaks the old protocol, so session operations fail with `protocol version mismatch`. Upgrade both binaries to matching versions (`gritty protocol-version` prints the local version), then run `gritty restart <host>` (or `gritty restart local`) to tear down the old daemon and bring a fresh one up on both sides. `restart` tolerates the mismatched handshake so it works without falling back to SSH; under the hood it calls `kill-server` (which is itself tolerant of the mismatch), destroys the tunnel, and `tunnel-create`s a new one.
 
 ## Design
 
