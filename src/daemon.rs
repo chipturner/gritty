@@ -222,12 +222,14 @@ fn build_session_entries(sessions: &HashMap<u32, SessionState>) -> Vec<SessionEn
                     id,
                     name: state.name.clone().unwrap_or_default(),
                     pty_path: meta.pty_path.clone(),
-                    shell_pid: meta.shell_pid,
+                    shell_pid: meta.shell_pid.load(Ordering::Relaxed),
                     created_at: meta.created_at,
                     attached: meta.attached.load(Ordering::Relaxed),
                     last_heartbeat: meta.last_heartbeat.load(Ordering::Relaxed),
-                    foreground_cmd: foreground_process(meta.shell_pid),
-                    cwd: foreground_cwd(meta.shell_pid),
+                    foreground_cmd: foreground_process(
+                        meta.shell_pid.load(Ordering::Relaxed),
+                    ),
+                    cwd: foreground_cwd(meta.shell_pid.load(Ordering::Relaxed)),
                     client_name: meta.client_name.lock().map(|n| n.clone()).unwrap_or_default(),
                     agent_forwarding_active: meta.wants_agent.load(Ordering::Relaxed),
                 }
@@ -711,7 +713,25 @@ async fn dispatch_control(
                         // silently skip the store -- the client records it,
                         // reconnects later, and gets OwnerChanged because the
                         // server still holds the initial creator's token.
-                        let Some(meta) = state.metadata.get() else {
+                        // The shell-spawn window is tens to hundreds of
+                        // milliseconds; poll briefly before bailing so a
+                        // user's follow-up `gritty connect host:name` right
+                        // after `gritty connect host:name` create doesn't
+                        // race.
+                        let meta = {
+                            let deadline = std::time::Instant::now()
+                                + std::time::Duration::from_secs(3);
+                            loop {
+                                if let Some(m) = state.metadata.get() {
+                                    break Some(m);
+                                }
+                                if std::time::Instant::now() >= deadline {
+                                    break None;
+                                }
+                                tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+                            }
+                        };
+                        let Some(meta) = meta else {
                             let _ = timed_send(
                                 &mut framed,
                                 Frame::Error {

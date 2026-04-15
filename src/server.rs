@@ -47,7 +47,11 @@ enum TailEvent {
 
 pub struct SessionMetadata {
     pub pty_path: String,
-    pub shell_pid: u32,
+    /// Shell PID, or 0 until the shell is actually spawned. Atomic so the
+    /// metadata slot can be populated before shell spawn (required for
+    /// attach_token storage on Attach-during-spawn) and updated once the
+    /// shell's pid is known.
+    pub shell_pid: AtomicU32,
     pub created_at: u64,
     pub attached: AtomicBool,
     pub last_heartbeat: AtomicU64,
@@ -1439,6 +1443,29 @@ pub async fn run(
     let pty_path =
         nix::unistd::ttyname(&slave).map(|p| p.display().to_string()).unwrap_or_default();
 
+    // Populate the session metadata slot early. shell_pid stays 0 until the
+    // shell actually spawns; client_name stays empty until the first client
+    // sends its Env. This lets the daemon's Attach handler store an owner
+    // token on sessions that are mid-spawn -- previously the set() happened
+    // after shell spawn, so an Attach that landed during the
+    // wait-for-first-client window saw metadata=None and couldn't persist a
+    // rotated token. (See the `initial_attach_token` doc on server::run.)
+    let created_at = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+    let _ = metadata_slot.set(SessionMetadata {
+        pty_path: pty_path.clone(),
+        shell_pid: AtomicU32::new(0),
+        created_at,
+        attached: AtomicBool::new(false),
+        last_heartbeat: AtomicU64::new(0),
+        client_name: std::sync::Mutex::new(String::new()),
+        wants_agent: AtomicBool::new(false),
+        wants_open: AtomicBool::new(false),
+        attach_token: AtomicU64::new(initial_attach_token),
+    });
+
     // Dup slave fds for shell stdio (before dropping slave)
     let slave_fd = slave.as_raw_fd();
     let stdin_fd = crate::security::checked_dup(slave_fd)?;
@@ -1514,11 +1541,13 @@ pub async fn run(
             ))
         });
 
-    // Wait for first active client before spawning shell (so we can read Env frame).
-    // Tail and send clients that arrive before the first active client get handled
-    // appropriately (tail subscribed to broadcast, send queued for rendezvous).
-    let initial_client_name;
-    let mut framed = loop {
+    // Wait for first active client + its Env frame before spawning the
+    // shell. If the first client disconnects before sending Env we'd
+    // otherwise spawn the shell with empty env permanently; loop back
+    // and wait for the next active client instead. A genuine timeout
+    // (client connected but hasn't sent Env in 2s) falls through with
+    // empty env -- rare in practice.
+    let (mut framed, initial_client_name) = loop {
         tokio::select! {
             client = client_rx.recv() => match client {
                 Some(ClientConn::Active {
@@ -1526,11 +1555,7 @@ pub async fn run(
                 }) => {
                     info!("first client connected via channel");
                     negotiated_caps.store(caps, std::sync::atomic::Ordering::Relaxed);
-                    // Stash client_name so it's available before Env frame.
-                    // The Attach cols/rows are ignored on first-client: session
-                    // creation already sized the PTY via NewSession.
-                    initial_client_name = cn;
-                    break f;
+                    break (f, cn);
                 }
                 Some(ClientConn::Tail(f)) => {
                     info!("tail client connected before shell spawn");
@@ -1555,14 +1580,31 @@ pub async fn run(
         }
     };
 
-    // Read optional Env frame from first client (2s timeout -- generous for slow SSH tunnels)
     let env_vars =
         match tokio::time::timeout(std::time::Duration::from_secs(2), framed.next()).await {
             Ok(Some(Ok(Frame::Env { vars }))) => {
                 debug!(count = vars.len(), "received env vars from client");
                 vars
             }
-            _ => Vec::new(),
+            Ok(None) | Ok(Some(Err(_))) => {
+                // Control-only callers (tests, tooling that creates but
+                // doesn't attach) drop the stream immediately after
+                // SessionCreated; spawning with empty env lets those cases
+                // proceed. A real attached user who disconnected before
+                // sending Env can force the richer env by reattaching.
+                warn!("first client disconnected before sending Env frame; spawning with empty env");
+                Vec::new()
+            }
+            Err(_) => {
+                warn!("first client did not send Env frame within 2s; spawning with empty env");
+                Vec::new()
+            }
+            Ok(Some(Ok(_other))) => {
+                warn!(
+                    "first client sent unexpected frame instead of Env; spawning with empty env"
+                );
+                Vec::new()
+            }
         };
 
     // Spawn shell (or custom command) on slave PTY
@@ -1623,22 +1665,12 @@ pub async fn run(
     });
 
     let shell_pid = managed.child.id().unwrap_or(0);
-    let created_at = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_secs();
-
-    let _ = metadata_slot.set(SessionMetadata {
-        pty_path,
-        shell_pid,
-        created_at,
-        attached: AtomicBool::new(false),
-        last_heartbeat: AtomicU64::new(0),
-        client_name: std::sync::Mutex::new(client_name),
-        wants_agent: AtomicBool::new(false),
-        wants_open: AtomicBool::new(false),
-        attach_token: AtomicU64::new(initial_attach_token),
-    });
+    if let Some(meta) = metadata_slot.get() {
+        meta.shell_pid.store(shell_pid, Ordering::Relaxed);
+        if let Ok(mut slot) = meta.client_name.lock() {
+            *slot = client_name;
+        }
+    }
 
     // First client is already connected — enter relay directly
     metadata_slot.get().unwrap().attached.store(true, Ordering::Relaxed);
