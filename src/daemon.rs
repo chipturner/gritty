@@ -511,6 +511,18 @@ async fn dispatch_control(
                     .await;
                     return false;
                 }
+                if n == "-" {
+                    let _ = timed_send(
+                        &mut framed,
+                        Frame::Error {
+                            code: ErrorCode::InvalidName,
+                            message: "session name must not be '-' (reserved for last-attached)"
+                                .to_string(),
+                        },
+                    )
+                    .await;
+                    return false;
+                }
                 let dup = sessions.values().any(|s| s.name.as_deref() == Some(n));
                 if dup {
                     let _ = timed_send(
@@ -840,6 +852,16 @@ async fn dispatch_control(
                         Frame::Error {
                             code: ErrorCode::InvalidName,
                             message: "session name must not be purely numeric (ambiguous with session IDs)".to_string(),
+                        },
+                    )
+                    .await;
+                } else if new_name == "-" {
+                    let _ = timed_send(
+                        &mut framed,
+                        Frame::Error {
+                            code: ErrorCode::InvalidName,
+                            message: "session name must not be '-' (reserved for last-attached)"
+                                .to_string(),
                         },
                     )
                     .await;
