@@ -1968,7 +1968,7 @@ pub async fn run(
                             }) => {
                                 info!("new client via channel, detaching old client");
                                 relay.negotiated_caps.store(caps, std::sync::atomic::Ordering::Relaxed);
-                                let _ = framed.send(Frame::Detached).await;
+                                let _ = send_framed_timed(&mut framed, Frame::Detached).await;
                                 relay.agent.disable();
                                 relay.tunnel.teardown();
                                 relay.pf.teardown();
