@@ -17,6 +17,16 @@ use tracing::{error, info, warn};
 
 const SEND_TIMEOUT: Duration = Duration::from_secs(5);
 
+/// Mint a fresh owner token. Monotonic counter scoped to the server process:
+/// unique across every attach for this daemon's lifetime. Clients detect server
+/// restarts separately via `server_id` in `HelloAck`, so the counter does not
+/// need to survive a daemon crash. Starts at 1 so 0 is reserved for "unclaimed"
+/// and "no token yet" on the client side.
+fn mint_attach_token() -> u64 {
+    static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+    NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+}
+
 /// Send a frame with a timeout. Returns `Ok(())` on success, `Err` on
 /// send failure or timeout (error is logged before returning).
 async fn timed_send(
@@ -488,6 +498,9 @@ async fn dispatch_control(
             let name_for_server = name_opt.clone();
             let cmd_for_server = command_opt;
             let cwd_for_server = cwd_opt;
+            // Fresh session: mint an owner token that the creator will store
+            // and present on any subsequent reconnect.
+            let owner_token = mint_attach_token();
             let handle = tokio::spawn(async move {
                 server::run(
                     client_rx,
@@ -502,6 +515,7 @@ async fn dispatch_control(
                     cols,
                     rows,
                     cwd_for_server,
+                    owner_token,
                 )
                 .await
             });
@@ -521,6 +535,9 @@ async fn dispatch_control(
             if timed_send(&mut framed, Frame::SessionCreated { id }).await.is_err() {
                 return false;
             }
+            if timed_send(&mut framed, Frame::AttachAck { token: owner_token }).await.is_err() {
+                return false;
+            }
 
             // Hand off connection to session for auto-attach. The session was
             // just created with the requested cols/rows, so no Attach-side
@@ -535,7 +552,15 @@ async fn dispatch_control(
             });
             false
         }
-        Frame::Attach { session, client_name, force, no_replay, cols, rows } => {
+        Frame::Attach {
+            session,
+            client_name,
+            force,
+            no_replay,
+            cols,
+            rows,
+            attach_token: provided_token,
+        } => {
             reap_sessions(sessions);
             if let Some(id) = resolve_session(sessions, &session, *last_attached) {
                 let state = &sessions[&id];
@@ -552,33 +577,77 @@ async fn dispatch_control(
                 } else if no_replay {
                     // Probe only (`connect -d`): confirm existence without
                     // handing off to the session task, so the ring buffer is
-                    // not drained and no attached client is evicted.
+                    // not drained and no attached client is evicted. Probes
+                    // do not claim ownership and get plain `Ok`.
                     let _ = timed_send(&mut framed, Frame::Ok).await;
                 } else {
-                    // Check if session is already attached and force not requested
+                    let current_token = state
+                        .metadata
+                        .get()
+                        .map(|m| m.attach_token.load(Ordering::Relaxed))
+                        .unwrap_or(0);
+                    // Stale owner: client presented a token but it no longer
+                    // matches. Someone else took over while this client was
+                    // disconnected. Terminal.
+                    if provided_token != 0 && provided_token != current_token {
+                        let _ = timed_send(
+                            &mut framed,
+                            Frame::Error {
+                                code: ErrorCode::OwnerChanged,
+                                message: format!(
+                                    "session {session} was taken over by another client"
+                                ),
+                            },
+                        )
+                        .await;
+                        return false;
+                    }
                     let is_attached = state
                         .metadata
                         .get()
                         .map(|m| m.attached.load(Ordering::Relaxed))
                         .unwrap_or(false);
                     if is_attached && !force {
+                        let current = state
+                            .metadata
+                            .get()
+                            .and_then(|m| m.client_name.lock().ok().map(|g| g.clone()))
+                            .unwrap_or_default();
+                        let message = if current.is_empty() {
+                            format!("session {session} is already attached")
+                        } else {
+                            format!("session {session} is already attached by {current}")
+                        };
                         let _ = timed_send(
                             &mut framed,
-                            Frame::Error {
-                                code: ErrorCode::AlreadyAttached,
-                                message: format!("session {session} is already attached"),
-                            },
+                            Frame::Error { code: ErrorCode::AlreadyAttached, message },
                         )
                         .await;
-                    } else if timed_send(&mut framed, Frame::Ok).await.is_ok() {
-                        *last_attached = Some(id);
-                        let _ = state.client_tx.send(ClientConn::Active {
-                            framed,
-                            client_name,
-                            capabilities,
-                            cols,
-                            rows,
-                        });
+                    } else {
+                        // Silent reconnect from the current owner keeps the
+                        // existing token so an in-flight AttachAck loss does
+                        // not poison the client. Every other path rotates.
+                        let new_token = if provided_token != 0 && provided_token == current_token {
+                            provided_token
+                        } else {
+                            mint_attach_token()
+                        };
+                        if let Some(meta) = state.metadata.get() {
+                            meta.attach_token.store(new_token, Ordering::Relaxed);
+                        }
+                        if timed_send(&mut framed, Frame::AttachAck { token: new_token })
+                            .await
+                            .is_ok()
+                        {
+                            *last_attached = Some(id);
+                            let _ = state.client_tx.send(ClientConn::Active {
+                                framed,
+                                client_name,
+                                capabilities,
+                                cols,
+                                rows,
+                            });
+                        }
                     }
                 }
             } else {

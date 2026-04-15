@@ -65,12 +65,13 @@ const TYPE_SESSION_CREATED: u8 = 0x60;
 const TYPE_SESSION_INFO: u8 = 0x61;
 const TYPE_OK: u8 = 0x62;
 const TYPE_ERROR: u8 = 0x63;
+const TYPE_ATTACH_ACK: u8 = 0x64;
 
 const HEADER_LEN: usize = 5; // type(1) + length(4)
 const MAX_FRAME_SIZE: usize = 1 << 20; // 1 MB
 
 /// Protocol version for handshake negotiation.
-pub const PROTOCOL_VERSION: u16 = 13;
+pub const PROTOCOL_VERSION: u16 = 14;
 
 /// Capability bit: client/server supports clipboard forwarding.
 pub const CAP_CLIPBOARD: u32 = 0x01;
@@ -85,6 +86,10 @@ pub enum ErrorCode {
     VersionMismatch,
     UnexpectedFrame,
     AlreadyAttached,
+    /// The attach token presented by the client does not match the current
+    /// owner of the session -- another client took over while this one was
+    /// disconnected. Terminal: the presenting client must exit (do not retry).
+    OwnerChanged,
     Unknown(u16),
 }
 
@@ -98,6 +103,7 @@ impl ErrorCode {
             Self::VersionMismatch => 5,
             Self::UnexpectedFrame => 6,
             Self::AlreadyAttached => 7,
+            Self::OwnerChanged => 8,
             Self::Unknown(v) => v,
         }
     }
@@ -111,6 +117,7 @@ impl ErrorCode {
             5 => Self::VersionMismatch,
             6 => Self::UnexpectedFrame,
             7 => Self::AlreadyAttached,
+            8 => Self::OwnerChanged,
             _ => Self::Unknown(v),
         }
     }
@@ -315,6 +322,12 @@ pub enum Frame {
         /// the right winsize. Zero = unknown (probe-only clients).
         cols: u16,
         rows: u16,
+        /// Owner token from a prior attach, or `0` for a fresh attach. A
+        /// non-zero token that does not match the server's current owner is
+        /// rejected with `ErrorCode::OwnerChanged` -- this is how we tell a
+        /// reconnecting owner apart from a stale client whose session was
+        /// taken over while disconnected.
+        attach_token: u64,
     },
     /// Read-only tail of a session's PTY output (client → server).
     Tail {
@@ -337,6 +350,12 @@ pub enum Frame {
         sessions: Vec<SessionEntry>,
     },
     Ok,
+    /// Response to a successful `Attach` or auto-attach following `NewSession`.
+    /// Carries the owner token the client must present on any subsequent
+    /// reconnect so the server can tell it apart from a stealing client.
+    AttachAck {
+        token: u64,
+    },
     Error {
         code: ErrorCode,
         message: String,
@@ -948,12 +967,34 @@ impl Decoder for FrameCodec {
                 off += 1;
                 let no_replay = p.get(off).copied().unwrap_or(0) != 0;
                 off += 1;
-                // cols/rows appended in protocol v12; default to 0 when absent
-                // so a truncated frame from a buggy client still decodes cleanly.
+                // cols/rows appended in protocol v12, attach_token in v14.
+                // Missing trailing fields default to 0 for forward compat.
                 let cols = if off + 2 <= p.len() { read_u16(p, off) } else { 0 };
                 off += 2;
                 let rows = if off + 2 <= p.len() { read_u16(p, off) } else { 0 };
-                Ok(Some(Frame::Attach { session, client_name, force, no_replay, cols, rows }))
+                off += 2;
+                let attach_token = if off + 8 <= p.len() {
+                    let mut b = [0u8; 8];
+                    b.copy_from_slice(&p[off..off + 8]);
+                    u64::from_be_bytes(b)
+                } else {
+                    0
+                };
+                Ok(Some(Frame::Attach {
+                    session,
+                    client_name,
+                    force,
+                    no_replay,
+                    cols,
+                    rows,
+                    attach_token,
+                }))
+            }
+            TYPE_ATTACH_ACK => {
+                expect_min_len(&payload, 8, "attach_ack")?;
+                let mut b = [0u8; 8];
+                b.copy_from_slice(&payload[0..8]);
+                Ok(Some(Frame::AttachAck { token: u64::from_be_bytes(b) }))
             }
             TYPE_RENAME_SESSION => {
                 if payload.len() < 2 {
@@ -1128,10 +1169,10 @@ impl Encoder<Frame> for FrameCodec {
                 dst.put_u16(cnb.len() as u16);
                 dst.extend_from_slice(cnb);
             }
-            Frame::Attach { session, client_name, force, no_replay, cols, rows } => {
+            Frame::Attach { session, client_name, force, no_replay, cols, rows, attach_token } => {
                 let sb = session.as_bytes();
                 let cnb = client_name.as_bytes();
-                let payload_len = 2 + sb.len() + 2 + cnb.len() + 2 + 4;
+                let payload_len = 2 + sb.len() + 2 + cnb.len() + 2 + 4 + 8;
                 dst.put_u8(TYPE_ATTACH);
                 dst.put_u32(payload_len as u32);
                 dst.put_u16(sb.len() as u16);
@@ -1142,6 +1183,12 @@ impl Encoder<Frame> for FrameCodec {
                 dst.put_u8(if no_replay { 1 } else { 0 });
                 dst.put_u16(cols);
                 dst.put_u16(rows);
+                dst.put_u64(attach_token);
+            }
+            Frame::AttachAck { token } => {
+                dst.put_u8(TYPE_ATTACH_ACK);
+                dst.put_u32(8);
+                dst.put_u64(token);
             }
             Frame::Error { code, message } => {
                 let mb = message.as_bytes();

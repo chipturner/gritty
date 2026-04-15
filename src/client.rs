@@ -248,7 +248,27 @@ fn suspend(raw_guard: &RawModeGuard, nb_guard: &NonBlockGuard) -> anyhow::Result
 }
 
 const SEND_TIMEOUT: Duration = Duration::from_secs(10);
-const RECONNECT_ATTEMPT_TIMEOUT: Duration = Duration::from_secs(5);
+/// Deadline for a single reconnect attempt: UDS connect + handshake + Attach reply.
+/// Sized generously for cellular/high-RTT links where one retransmit can push a
+/// 5s budget over the edge.
+const RECONNECT_ATTEMPT_TIMEOUT: Duration = Duration::from_secs(15);
+
+/// First sleep between reconnect attempts. Doubled on each failure, capped at
+/// `RECONNECT_BACKOFF_MAX`. Resets on successful reconnect.
+const RECONNECT_BACKOFF_INITIAL: Duration = Duration::from_secs(1);
+/// Upper bound on the reconnect retry sleep. Kept modest so a recovered link
+/// reattaches quickly.
+const RECONNECT_BACKOFF_MAX: Duration = Duration::from_secs(10);
+
+/// Compute the next reconnect sleep given the previous one. Pure function so the
+/// schedule is unit-testable.
+fn next_reconnect_delay(prev: Duration) -> Duration {
+    if prev < RECONNECT_BACKOFF_INITIAL {
+        RECONNECT_BACKOFF_INITIAL
+    } else {
+        prev.saturating_mul(2).min(RECONNECT_BACKOFF_MAX)
+    }
+}
 
 struct NonBlockGuard {
     fd: BorrowedFd<'static>,
@@ -411,7 +431,10 @@ const DEFAULT_HEARTBEAT_TIMEOUT: Duration = Duration::from_secs(60);
 /// the host likely slept. Force a liveness probe on resume.
 const SUSPEND_SKEW_THRESHOLD: Duration = Duration::from_secs(5);
 /// Deadline for the post-suspend probe reply before declaring the link dead.
-const SUSPEND_PROBE_DEADLINE: Duration = Duration::from_secs(5);
+/// Must tolerate NAT rebind + DNS recovery + a fresh TCP RTT on cellular, so
+/// this is intentionally generous -- a false disconnect on wake is worse than
+/// a slightly delayed real one (the idle timeout still catches truly dead links).
+const SUSPEND_PROBE_DEADLINE: Duration = Duration::from_secs(15);
 
 /// Events from local agent connection tasks to the relay loop.
 enum AgentEvent {
@@ -1473,6 +1496,7 @@ pub async fn run(
     heartbeat_timeout: u64,
     client_name: String,
     expected_server_id: u64,
+    mut attach_token: u64,
 ) -> anyhow::Result<i32> {
     let stdin = io::stdin();
     let stdin_fd = stdin.as_fd();
@@ -1595,6 +1619,7 @@ pub async fn run(
                 // removed the socket file) and exit instead of looping.
                 let mut socket_missing_since: Option<Instant> = None;
                 const SOCKET_GONE_GRACE: Duration = Duration::from_secs(3);
+                let mut backoff = Duration::ZERO;
                 if show_chrome {
                     write_stdout_async(
                         &async_stdout,
@@ -1604,9 +1629,10 @@ pub async fn run(
                 }
 
                 loop {
+                    backoff = next_reconnect_delay(backoff);
                     // Race sleep against stdin so Ctrl-C is instant
                     tokio::select! {
-                        _ = tokio::time::sleep(Duration::from_secs(1)) => {}
+                        _ = tokio::time::sleep(backoff) => {}
                         _ = sigterm.recv() => {
                             write_stdout_async(&async_stdout, b"\r\n").await?;
                             return Ok(1);
@@ -1659,9 +1685,10 @@ pub async fn run(
                     }
 
                     enum Attempt {
-                        Connected(Framed<UnixStream, FrameCodec>),
+                        Connected(Framed<UnixStream, FrameCodec>, u64),
                         SessionGone(String),
                         ServerRestarted,
+                        OwnerChanged,
                         HandshakeErr(String),
                         Retry,
                     }
@@ -1688,6 +1715,7 @@ pub async fn run(
                                 no_replay: false,
                                 cols,
                                 rows,
+                                attach_token,
                             })
                             .await
                             .is_err()
@@ -1695,9 +1723,14 @@ pub async fn run(
                             return Attempt::Retry;
                         }
                         match new_framed.next().await {
-                            Some(Ok(Frame::Ok)) => Attempt::Connected(new_framed),
+                            Some(Ok(Frame::AttachAck { token })) => {
+                                Attempt::Connected(new_framed, token)
+                            }
                             Some(Ok(Frame::Error { code: ErrorCode::AlreadyAttached, .. })) => {
                                 Attempt::Retry
+                            }
+                            Some(Ok(Frame::Error { code: ErrorCode::OwnerChanged, .. })) => {
+                                Attempt::OwnerChanged
                             }
                             Some(Ok(Frame::Error { message, .. })) => Attempt::SessionGone(message),
                             _ => Attempt::Retry,
@@ -1706,7 +1739,7 @@ pub async fn run(
                     .await;
 
                     match attempt {
-                        Ok(Attempt::Connected(new_framed)) => {
+                        Ok(Attempt::Connected(new_framed, new_token)) => {
                             if show_chrome {
                                 write_stdout_async(
                                     &async_stdout,
@@ -1714,6 +1747,7 @@ pub async fn run(
                                 )
                                 .await?;
                             }
+                            attach_token = new_token;
                             framed = new_framed;
                             break;
                         }
@@ -1732,6 +1766,14 @@ pub async fn run(
                             write_stdout_async(
                                 &async_stdout,
                                 b"\r\x1b[31m\xe2\x96\xb8 server restarted -- session is gone; reconnect manually\x1b[0m\x1b[K\r\n",
+                            )
+                            .await?;
+                            return Ok(1);
+                        }
+                        Ok(Attempt::OwnerChanged) => {
+                            write_stdout_async(
+                                &async_stdout,
+                                b"\r\x1b[31m\xe2\x96\xb8 session taken over by another client\x1b[0m\x1b[K\r\n",
                             )
                             .await?;
                             return Ok(1);
@@ -2163,5 +2205,27 @@ mod tests {
         assert_eq!(ep.state, EscapeState::AfterTilde);
         let a2 = ep.process(b".");
         assert_eq!(a2, vec![EscapeAction::Detach]);
+    }
+
+    #[test]
+    fn reconnect_backoff_starts_at_initial() {
+        assert_eq!(next_reconnect_delay(Duration::ZERO), RECONNECT_BACKOFF_INITIAL);
+    }
+
+    #[test]
+    fn reconnect_backoff_doubles_each_step() {
+        let d = next_reconnect_delay(Duration::from_secs(1));
+        assert_eq!(d, Duration::from_secs(2));
+        let d = next_reconnect_delay(d);
+        assert_eq!(d, Duration::from_secs(4));
+        let d = next_reconnect_delay(d);
+        assert_eq!(d, Duration::from_secs(8));
+    }
+
+    #[test]
+    fn reconnect_backoff_caps_at_max() {
+        assert_eq!(next_reconnect_delay(Duration::from_secs(8)), RECONNECT_BACKOFF_MAX);
+        assert_eq!(next_reconnect_delay(RECONNECT_BACKOFF_MAX), RECONNECT_BACKOFF_MAX);
+        assert_eq!(next_reconnect_delay(Duration::from_secs(300)), RECONNECT_BACKOFF_MAX);
     }
 }

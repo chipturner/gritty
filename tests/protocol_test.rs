@@ -185,6 +185,7 @@ fn roundtrip_attach() {
         no_replay: false,
         cols: 80,
         rows: 24,
+        attach_token: 0,
     };
     codec.encode(original.clone(), &mut buf).unwrap();
     let decoded = codec.decode(&mut buf).unwrap().unwrap();
@@ -202,10 +203,81 @@ fn roundtrip_attach_by_name() {
         no_replay: true,
         cols: 0,
         rows: 0,
+        attach_token: 0,
     };
     codec.encode(original.clone(), &mut buf).unwrap();
     let decoded = codec.decode(&mut buf).unwrap().unwrap();
     assert_eq!(original, decoded);
+}
+
+#[test]
+fn roundtrip_attach_with_token() {
+    let mut codec = FrameCodec;
+    let mut buf = BytesMut::new();
+    let original = Frame::Attach {
+        session: "myproject".to_string(),
+        client_name: "alice".to_string(),
+        force: true,
+        no_replay: false,
+        cols: 120,
+        rows: 40,
+        attach_token: 0xdead_beef_cafe_babe,
+    };
+    codec.encode(original.clone(), &mut buf).unwrap();
+    let decoded = codec.decode(&mut buf).unwrap().unwrap();
+    assert_eq!(original, decoded);
+}
+
+#[test]
+fn roundtrip_attach_ack() {
+    let mut codec = FrameCodec;
+    let mut buf = BytesMut::new();
+    let original = Frame::AttachAck { token: 0x0123_4567_89ab_cdef };
+    codec.encode(original.clone(), &mut buf).unwrap();
+    let decoded = codec.decode(&mut buf).unwrap().unwrap();
+    assert_eq!(original, decoded);
+}
+
+#[test]
+fn roundtrip_error_owner_changed() {
+    let mut codec = FrameCodec;
+    let mut buf = BytesMut::new();
+    let original =
+        Frame::Error { code: ErrorCode::OwnerChanged, message: "taken over".to_string() };
+    codec.encode(original.clone(), &mut buf).unwrap();
+    let decoded = codec.decode(&mut buf).unwrap().unwrap();
+    assert_eq!(original, decoded);
+}
+
+#[test]
+fn legacy_attach_without_token_decodes_as_zero() {
+    // A v13 client sends an Attach frame without the trailing u64. The new
+    // decoder should tolerate the shorter payload and default attach_token to 0.
+    let mut codec = FrameCodec;
+    let mut buf = BytesMut::new();
+    // Manually encode the v13 Attach layout: type + len + (sessLen u16 + "alpha"
+    // + cnLen u16 + "" + force u8 + no_replay u8 + cols u16 + rows u16)
+    let session = b"alpha";
+    let payload_len = 2 + session.len() + 2 + 0 + 1 + 1 + 2 + 2;
+    buf.put_u8(0x51); // TYPE_ATTACH
+    buf.put_u32(payload_len as u32);
+    buf.put_u16(session.len() as u16);
+    buf.put_slice(session);
+    buf.put_u16(0); // client_name
+    buf.put_u8(0); // force
+    buf.put_u8(0); // no_replay
+    buf.put_u16(80); // cols
+    buf.put_u16(24); // rows
+    let decoded = codec.decode(&mut buf).unwrap().unwrap();
+    match decoded {
+        Frame::Attach { attach_token, session, cols, rows, .. } => {
+            assert_eq!(attach_token, 0);
+            assert_eq!(session, "alpha");
+            assert_eq!(cols, 80);
+            assert_eq!(rows, 24);
+        }
+        other => panic!("expected Attach, got {other:?}"),
+    }
 }
 
 #[test]

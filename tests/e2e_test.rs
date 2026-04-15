@@ -57,6 +57,7 @@ async fn setup_session() -> (
             0,
             0,
             None,
+            0,
         )
         .await
     });
@@ -107,6 +108,7 @@ async fn setup_session_with_svc_path() -> (
             0,
             0,
             None,
+            0,
         )
         .await
     });
@@ -157,6 +159,7 @@ async fn setup_session_with_env(
             0,
             0,
             None,
+            0,
         )
         .await
     });
@@ -895,6 +898,7 @@ async fn setup_session_with_agent_path() -> (
             0,
             0,
             None,
+            0,
         )
         .await
     });
@@ -2438,6 +2442,7 @@ async fn reconnect_alt_screen_primes_client_and_discards_ring_buf() {
             0,
             0,
             None,
+            0,
         )
         .await
     });

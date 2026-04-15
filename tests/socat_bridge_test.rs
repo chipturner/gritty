@@ -175,6 +175,7 @@ async fn attach_session(proxy_path: &Path, session: &str) -> Framed<UnixStream, 
             no_replay: false,
             cols: 0,
             rows: 0,
+            attach_token: 0,
         })
         .await
         .unwrap();
@@ -183,7 +184,7 @@ async fn attach_session(proxy_path: &Path, session: &str) -> Framed<UnixStream, 
         .expect("timed out")
         .expect("stream ended")
         .expect("decode error");
-    assert_eq!(resp, Frame::Ok, "expected Ok for attach, got {resp:?}");
+    assert!(matches!(resp, Frame::AttachAck { .. }), "expected AttachAck for attach, got {resp:?}");
     framed
 }
 
@@ -1209,6 +1210,7 @@ async fn attach_nonexistent_session_through_proxy() {
             no_replay: false,
             cols: 0,
             rows: 0,
+            attach_token: 0,
         },
     )
     .await;

@@ -49,16 +49,17 @@ pub(crate) async fn connect_session(
             no_replay: detach,
             cols: attach_cols,
             rows: attach_rows,
+            attach_token: 0,
         })
         .await?;
 
     match Frame::expect_from(framed.next().await)? {
-        Frame::Ok => {
-            // Attached to existing session
-            if detach {
-                eprintln!("\x1b[32m\u{25b8} session {name} exists (not attaching, -d)\x1b[0m");
-                return Ok(());
-            }
+        Frame::Ok if detach => {
+            // Probe succeeded (connect -d): existence confirmed, not attaching.
+            eprintln!("\x1b[32m\u{25b8} session {name} exists (not attaching, -d)\x1b[0m");
+            return Ok(());
+        }
+        Frame::AttachAck { token } => {
             eprintln!("\x1b[32m\u{25b8} attached {name}\x1b[0m");
             let session_id = resolve_session_id(&ctl_path, &name).await?;
             let env_vars = vec![];
@@ -77,6 +78,7 @@ pub(crate) async fn connect_session(
                 settings.heartbeat_timeout,
                 settings.client_name.clone(),
                 server_id,
+                token,
             )
             .await?;
             std::process::exit(code);
@@ -106,16 +108,15 @@ pub(crate) async fn connect_session(
                     no_replay: detach,
                     cols: attach_cols,
                     rows: attach_rows,
+                    attach_token: 0,
                 })
                 .await?;
             match Frame::expect_from(framed.next().await)? {
-                Frame::Ok => {
-                    if detach {
-                        eprintln!(
-                            "\x1b[32m\u{25b8} session {name} exists (not attaching, -d)\x1b[0m"
-                        );
-                        return Ok(());
-                    }
+                Frame::Ok if detach => {
+                    eprintln!("\x1b[32m\u{25b8} session {name} exists (not attaching, -d)\x1b[0m");
+                    return Ok(());
+                }
+                Frame::AttachAck { token } => {
                     eprintln!("\x1b[32m\u{25b8} attached {name}\x1b[0m");
                     let session_id = resolve_session_id(&ctl_path, &name).await?;
                     let env_vars = vec![];
@@ -134,6 +135,7 @@ pub(crate) async fn connect_session(
                         settings.heartbeat_timeout,
                         settings.client_name.clone(),
                         server_id,
+                        token,
                     )
                     .await?;
                     std::process::exit(code);
@@ -174,6 +176,14 @@ pub(crate) async fn connect_session(
         Frame::SessionCreated { id } => {
             eprintln!("\x1b[32m\u{25b8} session {name}\x1b[0m");
 
+            // Daemon emits SessionCreated immediately followed by AttachAck
+            // with the session's owner token. The client stores the token so
+            // reconnects can be distinguished from third-party takeovers.
+            let token = match Frame::expect_from(framed.next().await)? {
+                Frame::AttachAck { token } => token,
+                other => anyhow::bail!("unexpected response from server: {other:?}"),
+            };
+
             // Send Env immediately so the server's 2s deferred-spawn deadline
             // is satisfied before -d returns or alert_detached_sessions runs
             // its own multi-RTT round-trip.
@@ -201,6 +211,7 @@ pub(crate) async fn connect_session(
                 settings.heartbeat_timeout,
                 settings.client_name.clone(),
                 server_id,
+                token,
             )
             .await?;
             std::process::exit(code);

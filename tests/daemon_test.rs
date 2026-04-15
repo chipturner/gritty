@@ -1,6 +1,6 @@
 use bytes::Bytes;
 use futures_util::{SinkExt, StreamExt};
-use gritty::protocol::{Frame, FrameCodec, PROTOCOL_VERSION};
+use gritty::protocol::{ErrorCode, Frame, FrameCodec, PROTOCOL_VERSION};
 use std::time::Duration;
 use tokio::net::UnixStream;
 use tokio::time::timeout;
@@ -95,6 +95,7 @@ async fn attach_session(
             no_replay: false,
             cols: 0,
             rows: 0,
+            attach_token: 0,
         })
         .await
         .unwrap();
@@ -103,7 +104,7 @@ async fn attach_session(
         .expect("timed out")
         .expect("stream ended")
         .expect("decode error");
-    assert_eq!(resp, Frame::Ok, "expected Ok for attach, got {resp:?}");
+    assert!(matches!(resp, Frame::AttachAck { .. }), "expected AttachAck for attach, got {resp:?}");
 
     // Send resize and wait for shell output
     framed.send(Frame::Resize { cols: 80, rows: 24 }).await.unwrap();
@@ -720,6 +721,7 @@ async fn attach_nonexistent_returns_error() {
             no_replay: false,
             cols: 0,
             rows: 0,
+            attach_token: 0,
         },
     )
     .await;
@@ -775,6 +777,7 @@ async fn attach_dead_session_returns_error() {
             no_replay: false,
             cols: 0,
             rows: 0,
+            attach_token: 0,
         },
     )
     .await;
@@ -901,6 +904,7 @@ async fn reconnect_via_daemon_after_disconnect() {
             no_replay: false,
             cols: 0,
             rows: 0,
+            attach_token: 0,
         })
         .await
         .unwrap();
@@ -909,7 +913,10 @@ async fn reconnect_via_daemon_after_disconnect() {
         .expect("timed out")
         .expect("stream ended")
         .expect("decode error");
-    assert_eq!(resp, Frame::Ok, "expected Ok for re-attach, got {resp:?}");
+    assert!(
+        matches!(resp, Frame::AttachAck { .. }),
+        "expected AttachAck for re-attach, got {resp:?}"
+    );
     framed.send(Frame::Resize { cols: 80, rows: 24 }).await.unwrap();
     drain_data(&mut framed, Duration::from_millis(500)).await;
 
@@ -971,6 +978,7 @@ async fn reconnect_after_session_killed_returns_error() {
             no_replay: false,
             cols: 0,
             rows: 0,
+            attach_token: 0,
         },
     )
     .await;
@@ -1190,10 +1198,11 @@ async fn attach_dash_resolves_to_last_session() {
             no_replay: false,
             cols: 0,
             rows: 0,
+            attach_token: 0,
         },
     )
     .await;
-    assert_eq!(resp, Frame::Ok);
+    assert!(matches!(resp, Frame::AttachAck { .. }), "expected AttachAck for attach, got {resp:?}");
     tokio::time::sleep(Duration::from_millis(100)).await;
 
     // Now "-" should resolve to alpha (last explicitly attached)
@@ -1206,13 +1215,236 @@ async fn attach_dash_resolves_to_last_session() {
             no_replay: false,
             cols: 0,
             rows: 0,
+            attach_token: 0,
         },
     )
     .await;
-    assert_eq!(resp, Frame::Ok, "attach - should resolve to last attached session (alpha)");
+    assert!(
+        matches!(resp, Frame::AttachAck { .. }),
+        "attach - should resolve to last attached session (alpha); got {resp:?}"
+    );
 
     kill_cleanup(&ctl_path, &id_a).await;
     kill_cleanup(&ctl_path, &_id_b).await;
+}
+
+/// Set up a fresh daemon + create a session via NewSession and keep the
+/// framed connection alive. Returns the session name, its attach_token, and
+/// the live framed connection (creator is auto-attached on this framed).
+async fn new_session_for_test(
+    ctl_path: &std::path::Path,
+    name: &str,
+    client_name: &str,
+) -> (Framed<UnixStream, FrameCodec>, u64) {
+    let stream = UnixStream::connect(ctl_path).await.unwrap();
+    let mut framed = Framed::new(stream, FrameCodec);
+    do_handshake(&mut framed).await;
+    framed
+        .send(Frame::NewSession {
+            name: name.to_string(),
+            command: String::new(),
+            cwd: String::new(),
+            cols: 0,
+            rows: 0,
+            client_name: client_name.to_string(),
+        })
+        .await
+        .unwrap();
+    match timeout(Duration::from_secs(3), framed.next()).await.unwrap().unwrap().unwrap() {
+        Frame::SessionCreated { .. } => {}
+        other => panic!("expected SessionCreated, got {other:?}"),
+    }
+    let token =
+        match timeout(Duration::from_secs(3), framed.next()).await.unwrap().unwrap().unwrap() {
+            Frame::AttachAck { token } => token,
+            other => panic!("expected AttachAck, got {other:?}"),
+        };
+    framed
+        .send(Frame::Env { vars: vec![("TERM".to_string(), "xterm".to_string())] })
+        .await
+        .unwrap();
+    drain_data(&mut framed, Duration::from_millis(500)).await;
+    (framed, token)
+}
+
+#[tokio::test]
+async fn new_session_returns_nonzero_attach_token() {
+    let (_tmp, ctl_path) = test_ctl();
+    let ctl = ctl_path.clone();
+    let _daemon = tokio::spawn(async move { gritty::daemon::run(&ctl, None).await });
+    wait_for_daemon(&ctl_path).await;
+
+    let (framed_a, token_a) = new_session_for_test(&ctl_path, "alpha", "laptop-a").await;
+    assert_ne!(token_a, 0, "daemon should mint a non-zero token for new sessions");
+
+    drop(framed_a);
+    kill_cleanup(&ctl_path, "alpha").await;
+}
+
+#[tokio::test]
+async fn stale_attach_token_rejected_with_owner_changed() {
+    // Setup: A creates session and has token_a. B force-takes-over. Server
+    // rotates to token_b. A's reconnect with token_a must be rejected with
+    // OwnerChanged (not a silent steal-back).
+    let (_tmp, ctl_path) = test_ctl();
+    let ctl = ctl_path.clone();
+    let _daemon = tokio::spawn(async move { gritty::daemon::run(&ctl, None).await });
+    wait_for_daemon(&ctl_path).await;
+
+    let (framed_a, token_a) = new_session_for_test(&ctl_path, "alpha", "laptop-a").await;
+    assert_ne!(token_a, 0);
+
+    // B forcefully takes over with no prior token.
+    let resp = control_request(
+        &ctl_path,
+        Frame::Attach {
+            session: "alpha".to_string(),
+            client_name: "laptop-b".to_string(),
+            force: true,
+            no_replay: false,
+            cols: 0,
+            rows: 0,
+            attach_token: 0,
+        },
+    )
+    .await;
+    let token_b = match resp {
+        Frame::AttachAck { token } => token,
+        other => panic!("expected AttachAck for force takeover, got {other:?}"),
+    };
+    assert_ne!(token_b, token_a, "takeover must rotate the owner token");
+
+    // A's stale reconnect: presents token_a, but the server now owns token_b.
+    // Must reject with OwnerChanged, regardless of force=true.
+    let resp = control_request(
+        &ctl_path,
+        Frame::Attach {
+            session: "alpha".to_string(),
+            client_name: "laptop-a".to_string(),
+            force: true,
+            no_replay: false,
+            cols: 0,
+            rows: 0,
+            attach_token: token_a,
+        },
+    )
+    .await;
+    match resp {
+        Frame::Error { code: ErrorCode::OwnerChanged, .. } => {}
+        other => panic!("expected OwnerChanged for stale reconnect, got {other:?}"),
+    }
+
+    drop(framed_a);
+    kill_cleanup(&ctl_path, "alpha").await;
+}
+
+#[tokio::test]
+async fn matching_attach_token_is_silent_reconnect() {
+    // Setup: A creates session with token_a. Immediately "reconnect" with
+    // force=true + token_a while the session is still attached. Server must
+    // accept (silent reconnect semantics) and return the SAME token so an
+    // in-flight AttachAck loss doesn't poison the client.
+    let (_tmp, ctl_path) = test_ctl();
+    let ctl = ctl_path.clone();
+    let _daemon = tokio::spawn(async move { gritty::daemon::run(&ctl, None).await });
+    wait_for_daemon(&ctl_path).await;
+
+    let (framed_a, token_a) = new_session_for_test(&ctl_path, "alpha", "laptop-a").await;
+    drop(framed_a); // simulate the old connection dying (detached)
+
+    // Give the reaper a beat.
+    tokio::time::sleep(Duration::from_millis(100)).await;
+
+    let resp = control_request(
+        &ctl_path,
+        Frame::Attach {
+            session: "alpha".to_string(),
+            client_name: "laptop-a".to_string(),
+            force: true,
+            no_replay: false,
+            cols: 0,
+            rows: 0,
+            attach_token: token_a,
+        },
+    )
+    .await;
+    match resp {
+        Frame::AttachAck { token } => {
+            assert_eq!(token, token_a, "silent reconnect must return the same token");
+        }
+        other => panic!("expected AttachAck for silent reconnect, got {other:?}"),
+    }
+
+    kill_cleanup(&ctl_path, "alpha").await;
+}
+
+#[tokio::test]
+async fn already_attached_error_names_current_client() {
+    let (_tmp, ctl_path) = test_ctl();
+
+    let ctl = ctl_path.clone();
+    let _daemon = tokio::spawn(async move { gritty::daemon::run(&ctl, None).await });
+    wait_for_daemon(&ctl_path).await;
+
+    // Create a session as "laptop-a" and keep the framed connection alive so
+    // the session stays attached for the duration of the test.
+    let stream = UnixStream::connect(&ctl_path).await.unwrap();
+    let mut framed_a = Framed::new(stream, FrameCodec);
+    do_handshake(&mut framed_a).await;
+    framed_a
+        .send(Frame::NewSession {
+            name: "alpha".to_string(),
+            command: String::new(),
+            cwd: String::new(),
+            cols: 0,
+            rows: 0,
+            client_name: "laptop-a".to_string(),
+        })
+        .await
+        .unwrap();
+    let resp = timeout(Duration::from_secs(3), framed_a.next())
+        .await
+        .expect("timed out")
+        .expect("stream ended")
+        .expect("decode error");
+    let id = match resp {
+        Frame::SessionCreated { id } => id.to_string(),
+        other => panic!("expected SessionCreated, got {other:?}"),
+    };
+    // Send an Env frame so the shell spawns and the session is fully attached.
+    framed_a
+        .send(Frame::Env { vars: vec![("TERM".to_string(), "xterm".to_string())] })
+        .await
+        .unwrap();
+    drain_data(&mut framed_a, Duration::from_millis(500)).await;
+
+    // Second laptop tries to attach without force -- should get AlreadyAttached
+    // with a message naming "laptop-a".
+    let resp = control_request(
+        &ctl_path,
+        Frame::Attach {
+            session: "alpha".to_string(),
+            client_name: "laptop-b".to_string(),
+            force: false,
+            no_replay: false,
+            cols: 0,
+            rows: 0,
+            attach_token: 0,
+        },
+    )
+    .await;
+    match resp {
+        Frame::Error { code: ErrorCode::AlreadyAttached, message } => {
+            assert!(
+                message.contains("laptop-a"),
+                "expected error message to name current attacher 'laptop-a', got: {message}"
+            );
+        }
+        other => panic!("expected AlreadyAttached error, got {other:?}"),
+    }
+
+    drop(framed_a);
+    kill_cleanup(&ctl_path, &id).await;
 }
 
 #[tokio::test]
@@ -1233,6 +1465,7 @@ async fn attach_dash_no_previous_session() {
             no_replay: false,
             cols: 0,
             rows: 0,
+            attach_token: 0,
         },
     )
     .await;

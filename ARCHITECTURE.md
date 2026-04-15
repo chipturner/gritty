@@ -54,16 +54,18 @@ sequenceDiagram
     C--xT: connect (tunnel down)
     Note over T: Monitor detects exit,<br/>respawns SSH
     C->>T: connect (tunnel back)
-    C->>S: Attach (cols, rows)
-    Note over S: Apply winsize +<br/>SIGWINCH (toggle if alt-screen)
-    S->>C: Ok
+    C->>S: Attach (cols, rows, attach_token)
+    Note over S: Validate token<br/>Apply winsize +<br/>SIGWINCH (toggle if alt-screen)
+    S->>C: AttachAck (token)
     end
 
     Note over C: [reconnected]
     Note over S: Replay scrollback<br/>+ partial line,<br/>then buffer drains
 ```
 
-The client pings every 5 seconds; no pong within 15 seconds means dead connection. The client enters a reconnect loop (retry every 1s, Ctrl-C to abort). Meanwhile, the tunnel monitor detects the SSH process exit and respawns it. The client reconnects through the restored tunnel transparently.
+The client probes for liveness on idle and declares the link dead after 60s with no server frame. It then enters a reconnect loop with exponential backoff (1s..10s, Ctrl-C to abort) and a per-attempt handshake+Attach budget of 15s -- generous enough to absorb cellular RTT plus a retransmit. Meanwhile the tunnel monitor detects the SSH process exit and respawns it. The client reconnects through the restored tunnel transparently.
+
+Each `Attach` carries an `attach_token` that the daemon minted on the previous successful attach. A stale token -- which happens when another client legitimately took over the session while this one was disconnected -- is rejected with `OwnerChanged`, and the client exits rather than silently stealing the session back. A matching token is a silent reconnect and returns the same token so an in-flight `AttachAck` loss can't poison future reconnects.
 
 ## Agent & URL Forwarding
 
