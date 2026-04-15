@@ -352,6 +352,7 @@ async fn tunnel_monitor(
     local_sock: PathBuf,
     remote_sock: String,
     extra_ssh_opts: Vec<String>,
+    foreground: bool,
     isolate_control_path: bool,
     connect_timeout: u64,
     stop: tokio_util::sync::CancellationToken,
@@ -410,7 +411,7 @@ async fn tunnel_monitor(
 
                 backoff = (backoff * 2).min(MAX_BACKOFF);
 
-                match spawn_tunnel(&dest, &local_sock, &remote_sock, &extra_ssh_opts, false, isolate_control_path, connect_timeout).await {
+                match spawn_tunnel(&dest, &local_sock, &remote_sock, &extra_ssh_opts, foreground, isolate_control_path, connect_timeout).await {
                     Ok(new_child) => {
                         info!("ssh tunnel respawned");
                         child = new_child;
@@ -933,6 +934,7 @@ pub async fn run(opts: ConnectOpts, ready_fd: Option<OwnedFd>) -> anyhow::Result
         local_sock.clone(),
         remote_sock,
         opts.ssh_options,
+        opts.foreground,
         opts.isolate_control_path,
         opts.connect_timeout,
         stop.clone(),
@@ -1508,6 +1510,7 @@ mod tests {
                 "/tmp/remote.sock".into(),
                 vec![],
                 false,
+                false,
                 30,
                 stop,
             ),
@@ -1537,6 +1540,7 @@ mod tests {
                 PathBuf::from("/tmp/nonexistent.sock"),
                 "/tmp/remote.sock".into(),
                 vec![],
+                false,
                 false,
                 30,
                 stop,
@@ -1569,6 +1573,7 @@ mod tests {
                 PathBuf::from("/tmp/nonexistent.sock"),
                 "/tmp/remote.sock".into(),
                 vec![],
+                false,
                 false,
                 30,
                 stop,
