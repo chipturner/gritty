@@ -654,6 +654,25 @@ async fn dispatch_control(
                         )
                         .await;
                     } else {
+                        // If the session was just created but server::run
+                        // hasn't yet populated `metadata` (shell still
+                        // spawning), we can't persist a new owner token. A
+                        // concurrent Attach on a not-yet-ready session would
+                        // otherwise mint a token, send it in AttachAck, and
+                        // silently skip the store -- the client records it,
+                        // reconnects later, and gets OwnerChanged because the
+                        // server still holds the initial creator's token.
+                        let Some(meta) = state.metadata.get() else {
+                            let _ = timed_send(
+                                &mut framed,
+                                Frame::Error {
+                                    code: ErrorCode::NoSuchSession,
+                                    message: format!("session {session} is still initializing"),
+                                },
+                            )
+                            .await;
+                            return false;
+                        };
                         // Silent reconnect from the current owner keeps the
                         // existing token so an in-flight AttachAck loss does
                         // not poison the client. Every other path rotates.
@@ -662,9 +681,7 @@ async fn dispatch_control(
                         } else {
                             mint_attach_token()
                         };
-                        if let Some(meta) = state.metadata.get() {
-                            meta.attach_token.store(new_token, Ordering::Relaxed);
-                        }
+                        meta.attach_token.store(new_token, Ordering::Relaxed);
                         if timed_send(&mut framed, Frame::AttachAck { token: new_token })
                             .await
                             .is_ok()
