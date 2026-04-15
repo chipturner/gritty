@@ -480,6 +480,10 @@ async fn dispatch_control(
 ) -> bool {
     match frame {
         Frame::NewSession { name, command, cwd, cols, rows, client_name } => {
+            // Reap before checking for duplicate names -- a session that
+            // just exited still lives in `sessions` until the next reap,
+            // and would otherwise trigger a spurious NameAlreadyExists.
+            reap_sessions(sessions);
             // Reject names containing control characters
             let name_opt = if name.is_empty() { None } else { Some(name) };
             let command_opt = if command.is_empty() { None } else { Some(command) };
