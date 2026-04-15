@@ -1695,7 +1695,13 @@ pub async fn run(
                             Ok(Ok(n)) => {
                                 let chunk = Bytes::copy_from_slice(&buf[..n]);
                                 alt_screen.scan(&chunk);
-                                scrollback.push(&chunk);
+                                // Do NOT push to `scrollback` while detached:
+                                // detached bytes are captured in `ring_buf`
+                                // and replayed verbatim on reconnect, while
+                                // `scrollback` holds pre-detach lines (last
+                                // prompt etc.) that we prepend to the flush.
+                                // Pushing to both duplicates every chunk on
+                                // main-screen reconnect.
                                 if tail_tx.receiver_count() > 0 {
                                     let _ = tail_tx.send(TailEvent::Data(chunk.clone()));
                                 }
