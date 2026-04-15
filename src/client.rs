@@ -1691,9 +1691,14 @@ pub async fn run(
                     if !ctl_path.exists() && !tunnel_supervisor_alive {
                         let first_seen = *socket_missing_since.get_or_insert_with(Instant::now);
                         if first_seen.elapsed() >= SOCKET_GONE_GRACE {
+                            // `\x1b[?1049l` leaves alt-screen first so the
+                            // error is visible on main screen -- otherwise
+                            // RawModeGuard's Drop emits it after the fact
+                            // and clobbers the message. No-op on main
+                            // screen.
                             write_stdout_async(
                                 &async_stdout,
-                                b"\r\x1b[31m\xe2\x96\xb8 server socket gone -- session is unreachable; reconnect manually\x1b[0m\x1b[K\r\n",
+                                b"\x1b[?1049l\r\x1b[31m\xe2\x96\xb8 server socket gone -- session is unreachable; reconnect manually\x1b[0m\x1b[K\r\n",
                             )
                             .await?;
                             return Ok(1);
@@ -1783,7 +1788,7 @@ pub async fn run(
                             write_stdout_async(
                                 &async_stdout,
                                 format!(
-                                    "\r\x1b[31m\u{25b8} session gone: {message}\x1b[0m\x1b[K\r\n"
+                                    "\x1b[?1049l\r\x1b[31m\u{25b8} session gone: {message}\x1b[0m\x1b[K\r\n"
                                 )
                                 .as_bytes(),
                             )
@@ -1793,7 +1798,7 @@ pub async fn run(
                         Ok(Attempt::ServerRestarted) => {
                             write_stdout_async(
                                 &async_stdout,
-                                b"\r\x1b[31m\xe2\x96\xb8 server restarted -- session is gone; reconnect manually\x1b[0m\x1b[K\r\n",
+                                b"\x1b[?1049l\r\x1b[31m\xe2\x96\xb8 server restarted -- session is gone; reconnect manually\x1b[0m\x1b[K\r\n",
                             )
                             .await?;
                             return Ok(1);
@@ -1801,7 +1806,7 @@ pub async fn run(
                         Ok(Attempt::OwnerChanged) => {
                             write_stdout_async(
                                 &async_stdout,
-                                b"\r\x1b[31m\xe2\x96\xb8 session taken over by another client\x1b[0m\x1b[K\r\n",
+                                b"\x1b[?1049l\r\x1b[31m\xe2\x96\xb8 session taken over by another client\x1b[0m\x1b[K\r\n",
                             )
                             .await?;
                             return Ok(1);
@@ -1809,7 +1814,7 @@ pub async fn run(
                         Ok(Attempt::VersionMismatch { server_version }) => {
                             let local = crate::protocol::PROTOCOL_VERSION;
                             let msg = format!(
-                                "\r\x1b[31m\u{25b8} protocol version mismatch (local={local} remote={server_version}) -- run `gritty restart` to upgrade\x1b[0m\x1b[K\r\n"
+                                "\x1b[?1049l\r\x1b[31m\u{25b8} protocol version mismatch (local={local} remote={server_version}) -- run `gritty restart` to upgrade\x1b[0m\x1b[K\r\n"
                             );
                             write_stdout_async(&async_stdout, msg.as_bytes()).await?;
                             return Ok(1);
@@ -1817,7 +1822,8 @@ pub async fn run(
                         Ok(Attempt::HandshakeErr(msg)) => {
                             write_stdout_async(
                                 &async_stdout,
-                                format!("\r\x1b[31m\u{25b8} {msg}\x1b[0m\x1b[K\r\n").as_bytes(),
+                                format!("\x1b[?1049l\r\x1b[31m\u{25b8} {msg}\x1b[0m\x1b[K\r\n")
+                                    .as_bytes(),
                             )
                             .await?;
                             // A server-side rejection (version mismatch etc.) is permanent.
