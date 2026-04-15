@@ -1917,49 +1917,6 @@ pub async fn run(
                         drain_pending_input(ready?, relay.pending_input, relay.pending_input_bytes)?;
                     }
 
-                    ready = relay.async_master.readable() => {
-                        let mut guard = ready?;
-                        match guard.try_io(|inner| {
-                            nix::unistd::read(inner, &mut buf).map_err(io::Error::from)
-                        }) {
-                            Ok(Ok(0)) => {
-                                debug!("pty EOF");
-                                break RelayExit::ShellExited(0);
-                            }
-                            Ok(Ok(n)) => {
-                                debug!(len = n, "pty -> socket");
-                                let chunk = Bytes::copy_from_slice(&buf[..n]);
-                                alt_screen.scan(&chunk);
-                                scrollback.push(&chunk);
-                                if relay.tail_tx.receiver_count() > 0 {
-                                    let _ = relay.tail_tx.send(TailEvent::Data(chunk.clone()));
-                                }
-                                match tokio::time::timeout(
-                                    CLIENT_SEND_TIMEOUT,
-                                    framed.send(Frame::Data(chunk)),
-                                ).await {
-                                    Ok(Ok(())) => {}
-                                    Ok(Err(e)) => {
-                                        warn!(error = %e, "client send failed, detaching");
-                                        break RelayExit::ClientGone;
-                                    }
-                                    Err(_) => {
-                                        warn!("client send timed out, detaching");
-                                        break RelayExit::ClientGone;
-                                    }
-                                }
-                            }
-                            Ok(Err(e)) => {
-                                if e.raw_os_error() == Some(libc::EIO) {
-                                    debug!("pty EIO (shell exited)");
-                                    break RelayExit::ShellExited(0);
-                                }
-                                return Err(e.into());
-                            }
-                            Err(_would_block) => continue,
-                        }
-                    }
-
                     new_client = client_rx.recv() => {
                         match new_client {
                             Some(ClientConn::Active {
@@ -2127,6 +2084,54 @@ pub async fn run(
                         relay.paste_deadline = None;
                         if let Some(reply) = relay.pending_paste.take() {
                             let _ = reply.send(None);
+                        }
+                    }
+
+                    // PTY-readable last: under sustained output every other
+                    // arm (takeover, agent/pf/tunnel/open/send/clipboard
+                    // events, paste/tunnel deadlines, pending-input drain) has
+                    // had a chance to fire. Biased select before this change
+                    // polled readable() third and starved the rest.
+                    ready = relay.async_master.readable() => {
+                        let mut guard = ready?;
+                        match guard.try_io(|inner| {
+                            nix::unistd::read(inner, &mut buf).map_err(io::Error::from)
+                        }) {
+                            Ok(Ok(0)) => {
+                                debug!("pty EOF");
+                                break RelayExit::ShellExited(0);
+                            }
+                            Ok(Ok(n)) => {
+                                debug!(len = n, "pty -> socket");
+                                let chunk = Bytes::copy_from_slice(&buf[..n]);
+                                alt_screen.scan(&chunk);
+                                scrollback.push(&chunk);
+                                if relay.tail_tx.receiver_count() > 0 {
+                                    let _ = relay.tail_tx.send(TailEvent::Data(chunk.clone()));
+                                }
+                                match tokio::time::timeout(
+                                    CLIENT_SEND_TIMEOUT,
+                                    framed.send(Frame::Data(chunk)),
+                                ).await {
+                                    Ok(Ok(())) => {}
+                                    Ok(Err(e)) => {
+                                        warn!(error = %e, "client send failed, detaching");
+                                        break RelayExit::ClientGone;
+                                    }
+                                    Err(_) => {
+                                        warn!("client send timed out, detaching");
+                                        break RelayExit::ClientGone;
+                                    }
+                                }
+                            }
+                            Ok(Err(e)) => {
+                                if e.raw_os_error() == Some(libc::EIO) {
+                                    debug!("pty EIO (shell exited)");
+                                    break RelayExit::ShellExited(0);
+                                }
+                                return Err(e.into());
+                            }
+                            Err(_would_block) => continue,
                         }
                     }
 
