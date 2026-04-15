@@ -1713,7 +1713,12 @@ pub async fn run(
                         let (cols, rows) = get_terminal_size();
                         if new_framed
                             .send(Frame::Attach {
-                                session: session.to_string(),
+                                // Reconnect by numeric id, not the original
+                                // target string. The user may have passed `-`
+                                // or a name that since resolved to a
+                                // different session; the id the daemon
+                                // handed us at attach time is stable.
+                                session: session_id.to_string(),
                                 client_name: client_name.clone(),
                                 force: true,
                                 no_replay: false,
