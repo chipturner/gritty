@@ -778,6 +778,13 @@ pub async fn run(opts: ConnectOpts, ready_fd: Option<OwnedFd>) -> anyhow::Result
             // We got the lock -- any leftover files are stale (process died).
             debug!("cleaning stale tunnel files for {connection_name}");
             cleanup_stale_files(&connection_name, false);
+            // Write PID immediately so `tunnel-destroy` can find us even
+            // during the startup window (ensure_remote_ready + spawn_tunnel
+            // + wait_for_socket can take tens of seconds on WAN links).
+            // Previously the PID was written only after the socket came up;
+            // disconnect saw lock-held-but-no-PID and failed with
+            // "cannot read PID".
+            let _ = std::fs::write(&pid_file, std::process::id().to_string());
             lock
         }
         Err(_) => {
@@ -891,8 +898,8 @@ pub async fn run(opts: ConnectOpts, ready_fd: Option<OwnedFd>) -> anyhow::Result
     }
     debug!("tunnel socket ready");
 
-    // Write PID + dest files
-    let _ = std::fs::write(&pid_file, std::process::id().to_string());
+    // PID is already written (right after we got the lock, above). Record
+    // the original destination so `restart` / auto-start can recover it.
     let _ = std::fs::write(&dest_file, &opts.destination);
 
     // 7. Signal readiness to parent (or print if foreground)
