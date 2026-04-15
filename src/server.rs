@@ -1357,8 +1357,14 @@ async fn force_tui_redraw(
     cols: u16,
     rows: u16,
 ) -> anyhow::Result<()> {
-    let nudge_rows = rows.saturating_sub(1).max(1);
-    apply_winsize(master, cols, nudge_rows);
+    // Toggle rows by default (rows-1 then rows). For rows <= 1 the toggle
+    // clamps to 1 == original, so TUIs see no change-of-size event and
+    // skip the repaint. Fall back to toggling cols in that degenerate
+    // case so there's always a real intermediate size.
+    let toggle_cols = rows <= 1 && cols >= 2;
+    let nudge_cols = if toggle_cols { cols.saturating_sub(1).max(1) } else { cols };
+    let nudge_rows = if toggle_cols { rows } else { rows.saturating_sub(1).max(1) };
+    apply_winsize(master, nudge_cols, nudge_rows);
 
     // Must restore original (cols, rows) before returning, even on a send
     // failure -- otherwise the PTY stays at the intermediate nudge size.
