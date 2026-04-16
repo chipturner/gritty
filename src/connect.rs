@@ -414,10 +414,15 @@ async fn tunnel_monitor(
                 debug!("ssh tunnel exited: {:?}", code);
 
                 // Non-transient failure: don't retry
-                // SSH exit 255 = connection error (transient). Signal-killed = no code.
-                // Everything else (auth failure, config error) = bail.
+                // SSH exit 255 = connection error (transient). Local signal-
+                // killed ssh = no code. REMOTE-side signal death (remote
+                // rebooted, OOM, SIGTERM during shutdown) surfaces as
+                // `128 + signum` -- 129..=159 in practice -- and these are
+                // transient too. Only bail on codes that are genuinely
+                // auth/config problems.
                 if let Some(c) = code
                     && c != 255
+                    && !(128..=159).contains(&c)
                 {
                     warn!("ssh tunnel exited with code {c} (not retrying)");
                     return;
