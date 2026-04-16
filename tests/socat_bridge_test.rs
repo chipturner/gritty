@@ -111,7 +111,10 @@ fn wait_for_socket(path: &Path, timeout_secs: u64) {
 }
 
 async fn do_handshake(framed: &mut Framed<UnixStream, FrameCodec>) {
-    framed.send(Frame::Hello { version: PROTOCOL_VERSION, capabilities: 0 }).await.unwrap();
+    framed
+        .send(Frame::Hello { version: PROTOCOL_VERSION, capabilities: 0, device_id: 1 })
+        .await
+        .unwrap();
     let resp = timeout(Duration::from_secs(5), framed.next())
         .await
         .expect("handshake timed out")

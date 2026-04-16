@@ -85,8 +85,9 @@ fn arb_frame() -> impl Strategy<Value = Frame> {
         // Fixed-field frames
         (any::<u16>(), any::<u16>()).prop_map(|(cols, rows)| Frame::Resize { cols, rows }),
         any::<i32>().prop_map(|code| Frame::Exit { code }),
-        (any::<u16>(), any::<u32>())
-            .prop_map(|(version, capabilities)| Frame::Hello { version, capabilities }),
+        (any::<u16>(), any::<u32>(), any::<u64>()).prop_map(
+            |(version, capabilities, device_id)| Frame::Hello { version, capabilities, device_id }
+        ),
         (any::<u16>(), any::<u32>(), any::<u64>()).prop_map(
             |(version, capabilities, server_id)| Frame::HelloAck {
                 version,

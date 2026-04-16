@@ -166,7 +166,10 @@ async fn tunnel_death_session_persists() {
     // Create a session via protocol through the proxy
     let stream = UnixStream::connect(&proxy_sock).await.unwrap();
     let mut framed = Framed::new(stream, FrameCodec);
-    framed.send(Frame::Hello { version: PROTOCOL_VERSION, capabilities: 0 }).await.unwrap();
+    framed
+        .send(Frame::Hello { version: PROTOCOL_VERSION, capabilities: 0, device_id: 1 })
+        .await
+        .unwrap();
     let ack = timeout(Duration::from_secs(5), framed.next())
         .await
         .expect("timed out")
@@ -214,7 +217,10 @@ async fn tunnel_death_session_persists() {
     // List sessions -- our session should still be there
     let stream = UnixStream::connect(&proxy_sock).await.unwrap();
     let mut framed = Framed::new(stream, FrameCodec);
-    framed.send(Frame::Hello { version: PROTOCOL_VERSION, capabilities: 0 }).await.unwrap();
+    framed
+        .send(Frame::Hello { version: PROTOCOL_VERSION, capabilities: 0, device_id: 1 })
+        .await
+        .unwrap();
     let ack = timeout(Duration::from_secs(5), framed.next())
         .await
         .expect("timed out")

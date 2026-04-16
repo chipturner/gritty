@@ -835,10 +835,10 @@ fn roundtrip_tail_by_id() {
 fn roundtrip_hello() {
     let mut codec = FrameCodec;
     let mut buf = BytesMut::new();
-    let original = Frame::Hello { version: PROTOCOL_VERSION, capabilities: 0 };
+    let original = Frame::Hello { version: PROTOCOL_VERSION, capabilities: 0, device_id: 42 };
     codec.encode(original.clone(), &mut buf).unwrap();
-    // type(1) + len(4) + version(2) + capabilities(4) = 11
-    assert_eq!(buf.len(), 11);
+    // type(1) + len(4) + version(2) + capabilities(4) + device_id(8) = 19
+    assert_eq!(buf.len(), 19);
     assert_eq!(buf[0], 0x01);
     let decoded = codec.decode(&mut buf).unwrap().unwrap();
     assert_eq!(original, decoded);
@@ -1229,12 +1229,12 @@ fn resize_tolerates_trailing_bytes() {
 fn hello_tolerates_trailing_bytes() {
     let mut codec = FrameCodec;
     let mut buf = BytesMut::new();
-    codec.encode(Frame::Hello { version: 9, capabilities: 1 }, &mut buf).unwrap();
+    codec.encode(Frame::Hello { version: 9, capabilities: 1, device_id: 0x42 }, &mut buf).unwrap();
     let old_len = u32::from_be_bytes([buf[1], buf[2], buf[3], buf[4]]);
     buf[1..5].copy_from_slice(&(old_len + 4).to_be_bytes());
     buf.extend_from_slice(&[0x00, 0x00, 0x00, 0x42]);
     let decoded = codec.decode(&mut buf).unwrap().unwrap();
-    assert_eq!(decoded, Frame::Hello { version: 9, capabilities: 1 });
+    assert_eq!(decoded, Frame::Hello { version: 9, capabilities: 1, device_id: 0x42 });
 }
 
 #[test]

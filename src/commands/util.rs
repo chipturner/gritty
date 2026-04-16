@@ -43,7 +43,7 @@ pub(crate) async fn server_request(
         anyhow::anyhow!("no server running (could not connect to {})", ctl_path.display())
     })?;
     let mut framed = Framed::new(stream, FrameCodec);
-    let info = gritty::handshake(&mut framed).await?;
+    let info = gritty::handshake(&mut framed, gritty::get_or_create_device_id()).await?;
     gritty::require_matched_version(&info)?;
     framed.send(frame).await?;
     Frame::expect_from(framed.next().await)
@@ -64,7 +64,7 @@ pub(crate) async fn server_request_any_version(
         anyhow::anyhow!("no server running (could not connect to {})", ctl_path.display())
     })?;
     let mut framed = Framed::new(stream, FrameCodec);
-    let _ = gritty::handshake(&mut framed).await?;
+    let _ = gritty::handshake(&mut framed, gritty::get_or_create_device_id()).await?;
     framed.send(frame).await?;
     Frame::expect_from(framed.next().await)
 }

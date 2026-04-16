@@ -36,12 +36,14 @@ pub struct HandshakeInfo {
 /// version unconditionally lets recovery commands act across the mismatch.
 pub async fn handshake(
     framed: &mut tokio_util::codec::Framed<tokio::net::UnixStream, protocol::FrameCodec>,
+    device_id: u64,
 ) -> anyhow::Result<HandshakeInfo> {
     use futures_util::{SinkExt, StreamExt};
     framed
         .send(protocol::Frame::Hello {
             version: protocol::PROTOCOL_VERSION,
             capabilities: protocol::CAP_CLIPBOARD,
+            device_id,
         })
         .await?;
     let reply = tokio::time::timeout(std::time::Duration::from_secs(5), framed.next())
@@ -74,6 +76,54 @@ pub fn require_matched_version(info: &HandshakeInfo) -> anyhow::Result<()> {
         );
     }
     Ok(())
+}
+
+/// Return a persistent per-machine device identifier, creating one on first use.
+///
+/// Stored in `$XDG_STATE_HOME/gritty/device_id` (typically `~/.local/state/gritty/device_id`).
+/// The value is a random non-zero `u64` generated via `getrandom`.
+pub fn get_or_create_device_id() -> u64 {
+    use std::path::PathBuf;
+
+    fn state_dir() -> PathBuf {
+        if let Some(proj) = directories::ProjectDirs::from("", "", "gritty")
+            && let Some(state) = proj.state_dir()
+        {
+            return state.to_path_buf();
+        }
+        // Fallback (non-XDG systems)
+        let home = std::env::var("HOME").unwrap_or_else(|_| ".".into());
+        PathBuf::from(home).join(".local/state/gritty")
+    }
+
+    let path = state_dir().join("device_id");
+
+    // Try reading an existing ID first.
+    if let Ok(contents) = std::fs::read_to_string(&path)
+        && let Ok(id) = contents.trim().parse::<u64>()
+        && id != 0
+    {
+        return id;
+    }
+
+    // Generate a new random ID (non-zero).
+    let mut buf = [0u8; 8];
+    getrandom::fill(&mut buf).expect("getrandom failed");
+    let id = u64::from_ne_bytes(buf) | 1;
+
+    // Persist -- best-effort; failure is non-fatal (we'll regenerate next time).
+    if let Some(dir) = path.parent() {
+        let _ = security::secure_create_dir_all(dir);
+    }
+    if std::fs::write(&path, format!("{id}\n")).is_ok() {
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let _ = std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600));
+        }
+    }
+
+    id
 }
 
 /// Collect TERM/LANG/COLORTERM from the environment for forwarding to remote sessions.

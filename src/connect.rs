@@ -727,7 +727,10 @@ async fn probe_tunnel_alive(local_sock: &std::path::Path) -> bool {
         let stream = tokio::net::UnixStream::connect(local_sock).await.ok()?;
         let codec = crate::protocol::FrameCodec;
         let mut framed = tokio_util::codec::Framed::new(stream, codec);
-        framed.send(Frame::Hello { version: PROTOCOL_VERSION, capabilities: 0 }).await.ok()?;
+        framed
+            .send(Frame::Hello { version: PROTOCOL_VERSION, capabilities: 0, device_id: 0 })
+            .await
+            .ok()?;
         match tokio::time::timeout(Duration::from_secs(1), framed.next()).await {
             Ok(Some(Ok(Frame::HelloAck { .. }))) => Some(()),
             _ => None,

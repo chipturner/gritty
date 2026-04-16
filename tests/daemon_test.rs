@@ -32,7 +32,14 @@ async fn wait_for_daemon(ctl_path: &std::path::Path) {
 
 /// Perform Hello handshake on a framed connection.
 async fn do_handshake(framed: &mut Framed<UnixStream, FrameCodec>) {
-    framed.send(Frame::Hello { version: PROTOCOL_VERSION, capabilities: 0 }).await.unwrap();
+    do_handshake_as(framed, 1).await;
+}
+
+async fn do_handshake_as(framed: &mut Framed<UnixStream, FrameCodec>, device_id: u64) {
+    framed
+        .send(Frame::Hello { version: PROTOCOL_VERSION, capabilities: 0, device_id })
+        .await
+        .unwrap();
     let resp = timeout(Duration::from_secs(3), framed.next())
         .await
         .expect("timed out")
@@ -43,9 +50,13 @@ async fn do_handshake(framed: &mut Framed<UnixStream, FrameCodec>) {
 
 /// Helper: send a control frame and get the response.
 async fn control_request(ctl_path: &std::path::Path, frame: Frame) -> Frame {
+    control_request_as(ctl_path, frame, 1).await
+}
+
+async fn control_request_as(ctl_path: &std::path::Path, frame: Frame, device_id: u64) -> Frame {
     let stream = UnixStream::connect(ctl_path).await.unwrap();
     let mut framed = Framed::new(stream, FrameCodec);
-    do_handshake(&mut framed).await;
+    do_handshake_as(&mut framed, device_id).await;
     framed.send(frame).await.unwrap();
     timeout(Duration::from_secs(3), framed.next())
         .await
@@ -141,7 +152,10 @@ async fn daemon_hello_ack_carries_server_version_on_mismatch() {
 
     let stream = UnixStream::connect(&ctl_path).await.unwrap();
     let mut framed = Framed::new(stream, FrameCodec);
-    framed.send(Frame::Hello { version: PROTOCOL_VERSION + 1, capabilities: 0 }).await.unwrap();
+    framed
+        .send(Frame::Hello { version: PROTOCOL_VERSION + 1, capabilities: 0, device_id: 1 })
+        .await
+        .unwrap();
     let resp = timeout(Duration::from_secs(3), framed.next())
         .await
         .expect("timed out")
@@ -169,7 +183,10 @@ async fn daemon_accepts_killserver_under_version_mismatch() {
     let stream = UnixStream::connect(&ctl_path).await.unwrap();
     let mut framed = Framed::new(stream, FrameCodec);
     // Pretend to be a newer client.
-    framed.send(Frame::Hello { version: PROTOCOL_VERSION + 7, capabilities: 0 }).await.unwrap();
+    framed
+        .send(Frame::Hello { version: PROTOCOL_VERSION + 7, capabilities: 0, device_id: 1 })
+        .await
+        .unwrap();
     let resp = timeout(Duration::from_secs(3), framed.next())
         .await
         .expect("timed out")
@@ -204,7 +221,10 @@ async fn daemon_rejects_non_killserver_frames_under_version_mismatch() {
 
     let stream = UnixStream::connect(&ctl_path).await.unwrap();
     let mut framed = Framed::new(stream, FrameCodec);
-    framed.send(Frame::Hello { version: PROTOCOL_VERSION + 3, capabilities: 0 }).await.unwrap();
+    framed
+        .send(Frame::Hello { version: PROTOCOL_VERSION + 3, capabilities: 0, device_id: 1 })
+        .await
+        .unwrap();
     let resp = timeout(Duration::from_secs(3), framed.next())
         .await
         .expect("timed out")
@@ -1307,16 +1327,17 @@ async fn attach_dash_resolves_to_last_session() {
 }
 
 /// Set up a fresh daemon + create a session via NewSession and keep the
-/// framed connection alive. Returns the session name, its attach_token, and
-/// the live framed connection (creator is auto-attached on this framed).
+/// framed connection alive. Returns the framed connection (creator is
+/// auto-attached on this framed).
 async fn new_session_for_test(
     ctl_path: &std::path::Path,
     name: &str,
     client_name: &str,
-) -> (Framed<UnixStream, FrameCodec>, u64) {
+    device_id: u64,
+) -> Framed<UnixStream, FrameCodec> {
     let stream = UnixStream::connect(ctl_path).await.unwrap();
     let mut framed = Framed::new(stream, FrameCodec);
-    do_handshake(&mut framed).await;
+    do_handshake_as(&mut framed, device_id).await;
     framed
         .send(Frame::NewSession {
             name: name.to_string(),
@@ -1332,48 +1353,33 @@ async fn new_session_for_test(
         Frame::SessionCreated { .. } => {}
         other => panic!("expected SessionCreated, got {other:?}"),
     }
-    let token =
-        match timeout(Duration::from_secs(3), framed.next()).await.unwrap().unwrap().unwrap() {
-            Frame::AttachAck { token, session_id: _ } => token,
-            other => panic!("expected AttachAck, got {other:?}"),
-        };
+    match timeout(Duration::from_secs(3), framed.next()).await.unwrap().unwrap().unwrap() {
+        Frame::AttachAck { .. } => {}
+        other => panic!("expected AttachAck, got {other:?}"),
+    }
     framed
         .send(Frame::Env { vars: vec![("TERM".to_string(), "xterm".to_string())] })
         .await
         .unwrap();
     drain_data(&mut framed, Duration::from_millis(500)).await;
-    (framed, token)
+    framed
 }
 
 #[tokio::test]
-async fn new_session_returns_nonzero_attach_token() {
+async fn different_device_rejected_with_owner_changed() {
+    // Device A (id=100) creates session. Device B (id=200) force-takes-over
+    // with attach_token=0 (explicit connect). Device A auto-reconnects with
+    // attach_token!=0 (ownership claim) -- must be rejected because device B
+    // is now the owner.
     let (_tmp, ctl_path) = test_ctl();
     let ctl = ctl_path.clone();
     let _daemon = tokio::spawn(async move { gritty::daemon::run(&ctl, None).await });
     wait_for_daemon(&ctl_path).await;
 
-    let (framed_a, token_a) = new_session_for_test(&ctl_path, "alpha", "laptop-a").await;
-    assert_ne!(token_a, 0, "daemon should mint a non-zero token for new sessions");
+    let framed_a = new_session_for_test(&ctl_path, "alpha", "laptop-a", 100).await;
 
-    drop(framed_a);
-    kill_cleanup(&ctl_path, "alpha").await;
-}
-
-#[tokio::test]
-async fn stale_attach_token_rejected_with_owner_changed() {
-    // Setup: A creates session and has token_a. B force-takes-over. Server
-    // rotates to token_b. A's reconnect with token_a must be rejected with
-    // OwnerChanged (not a silent steal-back).
-    let (_tmp, ctl_path) = test_ctl();
-    let ctl = ctl_path.clone();
-    let _daemon = tokio::spawn(async move { gritty::daemon::run(&ctl, None).await });
-    wait_for_daemon(&ctl_path).await;
-
-    let (framed_a, token_a) = new_session_for_test(&ctl_path, "alpha", "laptop-a").await;
-    assert_ne!(token_a, 0);
-
-    // B forcefully takes over with no prior token.
-    let resp = control_request(
+    // B forcefully takes over (explicit connect: attach_token=0).
+    let resp = control_request_as(
         &ctl_path,
         Frame::Attach {
             session: "alpha".to_string(),
@@ -1384,17 +1390,14 @@ async fn stale_attach_token_rejected_with_owner_changed() {
             rows: 0,
             attach_token: 0,
         },
+        200,
     )
     .await;
-    let token_b = match resp {
-        Frame::AttachAck { token, session_id: _ } => token,
-        other => panic!("expected AttachAck for force takeover, got {other:?}"),
-    };
-    assert_ne!(token_b, token_a, "takeover must rotate the owner token");
+    assert!(matches!(resp, Frame::AttachAck { .. }), "force takeover should succeed");
 
-    // A's stale reconnect: presents token_a, but the server now owns token_b.
-    // Must reject with OwnerChanged, regardless of force=true.
-    let resp = control_request(
+    // A's auto-reconnect: attach_token != 0 signals ownership claim.
+    // Hello carries device_id=100, but owner is now 200. Must reject.
+    let resp = control_request_as(
         &ctl_path,
         Frame::Attach {
             session: "alpha".to_string(),
@@ -1403,13 +1406,14 @@ async fn stale_attach_token_rejected_with_owner_changed() {
             no_replay: false,
             cols: 0,
             rows: 0,
-            attach_token: token_a,
+            attach_token: 100, // non-zero = auto-reconnect
         },
+        100,
     )
     .await;
     match resp {
         Frame::Error { code: ErrorCode::OwnerChanged, .. } => {}
-        other => panic!("expected OwnerChanged for stale reconnect, got {other:?}"),
+        other => panic!("expected OwnerChanged for different device, got {other:?}"),
     }
 
     drop(framed_a);
@@ -1417,23 +1421,21 @@ async fn stale_attach_token_rejected_with_owner_changed() {
 }
 
 #[tokio::test]
-async fn matching_attach_token_is_silent_reconnect() {
-    // Setup: A creates session with token_a. Immediately "reconnect" with
-    // force=true + token_a while the session is still attached. Server must
-    // accept (silent reconnect semantics) and return the SAME token so an
-    // in-flight AttachAck loss doesn't poison the client.
+async fn same_device_reconnect_succeeds() {
+    // Device A creates session, disconnects, reconnects with the same
+    // device_id. Should succeed (silent reconnect).
     let (_tmp, ctl_path) = test_ctl();
     let ctl = ctl_path.clone();
     let _daemon = tokio::spawn(async move { gritty::daemon::run(&ctl, None).await });
     wait_for_daemon(&ctl_path).await;
 
-    let (framed_a, token_a) = new_session_for_test(&ctl_path, "alpha", "laptop-a").await;
-    drop(framed_a); // simulate the old connection dying (detached)
+    let framed_a = new_session_for_test(&ctl_path, "alpha", "laptop-a", 100).await;
+    drop(framed_a); // simulate disconnect
 
-    // Give the reaper a beat.
     tokio::time::sleep(Duration::from_millis(100)).await;
 
-    let resp = control_request(
+    // Same device_id=100 reconnects with ownership claim.
+    let resp = control_request_as(
         &ctl_path,
         Frame::Attach {
             session: "alpha".to_string(),
@@ -1442,15 +1444,14 @@ async fn matching_attach_token_is_silent_reconnect() {
             no_replay: false,
             cols: 0,
             rows: 0,
-            attach_token: token_a,
+            attach_token: 100, // non-zero = auto-reconnect
         },
+        100,
     )
     .await;
     match resp {
-        Frame::AttachAck { token, session_id: _ } => {
-            assert_eq!(token, token_a, "silent reconnect must return the same token");
-        }
-        other => panic!("expected AttachAck for silent reconnect, got {other:?}"),
+        Frame::AttachAck { .. } => {}
+        other => panic!("expected AttachAck for same device reconnect, got {other:?}"),
     }
 
     kill_cleanup(&ctl_path, "alpha").await;

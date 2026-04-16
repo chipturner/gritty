@@ -49,7 +49,7 @@ pub struct SessionMetadata {
     pub pty_path: String,
     /// Shell PID, or 0 until the shell is actually spawned. Atomic so the
     /// metadata slot can be populated before shell spawn (required for
-    /// attach_token storage on Attach-during-spawn) and updated once the
+    /// owner_device_id storage on Attach-during-spawn) and updated once the
     /// shell's pid is known.
     pub shell_pid: AtomicU32,
     pub created_at: u64,
@@ -58,11 +58,12 @@ pub struct SessionMetadata {
     pub client_name: std::sync::Mutex<String>,
     pub wants_agent: AtomicBool,
     pub wants_open: AtomicBool,
-    /// Owner token. A client presenting a non-matching non-zero token on
-    /// reattach has been preempted and is rejected with `OwnerChanged`.
-    /// `0` means "never claimed"; any successful attach rotates this to a
-    /// fresh value unless the client is the current owner (silent reconnect).
-    pub attach_token: AtomicU64,
+    /// Persistent device identifier of the session's current owner. Set from
+    /// the Hello frame's `device_id` on attach or session creation. A non-zero
+    /// `attach_token` in a subsequent Attach triggers an ownership check: if
+    /// the Hello's `device_id` differs from this value, the attach is rejected
+    /// with `OwnerChanged`.
+    pub owner_device_id: AtomicU64,
 }
 
 /// Wraps a child process and its process group ID.
@@ -1493,7 +1494,7 @@ pub async fn run(
     initial_cols: u16,
     initial_rows: u16,
     cwd: Option<String>,
-    initial_attach_token: u64,
+    initial_device_id: u64,
 ) -> anyhow::Result<()> {
     // Allocate PTY with initial window size when available
     let winsize = if initial_cols > 0 && initial_rows > 0 {
@@ -1519,10 +1520,10 @@ pub async fn run(
     // Populate the session metadata slot early. shell_pid stays 0 until the
     // shell actually spawns; client_name stays empty until the first client
     // sends its Env. This lets the daemon's Attach handler store an owner
-    // token on sessions that are mid-spawn -- previously the set() happened
-    // after shell spawn, so an Attach that landed during the
-    // wait-for-first-client window saw metadata=None and couldn't persist a
-    // rotated token. (See the `initial_attach_token` doc on server::run.)
+    // device_id on sessions that are mid-spawn -- previously the set()
+    // happened after shell spawn, so an Attach that landed during the
+    // wait-for-first-client window saw metadata=None and couldn't persist
+    // the owner. (See the `initial_device_id` param on server::run.)
     let created_at = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default()
@@ -1536,7 +1537,7 @@ pub async fn run(
         client_name: std::sync::Mutex::new(String::new()),
         wants_agent: AtomicBool::new(false),
         wants_open: AtomicBool::new(false),
-        attach_token: AtomicU64::new(initial_attach_token),
+        owner_device_id: AtomicU64::new(initial_device_id),
     });
 
     // Dup slave fds for shell stdio (before dropping slave)

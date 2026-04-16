@@ -17,16 +17,6 @@ use tracing::{Instrument, debug, error, info, warn};
 
 const SEND_TIMEOUT: Duration = Duration::from_secs(5);
 
-/// Mint a fresh owner token. Monotonic counter scoped to the server process:
-/// unique across every attach for this daemon's lifetime. Clients detect server
-/// restarts separately via `server_id` in `HelloAck`, so the counter does not
-/// need to survive a daemon crash. Starts at 1 so 0 is reserved for "unclaimed"
-/// and "no token yet" on the client side.
-fn mint_attach_token() -> u64 {
-    static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
-    NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
-}
-
 /// Send a frame with a timeout. Returns `Ok(())` on success, `Err` on
 /// send failure or timeout (error is logged before returning).
 async fn timed_send(
@@ -279,17 +269,20 @@ enum VersionCheck {
 
 /// Perform Hello/HelloAck handshake and read control frame for a single connection.
 /// Spawned as a per-connection task so slow clients don't block the accept loop.
+#[allow(clippy::type_complexity)]
 async fn connection_handshake(
     stream: UnixStream,
-    tx: mpsc::Sender<(Frame, Framed<UnixStream, FrameCodec>, u32, VersionCheck)>,
+    tx: mpsc::Sender<(Frame, Framed<UnixStream, FrameCodec>, u32, VersionCheck, u64)>,
     server_id: u64,
 ) {
     let mut framed = Framed::new(stream, FrameCodec);
 
     // Read Hello handshake (5s timeout)
-    let (version, client_caps) =
+    let (version, client_caps, device_id) =
         match tokio::time::timeout(Duration::from_secs(5), framed.next()).await {
-            Ok(Some(Ok(Frame::Hello { version, capabilities }))) => (version, capabilities),
+            Ok(Some(Ok(Frame::Hello { version, capabilities, device_id }))) => {
+                (version, capabilities, device_id)
+            }
             Ok(Some(Ok(_))) => {
                 let _ = timed_send(
                     &mut framed,
@@ -352,7 +345,7 @@ async fn connection_handshake(
         }
     };
 
-    let _ = tx.send((frame, framed, negotiated, check)).await;
+    let _ = tx.send((frame, framed, negotiated, check, device_id)).await;
 }
 
 /// Run the daemon, listening on its socket.
@@ -421,7 +414,7 @@ pub async fn run(ctl_path: &Path, ready_fd: Option<OwnedFd>) -> anyhow::Result<(
 
     // Channel for handshake results -- spawned tasks send completed handshakes here
     let (conn_tx, mut conn_rx) =
-        mpsc::channel::<(Frame, Framed<UnixStream, FrameCodec>, u32, VersionCheck)>(64);
+        mpsc::channel::<(Frame, Framed<UnixStream, FrameCodec>, u32, VersionCheck, u64)>(64);
 
     loop {
         reap_sessions(&mut sessions);
@@ -451,7 +444,7 @@ pub async fn run(ctl_path: &Path, ready_fd: Option<OwnedFd>) -> anyhow::Result<(
                 }
                 false
             }
-            Some((frame, mut framed, capabilities, check)) = conn_rx.recv() => {
+            Some((frame, mut framed, capabilities, check, device_id)) = conn_rx.recv() => {
                 // Under a version mismatch the only frame we honor is
                 // KillServer -- it's the escape hatch for recovering from a
                 // half-upgraded deployment. Any other request would touch
@@ -475,7 +468,7 @@ pub async fn run(ctl_path: &Path, ready_fd: Option<OwnedFd>) -> anyhow::Result<(
                 } else {
                     dispatch_control(
                         frame, framed, &mut sessions, &mut next_id, ctl_path, &mut last_attached,
-                        ring_buffer_cap, oauth_tunnel_idle_timeout, capabilities,
+                        ring_buffer_cap, oauth_tunnel_idle_timeout, capabilities, device_id,
                     ).await
                 }
             }
@@ -523,6 +516,7 @@ async fn dispatch_control(
     ring_buffer_cap: usize,
     oauth_tunnel_idle_timeout: u64,
     capabilities: u32,
+    device_id: u64,
 ) -> bool {
     match frame {
         Frame::NewSession { name, command, cwd, cols, rows, client_name } => {
@@ -595,9 +589,7 @@ async fn dispatch_control(
             let name_for_server = name_opt.clone();
             let cmd_for_server = command_opt;
             let cwd_for_server = cwd_opt;
-            // Fresh session: mint an owner token that the creator will store
-            // and present on any subsequent reconnect.
-            let owner_token = mint_attach_token();
+            // Record the creator's device as the session owner.
             let session_span =
                 tracing::info_span!("session", id = id, name = name_opt.as_deref().unwrap_or(""),);
             let handle = tokio::spawn(
@@ -614,7 +606,7 @@ async fn dispatch_control(
                     cols,
                     rows,
                     cwd_for_server,
-                    owner_token,
+                    device_id,
                 )
                 .instrument(session_span),
             );
@@ -637,7 +629,7 @@ async fn dispatch_control(
             // reserved. Abort the task and drop the entry so future
             // NewSession for the same name succeeds.
             let send_ok = timed_send(&mut framed, Frame::SessionCreated { id }).await.is_ok()
-                && timed_send(&mut framed, Frame::AttachAck { token: owner_token, session_id: id })
+                && timed_send(&mut framed, Frame::AttachAck { token: device_id, session_id: id })
                     .await
                     .is_ok();
             if !send_ok {
@@ -690,15 +682,15 @@ async fn dispatch_control(
                     // do not claim ownership and get plain `Ok`.
                     let _ = timed_send(&mut framed, Frame::Ok).await;
                 } else {
-                    let current_token = state
+                    let current_owner = state
                         .metadata
                         .get()
-                        .map(|m| m.attach_token.load(Ordering::Relaxed))
+                        .map(|m| m.owner_device_id.load(Ordering::Relaxed))
                         .unwrap_or(0);
-                    // Stale owner: client presented a token but it no longer
-                    // matches. Someone else took over while this client was
-                    // disconnected. Terminal.
-                    if provided_token != 0 && provided_token != current_token {
+                    // Auto-reconnect (provided_token != 0): the client claims
+                    // ownership. Check Hello's device_id against the stored
+                    // owner. A mismatch means a different device took over.
+                    if provided_token != 0 && device_id != current_owner {
                         let _ = timed_send(
                             &mut framed,
                             Frame::Error {
@@ -735,17 +727,10 @@ async fn dispatch_control(
                     } else {
                         // If the session was just created but server::run
                         // hasn't yet populated `metadata` (shell still
-                        // spawning), we can't persist a new owner token. A
-                        // concurrent Attach on a not-yet-ready session would
-                        // otherwise mint a token, send it in AttachAck, and
-                        // silently skip the store -- the client records it,
-                        // reconnects later, and gets OwnerChanged because the
-                        // server still holds the initial creator's token.
-                        // The shell-spawn window is tens to hundreds of
-                        // milliseconds; poll briefly before bailing so a
-                        // user's follow-up `gritty connect host:name` right
-                        // after `gritty connect host:name` create doesn't
-                        // race.
+                        // spawning), we can't persist the new owner's
+                        // device_id. Poll briefly so a user's follow-up
+                        // `gritty connect host:name` right after create
+                        // doesn't race the spawn.
                         let meta = {
                             let deadline =
                                 std::time::Instant::now() + std::time::Duration::from_secs(3);
@@ -770,27 +755,19 @@ async fn dispatch_control(
                             .await;
                             return false;
                         };
-                        // Silent reconnect from the current owner keeps the
-                        // existing token so an in-flight AttachAck loss does
-                        // not poison the client. Every other path rotates.
-                        let new_token = if provided_token != 0 && provided_token == current_token {
-                            provided_token
-                        } else {
-                            mint_attach_token()
-                        };
-                        // Only rotate the stored owner token after the new
-                        // client has ACK'd receipt. If the AttachAck send
-                        // fails, the previous owner should keep their token
-                        // so their next reconnect doesn't get OwnerChanged
-                        // on a takeover that never actually landed.
+                        // Only update the stored owner after the new client
+                        // has ACK'd receipt. If the AttachAck send fails,
+                        // the previous owner should keep their device_id so
+                        // their next reconnect doesn't get OwnerChanged on
+                        // a takeover that never actually landed.
                         if timed_send(
                             &mut framed,
-                            Frame::AttachAck { token: new_token, session_id: id },
+                            Frame::AttachAck { token: device_id, session_id: id },
                         )
                         .await
                         .is_ok()
                         {
-                            meta.attach_token.store(new_token, Ordering::Relaxed);
+                            meta.owner_device_id.store(device_id, Ordering::Relaxed);
                             *last_attached = Some(id);
                             let _ = state.client_tx.send(ClientConn::Active {
                                 framed,

@@ -1631,7 +1631,7 @@ pub async fn run(
     heartbeat_timeout: u64,
     client_name: String,
     expected_server_id: u64,
-    mut attach_token: u64,
+    device_id: u64,
 ) -> anyhow::Result<i32> {
     let stdin = io::stdin();
     let stdin_fd = stdin.as_fd();
@@ -1868,7 +1868,7 @@ pub async fn run(
                     }
 
                     enum Attempt {
-                        Connected(Framed<UnixStream, FrameCodec>, u64),
+                        Connected(Framed<UnixStream, FrameCodec>),
                         SessionGone(String),
                         ServerRestarted,
                         OwnerChanged,
@@ -1897,7 +1897,7 @@ pub async fn run(
                             }
                         };
                         let mut new_framed = Framed::new(stream, FrameCodec);
-                        let info = match crate::handshake(&mut new_framed).await {
+                        let info = match crate::handshake(&mut new_framed, device_id).await {
                             Ok(info) => info,
                             Err(e) => return Attempt::HandshakeErr(e.to_string()),
                         };
@@ -1921,7 +1921,8 @@ pub async fn run(
                                 no_replay: false,
                                 cols,
                                 rows,
-                                attach_token,
+                                // Non-zero = auto-reconnect ownership claim.
+                                attach_token: device_id,
                             })
                             .await
                             .is_err()
@@ -1929,8 +1930,8 @@ pub async fn run(
                             return Attempt::Retry;
                         }
                         match new_framed.next().await {
-                            Some(Ok(Frame::AttachAck { token, session_id: _ })) => {
-                                Attempt::Connected(new_framed, token)
+                            Some(Ok(Frame::AttachAck { token: _, session_id: _ })) => {
+                                Attempt::Connected(new_framed)
                             }
                             Some(Ok(Frame::Error { code: ErrorCode::AlreadyAttached, .. })) => {
                                 Attempt::Retry
@@ -1945,7 +1946,7 @@ pub async fn run(
                     .await;
 
                     match attempt {
-                        Ok(Attempt::Connected(new_framed, new_token)) => {
+                        Ok(Attempt::Connected(new_framed)) => {
                             if show_chrome {
                                 write_stdout_async(
                                     &async_stdout,
@@ -1953,7 +1954,6 @@ pub async fn run(
                                 )
                                 .await?;
                             }
-                            attach_token = new_token;
                             framed = new_framed;
                             break;
                         }
@@ -2035,6 +2035,7 @@ pub async fn tail(
     mut framed: Framed<UnixStream, FrameCodec>,
     ctl_path: &Path,
     expected_server_id: u64,
+    device_id: u64,
 ) -> anyhow::Result<i32> {
     // Suppress stdin echo — tail is read-only. Guard restores on drop.
     let stdin_fd = unsafe { BorrowedFd::borrow_raw(libc::STDIN_FILENO) };
@@ -2232,7 +2233,7 @@ pub async fn tail(
                             }
                         };
                         let mut new_framed = Framed::new(stream, FrameCodec);
-                        let info = match crate::handshake(&mut new_framed).await {
+                        let info = match crate::handshake(&mut new_framed, device_id).await {
                             Ok(info) => info,
                             Err(e) => {
                                 let msg = e.to_string();

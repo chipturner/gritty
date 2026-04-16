@@ -73,7 +73,7 @@ const HEADER_LEN: usize = 5; // type(1) + length(4)
 const MAX_FRAME_SIZE: usize = 1 << 20; // 1 MB
 
 /// Protocol version for handshake negotiation.
-pub const PROTOCOL_VERSION: u16 = 18;
+pub const PROTOCOL_VERSION: u16 = 19;
 
 /// Capability bit: client/server supports clipboard forwarding.
 pub const CAP_CLIPBOARD: u32 = 0x01;
@@ -297,6 +297,11 @@ pub enum Frame {
     Hello {
         version: u16,
         capabilities: u32,
+        /// Persistent per-machine identifier. Generated once and stored in
+        /// `$XDG_STATE_HOME/gritty/device_id`. The server records this as the
+        /// session owner so auto-reconnects from a different device are
+        /// rejected with `OwnerChanged`.
+        device_id: u64,
     },
     /// Protocol version acknowledgement (server → client).
     ///
@@ -334,11 +339,11 @@ pub enum Frame {
         /// the right winsize. Zero = unknown (probe-only clients).
         cols: u16,
         rows: u16,
-        /// Owner token from a prior attach, or `0` for a fresh attach. A
-        /// non-zero token that does not match the server's current owner is
-        /// rejected with `ErrorCode::OwnerChanged` -- this is how we tell a
-        /// reconnecting owner apart from a stale client whose session was
-        /// taken over while disconnected.
+        /// Ownership claim for auto-reconnect. `0` = explicit connect (no
+        /// ownership check; server adopts the Hello's `device_id` as new
+        /// owner). Non-zero = auto-reconnect: the server compares the
+        /// Hello's `device_id` against the stored owner and rejects with
+        /// `ErrorCode::OwnerChanged` if they differ.
         attach_token: u64,
     },
     /// Read-only tail of a session's PTY output (client → server).
@@ -780,7 +785,10 @@ impl Decoder for FrameCodec {
             TYPE_HELLO => {
                 expect_min_len(&payload, 6, "hello")?;
                 let mut r = PayloadReader::new(&payload);
-                Ok(Some(Frame::Hello { version: r.u16(), capabilities: r.u32() }))
+                let version = r.u16();
+                let capabilities = r.u32();
+                let device_id = if payload.len() - r.offset() >= 8 { r.u64() } else { 0 };
+                Ok(Some(Frame::Hello { version, capabilities, device_id }))
             }
             TYPE_HELLO_ACK => {
                 expect_min_len(&payload, 14, "hello ack")?;
@@ -1093,8 +1101,8 @@ impl Encoder<Frame> for FrameCodec {
             Frame::Exit { code } => {
                 encode_fields!(dst, TYPE_EXIT, code => put_i32);
             }
-            Frame::Hello { version, capabilities } => {
-                encode_fields!(dst, TYPE_HELLO, version => put_u16, capabilities => put_u32);
+            Frame::Hello { version, capabilities, device_id } => {
+                encode_fields!(dst, TYPE_HELLO, version => put_u16, capabilities => put_u32, device_id => put_u64);
             }
             Frame::HelloAck { version, capabilities, server_id } => {
                 encode_fields!(

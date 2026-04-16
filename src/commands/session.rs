@@ -34,7 +34,7 @@ pub(crate) async fn connect_session(
     let (stream, _auto_started) =
         super::util::connect_or_start(&ctl_path, &auto_start_mode, wait).await?;
     let mut framed = Framed::new(stream, FrameCodec);
-    let info = gritty::handshake(&mut framed).await?;
+    let info = gritty::handshake(&mut framed, gritty::get_or_create_device_id()).await?;
     gritty::require_matched_version(&info)?;
     let server_id = info.server_id;
 
@@ -62,7 +62,7 @@ pub(crate) async fn connect_session(
             eprintln!("\x1b[32m\u{25b8} session {name} exists (not attaching, -d)\x1b[0m");
             return Ok(());
         }
-        Frame::AttachAck { token, session_id } => {
+        Frame::AttachAck { token: _, session_id } => {
             eprintln!("\x1b[32m\u{25b8} attached {name}\x1b[0m");
             let env_vars = vec![];
             let client_span = tracing::info_span!("client", session = %name, session_id);
@@ -81,7 +81,7 @@ pub(crate) async fn connect_session(
                 settings.heartbeat_timeout,
                 settings.client_name.clone(),
                 server_id,
-                token,
+                gritty::get_or_create_device_id(),
             )
             .instrument(client_span)
             .await?;
@@ -107,7 +107,7 @@ pub(crate) async fn connect_session(
     // was consumed by the failed attach
     let (stream, _) = super::util::connect_or_start(&ctl_path, &auto_start_mode, wait).await?;
     let mut framed = Framed::new(stream, FrameCodec);
-    let info = gritty::handshake(&mut framed).await?;
+    let info = gritty::handshake(&mut framed, gritty::get_or_create_device_id()).await?;
     gritty::require_matched_version(&info)?;
     let server_id = info.server_id;
     // Get terminal size for initial PTY dimensions
@@ -127,13 +127,13 @@ pub(crate) async fn connect_session(
         Frame::SessionCreated { id } => {
             eprintln!("\x1b[32m\u{25b8} session {name}\x1b[0m");
 
-            // Daemon emits SessionCreated immediately followed by AttachAck
-            // with the session's owner token. The client stores the token so
-            // reconnects can be distinguished from third-party takeovers.
-            let token = match Frame::expect_from(framed.next().await)? {
-                Frame::AttachAck { token, session_id: _ } => token,
+            // Daemon emits SessionCreated immediately followed by AttachAck.
+            // The token echoes the device_id (client ignores it -- ownership
+            // is tracked by the persistent device_id, not an ephemeral token).
+            match Frame::expect_from(framed.next().await)? {
+                Frame::AttachAck { .. } => {}
                 other => anyhow::bail!("unexpected response from server: {other:?}"),
-            };
+            }
 
             // Send Env immediately so the server's 2s deferred-spawn deadline
             // is satisfied before -d returns or alert_detached_sessions runs
@@ -163,7 +163,7 @@ pub(crate) async fn connect_session(
                 settings.heartbeat_timeout,
                 settings.client_name.clone(),
                 server_id,
-                token,
+                gritty::get_or_create_device_id(),
             )
             .instrument(client_span)
             .await?;
@@ -836,7 +836,7 @@ pub(crate) async fn tail_session(target: String, ctl_path: PathBuf) -> anyhow::R
         anyhow::anyhow!("no server running (could not connect to {})", ctl_path.display())
     })?;
     let mut framed = Framed::new(stream, FrameCodec);
-    let info = gritty::handshake(&mut framed).await?;
+    let info = gritty::handshake(&mut framed, gritty::get_or_create_device_id()).await?;
     gritty::require_matched_version(&info)?;
     let server_id = info.server_id;
     framed.send(Frame::Tail { session: session_id.to_string() }).await?;
@@ -844,7 +844,14 @@ pub(crate) async fn tail_session(target: String, ctl_path: PathBuf) -> anyhow::R
     match Frame::expect_from(framed.next().await)? {
         Frame::Ok => {
             eprintln!("\x1b[2;33m\u{25b8} tailing {target}\x1b[0m");
-            gritty::client::tail(session_id, framed, &ctl_path, server_id).await
+            gritty::client::tail(
+                session_id,
+                framed,
+                &ctl_path,
+                server_id,
+                gritty::get_or_create_device_id(),
+            )
+            .await
         }
         Frame::Error { message, .. } => anyhow::bail!("{message}"),
         other => anyhow::bail!("unexpected response from server: {other:?}"),
@@ -1106,7 +1113,9 @@ pub(crate) async fn list_all_sessions() -> anyhow::Result<()> {
                     .await
                     .map_err(|e| format!("connect: {e}"))?;
                 let mut framed = tokio_util::codec::Framed::new(stream, FrameCodec);
-                let info = gritty::handshake(&mut framed).await.map_err(|e| e.to_string())?;
+                let info = gritty::handshake(&mut framed, gritty::get_or_create_device_id())
+                    .await
+                    .map_err(|e| e.to_string())?;
                 gritty::require_matched_version(&info).map_err(|e| e.to_string())?;
                 futures_util::SinkExt::send(&mut framed, Frame::ListSessions)
                     .await
