@@ -1409,7 +1409,14 @@ async fn force_tui_redraw(
                         Ok(Ok(n)) => {
                             let chunk = Bytes::copy_from_slice(&buf[..n]);
                             alt_screen.scan(&chunk);
-                            scrollback.push(&chunk);
+                            // Skip scrollback capture while in alt-screen: TUI
+                            // apps (vim, htop) repaint full screens every
+                            // frame and poison scrollback with one-shot
+                            // cursor/color sequences that make no sense to
+                            // replay on a main-screen reconnect.
+                            if !alt_screen.in_alternate_screen() {
+                                scrollback.push(&chunk);
+                            }
                             if tail_tx.receiver_count() > 0 {
                                 let _ = tail_tx.send(TailEvent::Data(chunk.clone()));
                             }
@@ -2100,7 +2107,30 @@ pub async fn run(
                                     let msg = format!(
                                         "\r\n\x1b[2;33m[gritty: took over session (was active, heartbeat {hb_str})]\x1b[0m\r\n"
                                     );
-                                    let _ = send_framed_timed(&mut framed, Frame::Data(Bytes::from(msg))).await;
+                                    let mut replay_ok =
+                                        send_framed_timed(&mut framed, Frame::Data(Bytes::from(msg)))
+                                            .await
+                                            .is_ok();
+                                    // Replay scrollback so the taking-over client
+                                    // lands with context (shell prompt, last few
+                                    // lines of output). The outer-loop reconnect
+                                    // path already does this; in-relay takeover
+                                    // used to drop the new client onto a blank
+                                    // screen.
+                                    if replay_ok {
+                                        for line in scrollback.lines_and_partial() {
+                                            if send_framed_timed(&mut framed, Frame::Data(line))
+                                                .await
+                                                .is_err()
+                                            {
+                                                replay_ok = false;
+                                                break;
+                                            }
+                                        }
+                                    }
+                                    if replay_ok {
+                                        scrollback.clear();
+                                    }
                                 }
                             }
                             Some(ClientConn::Tail(f)) => {
@@ -2214,7 +2244,9 @@ pub async fn run(
                                 debug!(len = n, "pty -> socket");
                                 let chunk = Bytes::copy_from_slice(&buf[..n]);
                                 alt_screen.scan(&chunk);
-                                scrollback.push(&chunk);
+                                if !alt_screen.in_alternate_screen() {
+                                    scrollback.push(&chunk);
+                                }
                                 if relay.tail_tx.receiver_count() > 0 {
                                     let _ = relay.tail_tx.send(TailEvent::Data(chunk.clone()));
                                 }
