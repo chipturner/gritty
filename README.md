@@ -79,7 +79,7 @@ Local-only sessions (`gritty connect local:scratch`) are available for testing b
 - **URL open forwarding** -- `$BROWSER` requests forwarded to your local machine, with automatic OAuth callback tunneling (on by default)
 - **Port forwarding** -- `gritty lf remote:work 8080` to quick-check a remote web server locally, `gritty rf remote:work 5432` to let the session reach local postgres; client-initiated only (a compromised server cannot open forwards)
 - **File transfer** -- `gritty send` / `gritty receive` through the session connection, preserving permissions; `-r` for recursive directory transfer; pipe mode with `-` for composing with `tar` etc.
-- **Clipboard forwarding** -- `gritty copy` / `gritty paste` forward clipboard between remote session and local machine (uses `pbcopy`/`pbpaste` on macOS, `wl-copy`/`wl-paste` or `xclip`/`xsel` on Linux)
+- **Clipboard forwarding** -- `gritty copy` pushes clipboard content from a remote session to your local machine (uses `pbcopy` on macOS, `wl-copy`/`xclip`/`xsel` on Linux); copy-only by design (the server cannot read the client clipboard)
 - **Single binary, no network protocol** -- Unix domain sockets locally, SSH handles encryption and auth; optional TOML config for per-host defaults
 
 ## Commands
@@ -103,7 +103,6 @@ Local-only sessions (`gritty connect local:scratch`) are available for testing b
 | `gritty receive [dir]` | | Receive files from a paired sender |
 | `gritty open <url>` | | Open a URL on the local machine (for use inside gritty sessions) |
 | `gritty copy` | | Copy stdin to the client clipboard (for use inside gritty sessions) |
-| `gritty paste` | | Paste client clipboard to stdout (for use inside gritty sessions) |
 | `gritty info` | | Show diagnostics (paths, server status, tunnels) |
 | `gritty config` | | Open config in `$VISUAL`/`$EDITOR`/vi (creates from template if missing) |
 | `gritty doctor` | | Check for common issues (stale processes, orphaned sockets, config errors) |

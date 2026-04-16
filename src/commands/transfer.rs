@@ -235,7 +235,7 @@ fn print_progress(name: &str, transferred: u64, total: u64, last_render: &mut st
         return;
     }
     *last_render = now;
-    let pct = if total == 0 { 100 } else { (transferred * 100 / total).min(100) };
+    let pct = (transferred * 100).checked_div(total).map_or(100, |v| v.min(100));
     let bar_width = 20usize;
     let filled = (pct as usize * bar_width / 100).min(bar_width);
     let empty = bar_width - filled;

@@ -353,21 +353,6 @@ pub(crate) fn clipboard_copy() {
     }
 }
 
-/// Request clipboard from client via svc socket and write to stdout.
-pub(crate) fn clipboard_paste() {
-    use std::io::{Read, Write};
-
-    let mut stream = connect_svc_socket("");
-    let _ = stream.write_all(&[gritty::protocol::SvcRequest::Clipboard.to_byte()]);
-    let _ = stream.write_all(&[0x02]); // paste operation
-    let _ = stream.shutdown(std::net::Shutdown::Write);
-    let mut data = Vec::new();
-    let _ = stream.set_read_timeout(Some(std::time::Duration::from_secs(5)));
-    if stream.read_to_end(&mut data).is_ok() && !data.is_empty() {
-        let _ = std::io::stdout().write_all(&data);
-    }
-}
-
 pub(crate) fn open_url(url: &str) {
     use std::io::{Read, Write};
 

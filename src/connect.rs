@@ -732,9 +732,14 @@ async fn probe_tunnel_alive(local_sock: &std::path::Path) -> bool {
             .await
             .ok()?;
         match tokio::time::timeout(Duration::from_secs(1), framed.next()).await {
-            Ok(Some(Ok(Frame::HelloAck { .. }))) => Some(()),
-            _ => None,
+            Ok(Some(Ok(Frame::HelloAck { .. }))) => {}
+            _ => return None,
         }
+        // Send a control frame so the daemon doesn't wait 5s for one and
+        // log a spurious "control connection timed out" warning on every probe.
+        framed.send(Frame::ListSessions).await.ok()?;
+        let _ = tokio::time::timeout(Duration::from_secs(1), framed.next()).await;
+        Some(())
     };
     tokio::time::timeout(Duration::from_secs(3), probe).await.ok().flatten().is_some()
 }

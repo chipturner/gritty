@@ -26,7 +26,6 @@ Persistent TTY sessions over Unix domain sockets. Single binary, tmux-like CLI. 
 | `send [files...]` | | Send files to a paired receiver (`-r` for directories) |
 | `receive [dir]` | | Receive files from a paired sender |
 | `copy` | | Copy stdin to the client clipboard |
-| `paste` | | Paste client clipboard to stdout |
 | `open <url>` | | Open a URL on the local machine (for use inside gritty sessions) |
 | `info` | | Show diagnostics |
 | `config` | | Open config in `$VISUAL`/`$EDITOR`/vi |

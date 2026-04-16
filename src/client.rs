@@ -559,6 +559,8 @@ struct ClientPortForwardTable {
     forwards: HashMap<u32, ClientPortForwardState>,
     channels: HashMap<u32, (u32, mpsc::Sender<Bytes>)>,
     next_channel_id: std::sync::Arc<std::sync::atomic::AtomicU32>,
+    /// Local-forward requests waiting for server PortForwardReady/Stop.
+    pending_lf: HashMap<u32, tokio::net::UnixStream>,
 }
 
 impl ClientPortForwardTable {
@@ -571,6 +573,7 @@ impl ClientPortForwardTable {
             // insert into a single `channels` map, so partitioning prevents lf/rf
             // collisions.
             next_channel_id: std::sync::Arc::new(std::sync::atomic::AtomicU32::new(2)),
+            pending_lf: HashMap::new(),
         }
     }
 
@@ -584,6 +587,7 @@ impl ClientPortForwardTable {
             }
         }
         self.channels.clear();
+        self.pending_lf.clear();
     }
 }
 
@@ -991,8 +995,27 @@ impl ClientRelay<'_> {
             Some(Ok(Frame::PortForwardClose { channel_id })) => {
                 self.pf.channels.remove(&channel_id);
             }
+            // Port forward: server confirmed bind
+            Some(Ok(Frame::PortForwardReady { forward_id })) => {
+                if let Some(mut fwd_stream) = self.pf.pending_lf.remove(&forward_id) {
+                    use tokio::io::AsyncWriteExt;
+                    info!(forward_id, "local-forward: server confirmed bind");
+                    let _ = fwd_stream.write_all(&[0x01]).await;
+                    let target_port =
+                        self.client_initiated_forwards.get(&forward_id).copied().unwrap_or(0);
+                    self.start_pf_keepalive(forward_id, fwd_stream, target_port);
+                }
+            }
             // Port forward: teardown from server
             Some(Ok(Frame::PortForwardStop { forward_id })) => {
+                // If this was a pending local-forward, notify the `lf` process
+                // of the bind failure before it prints "active".
+                if let Some(mut fwd_stream) = self.pf.pending_lf.remove(&forward_id) {
+                    use tokio::io::AsyncWriteExt;
+                    warn!(forward_id, "local-forward: server bind failed");
+                    let _ = fwd_stream.write_all(&[0x02]).await;
+                    let _ = fwd_stream.write_all(b"server bind failed").await;
+                }
                 if let Some(fwd) = self.pf.forwards.remove(&forward_id) {
                     if let Some(h) = fwd.listener_handle {
                         h.abort();
@@ -1026,6 +1049,7 @@ impl ClientRelay<'_> {
         Ok(ControlFlow::Continue(()))
     }
 
+    #[allow(clippy::collapsible_match)]
     async fn handle_agent_event(
         &mut self,
         framed: &mut Framed<UnixStream, FrameCodec>,
@@ -1057,6 +1081,7 @@ impl ClientRelay<'_> {
         true
     }
 
+    #[allow(clippy::collapsible_match)]
     async fn handle_tunnel_event(
         &mut self,
         framed: &mut Framed<UnixStream, FrameCodec>,
@@ -1095,6 +1120,7 @@ impl ClientRelay<'_> {
         true
     }
 
+    #[allow(clippy::collapsible_match)]
     async fn handle_pf_event(
         &mut self,
         framed: &mut Framed<UnixStream, FrameCodec>,
@@ -1268,8 +1294,28 @@ impl ClientRelay<'_> {
             return;
         }
 
+        if direction == 0 {
+            // Local-forward: defer the success response until the server
+            // confirms the bind with PortForwardReady (or rejects with
+            // PortForwardStop). Responding immediately would tell `gritty lf`
+            // the forward is "active" before the server has actually bound.
+            self.pf.pending_lf.insert(forward_id, fwd_stream);
+            return;
+        }
+
         info!(forward_id, direction, listen_port, target_port, "port forward established");
         let _ = fwd_stream.write_all(&[0x01]).await;
+
+        self.start_pf_keepalive(forward_id, fwd_stream, target_port);
+    }
+
+    fn start_pf_keepalive(
+        &mut self,
+        forward_id: u32,
+        mut fwd_stream: tokio::net::UnixStream,
+        target_port: u16,
+    ) {
+        use tokio::io::AsyncReadExt;
 
         // Keepalive: when the controlling process disconnects, tear down the forward.
         let pf_tx = self.pf_event_tx.clone();
@@ -1279,7 +1325,7 @@ impl ClientRelay<'_> {
             let _ = pf_tx.send(ClientPortForwardEvent::ForwardStopped { forward_id });
         });
         // Track the keepalive task (and for lf, create the forwards entry) so teardown
-        // aborts it — dropping fwd_stream lets the `gritty lf`/`rf` process see EOF.
+        // aborts it -- dropping fwd_stream lets the `gritty lf`/`rf` process see EOF.
         self.pf
             .forwards
             .entry(forward_id)

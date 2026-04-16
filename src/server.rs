@@ -1199,6 +1199,7 @@ impl ServerRelay<'_> {
         }
     }
 
+    #[allow(clippy::collapsible_match)]
     async fn handle_tunnel_event(
         &mut self,
         framed: &mut Framed<UnixStream, FrameCodec>,
@@ -1288,6 +1289,7 @@ impl ServerRelay<'_> {
         }
     }
 
+    #[allow(clippy::collapsible_match)]
     async fn handle_pf_event(
         &mut self,
         framed: &mut Framed<UnixStream, FrameCodec>,

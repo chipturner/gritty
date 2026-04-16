@@ -162,12 +162,24 @@ impl ConfigFile {
                     .unwrap_or(10)
                     .max(1);
                 let v = h.and_then(|h| h.heartbeat_timeout).or(d.heartbeat_timeout).unwrap_or(60);
-                if v <= iv {
+                let v = if v <= iv {
                     eprintln!(
                         "warning: heartbeat_timeout ({v}s) must exceed heartbeat_interval ({iv}s); clamped to {}s",
                         iv + 1
                     );
                     iv + 1
+                } else {
+                    v
+                };
+                // The server's idle-evict fires after 120s of client silence.
+                // Ensure interval + timeout stays under that so a healthy
+                // client is never evicted before its first Ping.
+                let max_timeout = 110u64.saturating_sub(iv);
+                if v > max_timeout {
+                    eprintln!(
+                        "warning: heartbeat_interval ({iv}s) + heartbeat_timeout ({v}s) exceeds server idle-evict (120s); timeout clamped to {max_timeout}s"
+                    );
+                    max_timeout
                 } else {
                     v
                 }
@@ -485,5 +497,25 @@ mod tests {
         let c = cfg.resolve_tunnel("devbox");
         assert!(c.session.forward_agent);
         assert!(c.session.forward_open);
+    }
+
+    #[test]
+    fn heartbeat_timeout_clamped_to_avoid_idle_evict() {
+        let cfg: ConfigFile = toml::from_str(
+            r#"
+            [defaults]
+            heartbeat-interval = 90
+            heartbeat-timeout = 150
+            "#,
+        )
+        .unwrap();
+        let s = cfg.resolve_session(None);
+        // interval + timeout must stay under 120s (server idle-evict)
+        assert!(
+            s.heartbeat_interval + s.heartbeat_timeout <= 110,
+            "interval={} timeout={}",
+            s.heartbeat_interval,
+            s.heartbeat_timeout
+        );
     }
 }
