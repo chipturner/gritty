@@ -99,7 +99,7 @@ Handshake: `0x01` Hello, `0x02` HelloAck. Relay: `0x10` Data, `0x11` Resize, `0x
 
 `Error`: `[code: u16][message: remaining bytes]`. `ErrorCode`: `NoSuchSession(1)`, `NameAlreadyExists(2)`, `InvalidName(3)`, `EmptyName(4)`, `VersionMismatch(5)`, `UnexpectedFrame(6)`, `AlreadyAttached(7)`, `OwnerChanged(8)`, `Unknown(u16)`.
 
-`SessionInfo`: `[count: u32][per entry: [entry_len: u32][id: u32][name: u16-len + bytes][pty_path: u16-len + bytes][shell_pid: u32][created_at: u64][attached: u8][last_heartbeat: u64][foreground_cmd: u16-len + bytes][cwd: u16-len + bytes][client_name: u16-len + bytes][agent_forwarding_active: u8]]`. Decoder skips unknown trailing bytes within each entry_len; new fields default gracefully when absent (older servers).
+`SessionInfo`: `[count: u32][per entry: [entry_len: u32][id: u32][name: u16-len + bytes][pty_path: u16-len + bytes][shell_pid: u32][created_at: u64][attached: u8][last_heartbeat: u64][foreground_cmd: u16-len + bytes][cwd: u16-len + bytes][client_name: u16-len + bytes][agent_forwarding_active: u8][is_last_attached: u8]]`. Decoder skips unknown trailing bytes within each entry_len; new fields default gracefully when absent (older servers).
 
 `SvcRequest`: `OpenUrl=1`, `Send=2`, `Receive=3`, `Clipboard=5` (1-byte discriminator). Clipboard sub-protocol: `[0x01][data]` = copy, `[0x02]` = paste (server responds with clipboard content).
 
@@ -142,7 +142,7 @@ File transfer manifest (svc socket, not Frame protocol): sender writes `[file_co
 - **Fork before tokio** -- `daemonize()` MUST fork before creating the tokio runtime. `main()` is sync (no `#[tokio::main]`).
 
 ### Changing protocol/signatures
-- **`PROTOCOL_VERSION`** -- bump whenever frame types, encoding, or `SessionEntry` fields change. Currently v16. Version mismatch is **not** a hard gate at the handshake layer: the daemon always sends `HelloAck` with its own version so the client can see it, then rejects any non-`KillServer` follow-up frame with `ErrorCode::VersionMismatch`. This is deliberate -- `kill-server` and `restart` need to work across a mismatched handshake so users can recover without SSH. `tunnel-create --ignore-version-mismatch` still exists for the SSH-level pre-check but its value is mostly superseded by the in-band recovery flow.
+- **`PROTOCOL_VERSION`** -- bump whenever frame types, encoding, or `SessionEntry` fields change. Currently v17. Version mismatch is **not** a hard gate at the handshake layer: the daemon always sends `HelloAck` with its own version so the client can see it, then rejects any non-`KillServer` follow-up frame with `ErrorCode::VersionMismatch`. This is deliberate -- `kill-server` and `restart` need to work across a mismatched handshake so users can recover without SSH. `tunnel-create --ignore-version-mismatch` still exists for the SSH-level pre-check but its value is mostly superseded by the in-band recovery flow.
 - **`expect_min_len`** -- all fixed-field decoders use `expect_min_len` (not exact length checks), so trailing bytes are tolerated for forward extensibility.
 - **`Frame` enum** -- update: encoder, decoder, protocol tests, all `match frame` in server.rs, client.rs, daemon.rs, main.rs.
 - **`SessionInfo`** -- entry count `u32`. Changing `SessionEntry` fields requires updating both encoder and decoder in protocol.rs.

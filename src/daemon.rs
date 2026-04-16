@@ -213,10 +213,14 @@ fn foreground_cwd(shell_pid: u32) -> String {
     String::from_utf8_lossy(&path_bytes[..len]).into_owned()
 }
 
-fn build_session_entries(sessions: &HashMap<u32, SessionState>) -> Vec<SessionEntry> {
+fn build_session_entries(
+    sessions: &HashMap<u32, SessionState>,
+    last_attached: Option<u32>,
+) -> Vec<SessionEntry> {
     let mut entries: Vec<_> = sessions
         .iter()
         .map(|(&id, state)| {
+            let is_last_attached = last_attached == Some(id);
             if let Some(meta) = state.metadata.get() {
                 SessionEntry {
                     id,
@@ -230,6 +234,7 @@ fn build_session_entries(sessions: &HashMap<u32, SessionState>) -> Vec<SessionEn
                     cwd: foreground_cwd(meta.shell_pid.load(Ordering::Relaxed)),
                     client_name: meta.client_name.lock().map(|n| n.clone()).unwrap_or_default(),
                     agent_forwarding_active: meta.wants_agent.load(Ordering::Relaxed),
+                    is_last_attached,
                 }
             } else {
                 SessionEntry {
@@ -244,6 +249,7 @@ fn build_session_entries(sessions: &HashMap<u32, SessionState>) -> Vec<SessionEn
                     cwd: String::new(),
                     client_name: String::new(),
                     agent_forwarding_active: false,
+                    is_last_attached,
                 }
             }
         })
@@ -815,7 +821,7 @@ async fn dispatch_control(
         }
         Frame::ListSessions => {
             reap_sessions(sessions);
-            let entries = build_session_entries(sessions);
+            let entries = build_session_entries(sessions, *last_attached);
             let _ = timed_send(&mut framed, Frame::SessionInfo { sessions: entries }).await;
             false
         }

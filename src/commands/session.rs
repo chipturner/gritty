@@ -857,6 +857,9 @@ async fn resolve_tail_target(ctl_path: &Path, target: &str) -> anyhow::Result<u3
         anyhow::bail!("unexpected response to ListSessions");
     };
     if target == "-" {
+        if let Some(e) = sessions.iter().find(|e| e.is_last_attached) {
+            return Ok(e.id);
+        }
         return sessions
             .iter()
             .max_by_key(|e| e.last_heartbeat)

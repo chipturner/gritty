@@ -219,11 +219,19 @@ pub(crate) async fn port_forward_client_command(
             anyhow::bail!("unexpected response to ListSessions");
         };
         if session == "-" {
-            sessions
-                .iter()
-                .max_by_key(|e| e.last_heartbeat)
-                .map(|e| e.id)
-                .ok_or_else(|| anyhow::anyhow!("no sessions (cannot resolve '-')"))?
+            // Prefer the daemon's authoritative `is_last_attached` bit so
+            // lf/rf pick the same session `gritty connect -` would.
+            // Fall back to max-heartbeat when talking to an older server
+            // that doesn't populate the bit.
+            if let Some(e) = sessions.iter().find(|e| e.is_last_attached) {
+                e.id
+            } else {
+                sessions
+                    .iter()
+                    .max_by_key(|e| e.last_heartbeat)
+                    .map(|e| e.id)
+                    .ok_or_else(|| anyhow::anyhow!("no sessions (cannot resolve '-')"))?
+            }
         } else {
             sessions
                 .iter()
