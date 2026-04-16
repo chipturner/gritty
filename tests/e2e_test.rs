@@ -1,7 +1,7 @@
 use bytes::Bytes;
 use futures_util::{SinkExt, StreamExt};
 use gritty::protocol::{Frame, FrameCodec};
-use gritty::server::ClientConn;
+use gritty::server::{ClientConn, SessionConfig};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Arc, LazyLock, OnceLock};
@@ -47,17 +47,11 @@ async fn setup_session() -> (
         gritty::server::run(
             client_rx,
             meta_clone,
-            agent_path,
-            svc_path,
-            0,
-            None,
-            None,
-            1 << 20,
-            5,
-            0,
-            0,
-            None,
-            0,
+            SessionConfig {
+                agent_socket_path: agent_path,
+                svc_socket_path: svc_path,
+                ..Default::default()
+            },
         )
         .await
     });
@@ -98,17 +92,11 @@ async fn setup_session_with_svc_path() -> (
         gritty::server::run(
             client_rx,
             meta_clone,
-            agent_path,
-            svc_path,
-            0,
-            None,
-            None,
-            1 << 20,
-            5,
-            0,
-            0,
-            None,
-            0,
+            SessionConfig {
+                agent_socket_path: agent_path,
+                svc_socket_path: svc_path,
+                ..Default::default()
+            },
         )
         .await
     });
@@ -149,17 +137,11 @@ async fn setup_session_with_env(
         gritty::server::run(
             client_rx,
             meta_clone,
-            agent_path,
-            svc_path,
-            0,
-            None,
-            None,
-            1 << 20,
-            5,
-            0,
-            0,
-            None,
-            0,
+            SessionConfig {
+                agent_socket_path: agent_path,
+                svc_socket_path: svc_path,
+                ..Default::default()
+            },
         )
         .await
     });
@@ -889,17 +871,11 @@ async fn setup_session_with_agent_path() -> (
         gritty::server::run(
             client_rx,
             meta_clone,
-            agent_path_clone,
-            svc_path,
-            0,
-            None,
-            None,
-            1 << 20,
-            5,
-            0,
-            0,
-            None,
-            0,
+            SessionConfig {
+                agent_socket_path: agent_path_clone,
+                svc_socket_path: svc_path,
+                ..Default::default()
+            },
         )
         .await
     });
@@ -2433,17 +2409,12 @@ async fn reconnect_alt_screen_primes_client_and_discards_ring_buf() {
         gritty::server::run(
             client_rx,
             meta_clone,
-            agent_path,
-            svc_path,
-            0,
-            None,
-            Some(cmd),
-            1 << 20,
-            5,
-            0,
-            0,
-            None,
-            0,
+            SessionConfig {
+                agent_socket_path: agent_path,
+                svc_socket_path: svc_path,
+                command: Some(cmd),
+                ..Default::default()
+            },
         )
         .await
     });

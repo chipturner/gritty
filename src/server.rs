@@ -21,6 +21,39 @@ use tokio::sync::{broadcast, mpsc};
 use tokio_util::codec::Framed;
 use tracing::{debug, info, warn};
 
+/// Configuration for a session server task.
+pub struct SessionConfig {
+    pub agent_socket_path: PathBuf,
+    pub svc_socket_path: PathBuf,
+    pub session_id: u32,
+    pub session_name: Option<String>,
+    pub command: Option<String>,
+    pub ring_buffer_cap: usize,
+    pub oauth_tunnel_idle_timeout: u64,
+    pub initial_cols: u16,
+    pub initial_rows: u16,
+    pub cwd: Option<String>,
+    pub initial_device_id: u64,
+}
+
+impl Default for SessionConfig {
+    fn default() -> Self {
+        Self {
+            agent_socket_path: PathBuf::new(),
+            svc_socket_path: PathBuf::new(),
+            session_id: 0,
+            session_name: None,
+            command: None,
+            ring_buffer_cap: 1 << 20,
+            oauth_tunnel_idle_timeout: 5,
+            initial_cols: 0,
+            initial_rows: 0,
+            cwd: None,
+            initial_device_id: 0,
+        }
+    }
+}
+
 /// Wrapper to distinguish active, tail, and send connections arriving via channel.
 pub enum ClientConn {
     Active {
@@ -1480,22 +1513,24 @@ fn format_server_diag(
     s
 }
 
-#[allow(clippy::too_many_arguments)]
 pub async fn run(
     mut client_rx: mpsc::UnboundedReceiver<ClientConn>,
     metadata_slot: Arc<OnceLock<SessionMetadata>>,
-    agent_socket_path: PathBuf,
-    svc_socket_path: PathBuf,
-    session_id: u32,
-    session_name: Option<String>,
-    command: Option<String>,
-    ring_buffer_cap: usize,
-    oauth_tunnel_idle_timeout: u64,
-    initial_cols: u16,
-    initial_rows: u16,
-    cwd: Option<String>,
-    initial_device_id: u64,
+    config: SessionConfig,
 ) -> anyhow::Result<()> {
+    let SessionConfig {
+        agent_socket_path,
+        svc_socket_path,
+        session_id,
+        session_name,
+        command,
+        ring_buffer_cap,
+        oauth_tunnel_idle_timeout,
+        initial_cols,
+        initial_rows,
+        cwd,
+        initial_device_id,
+    } = config;
     // Allocate PTY with initial window size when available
     let winsize = if initial_cols > 0 && initial_rows > 0 {
         Some(nix::pty::Winsize {

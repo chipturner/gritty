@@ -2,7 +2,34 @@ use std::path::{Path, PathBuf};
 use tracing::Instrument;
 
 use super::AutoStart;
-use super::util::{format_age, format_timestamp, server_request};
+use super::util::{
+    discover_daemon_probes, format_age, format_timestamp, resolve_session_id, server_request,
+};
+
+fn client_config(
+    name: &str,
+    session_id: u32,
+    ctl_path: &Path,
+    settings: &gritty::config::SessionSettings,
+    server_id: u64,
+) -> gritty::client::ClientConfig {
+    gritty::client::ClientConfig {
+        session: name.to_string(),
+        session_id,
+        ctl_path: ctl_path.to_path_buf(),
+        env_vars: vec![],
+        no_escape: settings.no_escape,
+        forward_agent: settings.forward_agent,
+        forward_open: settings.forward_open,
+        oauth_redirect: settings.oauth_redirect,
+        oauth_timeout: settings.oauth_timeout,
+        heartbeat_interval: settings.heartbeat_interval,
+        heartbeat_timeout: settings.heartbeat_timeout,
+        client_name: settings.client_name.clone(),
+        expected_server_id: server_id,
+        device_id: gritty::get_or_create_device_id(),
+    }
+}
 
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn connect_session(
@@ -64,24 +91,10 @@ pub(crate) async fn connect_session(
         }
         Frame::AttachAck { token: _, session_id } => {
             eprintln!("\x1b[32m\u{25b8} attached {name}\x1b[0m");
-            let env_vars = vec![];
             let client_span = tracing::info_span!("client", session = %name, session_id);
             let code = gritty::client::run(
-                &name,
-                session_id,
                 framed,
-                &ctl_path,
-                env_vars,
-                settings.no_escape,
-                settings.forward_agent,
-                settings.forward_open,
-                settings.oauth_redirect,
-                settings.oauth_timeout,
-                settings.heartbeat_interval,
-                settings.heartbeat_timeout,
-                settings.client_name.clone(),
-                server_id,
-                gritty::get_or_create_device_id(),
+                client_config(&name, session_id, &ctl_path, &settings, server_id),
             )
             .instrument(client_span)
             .await?;
@@ -149,21 +162,8 @@ pub(crate) async fn connect_session(
 
             let client_span = tracing::info_span!("client", session = %name, session_id = id);
             let code = gritty::client::run(
-                &name,
-                id,
                 framed,
-                &ctl_path,
-                vec![], // Env already sent above
-                settings.no_escape,
-                settings.forward_agent,
-                settings.forward_open,
-                settings.oauth_redirect,
-                settings.oauth_timeout,
-                settings.heartbeat_interval,
-                settings.heartbeat_timeout,
-                settings.client_name.clone(),
-                server_id,
-                gritty::get_or_create_device_id(),
+                client_config(&name, id, &ctl_path, &settings, server_id),
             )
             .instrument(client_span)
             .await?;
@@ -830,7 +830,7 @@ pub(crate) async fn tail_session(target: String, ctl_path: PathBuf) -> anyhow::R
     // Resolve the target to a numeric id before opening the tail stream so
     // reconnect can reuse that id (the original target string may be `-`
     // or a name that can shift while we're tailing).
-    let session_id = resolve_tail_target(&ctl_path, &target).await?;
+    let session_id = resolve_session_id(&ctl_path, &target).await?;
 
     let stream = gritty::security::connect_verified(&ctl_path).await.map_err(|_| {
         anyhow::anyhow!("no server running (could not connect to {})", ctl_path.display())
@@ -856,33 +856,6 @@ pub(crate) async fn tail_session(target: String, ctl_path: PathBuf) -> anyhow::R
         Frame::Error { message, .. } => anyhow::bail!("{message}"),
         other => anyhow::bail!("unexpected response from server: {other:?}"),
     }
-}
-
-async fn resolve_tail_target(ctl_path: &Path, target: &str) -> anyhow::Result<u32> {
-    use gritty::protocol::Frame;
-
-    if let Ok(id) = target.parse::<u32>() {
-        return Ok(id);
-    }
-    let resp = server_request(ctl_path, Frame::ListSessions).await?;
-    let Frame::SessionInfo { sessions } = resp else {
-        anyhow::bail!("unexpected response to ListSessions");
-    };
-    if target == "-" {
-        if let Some(e) = sessions.iter().find(|e| e.is_last_attached) {
-            return Ok(e.id);
-        }
-        return sessions
-            .iter()
-            .max_by_key(|e| e.last_heartbeat)
-            .map(|e| e.id)
-            .ok_or_else(|| anyhow::anyhow!("no sessions (cannot resolve '-')"));
-    }
-    sessions
-        .iter()
-        .find(|e| e.name == target)
-        .map(|e| e.id)
-        .ok_or_else(|| anyhow::anyhow!("no such session: {target}"))
 }
 
 pub(crate) async fn rename_session(
@@ -1073,33 +1046,7 @@ pub(crate) async fn list_sessions(ctl_path: PathBuf) -> anyhow::Result<()> {
 pub(crate) async fn list_all_sessions() -> anyhow::Result<()> {
     use gritty::protocol::{Frame, FrameCodec, SessionEntry};
 
-    let mut probes: Vec<(String, PathBuf)> = Vec::new();
-    let local = gritty::daemon::control_socket_path();
-    if local.exists() {
-        probes.push(("local".to_string(), local));
-    }
-    // Union of (a) tunnels with live supervisor locks and (b) bare socket
-    // files. Either alone misses real cases: a supervisor can be in backoff
-    // with no socket yet (caught by the lock enumeration); a socket can be
-    // live while its supervisor lock is stale or gone (caught by the socket
-    // scan). Both paths surface as probes; connect failures become per-host
-    // warnings instead of silent drops.
-    let mut seen = std::collections::HashSet::new();
-    for info in gritty::connect::get_tunnel_info() {
-        if seen.insert(info.name.clone()) {
-            probes.push((info.name.clone(), gritty::connect::connection_socket_path(&info.name)));
-        }
-    }
-    if let Ok(entries) = std::fs::read_dir(gritty::daemon::socket_dir()) {
-        for entry in entries.flatten() {
-            let name = entry.file_name().to_string_lossy().to_string();
-            if let Some(stem) = name.strip_prefix("connect-").and_then(|s| s.strip_suffix(".sock"))
-                && seen.insert(stem.to_string())
-            {
-                probes.push((stem.to_string(), entry.path()));
-            }
-        }
-    }
+    let probes = discover_daemon_probes();
 
     if probes.is_empty() {
         anyhow::bail!("no server running");

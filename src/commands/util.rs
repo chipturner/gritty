@@ -27,13 +27,10 @@ pub(crate) fn resolve_ctl_path(
     }
 }
 
-/// Send a control frame to the server and return the response. Bails with an
-/// actionable error if the peer's `PROTOCOL_VERSION` differs from ours --
-/// every normal command wants matched versions. Use [`server_request_any_version`]
-/// for the `kill-server` recovery path.
-pub(crate) async fn server_request(
+async fn server_request_inner(
     ctl_path: &Path,
     frame: gritty::protocol::Frame,
+    check_version: bool,
 ) -> anyhow::Result<gritty::protocol::Frame> {
     use futures_util::{SinkExt, StreamExt};
     use gritty::protocol::{Frame, FrameCodec};
@@ -44,9 +41,22 @@ pub(crate) async fn server_request(
     })?;
     let mut framed = Framed::new(stream, FrameCodec);
     let info = gritty::handshake(&mut framed, gritty::get_or_create_device_id()).await?;
-    gritty::require_matched_version(&info)?;
+    if check_version {
+        gritty::require_matched_version(&info)?;
+    }
     framed.send(frame).await?;
     Frame::expect_from(framed.next().await)
+}
+
+/// Send a control frame to the server and return the response. Bails with an
+/// actionable error if the peer's `PROTOCOL_VERSION` differs from ours --
+/// every normal command wants matched versions. Use [`server_request_any_version`]
+/// for the `kill-server` recovery path.
+pub(crate) async fn server_request(
+    ctl_path: &Path,
+    frame: gritty::protocol::Frame,
+) -> anyhow::Result<gritty::protocol::Frame> {
+    server_request_inner(ctl_path, frame, true).await
 }
 
 /// Like `server_request`, but tolerates a protocol-version mismatch -- used
@@ -56,17 +66,7 @@ pub(crate) async fn server_request_any_version(
     ctl_path: &Path,
     frame: gritty::protocol::Frame,
 ) -> anyhow::Result<gritty::protocol::Frame> {
-    use futures_util::{SinkExt, StreamExt};
-    use gritty::protocol::{Frame, FrameCodec};
-    use tokio_util::codec::Framed;
-
-    let stream = gritty::security::connect_verified(ctl_path).await.map_err(|_| {
-        anyhow::anyhow!("no server running (could not connect to {})", ctl_path.display())
-    })?;
-    let mut framed = Framed::new(stream, FrameCodec);
-    let _ = gritty::handshake(&mut framed, gritty::get_or_create_device_id()).await?;
-    framed.send(frame).await?;
-    Frame::expect_from(framed.next().await)
+    server_request_inner(ctl_path, frame, false).await
 }
 
 /// Run the current binary with the given args. Both `gritty server` and
@@ -193,6 +193,34 @@ pub(crate) fn parse_port_spec(spec: &str) -> anyhow::Result<(u16, u16)> {
     }
 }
 
+/// Resolve a session target (numeric ID, name, or `-`) to its numeric ID.
+pub(crate) async fn resolve_session_id(ctl_path: &Path, target: &str) -> anyhow::Result<u32> {
+    use gritty::protocol::Frame;
+
+    if let Ok(id) = target.parse::<u32>() {
+        return Ok(id);
+    }
+    let Frame::SessionInfo { sessions } = server_request(ctl_path, Frame::ListSessions).await?
+    else {
+        anyhow::bail!("unexpected response to ListSessions");
+    };
+    if target == "-" {
+        if let Some(e) = sessions.iter().find(|e| e.is_last_attached) {
+            return Ok(e.id);
+        }
+        return sessions
+            .iter()
+            .max_by_key(|e| e.last_heartbeat)
+            .map(|e| e.id)
+            .ok_or_else(|| anyhow::anyhow!("no sessions (cannot resolve '-')"));
+    }
+    sessions
+        .iter()
+        .find(|e| e.name == target)
+        .map(|e| e.id)
+        .ok_or_else(|| anyhow::anyhow!("no such session: {target}"))
+}
+
 /// Run a port forward command via the client-side forward socket.
 /// Resolves the session name to its numeric id via the daemon, then connects
 /// to fwd-{host}-{id}.sock, sends the request, and blocks.
@@ -203,43 +231,12 @@ pub(crate) async fn port_forward_client_command(
     listen_port: u16,
     target_port: u16,
 ) -> anyhow::Result<()> {
-    use gritty::protocol::Frame;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
     let (host, session) = parse_target(target);
     let session = session.unwrap_or_else(|| "default".to_string());
     let ctl_path = resolve_ctl_path(ctl_socket, Some(&host))?;
-
-    let session_id = if let Ok(id) = session.parse::<u32>() {
-        id
-    } else {
-        let Frame::SessionInfo { sessions } =
-            server_request(&ctl_path, Frame::ListSessions).await?
-        else {
-            anyhow::bail!("unexpected response to ListSessions");
-        };
-        if session == "-" {
-            // Prefer the daemon's authoritative `is_last_attached` bit so
-            // lf/rf pick the same session `gritty connect -` would.
-            // Fall back to max-heartbeat when talking to an older server
-            // that doesn't populate the bit.
-            if let Some(e) = sessions.iter().find(|e| e.is_last_attached) {
-                e.id
-            } else {
-                sessions
-                    .iter()
-                    .max_by_key(|e| e.last_heartbeat)
-                    .map(|e| e.id)
-                    .ok_or_else(|| anyhow::anyhow!("no sessions (cannot resolve '-')"))?
-            }
-        } else {
-            sessions
-                .iter()
-                .find(|e| e.name == session)
-                .map(|e| e.id)
-                .ok_or_else(|| anyhow::anyhow!("no such session: {host}:{session}"))?
-        }
-    };
+    let session_id = resolve_session_id(&ctl_path, &session).await?;
 
     let fwd_path = gritty::client::forward_socket_path(&ctl_path, session_id);
 
@@ -290,37 +287,69 @@ pub(crate) async fn port_forward_client_command(
     Ok(())
 }
 
+/// Enumerate all reachable daemon sockets: local + tunnels + bare socket files.
+/// Returns `(host_name, socket_path)` pairs.
+pub(crate) fn discover_daemon_probes() -> Vec<(String, PathBuf)> {
+    let mut probes = Vec::new();
+    let local = gritty::daemon::control_socket_path();
+    if local.exists() {
+        probes.push(("local".to_string(), local));
+    }
+    let mut seen = std::collections::HashSet::new();
+    for info in gritty::connect::get_tunnel_info() {
+        if seen.insert(info.name.clone()) {
+            probes.push((info.name.clone(), gritty::connect::connection_socket_path(&info.name)));
+        }
+    }
+    if let Ok(entries) = std::fs::read_dir(gritty::daemon::socket_dir()) {
+        for entry in entries.flatten() {
+            let name = entry.file_name().to_string_lossy().to_string();
+            if let Some(stem) = name.strip_prefix("connect-").and_then(|s| s.strip_suffix(".sock"))
+                && seen.insert(stem.to_string())
+            {
+                probes.push((stem.to_string(), entry.path()));
+            }
+        }
+    }
+    probes
+}
+
+/// Connect to the per-session svc socket (`$GRITTY_SOCK`).
+/// `context` is appended to the "not set" error (e.g. `" with --forward-open"`).
+fn connect_svc_socket(context: &str) -> std::os::unix::net::UnixStream {
+    let sock_path = match std::env::var("GRITTY_SOCK") {
+        Ok(p) => p,
+        Err(_) => {
+            eprintln!("error: GRITTY_SOCK not set (are you inside a gritty session{context}?)");
+            std::process::exit(1);
+        }
+    };
+    match std::os::unix::net::UnixStream::connect(&sock_path) {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln!("error: could not connect to service socket ({sock_path}): {e}");
+            std::process::exit(1);
+        }
+    }
+}
+
 /// Read stdin and send to client clipboard via svc socket.
 pub(crate) fn clipboard_copy() {
     use std::io::{Read, Write};
 
-    let sock_path = match std::env::var("GRITTY_SOCK") {
-        Ok(p) => p,
-        Err(_) => {
-            eprintln!("error: GRITTY_SOCK not set (are you inside a gritty session?)");
-            std::process::exit(1);
-        }
-    };
     let mut data = Vec::new();
     if let Err(e) = std::io::stdin().read_to_end(&mut data) {
         eprintln!("error: reading stdin: {e}");
         std::process::exit(1);
     }
-    match std::os::unix::net::UnixStream::connect(&sock_path) {
-        Ok(mut stream) => {
-            if let Err(e) = stream
-                .write_all(&[gritty::protocol::SvcRequest::Clipboard.to_byte()])
-                .and_then(|_| stream.write_all(&[0x01]))
-                .and_then(|_| stream.write_all(&data))
-            {
-                eprintln!("error: clipboard copy failed: {e}");
-                std::process::exit(1);
-            }
-        }
-        Err(e) => {
-            eprintln!("error: could not connect to service socket ({sock_path}): {e}");
-            std::process::exit(1);
-        }
+    let mut stream = connect_svc_socket("");
+    if let Err(e) = stream
+        .write_all(&[gritty::protocol::SvcRequest::Clipboard.to_byte()])
+        .and_then(|_| stream.write_all(&[0x01]))
+        .and_then(|_| stream.write_all(&data))
+    {
+        eprintln!("error: clipboard copy failed: {e}");
+        std::process::exit(1);
     }
 }
 
@@ -328,67 +357,37 @@ pub(crate) fn clipboard_copy() {
 pub(crate) fn clipboard_paste() {
     use std::io::{Read, Write};
 
-    let sock_path = match std::env::var("GRITTY_SOCK") {
-        Ok(p) => p,
-        Err(_) => {
-            eprintln!("error: GRITTY_SOCK not set (are you inside a gritty session?)");
-            std::process::exit(1);
-        }
-    };
-    match std::os::unix::net::UnixStream::connect(&sock_path) {
-        Ok(mut stream) => {
-            let _ = stream.write_all(&[gritty::protocol::SvcRequest::Clipboard.to_byte()]);
-            let _ = stream.write_all(&[0x02]); // paste operation
-            let _ = stream.shutdown(std::net::Shutdown::Write);
-            let mut data = Vec::new();
-            let _ = stream.set_read_timeout(Some(std::time::Duration::from_secs(5)));
-            if stream.read_to_end(&mut data).is_ok() && !data.is_empty() {
-                let _ = std::io::stdout().write_all(&data);
-            }
-        }
-        Err(e) => {
-            eprintln!("error: could not connect to service socket ({sock_path}): {e}");
-            std::process::exit(1);
-        }
+    let mut stream = connect_svc_socket("");
+    let _ = stream.write_all(&[gritty::protocol::SvcRequest::Clipboard.to_byte()]);
+    let _ = stream.write_all(&[0x02]); // paste operation
+    let _ = stream.shutdown(std::net::Shutdown::Write);
+    let mut data = Vec::new();
+    let _ = stream.set_read_timeout(Some(std::time::Duration::from_secs(5)));
+    if stream.read_to_end(&mut data).is_ok() && !data.is_empty() {
+        let _ = std::io::stdout().write_all(&data);
     }
 }
 
 pub(crate) fn open_url(url: &str) {
     use std::io::{Read, Write};
 
-    let sock_path = match std::env::var("GRITTY_SOCK") {
-        Ok(p) => p,
-        Err(_) => {
-            eprintln!(
-                "error: GRITTY_SOCK not set (are you inside a gritty session with --forward-open?)"
-            );
-            std::process::exit(1);
-        }
-    };
-    match std::os::unix::net::UnixStream::connect(&sock_path) {
-        Ok(mut stream) => {
-            let _ = stream.write_all(&[gritty::protocol::SvcRequest::OpenUrl.to_byte()]);
-            let _ = stream.write_all(url.as_bytes());
-            let _ = stream.write_all(b"\n");
+    let mut stream = connect_svc_socket(" with --forward-open");
+    let _ = stream.write_all(&[gritty::protocol::SvcRequest::OpenUrl.to_byte()]);
+    let _ = stream.write_all(url.as_bytes());
+    let _ = stream.write_all(b"\n");
 
-            // Read response byte: 0x01 = forwarded, 0x00 = no client
-            let _ = stream.set_read_timeout(Some(std::time::Duration::from_secs(2)));
-            let mut resp = [0u8; 1];
-            match stream.read_exact(&mut resp) {
-                Ok(()) if resp[0] == 0x00 => {
-                    eprintln!("error: no client is connected with --forward-open");
-                    std::process::exit(1);
-                }
-                Ok(()) => {} // 0x01 or other = success
-                Err(_) => {
-                    // Timeout or older server -- degrade gracefully
-                    eprintln!("warning: could not confirm URL was forwarded (server may be older)");
-                }
-            }
-        }
-        Err(e) => {
-            eprintln!("error: could not connect to service socket ({sock_path}): {e}");
+    // Read response byte: 0x01 = forwarded, 0x00 = no client
+    let _ = stream.set_read_timeout(Some(std::time::Duration::from_secs(2)));
+    let mut resp = [0u8; 1];
+    match stream.read_exact(&mut resp) {
+        Ok(()) if resp[0] == 0x00 => {
+            eprintln!("error: no client is connected with --forward-open");
             std::process::exit(1);
+        }
+        Ok(()) => {} // 0x01 or other = success
+        Err(_) => {
+            // Timeout or older server -- degrade gracefully
+            eprintln!("warning: could not confirm URL was forwarded (server may be older)");
         }
     }
 }

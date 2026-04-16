@@ -73,21 +73,12 @@ async fn probe_daemon_sessions(ctl_path: &Path) -> Vec<DiscoveredSession> {
 async fn discover_all_sessions(
     ctl_socket: Option<&Path>,
 ) -> anyhow::Result<Vec<DiscoveredSession>> {
-    let mut probes: Vec<PathBuf> = Vec::new();
-
-    if let Some(p) = ctl_socket {
-        probes.push(p.to_path_buf());
+    let probes: Vec<PathBuf> = if let Some(p) = ctl_socket {
+        vec![p.to_path_buf()]
     } else {
-        let local = gritty::daemon::control_socket_path();
-        if local.exists() {
-            probes.push(local);
-        }
-        for info in gritty::connect::get_tunnel_info() {
-            if info.status == "healthy" {
-                probes.push(gritty::connect::connection_socket_path(&info.name));
-            }
-        }
-    }
+        let discovered = super::util::discover_daemon_probes();
+        discovered.into_iter().map(|(_, path)| path).collect()
+    };
 
     if probes.is_empty() {
         anyhow::bail!("no server running");

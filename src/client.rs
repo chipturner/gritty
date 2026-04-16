@@ -17,6 +17,24 @@ use tokio::signal::unix::{SignalKind, signal};
 use tokio::sync::mpsc;
 use tokio::time::Instant;
 
+/// Configuration for a client session.
+pub struct ClientConfig {
+    pub session: String,
+    pub session_id: u32,
+    pub ctl_path: PathBuf,
+    pub env_vars: Vec<(String, String)>,
+    pub no_escape: bool,
+    pub forward_agent: bool,
+    pub forward_open: bool,
+    pub oauth_redirect: bool,
+    pub oauth_timeout: u64,
+    pub heartbeat_interval: u64,
+    pub heartbeat_timeout: u64,
+    pub client_name: String,
+    pub expected_server_id: u64,
+    pub device_id: u64,
+}
+
 /// Compute the path for the forward socket used by `gritty lf`/`gritty rf`.
 /// Keyed on the immutable numeric session id so rename/`/`-in-name cannot
 /// desync the attached client and the `lf`/`rf` command.
@@ -1615,24 +1633,28 @@ async fn relay(
     }
 }
 
-#[allow(clippy::too_many_arguments)]
 pub async fn run(
-    session: &str,
-    session_id: u32,
     mut framed: Framed<UnixStream, FrameCodec>,
-    ctl_path: &Path,
-    env_vars: Vec<(String, String)>,
-    no_escape: bool,
-    forward_agent: bool,
-    forward_open: bool,
-    oauth_redirect: bool,
-    oauth_timeout: u64,
-    heartbeat_interval: u64,
-    heartbeat_timeout: u64,
-    client_name: String,
-    expected_server_id: u64,
-    device_id: u64,
+    config: ClientConfig,
 ) -> anyhow::Result<i32> {
+    let ClientConfig {
+        session,
+        session_id,
+        ctl_path,
+        env_vars,
+        no_escape,
+        forward_agent,
+        forward_open,
+        oauth_redirect,
+        oauth_timeout,
+        heartbeat_interval,
+        heartbeat_timeout,
+        client_name,
+        expected_server_id,
+        device_id,
+    } = config;
+    let session = &session;
+    let ctl_path = &ctl_path;
     let stdin = io::stdin();
     let stdin_fd = stdin.as_fd();
     // Safety: stdin lives for the duration of the program
