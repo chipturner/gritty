@@ -1757,13 +1757,27 @@ pub async fn run(
                         OwnerChanged,
                         VersionMismatch { server_version: u16 },
                         HandshakeErr(String),
+                        DaemonGone,
                         Retry,
                     }
 
                     let attempt = tokio::time::timeout(RECONNECT_ATTEMPT_TIMEOUT, async {
                         let stream = match crate::security::connect_verified(ctl_path).await {
                             Ok(s) => s,
-                            Err(_) => return Attempt::Retry,
+                            Err(e) => {
+                                // ECONNREFUSED with the socket file still on
+                                // disk and no tunnel supervisor is the stale-
+                                // socket signature of a crashed local daemon.
+                                // The SOCKET_GONE_GRACE window above only
+                                // covers socket-missing, so without this the
+                                // client would spin "reconnecting..." forever.
+                                if e.kind() == std::io::ErrorKind::ConnectionRefused
+                                    && !tunnel_supervisor_alive
+                                {
+                                    return Attempt::DaemonGone;
+                                }
+                                return Attempt::Retry;
+                            }
                         };
                         let mut new_framed = Framed::new(stream, FrameCodec);
                         let info = match crate::handshake(&mut new_framed).await {
@@ -1879,6 +1893,14 @@ pub async fn run(
                                 return Ok(1);
                             }
                             continue;
+                        }
+                        Ok(Attempt::DaemonGone) => {
+                            write_stdout_async(
+                                &async_stdout,
+                                b"\x1b[?1049l\r\x1b[31m\xe2\x96\xb8 daemon appears to have crashed -- session is gone; run `gritty server` or `gritty restart`\x1b[0m\x1b[K\r\n",
+                            )
+                            .await?;
+                            return Ok(1);
                         }
                         Ok(Attempt::Retry) | Err(_) => continue,
                     }
@@ -2073,12 +2095,20 @@ pub async fn tail(
                         VersionMismatch { local: u16, remote: u16 },
                         HandshakeRejected(String),
                         SessionGone(String),
+                        DaemonGone,
                         Retry,
                     }
                     let outcome = tokio::time::timeout(RECONNECT_ATTEMPT_TIMEOUT, async {
                         let stream = match crate::security::connect_verified(ctl_path).await {
                             Ok(s) => s,
-                            Err(_) => return Outcome::Retry,
+                            Err(e) => {
+                                if e.kind() == std::io::ErrorKind::ConnectionRefused
+                                    && !tunnel_supervisor_alive
+                                {
+                                    return Outcome::DaemonGone;
+                                }
+                                return Outcome::Retry;
+                            }
                         };
                         let mut new_framed = Framed::new(stream, FrameCodec);
                         let info = match crate::handshake(&mut new_framed).await {
@@ -2151,6 +2181,12 @@ pub async fn tail(
                         }
                         Ok(Outcome::SessionGone(message)) => {
                             eprintln!("\r\x1b[31m\u{25b8} session gone: {message}\x1b[0m\x1b[K");
+                            break 'outer 1;
+                        }
+                        Ok(Outcome::DaemonGone) => {
+                            eprintln!(
+                                "\r\x1b[31m\u{25b8} daemon appears to have crashed -- session is gone; run `gritty server` or `gritty restart`\x1b[0m\x1b[K"
+                            );
                             break 'outer 1;
                         }
                         Ok(Outcome::Retry) | Err(_) => continue,
