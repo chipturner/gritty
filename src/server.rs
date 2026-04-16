@@ -787,6 +787,7 @@ const PENDING_INPUT_CAP: usize = 1 << 20;
 /// (`connect -F`) silently stalls. Breaking to `ClientGone` on timeout lets
 /// takeover proceed and keeps the session unwedged.
 const CLIENT_SEND_TIMEOUT: Duration = Duration::from_secs(30);
+const IDLE_EVICT_TIMEOUT: Duration = Duration::from_secs(120);
 
 /// Non-blocking drain of any remaining PTY output after `child.wait()` fires,
 /// capturing final write(s) that raced with the exit. The master fd is
@@ -1990,10 +1991,12 @@ pub async fn run(
                 pending_paste: &mut pending_paste,
                 negotiated_caps: &negotiated_caps,
             };
+            let mut last_client_frame_at = tokio::time::Instant::now();
             loop {
                 tokio::select! {
                     biased;
                     frame = framed.next() => {
+                        last_client_frame_at = tokio::time::Instant::now();
                         if let ControlFlow::Break(exit) = relay.handle_client_frame(&mut framed, frame).await? {
                             break exit;
                         }
@@ -2001,6 +2004,21 @@ pub async fn run(
 
                     ready = relay.async_master.writable(), if !relay.pending_input.is_empty() => {
                         drain_pending_input(ready?, relay.pending_input, relay.pending_input_bytes)?;
+                    }
+
+                    // Idle client eviction: if no frame (not even a Ping)
+                    // has arrived in IDLE_EVICT_TIMEOUT, treat the TCP link
+                    // as half-open and release the slot so a new client can
+                    // attach. The client's heartbeat cadence (PING_IDLE=10s,
+                    // PING_TIMEOUT=60s) means 120s of total silence already
+                    // indicates the client has given up or the link is dead.
+                    () = tokio::time::sleep_until(last_client_frame_at + IDLE_EVICT_TIMEOUT) => {
+                        warn!(
+                            "client silent for {:?}, evicting to release attach slot",
+                            IDLE_EVICT_TIMEOUT
+                        );
+                        let _ = send_framed_timed(&mut framed, Frame::Detached).await;
+                        break RelayExit::ClientGone;
                     }
 
                     new_client = client_rx.recv() => {
