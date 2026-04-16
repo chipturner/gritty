@@ -166,8 +166,17 @@ fn remote_exec_command(
     let wrapped_cmd = format!("{preamble}; {remote_cmd}");
     let mut cmd = Command::new("ssh");
     cmd.args(base_ssh_args(dest, extra_ssh_opts, foreground, connect_timeout));
+    // Bound post-connect hangs for remote_exec: the ConnectTimeout in
+    // base_ssh_args only covers TCP/auth handshake. Without ServerAlive*
+    // a remote that wedges after login blocks indefinitely.
+    for opt in ["ServerAliveInterval=3", "ServerAliveCountMax=2"] {
+        cmd.arg("-o");
+        cmd.arg(opt);
+    }
     cmd.arg(dest.ssh_dest());
     cmd.arg(&wrapped_cmd);
+    // Kill the spawned ssh if this future is dropped (timeout / cancellation).
+    cmd.kill_on_drop(true);
     cmd
 }
 
@@ -191,7 +200,18 @@ async fn remote_exec(
     cmd.stderr(Stdio::piped());
     cmd.stdin(Stdio::null());
 
-    let output = cmd.output().await.context("failed to run ssh")?;
+    // Wall-clock ceiling on the entire ssh invocation. ServerAlive* bounds
+    // post-connect TCP hangs, but we still want an upper bound on e.g. a
+    // stuck shell profile or a fuse-stalled remote filesystem.
+    let output = tokio::time::timeout(Duration::from_secs(60), cmd.output())
+        .await
+        .map_err(|_| {
+            anyhow::anyhow!(
+                "ssh command timed out after 60s\n  to diagnose: {}",
+                format_ssh_diag(dest, extra_ssh_opts, foreground, connect_timeout)
+            )
+        })?
+        .context("failed to run ssh")?;
 
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
