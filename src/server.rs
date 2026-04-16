@@ -821,7 +821,23 @@ fn drain_pending_input(
                 *pending_bytes -= n;
                 *pending.front_mut().unwrap() = front.slice(n..);
             }
-            Ok(Err(e)) => return Err(e),
+            Ok(Err(e)) => {
+                // EIO on a slave-side PTY write means the shell has torn down
+                // the slave (exit, SIGHUP). The readable()/child.wait() arms
+                // already treat the same EIO on read as a clean shell exit
+                // (RelayExit::ShellExited). With `biased` select ordering,
+                // writable() polls first, so a stray byte in `pending` at
+                // shell-exit time would otherwise promote this to a fatal
+                // error and the client sees "session gone" instead of the
+                // shell's real exit code. Drop the pending bytes and let the
+                // read/wait arm observe exit on the next poll.
+                if e.raw_os_error() == Some(libc::EIO) {
+                    pending.clear();
+                    *pending_bytes = 0;
+                    return Ok(());
+                }
+                return Err(e);
+            }
             Err(_would_block) => break,
         }
     }
