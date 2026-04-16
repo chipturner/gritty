@@ -738,7 +738,7 @@ async fn tail_relay(
                     if framed.send(Frame::Data(chunk)).await.is_err() { break; }
                 }
                 Ok(TailEvent::Exit { code }) => {
-                    let _ = framed.send(Frame::Exit { code }).await;
+                    let _ = send_framed_timed(&mut framed, Frame::Exit { code }).await;
                     break;
                 }
                 Err(broadcast::error::RecvError::Lagged(n)) => {
@@ -749,7 +749,7 @@ async fn tail_relay(
                 Err(broadcast::error::RecvError::Closed) => break,
             },
             frame = framed.next() => match frame {
-                Some(Ok(Frame::Ping)) => { let _ = framed.send(Frame::Pong).await; }
+                Some(Ok(Frame::Ping)) => { let _ = send_framed_timed(&mut framed, Frame::Pong).await; }
                 _ => break,
             },
         }
@@ -903,7 +903,7 @@ impl ServerRelay<'_> {
                         .as_secs();
                     meta.last_heartbeat.store(now, Ordering::Relaxed);
                 }
-                let _ = framed.send(Frame::Pong).await;
+                let _ = send_framed_timed(framed, Frame::Pong).await;
             }
             Some(Ok(Frame::AgentForward)) => {
                 debug!("agent forwarding enabled by client");
@@ -1065,11 +1065,15 @@ impl ServerRelay<'_> {
                                     target_port,
                                 },
                             );
-                            let _ = framed.send(Frame::PortForwardReady { forward_id }).await;
+                            let _ =
+                                send_framed_timed(framed, Frame::PortForwardReady { forward_id })
+                                    .await;
                         }
                         Err(e) => {
                             warn!(forward_id, listen_port, "local-forward: bind failed: {e}");
-                            let _ = framed.send(Frame::PortForwardStop { forward_id }).await;
+                            let _ =
+                                send_framed_timed(framed, Frame::PortForwardStop { forward_id })
+                                    .await;
                         }
                     }
                 } else {
@@ -1083,7 +1087,7 @@ impl ServerRelay<'_> {
                             target_port,
                         },
                     );
-                    let _ = framed.send(Frame::PortForwardReady { forward_id }).await;
+                    let _ = send_framed_timed(framed, Frame::PortForwardReady { forward_id }).await;
                 }
             }
             Some(Ok(Frame::Env { vars: _ })) => {
@@ -1111,19 +1115,19 @@ impl ServerRelay<'_> {
                 if self.agent.enabled.load(Ordering::Relaxed) {
                     info!(channel_id, "relaying agent open");
                     self.agent.channels.insert(channel_id, writer_tx);
-                    let _ = framed.send(Frame::AgentOpen { channel_id }).await;
+                    let _ = send_framed_timed(framed, Frame::AgentOpen { channel_id }).await;
                 }
             }
             Some(AgentEvent::Data { channel_id, data }) => {
                 if self.agent.enabled.load(Ordering::Relaxed)
                     && self.agent.channels.contains_key(&channel_id)
                 {
-                    let _ = framed.send(Frame::AgentData { channel_id, data }).await;
+                    let _ = send_framed_timed(framed, Frame::AgentData { channel_id, data }).await;
                 }
             }
             Some(AgentEvent::Closed { channel_id }) => {
                 if self.agent.channels.remove(&channel_id).is_some() {
-                    let _ = framed.send(Frame::AgentClose { channel_id }).await;
+                    let _ = send_framed_timed(framed, Frame::AgentClose { channel_id }).await;
                 }
             }
             None => {
@@ -1146,10 +1150,10 @@ impl ServerRelay<'_> {
                     {
                         debug!(port, "setting up reverse tunnel for OAuth callback");
                         self.tunnel.port = Some(port);
-                        let _ = framed.send(Frame::TunnelListen { port }).await;
+                        let _ = send_framed_timed(framed, Frame::TunnelListen { port }).await;
                     }
                     info!(url, "forwarding URL to client");
-                    let _ = framed.send(Frame::OpenUrl { url }).await;
+                    let _ = send_framed_timed(framed, Frame::OpenUrl { url }).await;
                     let _ = stream.write_all(&[0x01]).await;
                 } else {
                     let _ = stream.write_all(&[0x00]).await;
@@ -1209,7 +1213,7 @@ impl ServerRelay<'_> {
                 }
             }
             Some(TunnelEvent::ConnectFailed { channel_id }) => {
-                let _ = framed.send(Frame::TunnelClose { channel_id }).await;
+                let _ = send_framed_timed(framed, Frame::TunnelClose { channel_id }).await;
             }
             Some(TunnelEvent::Data { channel_id, data }) => {
                 // Gate on channels map membership, mirroring agent/pf
@@ -1217,12 +1221,12 @@ impl ServerRelay<'_> {
                 // previous client forwards bytes to the new client on a
                 // channel_id the new client never opened.
                 if self.tunnel.channels.contains_key(&channel_id) {
-                    let _ = framed.send(Frame::TunnelData { channel_id, data }).await;
+                    let _ = send_framed_timed(framed, Frame::TunnelData { channel_id, data }).await;
                 }
             }
             Some(TunnelEvent::Closed { channel_id }) => {
                 if self.tunnel.channels.remove(&channel_id).is_some() {
-                    let _ = framed.send(Frame::TunnelClose { channel_id }).await;
+                    let _ = send_framed_timed(framed, Frame::TunnelClose { channel_id }).await;
                     if self.tunnel.channels.is_empty() && self.tunnel.port.is_some() {
                         self.tunnel.idle_deadline =
                             Some(tokio::time::Instant::now() + self.tunnel.idle_timeout);
@@ -1246,7 +1250,7 @@ impl ServerRelay<'_> {
             {
                 *self.transfer_state = TransferState::Idle;
             }
-            let _ = framed.send(frame).await;
+            let _ = send_framed_timed(framed, frame).await;
         }
     }
 
@@ -1292,16 +1296,17 @@ impl ServerRelay<'_> {
                 }
             }
             Some(PortForwardEvent::ConnectFailed { channel_id }) => {
-                let _ = framed.send(Frame::PortForwardClose { channel_id }).await;
+                let _ = send_framed_timed(framed, Frame::PortForwardClose { channel_id }).await;
             }
             Some(PortForwardEvent::Data { channel_id, data }) => {
                 if self.pf.channels.contains_key(&channel_id) {
-                    let _ = framed.send(Frame::PortForwardData { channel_id, data }).await;
+                    let _ = send_framed_timed(framed, Frame::PortForwardData { channel_id, data })
+                        .await;
                 }
             }
             Some(PortForwardEvent::Closed { channel_id }) => {
                 if let Some((forward_id, _)) = self.pf.channels.remove(&channel_id) {
-                    let _ = framed.send(Frame::PortForwardClose { channel_id }).await;
+                    let _ = send_framed_timed(framed, Frame::PortForwardClose { channel_id }).await;
                     if let Some(fwd) = self.pf.forwards.get_mut(&forward_id) {
                         fwd.channels.remove(&channel_id);
                     }
@@ -1319,7 +1324,7 @@ impl ServerRelay<'_> {
                     for ch_id in fwd.channels.keys() {
                         self.pf.channels.remove(ch_id);
                     }
-                    let _ = framed.send(Frame::PortForwardStop { forward_id }).await;
+                    let _ = send_framed_timed(framed, Frame::PortForwardStop { forward_id }).await;
                 }
             }
             None => {}
@@ -2095,7 +2100,7 @@ pub async fn run(
                                     let msg = format!(
                                         "\r\n\x1b[2;33m[gritty: took over session (was active, heartbeat {hb_str})]\x1b[0m\r\n"
                                     );
-                                    let _ = framed.send(Frame::Data(Bytes::from(msg))).await;
+                                    let _ = send_framed_timed(&mut framed, Frame::Data(Bytes::from(msg))).await;
                                 }
                             }
                             Some(ClientConn::Tail(f)) => {
@@ -2160,7 +2165,7 @@ pub async fn run(
                                 match event {
                                     ClipboardEvent::Copy { data } => {
                                         info!("clipboard operation forwarded");
-                                        let _ = framed.send(Frame::ClipboardSet { data }).await;
+                                        let _ = send_framed_timed(&mut framed, Frame::ClipboardSet { data }).await;
                                     }
                                     ClipboardEvent::Paste { reply } => {
                                         info!("clipboard operation forwarded");
@@ -2172,7 +2177,7 @@ pub async fn run(
                                         relay.paste_deadline = Some(
                                             tokio::time::Instant::now() + std::time::Duration::from_secs(5),
                                         );
-                                        let _ = framed.send(Frame::ClipboardGet).await;
+                                        let _ = send_framed_timed(&mut framed, Frame::ClipboardGet).await;
                                     }
                                 }
                             }
@@ -2283,10 +2288,10 @@ pub async fn run(
                     if tail_tx.receiver_count() > 0 {
                         let _ = tail_tx.send(TailEvent::Data(chunk.clone()));
                     }
-                    let _ = framed.send(Frame::Data(chunk)).await;
+                    let _ = send_framed_timed(&mut framed, Frame::Data(chunk)).await;
                 }
                 let _ = tail_tx.send(TailEvent::Exit { code });
-                let _ = framed.send(Frame::Exit { code }).await;
+                let _ = send_framed_timed(&mut framed, Frame::Exit { code }).await;
                 info!(code, "session ended");
                 break;
             }
