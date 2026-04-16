@@ -1436,6 +1436,50 @@ async fn force_tui_redraw(
 }
 
 #[allow(clippy::too_many_arguments)]
+fn format_server_diag(
+    ring_buf: &VecDeque<bytes::Bytes>,
+    ring_buf_size: usize,
+    ring_buf_dropped: usize,
+    ring_buffer_cap: usize,
+    alt_screen: &AltScreenTracker,
+    scrollback: &ScrollbackBuffer,
+    relay: &ServerRelay<'_>,
+    managed: &ManagedChild,
+) -> String {
+    use std::fmt::Write;
+    let mut s = String::new();
+    let _ = write!(s, "  shell pid: {}", managed.pgid);
+    if let Some(meta) = relay.metadata_slot.get() {
+        let cn = meta.client_name.lock().unwrap();
+        if !cn.is_empty() {
+            let _ = write!(s, "\n  client: {cn}");
+        }
+    }
+    let _ = write!(
+        s,
+        "\n  alt screen: {}",
+        if alt_screen.in_alternate_screen() { "yes" } else { "no" },
+    );
+    let _ = write!(s, "\n  scrollback lines: {}", scrollback.lines().len());
+    let _ = write!(
+        s,
+        "\n  ring buffer: {ring_buf_size} bytes in {} chunks ({ring_buf_dropped} dropped, cap {ring_buffer_cap})",
+        ring_buf.len(),
+    );
+    let _ = write!(s, "\n  pending pty input: {} bytes", relay.pending_input_bytes,);
+    let _ = write!(s, "\n  agent channels: {}", relay.agent.channels.len(),);
+    let _ = write!(s, "\n  tunnel channels: {}", relay.tunnel.channels.len(),);
+    let _ = write!(
+        s,
+        "\n  port forwards: {} ({} connections)",
+        relay.pf.forwards.len(),
+        relay.pf.channels.len(),
+    );
+    let _ = write!(s, "\n  tail clients: {}", relay.tail_tx.receiver_count());
+    s
+}
+
+#[allow(clippy::too_many_arguments)]
 pub async fn run(
     mut client_rx: mpsc::UnboundedReceiver<ClientConn>,
     metadata_slot: Arc<OnceLock<SessionMetadata>>,
@@ -2009,7 +2053,13 @@ pub async fn run(
                     biased;
                     frame = framed.next() => {
                         last_client_frame_at = tokio::time::Instant::now();
-                        if let ControlFlow::Break(exit) = relay.handle_client_frame(&mut framed, frame).await? {
+                        if matches!(&frame, Some(Ok(Frame::DiagRequest))) {
+                            let text = format_server_diag(
+                                &ring_buf, ring_buf_size, ring_buf_dropped, ring_buffer_cap,
+                                &alt_screen, &scrollback, &relay, &managed,
+                            );
+                            let _ = send_framed_timed(&mut framed, Frame::DiagResponse { text }).await;
+                        } else if let ControlFlow::Break(exit) = relay.handle_client_frame(&mut framed, frame).await? {
                             break exit;
                         }
                     }
@@ -2301,7 +2351,13 @@ pub async fn run(
                 if let Some(reply) = pending_paste.take() {
                     let _ = reply.send(None);
                 }
-                info!("client disconnected, waiting for reconnect");
+                info!(
+                    ring_buf_bytes = ring_buf_size,
+                    ring_buf_chunks = ring_buf.len(),
+                    ring_buf_dropped = ring_buf_dropped,
+                    alt_screen = alt_screen.in_alternate_screen(),
+                    "client disconnected, waiting for reconnect",
+                );
                 continue;
             }
             RelayExit::ShellExited(mut code) => {

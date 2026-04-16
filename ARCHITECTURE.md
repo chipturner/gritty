@@ -121,3 +121,4 @@ See `CLAUDE.md` for the full protocol reference.
 - **Client-side gates** -- URL opening (`--forward-open`), agent forwarding (`-A`), and clipboard read are all gated on the client
 - **Rate limiting** -- `OpenUrl` (2/30s), `ClipboardSet` (5/30s), `TunnelListen` (2/30s), `AgentOpen` (10/30s)
 - **Audit logging** -- info/warn level logging for all security-sensitive operations on client and server
+- **Runtime log control** -- SIGUSR1 cycles daemon log level without restart; SIGUSR2 reopens log file for external logrotate

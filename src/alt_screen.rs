@@ -104,7 +104,15 @@ impl AltScreenTracker {
     fn check_param(&mut self, entering: bool) {
         let param = &self.param_buf[..self.param_len];
         if param == b"1049" || param == b"1047" || param == b"47" {
+            let prev = self.in_alt;
             self.in_alt = entering;
+            if prev != entering {
+                tracing::trace!(
+                    entering,
+                    param = std::str::from_utf8(param).unwrap_or("?"),
+                    "alt-screen transition",
+                );
+            }
         }
     }
 }

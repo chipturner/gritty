@@ -13,7 +13,7 @@ use tokio::net::UnixStream;
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 use tokio_util::codec::Framed;
-use tracing::{error, info, warn};
+use tracing::{Instrument, debug, error, info, warn};
 
 const SEND_TIMEOUT: Duration = Duration::from_secs(5);
 
@@ -392,6 +392,7 @@ pub async fn run(ctl_path: &Path, ready_fd: Option<OwnedFd>) -> anyhow::Result<(
 
     let mut sessions: HashMap<u32, SessionState> = HashMap::new();
     let mut next_id: u32 = 0;
+    let mut next_conn_id: u64 = 0;
     let mut last_attached: Option<u32> = None;
     let session_config = crate::config::ConfigFile::load().resolve_session(None);
     let ring_buffer_cap = session_config.ring_buffer_size as usize;
@@ -400,6 +401,10 @@ pub async fn run(ctl_path: &Path, ready_fd: Option<OwnedFd>) -> anyhow::Result<(
     // Signal handlers
     let mut sigterm = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
     let mut sigint = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::interrupt())?;
+    let mut sigusr1 =
+        tokio::signal::unix::signal(tokio::signal::unix::SignalKind::user_defined1())?;
+    let mut sigusr2 =
+        tokio::signal::unix::signal(tokio::signal::unix::SignalKind::user_defined2())?;
 
     // Now fully initialized -- signal readiness to parent (daemonize pipe):
     // [0x01][pid: u32 LE]
@@ -428,8 +433,15 @@ pub async fn run(ctl_path: &Path, ready_fd: Option<OwnedFd>) -> anyhow::Result<(
                         if let Err(e) = crate::security::verify_peer_uid(&stream) {
                             warn!("{e}");
                         } else {
+                            let conn_id = next_conn_id;
+                            next_conn_id = next_conn_id.wrapping_add(1);
+                            debug!(conn_id, "accepted connection");
                             let tx = conn_tx.clone();
-                            tokio::spawn(connection_handshake(stream, tx, server_id));
+                            let conn_span = tracing::debug_span!("conn", id = conn_id);
+                            tokio::spawn(
+                                connection_handshake(stream, tx, server_id)
+                                    .instrument(conn_span),
+                            );
                         }
                     }
                     Err(e) => {
@@ -476,6 +488,16 @@ pub async fn run(ctl_path: &Path, ready_fd: Option<OwnedFd>) -> anyhow::Result<(
                 info!("SIGINT received, shutting down");
                 shutdown(&mut sessions, ctl_path);
                 true
+            }
+            _ = sigusr1.recv() => {
+                crate::logging::cycle_log_level();
+                info!(level = crate::logging::current_log_level_name(), "log level changed via SIGUSR1");
+                false
+            }
+            _ = sigusr2.recv() => {
+                crate::logging::reopen_log_file();
+                info!("log file reopened via SIGUSR2");
+                false
             }
         };
 
@@ -576,7 +598,9 @@ async fn dispatch_control(
             // Fresh session: mint an owner token that the creator will store
             // and present on any subsequent reconnect.
             let owner_token = mint_attach_token();
-            let handle = tokio::spawn(async move {
+            let session_span =
+                tracing::info_span!("session", id = id, name = name_opt.as_deref().unwrap_or(""),);
+            let handle = tokio::spawn(
                 server::run(
                     client_rx,
                     meta_clone,
@@ -592,8 +616,8 @@ async fn dispatch_control(
                     cwd_for_server,
                     owner_token,
                 )
-                .await
-            });
+                .instrument(session_span),
+            );
 
             sessions.insert(
                 id,

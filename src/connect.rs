@@ -5,7 +5,7 @@ use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::time::{Duration, Instant};
 use tokio::process::{Child, Command};
-use tracing::{debug, info, warn};
+use tracing::{Instrument, debug, info, warn};
 
 // ---------------------------------------------------------------------------
 // Destination parsing
@@ -1039,17 +1039,21 @@ pub async fn run(opts: ConnectOpts, ready_fd: Option<OwnedFd>) -> anyhow::Result
 
     // 8. Hand off the child to the tunnel monitor background task
     let original_child = guard.child.take().unwrap();
-    let mut monitor_handle = tokio::spawn(tunnel_monitor(
-        original_child,
-        dest,
-        local_sock.clone(),
-        opts.ssh_options,
-        opts.foreground,
-        opts.no_server_start,
-        opts.isolate_control_path,
-        opts.connect_timeout,
-        stop.clone(),
-    ));
+    let tunnel_span = tracing::info_span!("tunnel", name = %connection_name);
+    let mut monitor_handle = tokio::spawn(
+        tunnel_monitor(
+            original_child,
+            dest,
+            local_sock.clone(),
+            opts.ssh_options,
+            opts.foreground,
+            opts.no_server_start,
+            opts.isolate_control_path,
+            opts.connect_timeout,
+            stop.clone(),
+        )
+        .instrument(tunnel_span),
+    );
 
     // 9. Wait for signal or monitor death. Handle SIGINT too so `--foreground`
     // Ctrl-C runs cleanup instead of the default terminate-without-Drop.

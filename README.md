@@ -235,7 +235,7 @@ After a newline (or at session start), `~` enters escape mode:
 |----------|--------|
 | `~.` | Detach from session (clean exit, no auto-reconnect) |
 | `~R` | Force reconnect |
-| `~#` | Session status and RTT |
+| `~#` | Session status, RTT, and server-side diagnostics |
 | `~^Z` | Suspend the client (SIGTSTP) |
 | `~?` | Print help |
 | `~~` | Send a literal `~` |
@@ -265,6 +265,24 @@ gritty completions fish > ~/.config/fish/completions/gritty.fish
 **"[reconnecting...]" forever** -- the SSH tunnel is down and not coming back. Check `gritty tunnels` for tunnel status. If the tunnel shows as stale, `gritty tunnel-destroy <name>` to clean it up and `gritty tunnel-create <dest>` to re-establish. Check `gritty info` for log file paths if you need to dig deeper.
 
 **Protocol version mismatch after upgrade** -- after upgrading gritty on one side the other side's daemon still speaks the old protocol, so session operations fail with `protocol version mismatch`. Upgrade both binaries to matching versions (`gritty protocol-version` prints the local version), then run `gritty restart <host>` (or `gritty restart local`) to tear down the old daemon and bring a fresh one up on both sides. `restart` tolerates the mismatched handshake so it works without falling back to SSH; under the hood it calls `kill-server` (which is itself tolerant of the mismatch), destroys the tunnel, and `tunnel-create`s a new one.
+
+## Debugging
+
+**Log levels:** `-v` enables debug logging. `RUST_LOG=gritty=trace` enables the most verbose output (protocol-level frame tracing, alt-screen state machine transitions). `RUST_LOG=gritty::server=debug,gritty=info` enables debug logging for the server module only.
+
+**Runtime log-level adjustment:** Send SIGUSR1 to the daemon to cycle through log levels (info -> debug -> trace -> info) without restarting and losing sessions:
+```bash
+kill -USR1 $(cat $(gritty socket-path | xargs dirname)/daemon.pid)
+```
+
+**Log rotation:** Send SIGUSR2 to reopen the log file, compatible with external logrotate:
+```bash
+kill -USR2 $(cat $(gritty socket-path | xargs dirname)/daemon.pid)
+```
+
+**In-session diagnostics:** Press `~#` during a session to see both client-side status (RTT, uptime, bytes relayed) and server-side diagnostics (ring buffer state, alt-screen mode, channel counts, shell PID).
+
+**Log file locations:** `gritty info` shows the paths to `daemon.log` and `daemon.out`. `gritty doctor` checks log file sizes and warns if they grow past 50 MB.
 
 ## Design
 

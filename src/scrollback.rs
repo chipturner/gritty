@@ -33,6 +33,7 @@ impl ScrollbackBuffer {
         self.lines.push_back(line);
         if self.lines.len() > self.max_lines {
             self.lines.pop_front();
+            tracing::trace!(max = self.max_lines, "scrollback evicted oldest line");
         }
     }
 

@@ -4,7 +4,6 @@ use clap::{CommandFactory, Parser, Subcommand};
 use commands::*;
 use std::os::fd::{AsRawFd, OwnedFd};
 use std::path::{Path, PathBuf};
-use tracing_subscriber::EnvFilter;
 
 fn version_string() -> &'static str {
     static VERSION: std::sync::OnceLock<String> = std::sync::OnceLock::new();
@@ -348,34 +347,7 @@ enum Command {
 }
 
 fn init_tracing(verbose: bool, log_path: Option<&Path>) {
-    let filter = if std::env::var("RUST_LOG").is_ok() {
-        EnvFilter::from_default_env()
-    } else if verbose {
-        EnvFilter::new("gritty=debug")
-    } else {
-        EnvFilter::new("gritty=info")
-    };
-
-    match log_path.and_then(open_log_file) {
-        Some(file) => {
-            tracing_subscriber::fmt()
-                .with_env_filter(filter)
-                .with_writer(std::sync::Mutex::new(file))
-                .with_ansi(false)
-                .with_line_number(true)
-                .with_file(true)
-                .with_target(true)
-                .init();
-        }
-        None => {
-            tracing_subscriber::fmt().with_env_filter(filter).with_writer(std::io::stderr).init();
-        }
-    }
-}
-
-fn open_log_file(path: &Path) -> Option<std::fs::File> {
-    use std::os::unix::fs::OpenOptionsExt;
-    std::fs::OpenOptions::new().create(true).append(true).mode(0o600).open(path).ok()
+    gritty::logging::init_tracing(verbose, log_path);
 }
 
 /// Fork into background, returning the write end of the readiness pipe.

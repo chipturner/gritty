@@ -1,4 +1,5 @@
 use std::path::{Path, PathBuf};
+use tracing::Instrument;
 
 use super::AutoStart;
 use super::util::{format_age, format_timestamp, server_request};
@@ -64,6 +65,7 @@ pub(crate) async fn connect_session(
         Frame::AttachAck { token, session_id } => {
             eprintln!("\x1b[32m\u{25b8} attached {name}\x1b[0m");
             let env_vars = vec![];
+            let client_span = tracing::info_span!("client", session = %name, session_id);
             let code = gritty::client::run(
                 &name,
                 session_id,
@@ -81,6 +83,7 @@ pub(crate) async fn connect_session(
                 server_id,
                 token,
             )
+            .instrument(client_span)
             .await?;
             std::process::exit(code);
         }
@@ -144,6 +147,7 @@ pub(crate) async fn connect_session(
             // Alert about other detached sessions
             alert_detached_sessions(&name, &ctl_path).await;
 
+            let client_span = tracing::info_span!("client", session = %name, session_id = id);
             let code = gritty::client::run(
                 &name,
                 id,
@@ -161,6 +165,7 @@ pub(crate) async fn connect_session(
                 server_id,
                 token,
             )
+            .instrument(client_span)
             .await?;
             std::process::exit(code);
         }

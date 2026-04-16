@@ -987,6 +987,14 @@ impl ClientRelay<'_> {
                 self.pf.channels.retain(|_, (fid, _)| *fid != forward_id);
                 self.client_initiated_forwards.remove(&forward_id);
             }
+            Some(Ok(Frame::DiagResponse { text })) => {
+                let mut output = String::from("\r\n\x1b[2;33m[server diagnostics]\r\n");
+                for line in text.lines() {
+                    output.push_str(&format!("\x1b[0m\x1b[2m{line}\r\n"));
+                }
+                output.push_str("\x1b[0m");
+                write_stdout_async(self.async_stdout, output.as_bytes()).await?;
+            }
             Some(Ok(_)) => {} // ignore control/resize frames
             Some(Err(e)) => {
                 debug!("server connection error: {e}");
@@ -1461,6 +1469,10 @@ async fn relay(
                                             async_stdout,
                                             status.as_bytes(),
                                         ).await?;
+                                        // Request server-side diagnostics (displayed when DiagResponse arrives)
+                                        if !timed_send(framed, Frame::DiagRequest, relay.last_outbound_at).await {
+                                            return Ok(RelayExit::Disconnected);
+                                        }
                                     }
                                     EscapeAction::Help => {
                                         write_stdout_async(async_stdout, ESCAPE_HELP).await?;

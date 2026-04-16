@@ -14,6 +14,8 @@ const TYPE_DETACHED: u8 = 0x13;
 const TYPE_PING: u8 = 0x14;
 const TYPE_PONG: u8 = 0x15;
 const TYPE_ENV: u8 = 0x16;
+const TYPE_DIAG_REQUEST: u8 = 0x17;
+const TYPE_DIAG_RESPONSE: u8 = 0x18;
 
 // Agent forwarding
 const TYPE_AGENT_FORWARD: u8 = 0x20;
@@ -71,7 +73,7 @@ const HEADER_LEN: usize = 5; // type(1) + length(4)
 const MAX_FRAME_SIZE: usize = 1 << 20; // 1 MB
 
 /// Protocol version for handshake negotiation.
-pub const PROTOCOL_VERSION: u16 = 17;
+pub const PROTOCOL_VERSION: u16 = 18;
 
 /// Capability bit: client/server supports clipboard forwarding.
 pub const CAP_CLIPBOARD: u32 = 0x01;
@@ -188,6 +190,12 @@ pub enum Frame {
     /// Environment variables (client → server, sent before first Resize on new session).
     Env {
         vars: Vec<(String, String)>,
+    },
+    /// Client requests server-side diagnostics (client → server).
+    DiagRequest,
+    /// Server-side diagnostics (server → client). Opaque text blob displayed by the client.
+    DiagResponse {
+        text: String,
     },
     /// Client signals it can handle agent forwarding (client → server).
     AgentForward,
@@ -751,6 +759,7 @@ impl Decoder for FrameCodec {
 
         src.advance(HEADER_LEN);
         let payload = src.split_to(payload_len);
+        tracing::trace!(frame_type, payload_len, "decode frame");
 
         match frame_type {
             // Blob frames
@@ -1051,6 +1060,14 @@ impl Decoder for FrameCodec {
             TYPE_ENV => decode_env(payload),
             TYPE_SESSION_INFO => decode_session_info(payload),
 
+            // Diagnostics
+            TYPE_DIAG_REQUEST => Ok(Some(Frame::DiagRequest)),
+            TYPE_DIAG_RESPONSE => {
+                let text = String::from_utf8(payload.to_vec())
+                    .unwrap_or_else(|e| String::from_utf8_lossy(e.as_bytes()).into_owned());
+                Ok(Some(Frame::DiagResponse { text }))
+            }
+
             _ => Err(io::Error::new(
                 io::ErrorKind::InvalidData,
                 format!("unknown frame type: 0x{frame_type:02x}"),
@@ -1226,6 +1243,10 @@ impl Encoder<Frame> for FrameCodec {
             // Custom frames
             Frame::Env { vars } => encode_env(dst, &vars),
             Frame::SessionInfo { sessions } => encode_session_info(dst, &sessions),
+
+            // Diagnostics
+            Frame::DiagRequest => encode_empty(dst, TYPE_DIAG_REQUEST),
+            Frame::DiagResponse { text } => encode_str(dst, TYPE_DIAG_RESPONSE, &text),
         }
         Ok(())
     }
