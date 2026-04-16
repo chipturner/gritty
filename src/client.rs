@@ -1704,7 +1704,12 @@ pub async fn run(
                                 }
                                 _ => {}
                             }
-                            continue;
+                            // Fall through: impatient keystroke (not Ctrl-C)
+                            // cuts the current sleep short and triggers an
+                            // attempt now rather than restarting the outer
+                            // loop. Restarting here re-raced the same sleep,
+                            // so a user holding a key (>1 keystroke/sec)
+                            // starved every reconnect attempt.
                         }
                     }
                     backoff = sleep_for;
