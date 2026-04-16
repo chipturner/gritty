@@ -387,6 +387,19 @@ async fn tunnel_monitor(
     const MAX_BACKOFF: Duration = Duration::from_secs(60);
     /// If the tunnel stays alive for this long, reset the backoff.
     const HEALTHY_THRESHOLD: Duration = Duration::from_secs(30);
+    /// App-layer tunnel liveness probe. SSH's ServerAliveInterval covers
+    /// TCP-level liveness, but can't detect a remote gritty daemon that
+    /// died while ssh stayed up (OOM, crash, manual kill). Every 30s we
+    /// try to handshake with whatever is on the other end; after
+    /// PROBE_FAILURES_BEFORE_RESPAWN consecutive failures we kill ssh to
+    /// force a respawn that re-runs ensure_remote_ready and brings the
+    /// daemon back.
+    const PROBE_INTERVAL: Duration = Duration::from_secs(30);
+    const PROBE_FAILURES_BEFORE_RESPAWN: u32 = 2;
+    let mut probe_ticker = tokio::time::interval(PROBE_INTERVAL);
+    probe_ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    probe_ticker.tick().await; // consume the immediate first tick
+    let mut consecutive_probe_failures: u32 = 0;
 
     loop {
         drain_stderr(&mut child);
@@ -396,6 +409,22 @@ async fn tunnel_monitor(
             _ = stop.cancelled() => {
                 let _ = child.kill().await;
                 return;
+            }
+            _ = probe_ticker.tick() => {
+                if probe_tunnel_alive(&local_sock).await {
+                    consecutive_probe_failures = 0;
+                } else {
+                    consecutive_probe_failures += 1;
+                    if consecutive_probe_failures >= PROBE_FAILURES_BEFORE_RESPAWN {
+                        warn!(
+                            "tunnel probe failed {consecutive_probe_failures}x; remote daemon looks dead, killing ssh to respawn"
+                        );
+                        let _ = child.kill().await;
+                        consecutive_probe_failures = 0;
+                        // next iteration's child.wait() observes the kill.
+                    }
+                }
+                continue;
             }
             status = child.wait() => {
                 let status = match status {
@@ -683,6 +712,30 @@ pub enum TunnelStatus {
 }
 
 /// Probe a tunnel's status using lockfile + socket connectivity.
+/// App-layer tunnel probe for the monitor loop. Opens the local socket and
+/// exchanges Hello/HelloAck with whatever the tunnel is forwarding to; any
+/// failure (connection refused, timeout, EOF) means "daemon unresponsive".
+///
+/// Uses tight timeouts (3s total, 1s handshake) because this runs in the
+/// hot path -- a slow probe that blocks the select loop is worse than a
+/// false positive that triggers an unnecessary respawn.
+async fn probe_tunnel_alive(local_sock: &std::path::Path) -> bool {
+    use crate::protocol::{Frame, PROTOCOL_VERSION};
+    use futures_util::{SinkExt, StreamExt};
+
+    let probe = async {
+        let stream = tokio::net::UnixStream::connect(local_sock).await.ok()?;
+        let codec = crate::protocol::FrameCodec;
+        let mut framed = tokio_util::codec::Framed::new(stream, codec);
+        framed.send(Frame::Hello { version: PROTOCOL_VERSION, capabilities: 0 }).await.ok()?;
+        match tokio::time::timeout(Duration::from_secs(1), framed.next()).await {
+            Ok(Some(Ok(Frame::HelloAck { .. }))) => Some(()),
+            _ => None,
+        }
+    };
+    tokio::time::timeout(Duration::from_secs(3), probe).await.ok().flatten().is_some()
+}
+
 pub fn probe_tunnel_status(name: &str) -> TunnelStatus {
     let lock_path = connect_lock_path(name);
     if is_lock_held(&lock_path) {
