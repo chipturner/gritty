@@ -1056,8 +1056,14 @@ impl ClientRelay<'_> {
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
         let mut header = [0u8; 5];
-        if fwd_stream.read_exact(&mut header).await.is_err() {
-            return;
+        let read_result = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            fwd_stream.read_exact(&mut header),
+        )
+        .await;
+        match read_result {
+            Ok(Ok(_)) => {}
+            _ => return,
         }
         let direction = header[0];
         let listen_port = u16::from_be_bytes([header[1], header[2]]);
