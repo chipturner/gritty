@@ -78,25 +78,28 @@ pub fn require_matched_version(info: &HandshakeInfo) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// Path to the persistent device-id file.
+///
+/// `$XDG_STATE_HOME/gritty/device_id`, typically `~/.local/state/gritty/device_id`.
+pub fn device_id_path() -> std::path::PathBuf {
+    use std::path::PathBuf;
+    let dir = if let Some(proj) = directories::ProjectDirs::from("", "", "gritty")
+        && let Some(state) = proj.state_dir()
+    {
+        state.to_path_buf()
+    } else {
+        let home = std::env::var("HOME").unwrap_or_else(|_| ".".into());
+        PathBuf::from(home).join(".local/state/gritty")
+    };
+    dir.join("device_id")
+}
+
 /// Return a persistent per-machine device identifier, creating one on first use.
 ///
 /// Stored in `$XDG_STATE_HOME/gritty/device_id` (typically `~/.local/state/gritty/device_id`).
 /// The value is a random non-zero `u64` generated via `getrandom`.
 pub fn get_or_create_device_id() -> u64 {
-    use std::path::PathBuf;
-
-    fn state_dir() -> PathBuf {
-        if let Some(proj) = directories::ProjectDirs::from("", "", "gritty")
-            && let Some(state) = proj.state_dir()
-        {
-            return state.to_path_buf();
-        }
-        // Fallback (non-XDG systems)
-        let home = std::env::var("HOME").unwrap_or_else(|_| ".".into());
-        PathBuf::from(home).join(".local/state/gritty")
-    }
-
-    let path = state_dir().join("device_id");
+    let path = device_id_path();
 
     // Try reading an existing ID first.
     if let Ok(contents) = std::fs::read_to_string(&path)

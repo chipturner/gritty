@@ -103,7 +103,7 @@ Local-only sessions (`gritty connect local:scratch`) are available for testing b
 | `gritty receive [dir]` | | Receive files from a paired sender |
 | `gritty open <url>` | | Open a URL on the local machine (for use inside gritty sessions) |
 | `gritty copy` | | Copy stdin to the client clipboard (for use inside gritty sessions) |
-| `gritty info` | | Show diagnostics (paths, server status, tunnels) |
+| `gritty info` | | Show diagnostics (paths, server status, device id, tunnels) |
 | `gritty config` | | Open config in `$VISUAL`/`$EDITOR`/vi (creates from template if missing) |
 | `gritty doctor` | | Check for common issues (stale processes, orphaned sockets, config errors) |
 | `gritty server` | `s` | Start the server (backgrounds by default; `-f` for foreground) |

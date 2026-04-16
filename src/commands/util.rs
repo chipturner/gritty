@@ -422,6 +422,10 @@ pub(crate) async fn info(config: &gritty::config::ConfigFile) -> anyhow::Result<
     println!("socket dir:     {}", socket_dir.display());
     println!("server socket:  {}", ctl_path.display());
 
+    let device_id = gritty::get_or_create_device_id();
+    let device_id_path = gritty::device_id_path();
+    println!("device id:      {device_id} ({})", device_id_path.display());
+
     // Probe server status via server_request (which includes handshake)
     let pid_path = gritty::daemon::pid_file_path(&ctl_path);
     let pid = std::fs::read_to_string(&pid_path).ok().and_then(|s| s.trim().parse::<u32>().ok());
