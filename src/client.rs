@@ -919,13 +919,17 @@ impl ClientRelay<'_> {
             }
             // Port forward: teardown from server
             Some(Ok(Frame::PortForwardStop { forward_id })) => {
-                if let Some(fwd) = self.pf.forwards.remove(&forward_id)
-                    && let Some(h) = fwd.listener_handle
-                {
-                    h.abort();
+                if let Some(fwd) = self.pf.forwards.remove(&forward_id) {
+                    if let Some(h) = fwd.listener_handle {
+                        h.abort();
+                    }
+                    if let Some(h) = fwd.keepalive_handle {
+                        h.abort();
+                    }
                 }
                 // Remove channels belonging to this forward
                 self.pf.channels.retain(|_, (fid, _)| *fid != forward_id);
+                self.client_initiated_forwards.remove(&forward_id);
             }
             Some(Ok(_)) => {} // ignore control/resize frames
             Some(Err(e)) => {
