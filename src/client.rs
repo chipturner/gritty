@@ -422,9 +422,18 @@ fn clipboard_set(data: &[u8]) {
 }
 
 /// Send a frame with a timeout. Returns false if the send failed or timed out.
-async fn timed_send(framed: &mut Framed<UnixStream, FrameCodec>, frame: Frame) -> bool {
+/// On success, updates `last_outbound_at` so the heartbeat probe can key its
+/// cadence off the client's own sends (not inbound server traffic).
+async fn timed_send(
+    framed: &mut Framed<UnixStream, FrameCodec>,
+    frame: Frame,
+    last_outbound_at: &mut Instant,
+) -> bool {
     match tokio::time::timeout(SEND_TIMEOUT, framed.send(frame)).await {
-        Ok(Ok(())) => true,
+        Ok(Ok(())) => {
+            *last_outbound_at = Instant::now();
+            true
+        }
         Ok(Err(e)) => {
             debug!("send error: {e}");
             false
@@ -580,18 +589,22 @@ async fn send_init_frames(
     forward_agent: bool,
     agent_socket: Option<&str>,
     forward_open: bool,
+    last_outbound_at: &mut Instant,
 ) -> bool {
-    if !timed_send(framed, Frame::Env { vars: env_vars.to_vec() }).await {
+    if !timed_send(framed, Frame::Env { vars: env_vars.to_vec() }, last_outbound_at).await {
         return false;
     }
-    if forward_agent && agent_socket.is_some() && !timed_send(framed, Frame::AgentForward).await {
+    if forward_agent
+        && agent_socket.is_some()
+        && !timed_send(framed, Frame::AgentForward, last_outbound_at).await
+    {
         return false;
     }
-    if forward_open && !timed_send(framed, Frame::OpenForward).await {
+    if forward_open && !timed_send(framed, Frame::OpenForward, last_outbound_at).await {
         return false;
     }
     let (cols, rows) = get_terminal_size();
-    if !timed_send(framed, Frame::Resize { cols, rows }).await {
+    if !timed_send(framed, Frame::Resize { cols, rows }, last_outbound_at).await {
         return false;
     }
     true
@@ -614,6 +627,7 @@ struct ClientRelay<'a> {
     pf_event_tx: &'a mpsc::UnboundedSender<ClientPortForwardEvent>,
     client_initiated_forwards: &'a mut std::collections::HashMap<u32, u16>,
     last_activity: &'a mut Instant,
+    last_outbound_at: &'a mut Instant,
     last_ping_sent: &'a mut Instant,
     last_rtt: &'a mut Option<Duration>,
     connected_at: Instant,
@@ -681,11 +695,18 @@ impl ClientRelay<'_> {
                         }
                         Err(e) => {
                             debug!("failed to connect to local agent: {e}");
-                            let _ = timed_send(framed, Frame::AgentClose { channel_id }).await;
+                            let _ = timed_send(
+                                framed,
+                                Frame::AgentClose { channel_id },
+                                self.last_outbound_at,
+                            )
+                            .await;
                         }
                     }
                 } else {
-                    let _ = timed_send(framed, Frame::AgentClose { channel_id }).await;
+                    let _ =
+                        timed_send(framed, Frame::AgentClose { channel_id }, self.last_outbound_at)
+                            .await;
                 }
             }
             Some(Ok(Frame::AgentData { channel_id, data })) => {
@@ -724,15 +745,30 @@ impl ClientRelay<'_> {
             }
             Some(Ok(Frame::ClipboardGet)) => {
                 warn!("rejected clipboard read from remote");
-                let _ = timed_send(framed, Frame::ClipboardData { data: Bytes::new() }).await;
+                let _ = timed_send(
+                    framed,
+                    Frame::ClipboardData { data: Bytes::new() },
+                    self.last_outbound_at,
+                )
+                .await;
             }
             Some(Ok(Frame::TunnelListen { port })) => {
                 if !self.oauth_redirect {
                     debug!(port, "tunnel: oauth-redirect disabled, declining");
-                    let _ = timed_send(framed, Frame::TunnelClose { channel_id: 0 }).await;
+                    let _ = timed_send(
+                        framed,
+                        Frame::TunnelClose { channel_id: 0 },
+                        self.last_outbound_at,
+                    )
+                    .await;
                 } else if !self.tunnel_listen_limiter.check() {
                     warn!(port, "rate limited TunnelListen");
-                    let _ = timed_send(framed, Frame::TunnelClose { channel_id: 0 }).await;
+                    let _ = timed_send(
+                        framed,
+                        Frame::TunnelClose { channel_id: 0 },
+                        self.last_outbound_at,
+                    )
+                    .await;
                 } else {
                     // Bind synchronously to guarantee port is ready before OpenUrl
                     match std::net::TcpListener::bind(("127.0.0.1", port)) {
@@ -817,7 +853,12 @@ impl ClientRelay<'_> {
                         }
                         Err(e) => {
                             debug!(port, "tunnel: bind failed: {e}");
-                            let _ = timed_send(framed, Frame::TunnelClose { channel_id: 0 }).await;
+                            let _ = timed_send(
+                                framed,
+                                Frame::TunnelClose { channel_id: 0 },
+                                self.last_outbound_at,
+                            )
+                            .await;
                         }
                     }
                 }
@@ -859,13 +900,23 @@ impl ClientRelay<'_> {
             // Port forward: server asks client to bind a port -- rejected (client-initiated only)
             Some(Ok(Frame::PortForwardListen { forward_id, listen_port, .. })) => {
                 warn!(forward_id, listen_port, "rejected server-initiated port bind");
-                let _ = timed_send(framed, Frame::PortForwardStop { forward_id }).await;
+                let _ = timed_send(
+                    framed,
+                    Frame::PortForwardStop { forward_id },
+                    self.last_outbound_at,
+                )
+                .await;
             }
             // Port forward: new TCP connection from server side (only accept client-initiated)
             Some(Ok(Frame::PortForwardOpen { forward_id, channel_id, target_port })) => {
                 let Some(&expected_port) = self.client_initiated_forwards.get(&forward_id) else {
                     warn!(forward_id, target_port, "rejected unsolicited port forward open");
-                    let _ = timed_send(framed, Frame::PortForwardClose { channel_id }).await;
+                    let _ = timed_send(
+                        framed,
+                        Frame::PortForwardClose { channel_id },
+                        self.last_outbound_at,
+                    )
+                    .await;
                     return Ok(ControlFlow::Continue(()));
                 };
                 if target_port != expected_port {
@@ -897,7 +948,12 @@ impl ClientRelay<'_> {
                     }
                     Err(e) => {
                         debug!(channel_id, expected_port, "pf connect failed: {e}");
-                        let _ = timed_send(framed, Frame::PortForwardClose { channel_id }).await;
+                        let _ = timed_send(
+                            framed,
+                            Frame::PortForwardClose { channel_id },
+                            self.last_outbound_at,
+                        )
+                        .await;
                     }
                 }
             }
@@ -952,14 +1008,20 @@ impl ClientRelay<'_> {
         match event {
             Some(AgentEvent::Data { channel_id, data }) => {
                 if self.agent.channels.contains_key(&channel_id)
-                    && !timed_send(framed, Frame::AgentData { channel_id, data }).await
+                    && !timed_send(
+                        framed,
+                        Frame::AgentData { channel_id, data },
+                        self.last_outbound_at,
+                    )
+                    .await
                 {
                     return false;
                 }
             }
             Some(AgentEvent::Closed { channel_id }) => {
                 if self.agent.channels.remove(&channel_id).is_some()
-                    && !timed_send(framed, Frame::AgentClose { channel_id }).await
+                    && !timed_send(framed, Frame::AgentClose { channel_id }, self.last_outbound_at)
+                        .await
                 {
                     return false;
                 }
@@ -977,18 +1039,28 @@ impl ClientRelay<'_> {
         match event {
             Some(ClientTunnelEvent::Accepted { channel_id, writer_tx }) => {
                 self.tunnel.channels.insert(channel_id, writer_tx);
-                if !timed_send(framed, Frame::TunnelOpen { channel_id }).await {
+                if !timed_send(framed, Frame::TunnelOpen { channel_id }, self.last_outbound_at)
+                    .await
+                {
                     return false;
                 }
             }
             Some(ClientTunnelEvent::Data { channel_id, data }) => {
-                if !timed_send(framed, Frame::TunnelData { channel_id, data }).await {
+                if !timed_send(
+                    framed,
+                    Frame::TunnelData { channel_id, data },
+                    self.last_outbound_at,
+                )
+                .await
+                {
                     return false;
                 }
             }
             Some(ClientTunnelEvent::Closed { channel_id }) => {
                 self.tunnel.channels.remove(&channel_id);
-                if !timed_send(framed, Frame::TunnelClose { channel_id }).await {
+                if !timed_send(framed, Frame::TunnelClose { channel_id }, self.last_outbound_at)
+                    .await
+                {
                     return false;
                 }
             }
@@ -1010,6 +1082,7 @@ impl ClientRelay<'_> {
                     if !timed_send(
                         framed,
                         Frame::PortForwardOpen { forward_id, channel_id, target_port },
+                        self.last_outbound_at,
                     )
                     .await
                     {
@@ -1019,14 +1092,24 @@ impl ClientRelay<'_> {
             }
             Some(ClientPortForwardEvent::Data { channel_id, data }) => {
                 if self.pf.channels.contains_key(&channel_id)
-                    && !timed_send(framed, Frame::PortForwardData { channel_id, data }).await
+                    && !timed_send(
+                        framed,
+                        Frame::PortForwardData { channel_id, data },
+                        self.last_outbound_at,
+                    )
+                    .await
                 {
                     return false;
                 }
             }
             Some(ClientPortForwardEvent::Closed { channel_id }) => {
                 if self.pf.channels.remove(&channel_id).is_some()
-                    && !timed_send(framed, Frame::PortForwardClose { channel_id }).await
+                    && !timed_send(
+                        framed,
+                        Frame::PortForwardClose { channel_id },
+                        self.last_outbound_at,
+                    )
+                    .await
                 {
                     return false;
                 }
@@ -1039,7 +1122,9 @@ impl ClientRelay<'_> {
                 }
                 self.pf.channels.retain(|_, (fid, _)| *fid != forward_id);
                 self.client_initiated_forwards.remove(&forward_id);
-                if !timed_send(framed, Frame::PortForwardStop { forward_id }).await {
+                if !timed_send(framed, Frame::PortForwardStop { forward_id }, self.last_outbound_at)
+                    .await
+                {
                     return false;
                 }
             }
@@ -1148,6 +1233,7 @@ impl ClientRelay<'_> {
         if !timed_send(
             framed,
             Frame::PortForwardRequest { forward_id, direction, listen_port, target_port },
+            self.last_outbound_at,
         )
         .await
         {
@@ -1207,6 +1293,11 @@ async fn relay(
     let mut heartbeat_interval = tokio::time::interval(hb_interval);
     heartbeat_interval.reset(); // first tick is immediate otherwise; delay it
     let mut last_activity = Instant::now();
+    // Timestamp of the last frame we successfully sent to the server. The
+    // ping cadence is driven off this (not last_activity) so steady inbound
+    // server output doesn't suppress the probes the server uses for its
+    // idle-evict decision.
+    let mut last_outbound_at = Instant::now();
     let mut last_ping_sent = Instant::now();
     let mut last_rtt: Option<Duration> = None;
     let mut last_tick_mono = Instant::now();
@@ -1245,6 +1336,7 @@ async fn relay(
         pf_event_tx: &pf_event_tx,
         client_initiated_forwards: &mut client_initiated_forwards,
         last_activity: &mut last_activity,
+        last_outbound_at: &mut last_outbound_at,
         last_ping_sent: &mut last_ping_sent,
         last_rtt: &mut last_rtt,
         connected_at: Instant::now(),
@@ -1270,7 +1362,7 @@ async fn relay(
                             for action in esc.process(&buf[..n]) {
                                 match action {
                                     EscapeAction::Data(data) => {
-                                        if !timed_send(framed, Frame::Data(Bytes::from(data))).await {
+                                        if !timed_send(framed, Frame::Data(Bytes::from(data)), relay.last_outbound_at).await {
                                             return Ok(RelayExit::Disconnected);
                                         }
                                     }
@@ -1295,7 +1387,7 @@ async fn relay(
                                         suspend_probe_baseline = None;
                                         // Re-sync terminal size after resume
                                         let (cols, rows) = get_terminal_size();
-                                        if !timed_send(framed, Frame::Resize { cols, rows }).await {
+                                        if !timed_send(framed, Frame::Resize { cols, rows }, relay.last_outbound_at).await {
                                             return Ok(RelayExit::Disconnected);
                                         }
                                     }
@@ -1375,7 +1467,7 @@ async fn relay(
                                     }
                                 }
                             }
-                        } else if !timed_send(framed, Frame::Data(Bytes::copy_from_slice(&buf[..n]))).await {
+                        } else if !timed_send(framed, Frame::Data(Bytes::copy_from_slice(&buf[..n])), relay.last_outbound_at).await {
                             return Ok(RelayExit::Disconnected);
                         }
                     }
@@ -1431,7 +1523,7 @@ async fn relay(
             _ = sigwinch.recv() => {
                 let (cols, rows) = get_terminal_size();
                 debug!(cols, rows, "SIGWINCH → resize");
-                if !timed_send(framed, Frame::Resize { cols, rows }).await {
+                if !timed_send(framed, Frame::Resize { cols, rows }, relay.last_outbound_at).await {
                     return Ok(RelayExit::Disconnected);
                 }
             }
@@ -1456,9 +1548,13 @@ async fn relay(
                     return Ok(RelayExit::Disconnected);
                 }
 
-                // Fire a probe if idle long enough OR we just came back from suspend.
+                // Fire a probe if we haven't sent anything recently OR we just
+                // came back from suspend. Keying off last_outbound_at (not
+                // last_activity) is what proves liveness to the server's
+                // idle-evict: steady inbound server output does not prove the
+                // client can still send.
                 let should_probe = suspended
-                    || relay.last_activity.elapsed() >= hb_interval;
+                    || relay.last_outbound_at.elapsed() >= hb_interval;
                 if should_probe {
                     if suspended {
                         debug!(
@@ -1471,7 +1567,7 @@ async fn relay(
                             Some(Instant::now() + SUSPEND_PROBE_DEADLINE);
                     }
                     *relay.last_ping_sent = Instant::now();
-                    if !timed_send(framed, Frame::Ping).await {
+                    if !timed_send(framed, Frame::Ping, relay.last_outbound_at).await {
                         return Ok(RelayExit::Disconnected);
                     }
                 }
@@ -1608,12 +1704,16 @@ pub async fn run(
     let mut alt_screen = AltScreenTracker::new();
 
     loop {
+        // Reset every reconnect: a fresh TCP/UDS connection is a fresh liveness
+        // window, so the next ping cadence starts from now.
+        let mut last_outbound_at = Instant::now();
         let result = if send_init_frames(
             &mut framed,
             &current_env,
             forward_agent,
             agent_socket.as_deref(),
             forward_open,
+            &mut last_outbound_at,
         )
         .await
         {
@@ -1948,6 +2048,9 @@ pub async fn tail(
     let mut heartbeat_interval = tokio::time::interval(DEFAULT_HEARTBEAT_INTERVAL);
     heartbeat_interval.reset();
     let mut last_activity = Instant::now();
+    // Last time we successfully sent a frame; drives ping cadence so the
+    // server's idle-evict doesn't fire during steady inbound traffic.
+    let mut last_outbound_at = Instant::now();
     let mut last_tick_mono = Instant::now();
     let mut last_tick_wall = std::time::SystemTime::now();
     let mut suspend_probe_deadline: Option<Instant> = None;
@@ -2011,7 +2114,7 @@ pub async fn tail(
                     }
 
                     let should_probe = suspended
-                        || last_activity.elapsed() >= DEFAULT_HEARTBEAT_INTERVAL;
+                        || last_outbound_at.elapsed() >= DEFAULT_HEARTBEAT_INTERVAL;
                     if should_probe {
                         if suspended {
                             suspend_probe_baseline = Some(last_activity);
@@ -2021,6 +2124,7 @@ pub async fn tail(
                         if framed.send(Frame::Ping).await.is_err() {
                             break 'relay None;
                         }
+                        last_outbound_at = Instant::now();
                     }
                 }
                 _ = async {
@@ -2405,5 +2509,34 @@ mod tests {
         assert_eq!(next_reconnect_delay(Duration::from_secs(8)), RECONNECT_BACKOFF_MAX);
         assert_eq!(next_reconnect_delay(RECONNECT_BACKOFF_MAX), RECONNECT_BACKOFF_MAX);
         assert_eq!(next_reconnect_delay(Duration::from_secs(300)), RECONNECT_BACKOFF_MAX);
+    }
+
+    // Regression: the client's ping cadence must key off outbound silence, not
+    // inbound. If it keyed off inbound activity, a session with steady server
+    // output (e.g. a full-screen TUI or tail -f) would never trigger the probe,
+    // the client would never send a Ping, and the server's idle-evict would
+    // close the connection. See commit 7fe1c08 for the idle-evict that exposed
+    // this.
+    #[tokio::test]
+    async fn timed_send_updates_last_outbound_at() {
+        use tokio::net::UnixStream;
+        use tokio_util::codec::Framed;
+
+        let (a, b) = UnixStream::pair().unwrap();
+        let mut framed_a = Framed::new(a, FrameCodec);
+        let mut framed_b = Framed::new(b, FrameCodec);
+
+        let mut last_outbound_at = Instant::now();
+        let before = last_outbound_at;
+        tokio::time::sleep(Duration::from_millis(20)).await;
+
+        assert!(
+            timed_send(&mut framed_a, Frame::Ping, &mut last_outbound_at).await,
+            "send should succeed",
+        );
+        assert!(last_outbound_at > before, "successful send must advance last_outbound_at",);
+
+        // Drain the receiver so the pipe stays open.
+        let _ = framed_b.next().await;
     }
 }
