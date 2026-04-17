@@ -1000,11 +1000,34 @@ pub async fn run(opts: ConnectOpts, ready_fd: Option<OwnedFd>) -> anyhow::Result
                         eprintln!("\x1b[2;33m\u{25b8} tunnel {connection_name} starting\x1b[0m")
                     }
                 }
+                // Race the socket-up wait against the peer supervisor
+                // dying during its own startup. Without this second arm,
+                // a peer that crashes after we've observed its lock would
+                // leave us polling the socket path for the full deadline
+                // before giving up. `is_lock_held` releases its probe
+                // flock immediately, so polling it is cheap.
                 let deadline = socket_wait_deadline(opts.connect_timeout);
-                if let Err(e) = wait_for_socket(&local_sock, deadline).await {
-                    bail!(
-                        "another tunnel-create for {connection_name} is in progress but its socket never came up: {e}"
-                    );
+                let peer_watch = async {
+                    loop {
+                        tokio::time::sleep(Duration::from_millis(500)).await;
+                        if !is_lock_held(&lock_path) {
+                            return;
+                        }
+                    }
+                };
+                tokio::select! {
+                    r = wait_for_socket(&local_sock, deadline) => {
+                        if let Err(e) = r {
+                            bail!(
+                                "another tunnel-create for {connection_name} is in progress but its socket never came up: {e}"
+                            );
+                        }
+                    }
+                    _ = peer_watch => {
+                        bail!(
+                            "another tunnel-create for {connection_name} released its lock before the socket came up; retry this command"
+                        );
+                    }
                 }
                 println!("{}", local_sock.display());
                 match pid_hint {

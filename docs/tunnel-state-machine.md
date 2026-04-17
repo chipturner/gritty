@@ -58,6 +58,7 @@ stateDiagram-v2
 
     WaitingForPeer --> [*]: wait_for_socket ok\n(print socket path, exit 0)
     WaitingForPeer --> Failed: wait_for_socket timeout
+    WaitingForPeer --> Failed: peer released flock\n(supervisor died mid-startup)
 
     state Starting {
         direction TB
@@ -137,7 +138,10 @@ backoff not trip the client's short socket-gone grace.
    child: the socket path is shared and the invocation is expected to be
    idempotent (`auto_start` relies on "`tunnel-create` exit 0 ==> socket is
    ready"). We fall through to `wait_for_socket` to absorb the startup race,
-   then signal ready and exit.
+   then signal ready and exit. The wait races against a concurrent
+   `is_lock_held` poll so a peer supervisor that crashes during its own
+   startup surfaces as a fast, diagnosable error instead of forcing us to
+   wait the full `socket_wait_deadline`.
 2. **Absent -> Starting** -- `try_acquire_lock` returned `Ok`. We own the
    supervisor role. Clean any stale `.sock`/`.pid`/`.dest` (we don't remove
    the lock we just acquired), then write the `.pid` file **immediately**
