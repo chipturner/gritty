@@ -1,5 +1,5 @@
 use crate::alt_screen::AltScreenTracker;
-use crate::protocol::{Frame, FrameCodec};
+use crate::protocol::{Frame, FrameCodec, IDLE_EVICT_TIMEOUT};
 use crate::scrollback::ScrollbackBuffer;
 use bytes::Bytes;
 use futures_util::{SinkExt, StreamExt};
@@ -821,7 +821,6 @@ const PENDING_INPUT_CAP: usize = 1 << 20;
 /// (`connect -F`) silently stalls. Breaking to `ClientGone` on timeout lets
 /// takeover proceed and keeps the session unwedged.
 const CLIENT_SEND_TIMEOUT: Duration = Duration::from_secs(30);
-const IDLE_EVICT_TIMEOUT: Duration = Duration::from_secs(120);
 
 /// Non-blocking drain of any remaining PTY output after `child.wait()` fires,
 /// capturing final write(s) that raced with the exit. The master fd is

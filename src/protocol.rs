@@ -78,6 +78,18 @@ pub const PROTOCOL_VERSION: u16 = 19;
 /// Capability bit: client/server supports clipboard forwarding.
 pub const CAP_CLIPBOARD: u32 = 0x01;
 
+/// How long the server waits with no inbound client frames before declaring the
+/// attached client dead and dropping to the unattached ring-buffer state. This
+/// is a cross-module contract: `config.rs` clamps client heartbeat settings so
+/// `interval + timeout` stays under it, guaranteeing a healthy client always
+/// proves liveness before the server evicts it.
+pub const IDLE_EVICT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(90);
+
+/// Slack between the client's heartbeat ceiling and the server's idle-evict.
+/// Absorbs scheduling jitter and one RTT so a client right at the ceiling is
+/// never evicted by a hair.
+pub const IDLE_EVICT_SAFETY_MARGIN: std::time::Duration = std::time::Duration::from_secs(10);
+
 /// Structured error codes for forward-compatible error handling.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ErrorCode {

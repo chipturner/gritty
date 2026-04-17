@@ -3,8 +3,17 @@ use std::path::PathBuf;
 
 use serde::Deserialize;
 
+use crate::protocol::{IDLE_EVICT_SAFETY_MARGIN, IDLE_EVICT_TIMEOUT};
+
 /// Embedded default config template (from repo root config.toml).
 pub const DEFAULT_CONFIG: &str = include_str!("../config.toml");
+
+/// Upper bound on `heartbeat_interval + heartbeat_timeout` in seconds. Derived
+/// from the server's idle-evict window less a safety margin, so tuning the
+/// server constant automatically re-tunes the client clamp.
+const fn idle_evict_ceiling_secs() -> u64 {
+    IDLE_EVICT_TIMEOUT.as_secs() - IDLE_EVICT_SAFETY_MARGIN.as_secs()
+}
 
 /// Resolved session settings after merging all config layers.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -171,13 +180,16 @@ impl ConfigFile {
                 } else {
                     v
                 };
-                // The server's idle-evict fires after 120s of client silence.
-                // Ensure interval + timeout stays under that so a healthy
-                // client is never evicted before its first Ping.
-                let max_timeout = 110u64.saturating_sub(iv);
+                // The server's idle-evict fires after IDLE_EVICT_TIMEOUT of
+                // client silence. Keep interval + timeout under that (less a
+                // safety margin) so a healthy client always sends a Ping
+                // before the server gives up on it.
+                let ceiling = idle_evict_ceiling_secs();
+                let max_timeout = ceiling.saturating_sub(iv);
                 if v > max_timeout {
+                    let evict = IDLE_EVICT_TIMEOUT.as_secs();
                     eprintln!(
-                        "warning: heartbeat_interval ({iv}s) + heartbeat_timeout ({v}s) exceeds server idle-evict (120s); timeout clamped to {max_timeout}s"
+                        "warning: heartbeat_interval ({iv}s) + heartbeat_timeout ({v}s) exceeds server idle-evict ({evict}s); timeout clamped to {max_timeout}s"
                     );
                     max_timeout
                 } else {
@@ -504,18 +516,31 @@ mod tests {
         let cfg: ConfigFile = toml::from_str(
             r#"
             [defaults]
-            heartbeat-interval = 90
-            heartbeat-timeout = 150
+            heartbeat-interval = 30
+            heartbeat-timeout = 100
             "#,
         )
         .unwrap();
         let s = cfg.resolve_session(None);
-        // interval + timeout must stay under 120s (server idle-evict)
         assert!(
-            s.heartbeat_interval + s.heartbeat_timeout <= 110,
-            "interval={} timeout={}",
+            s.heartbeat_interval + s.heartbeat_timeout <= idle_evict_ceiling_secs(),
+            "interval={} timeout={} ceiling={}",
             s.heartbeat_interval,
-            s.heartbeat_timeout
+            s.heartbeat_timeout,
+            idle_evict_ceiling_secs()
         );
+        assert_eq!(s.heartbeat_timeout, idle_evict_ceiling_secs() - 30);
+    }
+
+    // Guard: the built-in defaults must always fit under the idle-evict
+    // ceiling without clamping. If IDLE_EVICT_TIMEOUT is ever lowered, this
+    // test forces the defaults to be reconsidered in the same change.
+    #[test]
+    fn heartbeat_defaults_fit_under_idle_evict() {
+        let cfg: ConfigFile = toml::from_str("").unwrap();
+        let s = cfg.resolve_session(None);
+        assert!(s.heartbeat_interval + s.heartbeat_timeout <= idle_evict_ceiling_secs());
+        assert_eq!(s.heartbeat_interval, 10);
+        assert_eq!(s.heartbeat_timeout, 60);
     }
 }
