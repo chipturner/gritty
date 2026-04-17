@@ -476,6 +476,14 @@ fn wall_elapsed(since: std::time::SystemTime, now: std::time::SystemTime) -> Dur
     now.duration_since(since).unwrap_or(Duration::ZERO)
 }
 
+/// True when more than `hb_timeout` of wall-clock time has passed since the
+/// server last proved it was alive. Shared by the heartbeat tick and the stdin
+/// arm so a keystroke after laptop wake short-circuits straight to reconnect
+/// instead of stalling in `timed_send` against a dead socket.
+fn link_is_stale(last_activity: std::time::SystemTime, hb_timeout: Duration) -> bool {
+    wall_elapsed(last_activity, std::time::SystemTime::now()) > hb_timeout
+}
+
 /// Events from local agent connection tasks to the relay loop.
 enum AgentEvent {
     Data { channel_id: u32, data: Bytes },
@@ -1434,6 +1442,17 @@ async fn relay(
                     }
                     Ok(Ok(n)) => {
                         debug!(len = n, "stdin → socket");
+                        // Wake-from-suspend fast path: the heartbeat tick is
+                        // monotonic and may not fire for up to hb_interval
+                        // after wake, so a keystroke would otherwise stall in
+                        // timed_send against a dead socket for SEND_TIMEOUT.
+                        // Check wall-clock staleness here and go straight to
+                        // reconnect. The keystroke is dropped -- that's fine;
+                        // the user is about to see the reconnect banner.
+                        if link_is_stale(*relay.last_activity, hb_timeout) {
+                            debug!("stdin after stale link; reconnecting without send");
+                            return Ok(RelayExit::Disconnected);
+                        }
                         if let Some(ref mut esc) = escape {
                             for action in esc.process(&buf[..n]) {
                                 match action {
@@ -1600,9 +1619,7 @@ async fn relay(
                 // suspend because SystemTime keeps advancing while the process
                 // is frozen. No suspend heuristics -- just "have we heard from
                 // the server in the last N seconds of real time?"
-                if wall_elapsed(*relay.last_activity, std::time::SystemTime::now())
-                    > hb_timeout
-                {
+                if link_is_stale(*relay.last_activity, hb_timeout) {
                     debug!("idle timeout");
                     return Ok(RelayExit::Disconnected);
                 }
@@ -2124,9 +2141,7 @@ pub async fn tail(
                     }
                 }
                 _ = heartbeat_interval.tick() => {
-                    if wall_elapsed(last_activity, std::time::SystemTime::now())
-                        > DEFAULT_HEARTBEAT_TIMEOUT
-                    {
+                    if link_is_stale(last_activity, DEFAULT_HEARTBEAT_TIMEOUT) {
                         debug!("tail idle timeout");
                         break 'relay None;
                     }
@@ -2522,6 +2537,30 @@ mod tests {
         let t0 = std::time::SystemTime::UNIX_EPOCH + Duration::from_secs(1_700_000_000);
         let earlier = t0 - Duration::from_secs(60);
         assert_eq!(wall_elapsed(t0, earlier), Duration::ZERO);
+    }
+
+    #[test]
+    fn link_is_stale_fresh_activity_is_not_stale() {
+        let now = std::time::SystemTime::now();
+        assert!(!link_is_stale(now, Duration::from_secs(60)));
+    }
+
+    // The wake-from-suspend case: last_activity is minutes in the past because
+    // SystemTime kept advancing while the process was frozen. The stdin arm
+    // checks this before timed_send so a keystroke triggers immediate reconnect
+    // instead of a SEND_TIMEOUT stall against a dead socket.
+    #[test]
+    fn link_is_stale_old_activity_is_stale() {
+        let past = std::time::SystemTime::now() - Duration::from_secs(1800);
+        assert!(link_is_stale(past, Duration::from_secs(60)));
+    }
+
+    // last_activity in the future (clock stepped backward after it was
+    // recorded) must not be treated as stale -- we have no evidence of silence.
+    #[test]
+    fn link_is_stale_future_activity_is_not_stale() {
+        let future = std::time::SystemTime::now() + Duration::from_secs(3600);
+        assert!(!link_is_stale(future, Duration::from_secs(60)));
     }
 
     // Regression: the client's ping cadence must key off outbound silence, not
