@@ -67,6 +67,8 @@ The client probes for liveness on idle and declares the link dead after 60s with
 
 Each `Attach` carries an `attach_token` that the daemon minted on the previous successful attach. A stale token -- which happens when another client legitimately took over the session while this one was disconnected -- is rejected with `OwnerChanged`, and the client exits rather than silently stealing the session back. A matching token is a silent reconnect and returns the same token so an in-flight `AttachAck` loss can't poison future reconnects.
 
+The tunnel supervisor -- ssh child lifecycle, app-layer probing, exponential backoff, remote-ready re-priming, and the `healthy` / `reconnecting` / `stale` status values -- has its own state machine documented separately; see [docs/tunnel-state-machine.md](docs/tunnel-state-machine.md).
+
 ## Agent & URL Forwarding
 
 ```mermaid

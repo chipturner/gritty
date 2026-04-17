@@ -76,7 +76,7 @@ Nine modules behind a lib crate (`src/lib.rs` hosts `collect_env_vars()`, `spawn
 - **`protocol`** -- `Frame` enum, `Encoder`/`Decoder`, wire `[type: u8][length: u32 BE][payload]`. `PROTOCOL_VERSION: u16`. `SessionEntry` for list metadata. `SvcRequest` enum for svc socket dispatch. Also hosts `IDLE_EVICT_TIMEOUT` (90s) + `IDLE_EVICT_SAFETY_MARGIN` (10s) as a shared contract: `server.rs` uses the timeout directly, `config.rs` clamps client heartbeat settings so `interval + timeout <= IDLE_EVICT_TIMEOUT - margin`.
 - **`daemon`** -- Accept loop on `ctl.sock`. Handshake, control frame, route. `HashMap<u32, SessionState>`. Hands off `Framed<UnixStream>` to session tasks via `mpsc`.
 - **`server`** -- Per-session: PTY, client relay, ring buffer, forwarding (agent/URL/tunnel/port), file transfer, tail broadcast. Per-session sockets: `agent-{id}.sock` + `svc-{id}.sock`. Client-side forward socket: `fwd-{host}-{id}.sock` (created by the client, used by `gritty lf`/`gritty rf` to request port forwards).
-- **`connect`** (module, implements `tunnel-create` CLI) -- Self-backgrounding SSH tunnel. Monitor respawns on transient failure (backoff 1s to 60s, resets after 30s healthy); respawn preserves the original `foreground` flag and re-runs `ensure_remote_ready` so a rebooted remote gets its `gritty server` started again before SSH forwards bytes. Per-tunnel files: `.sock`, `.pid` (written immediately on lock acquisition), `.lock`, `.dest`, `.log`, `.out`. `ConnectGuard` Drop cleans up.
+- **`connect`** (module, implements `tunnel-create` CLI) -- Self-backgrounding SSH tunnel. Monitor respawns on transient failure (backoff 1s to 60s, resets after 30s healthy); respawn preserves the original `foreground` flag and re-runs `ensure_remote_ready` so a rebooted remote gets its `gritty server` started again before SSH forwards bytes. Per-tunnel files: `.sock`, `.pid` (written immediately on lock acquisition), `.lock`, `.dest`, `.log`, `.out`. `ConnectGuard` Drop cleans up. **The supervisor's full state machine (including app-layer probing, exit-code classification, `TunnelStatus` projection, and invariants the client observer relies on) is documented in [docs/tunnel-state-machine.md](docs/tunnel-state-machine.md) -- update it in the same commit as any change to `connect.rs` behavior.**
 - **`alt_screen`** -- `AltScreenTracker`: byte-scanning state machine that detects alternate screen mode (`?1049`, `?1047`, `?47`). Used by server for smart reconnect.
 - **`scrollback`** -- `ScrollbackBuffer`: tracks last 50 lines of PTY output for replay on main-screen reconnect.
 - **`table`** -- `print_table()` for tabular output.
@@ -167,6 +167,7 @@ File transfer manifest (svc socket, not Frame protocol): sender writes `[file_co
   - **README.md** -- command table, flags, session env vars, config defaults, escape sequences
   - **CLAUDE.md** -- module descriptions, wire format codes, `server::run()` signature, key patterns
   - **ARCHITECTURE.md** -- high-level feature descriptions, diagrams
+  - **docs/tunnel-state-machine.md** -- any change to `connect.rs` supervisor behavior (states, transitions, timing constants, exit-code classification, `TunnelStatus` projection, flock/client-observer contract)
 
 ### Style
 - `main()` returns `()`. Errors via `eprintln!("error: ...")`. Never `-> anyhow::Result` on `main()`.

@@ -261,7 +261,7 @@ gritty completions fish > ~/.config/fish/completions/gritty.fish
 
 **First connect hangs or fails** -- gritty backgrounds the SSH tunnel, so it can't prompt for a password or host key. Make sure `ssh <destination>` works first, then use `gritty connect`.
 
-**"[reconnecting...]" forever** -- the SSH tunnel is down and not coming back. Check `gritty tunnels` for tunnel status. If the tunnel shows as stale, `gritty tunnel-destroy <name>` to clean it up and `gritty tunnel-create <dest>` to re-establish. Check `gritty info` for log file paths if you need to dig deeper.
+**"[reconnecting...]" forever** -- the SSH tunnel is down and not coming back. Check `gritty tunnels` for tunnel status. If the tunnel shows as stale, `gritty tunnel-destroy <name>` to clean it up and `gritty tunnel-create <dest>` to re-establish. Check `gritty info` for log file paths if you need to dig deeper. See [docs/tunnel-state-machine.md](docs/tunnel-state-machine.md) for the `healthy` / `reconnecting` / `stale` state definitions and the full supervisor state diagram.
 
 **Protocol version mismatch after upgrade** -- after upgrading gritty on one side the other side's daemon still speaks the old protocol, so session operations fail with `protocol version mismatch`. Upgrade both binaries to matching versions (`gritty protocol-version` prints the local version), then run `gritty restart <host>` (or `gritty restart local`) to tear down the old daemon and bring a fresh one up on both sides. `restart` tolerates the mismatched handshake so it works without falling back to SSH; under the hood it calls `kill-server` (which is itself tolerant of the mismatch), destroys the tunnel, and `tunnel-create`s a new one.
 
@@ -291,7 +291,7 @@ All communication -- control and session relay -- flows through a single server 
 
 Locally, the socket is `0600`, the directory is `0700`, and every `accept()` verifies the peer UID. The attack surface is small because there's very little to attack.
 
-See [ARCHITECTURE.md](ARCHITECTURE.md) for diagrams and detailed protocol description.
+See [ARCHITECTURE.md](ARCHITECTURE.md) for diagrams and detailed protocol description, and [docs/tunnel-state-machine.md](docs/tunnel-state-machine.md) for the tunnel supervisor state machine.
 
 ## Security Model
 
