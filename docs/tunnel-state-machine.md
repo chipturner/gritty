@@ -63,17 +63,17 @@ stateDiagram-v2
     state Starting {
         direction TB
         [*] --> Preflight
-        Preflight --> Preflight: ensure_remote_ready\n(ssh + socket-path + server-start)
-        Preflight --> SpawnChild: got remote_sock + version\n(version-check; bail unless ignore-version-mismatch flag)
+        Preflight --> Preflight: ensure_remote_ready\n(ssh, socket path, server start)
+        Preflight --> SpawnChild: got remote_sock and version\n(version check, may bail)
         SpawnChild --> WaitForSocket: ssh spawned\n(stderr drained to .out)
-        WaitForSocket --> Ready: UnixStream::connect ok
+        WaitForSocket --> Ready: UnixStream.connect ok
         WaitForSocket --> ChildDiedEarly: child.wait() won the select\n(ssh exited before socket bind)
         WaitForSocket --> SocketTimeout: wait_for_socket deadline\n(ssh alive but never bound the forward socket)
     }
 
     Starting --> Running: Ready\n(write .dest, signal_ready,\nspawn tunnel_monitor)
     Starting --> Failed: ChildDiedEarly\n(bail, point at .out)
-    Starting --> Failed: SocketTimeout\n(bail, point at foreground-mode hint)
+    Starting --> Failed: SocketTimeout\n(bail, point at foreground hint)
 
     state Running {
         direction LR
@@ -97,20 +97,20 @@ stateDiagram-v2
     }
 
     note right of Running
-        Externally observable via probe_tunnel_status:
-        Alive + ProbeFailing => TunnelStatus::Healthy
+        Externally observable via probe_tunnel_status.
+        Alive and ProbeFailing map to TunnelStatus.Healthy
         (socket still bound; probe failure has not
-        yet killed the child)
-        KillingChild + ChildExited + Backoff +
-        EnsureRemoteRetry + SpawnRetry =>
-        TunnelStatus::Reconnecting
-        (flock held; socket gone or wedged)
+        yet killed the child).
+        KillingChild, ChildExited, Backoff,
+        EnsureRemoteRetry, and SpawnRetry map to
+        TunnelStatus.Reconnecting
+        (flock held; socket gone or wedged).
     end note
 
     note left of Starting
-        Also observes as TunnelStatus::Reconnecting
-        from outside: flock held, socket not yet
-        bound. The client's reconnect grace relies
+        Also maps to TunnelStatus.Reconnecting
+        from outside. flock held, socket not yet
+        bound. The client reconnect grace relies
         on this so it does not give up during a
         slow initial tunnel setup.
     end note
@@ -123,7 +123,7 @@ stateDiagram-v2
         direction TB
         [*] --> CancelMonitor: stop.cancel()
         CancelMonitor --> KillChild: monitor awaits child.kill()
-        KillChild --> ReleaseFlock: ConnectGuard::drop\n(SIGTERM ssh, drop Flock)
+        KillChild --> ReleaseFlock: ConnectGuard.drop\n(SIGTERM ssh, drop Flock)
         ReleaseFlock --> CleanupFiles: flock released\n(no racing O_CREAT can double-lock)
         CleanupFiles --> [*]: rm sock/pid/lock/dest
     }
