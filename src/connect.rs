@@ -475,6 +475,14 @@ async fn tunnel_monitor(
                     return;
                 }
 
+                // This child is gone; its probe-failure history should not
+                // carry over and pre-charge the counter against whichever
+                // child we spawn next. Without this, a child that exited for
+                // an unrelated reason while the counter sat at 1 caused the
+                // first probe on the replacement child to immediately cross
+                // the threshold.
+                consecutive_probe_failures = 0;
+
                 let code = status.code();
                 info!("ssh tunnel exited: {:?}", code);
 
