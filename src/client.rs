@@ -465,14 +465,16 @@ async fn timed_send(
 
 const DEFAULT_HEARTBEAT_INTERVAL: Duration = Duration::from_secs(10);
 const DEFAULT_HEARTBEAT_TIMEOUT: Duration = Duration::from_secs(60);
-/// If wall-clock advances much faster than monotonic between heartbeat ticks,
-/// the host likely slept. Force a liveness probe on resume.
-const SUSPEND_SKEW_THRESHOLD: Duration = Duration::from_secs(5);
-/// Deadline for the post-suspend probe reply before declaring the link dead.
-/// Must tolerate NAT rebind + DNS recovery + a fresh TCP RTT on cellular, so
-/// this is intentionally generous -- a false disconnect on wake is worse than
-/// a slightly delayed real one (the idle timeout still catches truly dead links).
-const SUSPEND_PROBE_DEADLINE: Duration = Duration::from_secs(15);
+
+/// Wall-clock elapsed between `since` and `now`. `Instant` on Linux uses
+/// `CLOCK_MONOTONIC` which pauses during laptop suspend, so `Instant::elapsed`
+/// under-reports silence across a lid-close. `SystemTime` keeps advancing, so
+/// we use it to drive idle detection. Returns `Duration::ZERO` if the clock
+/// moved backward (NTP correction, manual set) so we never declare the link
+/// idle from a clock adjustment.
+fn wall_elapsed(since: std::time::SystemTime, now: std::time::SystemTime) -> Duration {
+    now.duration_since(since).unwrap_or(Duration::ZERO)
+}
 
 /// Events from local agent connection tasks to the relay loop.
 enum AgentEvent {
@@ -648,7 +650,7 @@ struct ClientRelay<'a> {
     pf: &'a mut ClientPortForwardTable,
     pf_event_tx: &'a mpsc::UnboundedSender<ClientPortForwardEvent>,
     client_initiated_forwards: &'a mut std::collections::HashMap<u32, u16>,
-    last_activity: &'a mut Instant,
+    last_activity: &'a mut std::time::SystemTime,
     last_outbound_at: &'a mut Instant,
     last_ping_sent: &'a mut Instant,
     last_rtt: &'a mut Option<Duration>,
@@ -666,9 +668,13 @@ impl ClientRelay<'_> {
         framed: &mut Framed<UnixStream, FrameCodec>,
         frame: Option<Result<Frame, io::Error>>,
     ) -> Result<ControlFlow<RelayExit>, anyhow::Error> {
-        // Any frame received from the server is proof-of-life; reset the idle timer.
+        // Any frame received from the server is proof-of-life; reset the idle
+        // timer. We use SystemTime (not Instant) so the timer keeps advancing
+        // across laptop suspend -- Instant is CLOCK_MONOTONIC on Linux and
+        // pauses during suspend, which would hide silence that accumulated
+        // while the lid was closed.
         if matches!(frame, Some(Ok(_))) {
-            *self.last_activity = Instant::now();
+            *self.last_activity = std::time::SystemTime::now();
         }
         match frame {
             Some(Ok(Frame::Data(data))) => {
@@ -1364,7 +1370,11 @@ async fn relay(
 ) -> anyhow::Result<RelayExit> {
     let mut heartbeat_interval = tokio::time::interval(hb_interval);
     heartbeat_interval.reset(); // first tick is immediate otherwise; delay it
-    let mut last_activity = Instant::now();
+    // SystemTime (not Instant) because Instant pauses during laptop suspend on
+    // Linux, which would hide silence accumulated across a lid-close. We don't
+    // detect suspend; we just observe that no server frame has arrived in N
+    // seconds of wall-clock time.
+    let mut last_activity = std::time::SystemTime::now();
     // Timestamp of the last frame we successfully sent to the server. The
     // ping cadence is driven off this (not last_activity) so steady inbound
     // server output doesn't suppress the probes the server uses for its
@@ -1372,12 +1382,6 @@ async fn relay(
     let mut last_outbound_at = Instant::now();
     let mut last_ping_sent = Instant::now();
     let mut last_rtt: Option<Duration> = None;
-    let mut last_tick_mono = Instant::now();
-    let mut last_tick_wall = std::time::SystemTime::now();
-    // When set, a post-suspend probe is outstanding; if no server frame arrives
-    // by this deadline we treat the connection as dead and reconnect.
-    let mut suspend_probe_deadline: Option<Instant> = None;
-    let mut suspend_probe_baseline: Option<Instant> = None;
 
     // Agent channel management
     let mut agent = ClientAgentState::new();
@@ -1448,15 +1452,10 @@ async fn relay(
                                     }
                                     EscapeAction::Suspend => {
                                         suspend(raw_guard, nb_guard)?;
-                                        // Avoid a spurious idle-timeout or suspend-probe after
-                                        // returning from SIGTSTP.
+                                        // Avoid a spurious idle-timeout after returning from SIGTSTP.
                                         heartbeat_interval = tokio::time::interval(hb_interval);
                                         heartbeat_interval.reset();
-                                        *relay.last_activity = Instant::now();
-                                        last_tick_mono = Instant::now();
-                                        last_tick_wall = std::time::SystemTime::now();
-                                        suspend_probe_deadline = None;
-                                        suspend_probe_baseline = None;
+                                        *relay.last_activity = std::time::SystemTime::now();
                                         // Re-sync terminal size after resume
                                         let (cols, rows) = get_terminal_size();
                                         if !timed_send(framed, Frame::Resize { cols, rows }, relay.last_outbound_at).await {
@@ -1556,14 +1555,6 @@ async fn relay(
                 if let ControlFlow::Break(exit) = relay.handle_server_frame(framed, frame).await? {
                     return Ok(exit);
                 }
-                // Any server frame satisfies an outstanding post-suspend probe.
-                if let Some(baseline) = suspend_probe_baseline
-                    && *relay.last_activity > baseline
-                {
-                    debug!("post-suspend probe satisfied");
-                    suspend_probe_deadline = None;
-                    suspend_probe_baseline = None;
-                }
             }
 
             event = agent_event_rx.recv() => {
@@ -1605,65 +1596,27 @@ async fn relay(
             }
 
             _ = heartbeat_interval.tick() => {
-                // Detect suspend/resume by comparing wall-clock and monotonic deltas.
-                // Both Instant and SystemTime tick together while the process runs; during
-                // a full suspend Instant pauses but SystemTime doesn't, so wall >> mono on
-                // the first tick after resume.
-                let mono_now = Instant::now();
-                let wall_now = std::time::SystemTime::now();
-                let mono_delta = mono_now.saturating_duration_since(last_tick_mono);
-                let wall_delta = wall_now
-                    .duration_since(last_tick_wall)
-                    .unwrap_or(Duration::ZERO);
-                last_tick_mono = mono_now;
-                last_tick_wall = wall_now;
-                let suspended = wall_delta > mono_delta + SUSPEND_SKEW_THRESHOLD;
-
-                if relay.last_activity.elapsed() > hb_timeout {
+                // Wall-clock silence check: works correctly across laptop
+                // suspend because SystemTime keeps advancing while the process
+                // is frozen. No suspend heuristics -- just "have we heard from
+                // the server in the last N seconds of real time?"
+                if wall_elapsed(*relay.last_activity, std::time::SystemTime::now())
+                    > hb_timeout
+                {
                     debug!("idle timeout");
                     return Ok(RelayExit::Disconnected);
                 }
 
-                // Fire a probe if we haven't sent anything recently OR we just
-                // came back from suspend. Keying off last_outbound_at (not
-                // last_activity) is what proves liveness to the server's
-                // idle-evict: steady inbound server output does not prove the
-                // client can still send.
-                let should_probe = suspended
-                    || relay.last_outbound_at.elapsed() >= hb_interval;
-                if should_probe {
-                    if suspended {
-                        debug!(
-                            wall_ms = wall_delta.as_millis(),
-                            mono_ms = mono_delta.as_millis(),
-                            "suspend detected, probing link",
-                        );
-                        suspend_probe_baseline = Some(*relay.last_activity);
-                        suspend_probe_deadline =
-                            Some(Instant::now() + SUSPEND_PROBE_DEADLINE);
-                    }
+                // Fire a Ping whenever we've been outbound-silent for a tick.
+                // Keying off last_outbound_at (not last_activity) is what
+                // proves liveness to the server's idle-evict: steady inbound
+                // server output does not prove the client can still send.
+                if relay.last_outbound_at.elapsed() >= hb_interval {
                     *relay.last_ping_sent = Instant::now();
                     if !timed_send(framed, Frame::Ping, relay.last_outbound_at).await {
                         return Ok(RelayExit::Disconnected);
                     }
                 }
-            }
-
-            _ = async {
-                match suspend_probe_deadline {
-                    Some(d) => tokio::time::sleep_until(d).await,
-                    None => std::future::pending().await,
-                }
-            } => {
-                // Deadline fired with no activity past baseline -> link is dead.
-                if let Some(baseline) = suspend_probe_baseline
-                    && *relay.last_activity <= baseline
-                {
-                    debug!("post-suspend probe timed out");
-                    return Ok(RelayExit::Disconnected);
-                }
-                suspend_probe_deadline = None;
-                suspend_probe_baseline = None;
             }
 
             _ = sigterm.recv() => {
@@ -2128,14 +2081,12 @@ pub async fn tail(
 
     let mut heartbeat_interval = tokio::time::interval(DEFAULT_HEARTBEAT_INTERVAL);
     heartbeat_interval.reset();
-    let mut last_activity = Instant::now();
+    // SystemTime (not Instant) because Instant pauses during laptop suspend on
+    // Linux, hiding silence across a lid-close. See `wall_elapsed`.
+    let mut last_activity = std::time::SystemTime::now();
     // Last time we successfully sent a frame; drives ping cadence so the
     // server's idle-evict doesn't fire during steady inbound traffic.
     let mut last_outbound_at = Instant::now();
-    let mut last_tick_mono = Instant::now();
-    let mut last_tick_wall = std::time::SystemTime::now();
-    let mut suspend_probe_deadline: Option<Instant> = None;
-    let mut suspend_probe_baseline: Option<Instant> = None;
     let mut sigint = signal(SignalKind::interrupt())?;
     let mut sigterm = signal(SignalKind::terminate())?;
     let mut sighup = signal(SignalKind::hangup())?;
@@ -2149,13 +2100,7 @@ pub async fn tail(
             tokio::select! {
                 frame = framed.next() => {
                     if matches!(frame, Some(Ok(_))) {
-                        last_activity = Instant::now();
-                        if let Some(baseline) = suspend_probe_baseline
-                            && last_activity > baseline
-                        {
-                            suspend_probe_deadline = None;
-                            suspend_probe_baseline = None;
-                        }
+                        last_activity = std::time::SystemTime::now();
                     }
                     match frame {
                         Some(Ok(Frame::Data(data))) => {
@@ -2179,49 +2124,18 @@ pub async fn tail(
                     }
                 }
                 _ = heartbeat_interval.tick() => {
-                    let mono_now = Instant::now();
-                    let wall_now = std::time::SystemTime::now();
-                    let mono_delta = mono_now.saturating_duration_since(last_tick_mono);
-                    let wall_delta = wall_now
-                        .duration_since(last_tick_wall)
-                        .unwrap_or(Duration::ZERO);
-                    last_tick_mono = mono_now;
-                    last_tick_wall = wall_now;
-                    let suspended = wall_delta > mono_delta + SUSPEND_SKEW_THRESHOLD;
-
-                    if last_activity.elapsed() > DEFAULT_HEARTBEAT_TIMEOUT {
+                    if wall_elapsed(last_activity, std::time::SystemTime::now())
+                        > DEFAULT_HEARTBEAT_TIMEOUT
+                    {
                         debug!("tail idle timeout");
                         break 'relay None;
                     }
-
-                    let should_probe = suspended
-                        || last_outbound_at.elapsed() >= DEFAULT_HEARTBEAT_INTERVAL;
-                    if should_probe {
-                        if suspended {
-                            suspend_probe_baseline = Some(last_activity);
-                            suspend_probe_deadline =
-                                Some(Instant::now() + SUSPEND_PROBE_DEADLINE);
-                        }
+                    if last_outbound_at.elapsed() >= DEFAULT_HEARTBEAT_INTERVAL {
                         if framed.send(Frame::Ping).await.is_err() {
                             break 'relay None;
                         }
                         last_outbound_at = Instant::now();
                     }
-                }
-                _ = async {
-                    match suspend_probe_deadline {
-                        Some(d) => tokio::time::sleep_until(d).await,
-                        None => std::future::pending().await,
-                    }
-                } => {
-                    if let Some(baseline) = suspend_probe_baseline
-                        && last_activity <= baseline
-                    {
-                        debug!("tail post-suspend probe timed out");
-                        break 'relay None;
-                    }
-                    suspend_probe_deadline = None;
-                    suspend_probe_baseline = None;
                 }
                 _ = sigint.recv() => {
                     break 'outer 0;
@@ -2346,11 +2260,7 @@ pub async fn tail(
                             }
                             framed = new_framed;
                             heartbeat_interval.reset();
-                            last_activity = Instant::now();
-                            last_tick_mono = Instant::now();
-                            last_tick_wall = std::time::SystemTime::now();
-                            suspend_probe_deadline = None;
-                            suspend_probe_baseline = None;
+                            last_activity = std::time::SystemTime::now();
                             break;
                         }
                         Ok(Outcome::ServerRestarted) => {
@@ -2590,6 +2500,28 @@ mod tests {
         assert_eq!(next_reconnect_delay(Duration::from_secs(8)), RECONNECT_BACKOFF_MAX);
         assert_eq!(next_reconnect_delay(RECONNECT_BACKOFF_MAX), RECONNECT_BACKOFF_MAX);
         assert_eq!(next_reconnect_delay(Duration::from_secs(300)), RECONNECT_BACKOFF_MAX);
+    }
+
+    #[test]
+    fn wall_elapsed_forward_returns_diff() {
+        let t0 = std::time::SystemTime::UNIX_EPOCH + Duration::from_secs(1_700_000_000);
+        let t1 = t0 + Duration::from_secs(30);
+        assert_eq!(wall_elapsed(t0, t1), Duration::from_secs(30));
+    }
+
+    #[test]
+    fn wall_elapsed_equal_is_zero() {
+        let t0 = std::time::SystemTime::UNIX_EPOCH + Duration::from_secs(1_700_000_000);
+        assert_eq!(wall_elapsed(t0, t0), Duration::ZERO);
+    }
+
+    // Clock going backward (NTP correction, manual set) must not declare the
+    // link idle -- we have no evidence of silence, just a jumpy clock.
+    #[test]
+    fn wall_elapsed_backward_is_zero() {
+        let t0 = std::time::SystemTime::UNIX_EPOCH + Duration::from_secs(1_700_000_000);
+        let earlier = t0 - Duration::from_secs(60);
+        assert_eq!(wall_elapsed(t0, earlier), Duration::ZERO);
     }
 
     // Regression: the client's ping cadence must key off outbound silence, not
