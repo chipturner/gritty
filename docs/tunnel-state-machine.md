@@ -37,9 +37,13 @@ A tunnel named `NAME` owns these files in `socket_dir()`:
 | `connect-NAME.log`      | tracing subscriber                       | Supervisor's own structured logs. |
 | `connect-NAME.out`      | daemonize stderr redirection             | ssh child's stderr (forward-setup errors, etc.). |
 
-Invariant: the `.lock` file's flock status is the single liveness truth.
-Everything else is advisory -- if the lock is free, any other leftover file is
-stale by definition.
+Invariant: the flock held on the `.lock` *inode* is the single liveness truth.
+Everything else is advisory -- if the inode's flock is free, any other leftover
+file is stale by definition. `ConnectGuard::drop` releases the flock **before**
+unlinking the lock file, so a racing `try_acquire_lock` never observes a
+"file unlinked but inode still locked" window in which it could `O_CREAT` a
+new inode at the path and end up holding a valid flock concurrently with the
+departing supervisor.
 
 ## State diagram
 

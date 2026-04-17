@@ -886,11 +886,20 @@ impl Drop for ConnectGuard {
             }
         }
 
+        // Release the flock *before* unlinking the lock file. If we
+        // unlink first while still holding the flock, a racing
+        // try_acquire_lock can O_CREAT a new inode at the same path
+        // and flock it successfully -- two supervisors then hold
+        // "the lock" on different inodes until we release ours. The
+        // flock-on-inode is the real ground truth; by dropping it
+        // first, any racing acquirer observes a consistent "lock free"
+        // state, O_CREAT either the old inode (which is now unlocked)
+        // or a new one.
+        let _ = self._lock.take();
         let _ = std::fs::remove_file(&self.local_sock);
         let _ = std::fs::remove_file(&self.pid_file);
         let _ = std::fs::remove_file(&self.lock_file);
         let _ = std::fs::remove_file(&self.dest_file);
-        // _lock drops here, releasing the flock
     }
 }
 
