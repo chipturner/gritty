@@ -67,11 +67,13 @@ stateDiagram-v2
         Preflight --> SpawnChild: got remote_sock + version\n(version-check; bail unless --ignore-version-mismatch)
         SpawnChild --> WaitForSocket: ssh spawned\n(stderr drained to .out)
         WaitForSocket --> Ready: UnixStream::connect ok
-        WaitForSocket --> Aborted: child exited before socket\nor wait_for_socket timeout
+        WaitForSocket --> ChildDiedEarly: child.wait() won the select\n(ssh exited before socket bind)
+        WaitForSocket --> SocketTimeout: wait_for_socket deadline\n(ssh alive but never bound -L)
     }
 
     Starting --> Running: Ready\n(write .dest, signal_ready,\nspawn tunnel_monitor)
-    Starting --> Failed: Aborted
+    Starting --> Failed: ChildDiedEarly\n(bail, point at .out)
+    Starting --> Failed: SocketTimeout\n(bail, point at --foreground hint)
 
     state Running {
         direction LR
@@ -90,11 +92,30 @@ stateDiagram-v2
         Backoff --> EnsureRemoteRetry: timer fires
         EnsureRemoteRetry --> Backoff: ensure_remote_ready err\n(retry from top)
         EnsureRemoteRetry --> SpawnRetry: got fresh remote_sock
-        SpawnRetry --> Alive: ssh respawned
+        SpawnRetry --> Alive: ssh respawned\n(update child_spawned_at)
         SpawnRetry --> Backoff: spawn_tunnel err
     }
 
-    Running --> Stopping: SIGTERM / SIGINT\n(run() select)
+    note right of Running
+        Externally observable via probe_tunnel_status:
+        Alive + ProbeFailing => TunnelStatus::Healthy
+        (socket still bound; probe failure has not
+        yet killed the child)
+        KillingChild + ChildExited + Backoff +
+        EnsureRemoteRetry + SpawnRetry =>
+        TunnelStatus::Reconnecting
+        (flock held; socket gone or wedged)
+    end note
+
+    note left of Starting
+        Also observes as TunnelStatus::Reconnecting
+        from outside: flock held, socket not yet
+        bound. The client's reconnect grace relies
+        on this so it does not give up during a
+        slow initial tunnel setup.
+    end note
+
+    Running --> Stopping: SIGTERM / SIGINT\n(run() select;\ninterrupts Backoff sleep too)
     Running --> Stopping: monitor returned\n(NonTransient exit)
     Running --> Stopping: stop.cancelled()\n(ConnectGuard drop)
 
@@ -102,8 +123,9 @@ stateDiagram-v2
         direction TB
         [*] --> CancelMonitor: stop.cancel()
         CancelMonitor --> KillChild: monitor awaits child.kill()
-        KillChild --> CleanupFiles: ConnectGuard::drop\n(SIGTERM ssh, rm sock/pid/lock/dest)
-        CleanupFiles --> [*]: flock released
+        KillChild --> ReleaseFlock: ConnectGuard::drop\n(SIGTERM ssh, drop Flock)
+        ReleaseFlock --> CleanupFiles: flock released\n(no racing O_CREAT can double-lock)
+        CleanupFiles --> [*]: rm sock/pid/lock/dest
     }
 
     Stopping --> [*]
@@ -119,9 +141,15 @@ values via `probe_tunnel_status(name) -> TunnelStatus`:
 
 | Observed                                     | `TunnelStatus`  | Internal states that produce it |
 |----------------------------------------------|-----------------|---------------------------------|
-| lock held + `.sock` connectable              | `Healthy`       | `Running.Alive`, `Running.ProbeFailing` (socket is still up during probe) |
-| lock held + `.sock` not connectable          | `Reconnecting`  | `Starting.*`, `Running.KillingChild`, `Running.ChildExited`, `Running.Backoff`, `Running.EnsureRemoteRetry`, `Running.SpawnRetry` |
+| lock held + `.sock` connectable              | `Healthy`       | `Running.Alive`, `Running.ProbeFailing` (socket stays bound during probe; a failing probe has not yet killed the ssh child) |
+| lock held + `.sock` not connectable          | `Reconnecting`  | `Starting.Preflight`, `Starting.SpawnChild`, `Starting.WaitForSocket` (initial setup), plus `Running.KillingChild`, `Running.ChildExited`, `Running.Backoff`, `Running.EnsureRemoteRetry`, `Running.SpawnRetry` (respawn cycle) |
 | lock free                                    | `Stale`         | Supervisor absent / dead; `.sock`/`.pid` orphaned. `get_tunnel_info` GCs stale files as a side effect. |
+
+The `Starting.*` row matters for the client observer: during a slow
+initial tunnel setup (cellular RTT, remote cold-start), the client sees
+lock-held + socket-missing and must keep retrying past its own
+`SOCKET_GONE_GRACE` window -- same treatment as a respawn cycle. The
+state machine deliberately makes these indistinguishable from outside.
 
 The client's reconnect loop (`src/client.rs`) uses `is_lock_held` directly,
 not `TunnelStatus`: a held lock means "supervisor is alive and may be
@@ -159,9 +187,19 @@ backoff not trip the client's short socket-gone grace.
    drained to our stderr (== `.out` in daemonized mode) so mux errors like
    `mux_client_forward: forwarding request failed` surface without waiting
    for `wait_for_socket` to time out.
-5. **Starting.WaitForSocket -> Running** -- `wait_for_socket` raced against
-   `child.wait()`. On child exit first, bail with a diagnostic pointing at
-   `.out`. On socket ready first, write `.dest`, call `signal_ready` so the
+5. **Starting.WaitForSocket -> Running / Failed** -- the select has two
+   failure branches, surfaced as distinct states in the diagram:
+   - **ChildDiedEarly** (`child.wait()` wins): ssh exited before binding
+     the `-L` socket. Bail with a diagnostic pointing the user at `.out`
+     (where the child's stderr drained to). Root causes: bad forward
+     spec, `ExitOnForwardFailure=yes` tripping, remote host rejected
+     the connection after auth.
+   - **SocketTimeout** (`wait_for_socket` deadline): ssh is still alive
+     but never called bind() on the forward. Bail with a diagnostic
+     that additionally points at the `--foreground` hint (a password
+     prompt that wasn't answered is the common cause).
+
+   On socket-ready first, write `.dest`, call `signal_ready` so the
    parent `tunnel-create` process exits, and hand the ssh child to
    `tunnel_monitor`.
 
