@@ -387,11 +387,95 @@ fn drain_stderr(child: &mut Child) {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Tunnel monitor timing constants and pure helpers
+// ---------------------------------------------------------------------------
+
+/// Minimum backoff between respawn attempts; also the initial value.
+const MIN_RESPAWN_BACKOFF: Duration = Duration::from_secs(1);
+/// Maximum backoff between respawn attempts.
+const MAX_RESPAWN_BACKOFF: Duration = Duration::from_secs(60);
+/// A child that lived at least this long before dying is considered a
+/// healthy cycle; the next respawn uses `MIN_RESPAWN_BACKOFF`.
+const HEALTHY_CHILD_THRESHOLD: Duration = Duration::from_secs(30);
+/// App-layer tunnel liveness probe cadence. SSH's ServerAliveInterval
+/// covers TCP-level liveness, but can't detect a remote gritty daemon
+/// that died while ssh stayed up (OOM, crash, manual kill).
+const PROBE_INTERVAL: Duration = Duration::from_secs(30);
+/// Consecutive probe failures before we kill ssh to force a respawn.
+const PROBE_FAILURES_BEFORE_RESPAWN: u32 = 2;
+
+/// Classification of an ssh child's exit status. The monitor retries on
+/// `Transient` and gives up on `NonTransient`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ExitClass {
+    Transient,
+    NonTransient,
+}
+
+/// Map an ssh exit status to our retry policy.
+///
+/// Transient (retry):
+/// - `None` (code): locally signal-killed; typically our own
+///   `child.kill()` after a probe failure.
+/// - `Some(255)`: ssh's own connection-error exit.
+/// - `Some(128..=159)`: remote-side signal death (reboot, OOM,
+///   SIGTERM during remote shutdown) -- ssh reports these as
+///   `128 + signum`.
+///
+/// Non-transient (give up):
+/// - Any other exit code (auth failure, config error, etc.).
+fn classify_exit(status: std::process::ExitStatus) -> ExitClass {
+    match status.code() {
+        None => ExitClass::Transient,
+        Some(255) => ExitClass::Transient,
+        Some(c) if (128..=159).contains(&c) => ExitClass::Transient,
+        Some(_) => ExitClass::NonTransient,
+    }
+}
+
+/// Given the previous backoff and the just-exited child's uptime,
+/// returns `(sleep_duration, next_backoff)`:
+/// - `sleep_duration`: how long to wait before the next respawn.
+/// - `next_backoff`: the value to carry forward (doubled, capped
+///   at `MAX_RESPAWN_BACKOFF`).
+///
+/// If the prior child lived at least `HEALTHY_CHILD_THRESHOLD`, the
+/// cycle is considered healthy and the sleep resets to
+/// `MIN_RESPAWN_BACKOFF` before doubling -- so a tunnel that stabilized
+/// for 30s+ gets an aggressive 1s retry on its first death.
+fn next_backoff(prev: Duration, prior_uptime: Duration) -> (Duration, Duration) {
+    let sleep = if prior_uptime >= HEALTHY_CHILD_THRESHOLD { MIN_RESPAWN_BACKOFF } else { prev };
+    let next = (sleep * 2).min(MAX_RESPAWN_BACKOFF);
+    (sleep, next)
+}
+
+/// Per-child supervised state. Grouping child handle, spawn time, and
+/// probe-failure counter into one struct prevents counters from leaking
+/// across respawns: replacing the `ChildState` is the only way to
+/// install a new child, and that construction zeroes `probe_failures`
+/// and resets `spawned_at` by virtue of the `new()` constructor.
+struct ChildState {
+    child: Child,
+    spawned_at: Instant,
+    probe_failures: u32,
+}
+
+impl ChildState {
+    fn new(child: Child) -> Self {
+        Self { child, spawned_at: Instant::now(), probe_failures: 0 }
+    }
+
+    fn uptime(&self) -> Duration {
+        self.spawned_at.elapsed()
+    }
+}
+
 /// Background task: monitor SSH child, respawn on transient failure.
 /// Uses exponential backoff (1s..60s) and never gives up on transient errors.
 #[allow(clippy::too_many_arguments)]
 async fn tunnel_monitor(
-    mut child: Child,
+    child: Child,
     dest: Destination,
     local_sock: PathBuf,
     extra_ssh_opts: Vec<String>,
@@ -407,62 +491,47 @@ async fn tunnel_monitor(
     // state below is populated before the first respawn's spawn_tunnel.
     #[allow(unused_assignments)]
     let mut remote_sock = String::new();
-    let mut backoff = Duration::from_secs(1);
-    const MAX_BACKOFF: Duration = Duration::from_secs(60);
-    /// If the tunnel stays alive for this long, reset the backoff.
-    const HEALTHY_THRESHOLD: Duration = Duration::from_secs(30);
-    /// App-layer tunnel liveness probe. SSH's ServerAliveInterval covers
-    /// TCP-level liveness, but can't detect a remote gritty daemon that
-    /// died while ssh stayed up (OOM, crash, manual kill). Every 30s we
-    /// try to handshake with whatever is on the other end; after
-    /// PROBE_FAILURES_BEFORE_RESPAWN consecutive failures we kill ssh to
-    /// force a respawn that re-runs ensure_remote_ready and brings the
-    /// daemon back.
-    const PROBE_INTERVAL: Duration = Duration::from_secs(30);
-    const PROBE_FAILURES_BEFORE_RESPAWN: u32 = 2;
+    let mut backoff = MIN_RESPAWN_BACKOFF;
     let mut probe_ticker = tokio::time::interval(PROBE_INTERVAL);
     probe_ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     probe_ticker.tick().await; // consume the immediate first tick
-    let mut consecutive_probe_failures: u32 = 0;
-    // Track when the *current* ssh child was spawned. Updated only when a
-    // new child is successfully handed in, never on probe ticks -- otherwise
-    // the `HEALTHY_THRESHOLD` check below would measure time-since-last-
-    // probe (<=30s) instead of actual child uptime, and backoff would never
-    // reset on a long-lived tunnel.
-    let mut child_spawned_at = Instant::now();
+    let mut state = ChildState::new(child);
 
     loop {
         tokio::select! {
             _ = stop.cancelled() => {
-                let _ = child.kill().await;
+                let _ = state.child.kill().await;
                 return;
             }
             _ = probe_ticker.tick() => {
                 match probe_tunnel_alive(&local_sock).await {
                     Ok(()) => {
-                        if consecutive_probe_failures > 0 {
+                        if state.probe_failures > 0 {
                             info!("tunnel probe recovered");
                         }
-                        consecutive_probe_failures = 0;
+                        state.probe_failures = 0;
                     }
                     Err(why) => {
-                        consecutive_probe_failures += 1;
+                        state.probe_failures += 1;
                         info!(
-                            "tunnel probe failed ({why}) [{consecutive_probe_failures}/{PROBE_FAILURES_BEFORE_RESPAWN}]"
+                            "tunnel probe failed ({why}) [{}/{PROBE_FAILURES_BEFORE_RESPAWN}]",
+                            state.probe_failures
                         );
-                        if consecutive_probe_failures >= PROBE_FAILURES_BEFORE_RESPAWN {
+                        if state.probe_failures >= PROBE_FAILURES_BEFORE_RESPAWN {
                             warn!(
-                                "tunnel probe failed {consecutive_probe_failures}x; remote daemon looks dead, killing ssh to respawn"
+                                "tunnel probe failed {}x; remote daemon looks dead, killing ssh to respawn",
+                                state.probe_failures
                             );
-                            let _ = child.kill().await;
-                            consecutive_probe_failures = 0;
-                            // next iteration's child.wait() observes the kill.
+                            let _ = state.child.kill().await;
+                            // The failure counter is zeroed when the
+                            // replacement ChildState is installed below;
+                            // no need to reset here.
                         }
                     }
                 }
                 continue;
             }
-            status = child.wait() => {
+            status = state.child.wait() => {
                 let status = match status {
                     Ok(s) => s,
                     Err(e) => {
@@ -475,45 +544,29 @@ async fn tunnel_monitor(
                     return;
                 }
 
-                // This child is gone; its probe-failure history should not
-                // carry over and pre-charge the counter against whichever
-                // child we spawn next. Without this, a child that exited for
-                // an unrelated reason while the counter sat at 1 caused the
-                // first probe on the replacement child to immediately cross
-                // the threshold.
-                consecutive_probe_failures = 0;
+                // This child is gone; zero the probe-failure counter so
+                // a later ensure_remote_ready / spawn_tunnel retry loop
+                // doesn't operate on stale failure history before a
+                // replacement ChildState gets installed.
+                state.probe_failures = 0;
 
                 let code = status.code();
                 info!("ssh tunnel exited: {:?}", code);
 
-                // Non-transient failure: don't retry
-                // SSH exit 255 = connection error (transient). Local signal-
-                // killed ssh = no code. REMOTE-side signal death (remote
-                // rebooted, OOM, SIGTERM during shutdown) surfaces as
-                // `128 + signum` -- 129..=159 in practice -- and these are
-                // transient too. Only bail on codes that are genuinely
-                // auth/config problems.
-                if let Some(c) = code
-                    && c != 255
-                    && !(128..=159).contains(&c)
-                {
-                    warn!("ssh tunnel exited with code {c} (not retrying)");
+                if classify_exit(status) == ExitClass::NonTransient {
+                    warn!("ssh tunnel exited with code {code:?} (not retrying)");
                     return;
                 }
 
-                // Reset backoff if the tunnel was alive long enough
-                if child_spawned_at.elapsed() >= HEALTHY_THRESHOLD {
-                    backoff = Duration::from_secs(1);
-                }
+                let (sleep, next) = next_backoff(backoff, state.uptime());
+                backoff = next;
 
-                info!("ssh tunnel died, retrying in {}s", backoff.as_secs());
+                info!("ssh tunnel died, retrying in {}s", sleep.as_secs());
 
                 tokio::select! {
-                    _ = tokio::time::sleep(backoff) => {}
+                    _ = tokio::time::sleep(sleep) => {}
                     _ = stop.cancelled() => return,
                 }
-
-                backoff = (backoff * 2).min(MAX_BACKOFF);
 
                 // Re-run ensure_remote_ready so a remote that rebooted,
                 // crashed, or was upgraded gets its gritty server started
@@ -545,8 +598,7 @@ async fn tunnel_monitor(
                 match spawn_tunnel(&dest, &local_sock, &remote_sock, &extra_ssh_opts, foreground, isolate_control_path, connect_timeout).await {
                     Ok(new_child) => {
                         info!("ssh tunnel respawned");
-                        child = new_child;
-                        child_spawned_at = Instant::now();
+                        state = ChildState::new(new_child);
                     }
                     Err(e) => {
                         warn!("failed to respawn ssh tunnel: {e}");
@@ -1837,5 +1889,102 @@ mod tests {
         let msg = err.to_string();
         assert!(msg.contains("timed out after 1s"), "msg: {msg}");
         assert!(msg.contains("not found") || msg.contains("No such file"), "msg: {msg}");
+    }
+
+    // -----------------------------------------------------------------------
+    // classify_exit / next_backoff (pure helpers)
+    // -----------------------------------------------------------------------
+
+    /// Build an `ExitStatus` with a given exit code (Unix wait status
+    /// encoding: exit code in bits 8..=15).
+    fn status_with_code(code: i32) -> std::process::ExitStatus {
+        use std::os::unix::process::ExitStatusExt;
+        std::process::ExitStatus::from_raw(code << 8)
+    }
+
+    /// Build an `ExitStatus` that reports death-by-signal (signal in
+    /// bits 0..=6 of the wait status).
+    fn status_killed_by_signal(signal: i32) -> std::process::ExitStatus {
+        use std::os::unix::process::ExitStatusExt;
+        std::process::ExitStatus::from_raw(signal)
+    }
+
+    #[test]
+    fn classify_exit_ssh_255_is_transient() {
+        assert_eq!(classify_exit(status_with_code(255)), ExitClass::Transient);
+    }
+
+    #[test]
+    fn classify_exit_local_signal_kill_is_transient() {
+        // code() == None -- typical of our own child.kill() after probe fail
+        assert_eq!(classify_exit(status_killed_by_signal(9)), ExitClass::Transient);
+        assert_eq!(classify_exit(status_killed_by_signal(15)), ExitClass::Transient);
+    }
+
+    #[test]
+    fn classify_exit_remote_signal_range_is_transient() {
+        // ssh reports remote signal death as 128 + signum
+        for code in 128..=159 {
+            assert_eq!(
+                classify_exit(status_with_code(code)),
+                ExitClass::Transient,
+                "code {code} should be transient"
+            );
+        }
+    }
+
+    #[test]
+    fn classify_exit_auth_config_codes_are_nontransient() {
+        // Genuine failures we don't want to retry-hammer
+        for code in [1, 2, 5, 127, 160, 254] {
+            assert_eq!(
+                classify_exit(status_with_code(code)),
+                ExitClass::NonTransient,
+                "code {code} should be non-transient"
+            );
+        }
+    }
+
+    #[test]
+    fn next_backoff_resets_after_healthy_child() {
+        // Child lived 45s > HEALTHY_CHILD_THRESHOLD (30s): sleep resets to MIN
+        let (sleep, next) = next_backoff(Duration::from_secs(16), Duration::from_secs(45));
+        assert_eq!(sleep, MIN_RESPAWN_BACKOFF);
+        assert_eq!(next, Duration::from_secs(2));
+    }
+
+    #[test]
+    fn next_backoff_keeps_growing_after_unhealthy_child() {
+        let (sleep, next) = next_backoff(Duration::from_secs(8), Duration::from_secs(5));
+        assert_eq!(sleep, Duration::from_secs(8));
+        assert_eq!(next, Duration::from_secs(16));
+    }
+
+    #[test]
+    fn next_backoff_caps_at_max() {
+        let (sleep, next) = next_backoff(MAX_RESPAWN_BACKOFF, Duration::from_secs(5));
+        assert_eq!(sleep, MAX_RESPAWN_BACKOFF);
+        assert_eq!(next, MAX_RESPAWN_BACKOFF);
+    }
+
+    #[test]
+    fn next_backoff_threshold_is_inclusive() {
+        // exactly HEALTHY_CHILD_THRESHOLD: counts as healthy
+        let (sleep, _) = next_backoff(Duration::from_secs(16), HEALTHY_CHILD_THRESHOLD);
+        assert_eq!(sleep, MIN_RESPAWN_BACKOFF);
+        // just under threshold: unhealthy, keeps current backoff
+        let (sleep, _) = next_backoff(
+            Duration::from_secs(16),
+            HEALTHY_CHILD_THRESHOLD - Duration::from_millis(1),
+        );
+        assert_eq!(sleep, Duration::from_secs(16));
+    }
+
+    #[test]
+    fn next_backoff_initial_value_doubles_to_two_seconds() {
+        // First failure of a short-lived child: sleep=1s, next=2s
+        let (sleep, next) = next_backoff(MIN_RESPAWN_BACKOFF, Duration::from_secs(2));
+        assert_eq!(sleep, MIN_RESPAWN_BACKOFF);
+        assert_eq!(next, Duration::from_secs(2));
     }
 }
