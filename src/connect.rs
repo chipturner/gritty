@@ -1020,6 +1020,15 @@ pub async fn run(opts: ConnectOpts, ready_fd: Option<OwnedFd>) -> anyhow::Result
         }
     };
 
+    // 3. Install SIGTERM/SIGINT handlers *before* any slow step so a signal
+    //    during ensure_remote_ready / spawn_tunnel / wait_for_socket no
+    //    longer terminates us via the default handler -- which would skip
+    //    ConnectGuard::drop and leave .sock/.pid/.lock behind for the next
+    //    invocation to clean up. The handlers are queued until we poll
+    //    them in the main select below.
+    let mut sigterm = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
+    let mut sigint = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::interrupt())?;
+
     // 4. Ensure remote server is running and get socket path
     let (remote_sock, remote_version) = ensure_remote_ready(
         &dest,
@@ -1124,10 +1133,8 @@ pub async fn run(opts: ConnectOpts, ready_fd: Option<OwnedFd>) -> anyhow::Result
         .instrument(tunnel_span),
     );
 
-    // 9. Wait for signal or monitor death. Handle SIGINT too so `--foreground`
-    // Ctrl-C runs cleanup instead of the default terminate-without-Drop.
-    let mut sigterm = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
-    let mut sigint = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::interrupt())?;
+    // 9. Wait for signal or monitor death. Signal handlers were installed
+    // back at step 3 so a signal during setup doesn't bypass cleanup.
     let monitor_done = tokio::select! {
         _ = sigterm.recv() => false,
         _ = sigint.recv() => false,
