@@ -1,4 +1,5 @@
 use crate::alt_screen::AltScreenTracker;
+use crate::net_watch::NetWatcher;
 use crate::protocol::{ErrorCode, Frame, FrameCodec};
 use bytes::Bytes;
 use futures_util::{SinkExt, StreamExt};
@@ -1385,6 +1386,7 @@ async fn relay(
     fwd_listener: &Option<tokio::net::UnixListener>,
     limiters: &mut SecurityLimiters,
     alt_screen: &mut AltScreenTracker,
+    net: &NetWatcher,
 ) -> anyhow::Result<RelayExit> {
     let mut heartbeat_interval = tokio::time::interval(hb_interval);
     heartbeat_interval.reset(); // first tick is immediate otherwise; delay it
@@ -1624,6 +1626,19 @@ async fn relay(
                 }
             }
 
+            _ = net.changed() => {
+                // OS reports the network path changed (wifi/ethernet/VPN).
+                // Advisory only: send a Ping now so a dead socket surfaces as
+                // a send failure immediately and a live one round-trips a
+                // Pong that refreshes last_activity. The wall-clock heartbeat
+                // below remains the correctness backstop.
+                debug!("network path changed; probing link");
+                *relay.last_ping_sent = Instant::now();
+                if !timed_send(framed, Frame::Ping, relay.last_outbound_at).await {
+                    return Ok(RelayExit::Disconnected);
+                }
+            }
+
             _ = heartbeat_interval.tick() => {
                 // Wall-clock silence check: works correctly across laptop
                 // suspend because SystemTime keeps advancing while the process
@@ -1757,6 +1772,7 @@ pub async fn run(
     };
 
     let mut limiters = SecurityLimiters::new();
+    let net = NetWatcher::spawn();
     // Mirrors the server's alt-screen tracker so we can suppress our own
     // reconnect chrome (▸ reconnecting..., ▸ reconnected) when a TUI is
     // running -- those writes would otherwise land directly in the alt
@@ -1798,6 +1814,7 @@ pub async fn run(
                 &fwd_listener,
                 &mut limiters,
                 &mut alt_screen,
+                &net,
             )
             .await?
         } else {
@@ -1839,9 +1856,19 @@ pub async fn run(
                     // `continue` below and doubled the backoff without ever
                     // attempting to connect.
                     let sleep_for = next_reconnect_delay(backoff);
+                    let mut net_hint = false;
                     // Race sleep against stdin so Ctrl-C is instant
                     tokio::select! {
                         _ = tokio::time::sleep(sleep_for) => {}
+                        _ = net.changed() => {
+                            // Network path changed while backing off --
+                            // connectivity may have returned. Attempt now
+                            // and reset the backoff so a long outage
+                            // followed by wifi-returns doesn't sit out the
+                            // remainder of a 10s sleep.
+                            debug!("network path changed; retrying reconnect now");
+                            net_hint = true;
+                        }
                         _ = sigterm.recv() => {
                             write_stdout_async(&async_stdout, b"\r\n").await?;
                             return Ok(1);
@@ -1872,7 +1899,7 @@ pub async fn run(
                             // starved every reconnect attempt.
                         }
                     }
-                    backoff = sleep_for;
+                    backoff = if net_hint { Duration::ZERO } else { sleep_for };
 
                     let elapsed = reconnect_started.elapsed().as_secs();
                     if show_chrome {
@@ -2114,6 +2141,7 @@ pub async fn tail(
     // Track the PTY's alt-screen mode so we can suppress reconnect chrome
     // when tailing a session where a TUI is running.
     let mut alt_screen = AltScreenTracker::new();
+    let net = NetWatcher::spawn();
 
     let code = 'outer: loop {
         let result = 'relay: loop {
@@ -2142,6 +2170,13 @@ pub async fn tail(
                             break 'relay None;
                         }
                     }
+                }
+                _ = net.changed() => {
+                    debug!("network path changed; probing tail link");
+                    if framed.send(Frame::Ping).await.is_err() {
+                        break 'relay None;
+                    }
+                    last_outbound_at = Instant::now();
                 }
                 _ = heartbeat_interval.tick() => {
                     if link_is_stale(last_activity, DEFAULT_HEARTBEAT_TIMEOUT) {
@@ -2180,6 +2215,7 @@ pub async fn tail(
                 loop {
                     tokio::select! {
                         _ = tokio::time::sleep(Duration::from_secs(1)) => {}
+                        _ = net.changed() => {}
                         _ = sigint.recv() => { break 'outer 0; }
                         _ = sigterm.recv() => { break 'outer 1; }
                         _ = sighup.recv() => { break 'outer 1; }

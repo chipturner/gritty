@@ -65,6 +65,8 @@ sequenceDiagram
 
 The client probes for liveness on idle and declares the link dead after 60s with no server frame. It then enters a reconnect loop with exponential backoff (1s..10s, Ctrl-C to abort) and a per-attempt handshake+Attach budget of 15s -- generous enough to absorb cellular RTT plus a retransmit. Meanwhile the tunnel monitor detects the SSH process exit and respawns it. The client reconnects through the restored tunnel transparently.
 
+On macOS, both the client and the tunnel supervisor subscribe to `nw_path_monitor` (Network.framework) for OS-level network path-change hints -- wifi join/leave, ethernet plug/unplug, VPN up/down, wake-from-sleep route restore. A path-change event is advisory: the client sends an immediate Ping (surfacing a dead socket without waiting 60s), and any in-progress backoff sleep is cut short with backoff reset to the minimum. This is a latency optimization only; the wall-clock heartbeat and ssh's `ServerAliveInterval` remain the correctness backstops on every platform.
+
 Each `Attach` carries an `attach_token` that the daemon minted on the previous successful attach. A stale token -- which happens when another client legitimately took over the session while this one was disconnected -- is rejected with `OwnerChanged`, and the client exits rather than silently stealing the session back. A matching token is a silent reconnect and returns the same token so an in-flight `AttachAck` loss can't poison future reconnects.
 
 The tunnel supervisor -- ssh child lifecycle, app-layer probing, exponential backoff, remote-ready re-priming, and the `healthy` / `reconnecting` / `stale` status values -- has its own state machine documented separately; see [docs/tunnel-state-machine.md](docs/tunnel-state-machine.md).

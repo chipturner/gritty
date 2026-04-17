@@ -82,6 +82,7 @@ stateDiagram-v2
         Alive --> ProbeFailing: probe failed\n(counter++)
         ProbeFailing --> Alive: next probe ok
         ProbeFailing --> KillingChild: counter >= 2\n(kill ssh, reset counter)
+        Alive --> KillingChild: net path changed\n+ one-shot probe failed\n(macOS only)
         Alive --> ChildExited: child.wait() returned
         KillingChild --> ChildExited: child.wait() observes kill
 
@@ -90,6 +91,7 @@ stateDiagram-v2
         NonTransient --> [*]: warn, monitor returns
         Backoff --> Backoff: sleep(backoff)\nreset to 1s if child_spawned_at\nelapsed >=30s,\nelse double to <=60s
         Backoff --> EnsureRemoteRetry: timer fires
+        Backoff --> EnsureRemoteRetry: net path changed\n(macOS; reset backoff to 1s)
         EnsureRemoteRetry --> Backoff: ensure_remote_ready err\n(retry from top)
         EnsureRemoteRetry --> SpawnRetry: got fresh remote_sock
         SpawnRetry --> Alive: ssh respawned\n(update child_spawned_at)
@@ -205,9 +207,13 @@ backoff not trip the client's short socket-gone grace.
 
 ### Supervisor loop (`tunnel_monitor`)
 
-The monitor runs a `tokio::select!` with three arms:
+The monitor runs a `tokio::select!` with four arms:
 
 - **`stop.cancelled()`** -- kill ssh child and return.
+- **`net.changed()`** (macOS only) -- OS network path changed; run a single
+  `probe_tunnel_alive` now and kill ssh on failure (single-strike, no
+  2-count: the path *did* change, so one failure is sufficient evidence).
+  Advisory latency win over waiting ~6-9s for ssh's `ServerAlive*`.
 - **`probe_ticker.tick()`** -- every 30s, run `probe_tunnel_alive` against
   the local socket. The probe does `Hello -> HelloAck -> ListSessions` with
   a 3s outer timeout and 1s inner timeouts. This catches remote-daemon death
@@ -222,6 +228,10 @@ The monitor runs a `tokio::select!` with three arms:
     from the remote side: reboot, OOM, SIGTERM during shutdown), and `None`
     (local signal-kill, typically our own `child.kill()` from the probe
     arm) are all transient -- sleep the current `backoff`, then retry.
+- The `Backoff` sleep is itself a `select!` racing `stop.cancelled()` and
+  (on macOS) `net.changed()`: a path-change event during backoff resets
+  `backoff` to 1s and retries immediately, so wifi returning after a long
+  outage doesn't sit out the remainder of a 60s sleep.
 - Whenever a respawn succeeds, the "healthy threshold" logic
   (`spawned_at.elapsed() >= 30s` at the *next* exit) resets `backoff` back
   to 1s. That means a tunnel that dies five minutes into a stable run waits

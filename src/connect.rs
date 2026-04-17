@@ -492,6 +492,7 @@ async fn tunnel_monitor(
     #[allow(unused_assignments)]
     let mut remote_sock = String::new();
     let mut backoff = MIN_RESPAWN_BACKOFF;
+    let net = crate::net_watch::NetWatcher::spawn();
     let mut probe_ticker = tokio::time::interval(PROBE_INTERVAL);
     probe_ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     probe_ticker.tick().await; // consume the immediate first tick
@@ -502,6 +503,25 @@ async fn tunnel_monitor(
             _ = stop.cancelled() => {
                 let _ = state.child.kill().await;
                 return;
+            }
+            _ = net.changed() => {
+                // OS says the network path changed. ssh's ServerAlive* will
+                // self-detect a dead TCP socket in ~6-9s, but an immediate
+                // app-layer probe here gets us to respawn in ~3s instead.
+                // Single-strike: the path DID change, so one probe failure
+                // is sufficient evidence -- unlike the periodic ticker which
+                // tolerates one transient miss.
+                info!("network path changed; probing tunnel");
+                match probe_tunnel_alive(&local_sock).await {
+                    Ok(()) => {
+                        state.probe_failures = 0;
+                    }
+                    Err(why) => {
+                        info!("tunnel probe failed after path change ({why}); killing ssh to respawn");
+                        let _ = state.child.kill().await;
+                    }
+                }
+                continue;
             }
             _ = probe_ticker.tick() => {
                 match probe_tunnel_alive(&local_sock).await {
@@ -565,6 +585,14 @@ async fn tunnel_monitor(
 
                 tokio::select! {
                     _ = tokio::time::sleep(sleep) => {}
+                    _ = net.changed() => {
+                        // Connectivity may have returned while we were
+                        // backing off; retry now with a fresh backoff so a
+                        // long outage doesn't leave us sitting out the
+                        // remainder of a 60s sleep after wifi returns.
+                        info!("network path changed during backoff; retrying now");
+                        backoff = MIN_RESPAWN_BACKOFF;
+                    }
                     _ = stop.cancelled() => return,
                 }
 
