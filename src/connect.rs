@@ -564,10 +564,17 @@ async fn tunnel_monitor(
 // Remote server management
 // ---------------------------------------------------------------------------
 
+// Stdout contract: EXACTLY two lines -- socket path, then protocol
+// version (optional on older remotes). Any command before the final
+// `echo` must redirect its stdout to /dev/null; otherwise its output
+// becomes the first line and ensure_remote_ready parses it as the
+// socket path. `gritty server` today only prints to stderr, but
+// redirecting defensively keeps the contract from silently breaking
+// if that ever changes.
 const REMOTE_ENSURE_CMD: &str = "\
     SOCK=$(gritty socket-path) && \
     (gritty ls local >/dev/null 2>&1 || \
-     { gritty server && sleep 0.3; }) && \
+     { gritty server >/dev/null 2>&1 && sleep 0.3; }) && \
     echo \"$SOCK\" && \
     { gritty protocol-version 2>/dev/null || true; }";
 
