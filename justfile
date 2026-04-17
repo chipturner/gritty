@@ -3,6 +3,9 @@ set shell := ["zsh", "-uc"]
 default:
     just --list
 
+up:
+	git pull --rebase && cargo build --release
+
 # Build the project
 build:
     cargo build
