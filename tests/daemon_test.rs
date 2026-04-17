@@ -18,10 +18,8 @@ fn test_ctl() -> (tempfile::TempDir, std::path::PathBuf) {
 async fn wait_for_daemon(ctl_path: &std::path::Path) {
     let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
     loop {
-        if ctl_path.exists() {
-            if UnixStream::connect(ctl_path).await.is_ok() {
-                return;
-            }
+        if ctl_path.exists() && UnixStream::connect(ctl_path).await.is_ok() {
+            return;
         }
         if tokio::time::Instant::now() >= deadline {
             panic!("daemon did not start within 5s");

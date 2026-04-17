@@ -258,6 +258,7 @@ fn legacy_attach_without_token_decodes_as_zero() {
     // Manually encode the v13 Attach layout: type + len + (sessLen u16 + "alpha"
     // + cnLen u16 + "" + force u8 + no_replay u8 + cols u16 + rows u16)
     let session = b"alpha";
+    #[allow(clippy::identity_op)]
     let payload_len = 2 + session.len() + 2 + 0 + 1 + 1 + 2 + 2;
     buf.put_u8(0x51); // TYPE_ATTACH
     buf.put_u32(payload_len as u32);

@@ -264,11 +264,12 @@ mod tests {
         feed_stream.write_all(b"hello").await.unwrap();
         tokio::time::sleep(std::time::Duration::from_millis(100)).await;
 
-        let data = received.lock().unwrap();
-        assert_eq!(data.len(), 1);
-        assert_eq!(data[0].0, 42);
-        assert_eq!(&data[0].1[..], b"hello");
-        drop(data);
+        {
+            let data = received.lock().unwrap();
+            assert_eq!(data.len(), 1);
+            assert_eq!(data[0].0, 42);
+            assert_eq!(&data[0].1[..], b"hello");
+        }
 
         // Close the feed stream -> triggers on_close
         drop(feed_stream);

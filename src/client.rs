@@ -278,15 +278,25 @@ const RECONNECT_BACKOFF_INITIAL: Duration = Duration::from_secs(1);
 /// reattaches quickly.
 const RECONNECT_BACKOFF_MAX: Duration = Duration::from_secs(10);
 
-/// Treat these handshake-error prefixes as permanent: the server rejected
-/// us, or the endpoint accepted the connection but EOF'd before/during
-/// reply (typical of a tunnel forwarding to a daemon that's been
-/// kill-server'd). No amount of client-side retry recovers -- the user
-/// has to run `gritty restart`.
-fn is_terminal_handshake_err(msg: &str) -> bool {
-    msg.starts_with("handshake rejected")
-        || msg.starts_with("daemon closed connection")
-        || msg.starts_with("daemon protocol error")
+/// Decide whether a handshake error should abort the reconnect loop.
+///
+/// `handshake rejected` is always terminal -- the server spoke and refused us.
+///
+/// `daemon closed connection` / `daemon protocol error` (accept-then-EOF) is
+/// only terminal when there is **no** tunnel supervisor: for `local` that
+/// means the daemon was kill-server'd and retrying can't help. Under a live
+/// supervisor, accept-then-EOF is the normal signature of ssh dying mid-
+/// handshake (ServerAlive timeout or supervisor-kill after wake-from-suspend);
+/// the supervisor will respawn ssh and re-run `ensure_remote_ready`, so the
+/// client should keep retrying.
+fn is_terminal_handshake_err(msg: &str, tunnel_supervisor_alive: bool) -> bool {
+    if msg.starts_with("handshake rejected") {
+        return true;
+    }
+    if tunnel_supervisor_alive {
+        return false;
+    }
+    msg.starts_with("daemon closed connection") || msg.starts_with("daemon protocol error")
 }
 
 /// Compute the next reconnect sleep given the previous one. Pure function so the
@@ -2037,14 +2047,7 @@ pub async fn run(
                                     .as_bytes(),
                             )
                             .await?;
-                            // Server-side rejection (version mismatch, etc.)
-                            // is permanent. "daemon closed connection" is
-                            // also terminal: the UDS endpoint accepts but
-                            // EOFs during handshake -- typically the tunnel
-                            // is forwarding to a dead/killed daemon. No
-                            // number of client-side retries fixes this;
-                            // user has to run `gritty restart`.
-                            if is_terminal_handshake_err(&msg) {
+                            if is_terminal_handshake_err(&msg, tunnel_supervisor_alive) {
                                 return Ok(1);
                             }
                             continue;
@@ -2234,7 +2237,7 @@ pub async fn tail(
                             Ok(info) => info,
                             Err(e) => {
                                 let msg = e.to_string();
-                                if is_terminal_handshake_err(&msg) {
+                                if is_terminal_handshake_err(&msg, tunnel_supervisor_alive) {
                                     return Outcome::HandshakeRejected(msg);
                                 }
                                 return Outcome::Retry;
@@ -2515,6 +2518,28 @@ mod tests {
         assert_eq!(next_reconnect_delay(Duration::from_secs(8)), RECONNECT_BACKOFF_MAX);
         assert_eq!(next_reconnect_delay(RECONNECT_BACKOFF_MAX), RECONNECT_BACKOFF_MAX);
         assert_eq!(next_reconnect_delay(Duration::from_secs(300)), RECONNECT_BACKOFF_MAX);
+    }
+
+    #[test]
+    fn handshake_rejected_is_always_terminal() {
+        assert!(is_terminal_handshake_err("handshake rejected: nope", false));
+        assert!(is_terminal_handshake_err("handshake rejected: nope", true));
+    }
+
+    #[test]
+    fn handshake_eof_terminal_only_without_supervisor() {
+        // Local daemon (no supervisor): accept-then-EOF means daemon is gone.
+        assert!(is_terminal_handshake_err("daemon closed connection", false));
+        assert!(is_terminal_handshake_err("daemon protocol error: x", false));
+        // Live tunnel supervisor: ssh dying mid-handshake is transient.
+        assert!(!is_terminal_handshake_err("daemon closed connection", true));
+        assert!(!is_terminal_handshake_err("daemon protocol error: x", true));
+    }
+
+    #[test]
+    fn handshake_other_errs_never_terminal() {
+        assert!(!is_terminal_handshake_err("handshake timed out after 10s", false));
+        assert!(!is_terminal_handshake_err("handshake timed out after 10s", true));
     }
 
     #[test]
