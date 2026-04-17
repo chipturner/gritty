@@ -46,9 +46,13 @@ pub async fn handshake(
             device_id,
         })
         .await?;
-    let reply = tokio::time::timeout(std::time::Duration::from_secs(5), framed.next())
+    // 10s gives headroom for a 300-500ms RTT link with one TCP retransmit.
+    // The reconnect loop wraps this in RECONNECT_ATTEMPT_TIMEOUT (15s) so the
+    // overall bound is unchanged there; this only loosens the initial connect
+    // and server_request paths on marginal links.
+    let reply = tokio::time::timeout(std::time::Duration::from_secs(10), framed.next())
         .await
-        .map_err(|_| anyhow::anyhow!("handshake timed out after 5s"))?;
+        .map_err(|_| anyhow::anyhow!("handshake timed out after 10s"))?;
     match protocol::Frame::expect_from(reply)? {
         protocol::Frame::HelloAck { version, capabilities, server_id } => Ok(HandshakeInfo {
             version,
