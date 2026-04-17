@@ -64,21 +64,21 @@ stateDiagram-v2
         direction TB
         [*] --> Preflight
         Preflight --> Preflight: ensure_remote_ready\n(ssh + socket-path + server-start)
-        Preflight --> SpawnChild: got remote_sock + version\n(version-check; bail unless --ignore-version-mismatch)
+        Preflight --> SpawnChild: got remote_sock + version\n(version-check; bail unless ignore-version-mismatch flag)
         SpawnChild --> WaitForSocket: ssh spawned\n(stderr drained to .out)
         WaitForSocket --> Ready: UnixStream::connect ok
         WaitForSocket --> ChildDiedEarly: child.wait() won the select\n(ssh exited before socket bind)
-        WaitForSocket --> SocketTimeout: wait_for_socket deadline\n(ssh alive but never bound -L)
+        WaitForSocket --> SocketTimeout: wait_for_socket deadline\n(ssh alive but never bound the forward socket)
     }
 
     Starting --> Running: Ready\n(write .dest, signal_ready,\nspawn tunnel_monitor)
     Starting --> Failed: ChildDiedEarly\n(bail, point at .out)
-    Starting --> Failed: SocketTimeout\n(bail, point at --foreground hint)
+    Starting --> Failed: SocketTimeout\n(bail, point at foreground-mode hint)
 
     state Running {
         direction LR
         [*] --> Alive
-        Alive --> Alive: probe_tunnel_alive ok\n(Hello -> HelloAck -> ListSessions,\nreset failure counter)
+        Alive --> Alive: probe_tunnel_alive ok\n(Hello / HelloAck / ListSessions,\nreset failure counter)
         Alive --> ProbeFailing: probe failed\n(counter++)
         ProbeFailing --> Alive: next probe ok
         ProbeFailing --> KillingChild: counter >= 2\n(kill ssh, reset counter)
