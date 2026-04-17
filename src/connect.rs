@@ -304,6 +304,11 @@ fn tunnel_command(
 }
 
 /// Spawn the SSH tunnel, returning the child process.
+///
+/// Stderr is drained here (not in the monitor) so that forward-setup errors
+/// like `mux_client_forward: forwarding request failed` surface in `.out`
+/// while `wait_for_socket` is still polling -- otherwise they sit unread in
+/// the pipe and are dropped when the wait times out.
 async fn spawn_tunnel(
     dest: &Destination,
     local_sock: &Path,
@@ -313,9 +318,10 @@ async fn spawn_tunnel(
     isolate_control_path: bool,
     connect_timeout: u64,
 ) -> anyhow::Result<Child> {
-    debug!("tunnel: {} -> {}:{}", local_sock.display(), dest.ssh_dest(), remote_sock,);
-    // When riding a ControlMaster mux we don't control, StreamLocalBindUnlink
-    // may not be set on the master, so unlink ourselves before binding.
+    // Clear any stale socket so SSH's bind() doesn't hit EADDRINUSE. With the
+    // default isolate_control_path=true this is sufficient; when a user opts
+    // back into ControlMaster mux, a master that still holds this forward will
+    // keep its listener on the now-deleted inode -- that's the opt-in footgun.
     let _ = std::fs::remove_file(local_sock);
     let mut cmd = tunnel_command(
         dest,
@@ -327,8 +333,10 @@ async fn spawn_tunnel(
         connect_timeout,
     );
     cmd.kill_on_drop(true);
-    let child = cmd.spawn().context("failed to spawn ssh tunnel")?;
-    debug!("ssh tunnel pid: {:?}", child.id());
+    info!("spawning ssh tunnel: {}", format_command(&cmd));
+    let mut child = cmd.spawn().context("failed to spawn ssh tunnel")?;
+    info!("ssh tunnel pid: {:?}", child.id());
+    drain_stderr(&mut child);
     Ok(child)
 }
 
@@ -339,14 +347,30 @@ fn socket_wait_deadline(connect_timeout: u64) -> Duration {
 }
 
 /// Poll until the local socket is connectable (200ms interval).
+///
+/// On timeout, the last `connect()` error is included so callers can tell
+/// NotFound (ssh never bound the -L listener) from ConnectionRefused
+/// (socket exists, nothing listening) from InvalidInput (path too long).
 async fn wait_for_socket(path: &Path, timeout: Duration) -> anyhow::Result<()> {
     let deadline = Instant::now() + timeout;
+    let mut last_kind = None;
     loop {
-        if std::os::unix::net::UnixStream::connect(path).is_ok() {
-            return Ok(());
-        }
-        if Instant::now() >= deadline {
-            bail!("timeout waiting for SSH tunnel socket at {}", path.display());
+        match std::os::unix::net::UnixStream::connect(path) {
+            Ok(_) => return Ok(()),
+            Err(e) => {
+                if last_kind != Some(e.kind()) {
+                    info!("waiting for tunnel socket {}: {}: {e}", path.display(), e.kind());
+                    last_kind = Some(e.kind());
+                }
+                if Instant::now() >= deadline {
+                    bail!(
+                        "timed out after {}s waiting for SSH tunnel socket at {} ({}: {e})",
+                        timeout.as_secs(),
+                        path.display(),
+                        e.kind(),
+                    );
+                }
+            }
         }
         tokio::time::sleep(Duration::from_millis(200)).await;
     }
@@ -402,7 +426,6 @@ async fn tunnel_monitor(
     let mut consecutive_probe_failures: u32 = 0;
 
     loop {
-        drain_stderr(&mut child);
         let spawned_at = Instant::now();
 
         tokio::select! {
@@ -411,17 +434,26 @@ async fn tunnel_monitor(
                 return;
             }
             _ = probe_ticker.tick() => {
-                if probe_tunnel_alive(&local_sock).await {
-                    consecutive_probe_failures = 0;
-                } else {
-                    consecutive_probe_failures += 1;
-                    if consecutive_probe_failures >= PROBE_FAILURES_BEFORE_RESPAWN {
-                        warn!(
-                            "tunnel probe failed {consecutive_probe_failures}x; remote daemon looks dead, killing ssh to respawn"
-                        );
-                        let _ = child.kill().await;
+                match probe_tunnel_alive(&local_sock).await {
+                    Ok(()) => {
+                        if consecutive_probe_failures > 0 {
+                            info!("tunnel probe recovered");
+                        }
                         consecutive_probe_failures = 0;
-                        // next iteration's child.wait() observes the kill.
+                    }
+                    Err(why) => {
+                        consecutive_probe_failures += 1;
+                        info!(
+                            "tunnel probe failed ({why}) [{consecutive_probe_failures}/{PROBE_FAILURES_BEFORE_RESPAWN}]"
+                        );
+                        if consecutive_probe_failures >= PROBE_FAILURES_BEFORE_RESPAWN {
+                            warn!(
+                                "tunnel probe failed {consecutive_probe_failures}x; remote daemon looks dead, killing ssh to respawn"
+                            );
+                            let _ = child.kill().await;
+                            consecutive_probe_failures = 0;
+                            // next iteration's child.wait() observes the kill.
+                        }
                     }
                 }
                 continue;
@@ -440,7 +472,7 @@ async fn tunnel_monitor(
                 }
 
                 let code = status.code();
-                debug!("ssh tunnel exited: {:?}", code);
+                info!("ssh tunnel exited: {:?}", code);
 
                 // Non-transient failure: don't retry
                 // SSH exit 255 = connection error (transient). Local signal-
@@ -536,7 +568,7 @@ async fn ensure_remote_ready(
     connect_timeout: u64,
 ) -> anyhow::Result<(String, Option<u16>)> {
     let remote_cmd = if no_server_start { "gritty socket-path" } else { REMOTE_ENSURE_CMD };
-    debug!("ensuring remote server (no_server_start={no_server_start})");
+    info!("ensuring remote server (no_server_start={no_server_start})");
 
     let output = remote_exec(dest, remote_cmd, extra_ssh_opts, foreground, connect_timeout).await?;
 
@@ -575,6 +607,14 @@ fn connect_lock_path(connection_name: &str) -> PathBuf {
 
 pub fn connect_dest_path(connection_name: &str) -> PathBuf {
     crate::daemon::socket_dir().join(format!("connect-{connection_name}.dest"))
+}
+
+pub fn connect_log_path(connection_name: &str) -> PathBuf {
+    crate::daemon::socket_dir().join(format!("connect-{connection_name}.log"))
+}
+
+pub fn connect_out_path(connection_name: &str) -> PathBuf {
+    crate::daemon::socket_dir().join(format!("connect-{connection_name}.out"))
 }
 
 /// Compute the local socket path for a given connection name.
@@ -719,29 +759,33 @@ pub enum TunnelStatus {
 /// Uses tight timeouts (3s total, 1s handshake) because this runs in the
 /// hot path -- a slow probe that blocks the select loop is worse than a
 /// false positive that triggers an unnecessary respawn.
-async fn probe_tunnel_alive(local_sock: &std::path::Path) -> bool {
+async fn probe_tunnel_alive(local_sock: &std::path::Path) -> Result<(), &'static str> {
     use crate::protocol::{Frame, PROTOCOL_VERSION};
     use futures_util::{SinkExt, StreamExt};
 
     let probe = async {
-        let stream = tokio::net::UnixStream::connect(local_sock).await.ok()?;
+        let stream =
+            tokio::net::UnixStream::connect(local_sock).await.map_err(|_| "connect failed")?;
         let codec = crate::protocol::FrameCodec;
         let mut framed = tokio_util::codec::Framed::new(stream, codec);
         framed
             .send(Frame::Hello { version: PROTOCOL_VERSION, capabilities: 0, device_id: 0 })
             .await
-            .ok()?;
+            .map_err(|_| "Hello send failed")?;
         match tokio::time::timeout(Duration::from_secs(1), framed.next()).await {
             Ok(Some(Ok(Frame::HelloAck { .. }))) => {}
-            _ => return None,
+            Ok(Some(Ok(_))) => return Err("unexpected frame"),
+            Ok(Some(Err(_))) => return Err("decode error"),
+            Ok(None) => return Err("EOF before HelloAck"),
+            Err(_) => return Err("HelloAck timeout"),
         }
         // Send a control frame so the daemon doesn't wait 5s for one and
         // log a spurious "control connection timed out" warning on every probe.
-        framed.send(Frame::ListSessions).await.ok()?;
+        framed.send(Frame::ListSessions).await.map_err(|_| "ListSessions send failed")?;
         let _ = tokio::time::timeout(Duration::from_secs(1), framed.next()).await;
-        Some(())
+        Ok(())
     };
-    tokio::time::timeout(Duration::from_secs(3), probe).await.ok().flatten().is_some()
+    tokio::time::timeout(Duration::from_secs(3), probe).await.unwrap_or(Err("probe timeout"))
 }
 
 pub fn probe_tunnel_status(name: &str) -> TunnelStatus {
@@ -965,7 +1009,7 @@ pub async fn run(opts: ConnectOpts, ready_fd: Option<OwnedFd>) -> anyhow::Result
         opts.connect_timeout,
     )
     .await?;
-    debug!(remote_sock, ?remote_version, "remote socket path");
+    info!(remote_sock, ?remote_version, "remote socket path");
 
     // Check protocol version compatibility
     if let Some(rv) = remote_version
@@ -1006,37 +1050,34 @@ pub async fn run(opts: ConnectOpts, ready_fd: Option<OwnedFd>) -> anyhow::Result
         stop: stop.clone(),
     };
 
-    // 6. Wait for local socket to become connectable (race against child exit)
+    // 6. Wait for local socket to become connectable (race against child exit).
+    // SSH stderr is already draining to our own stderr (-> .out in daemonized
+    // mode), so both the timeout arm and the child-exit arm point the user at
+    // that output rather than trying to re-read the pipe here.
     let mut child = guard.child.take().unwrap();
+    let diag = format_ssh_diag(&dest, &opts.ssh_options, opts.foreground, opts.connect_timeout);
+    let fg_hint = if opts.foreground {
+        String::new()
+    } else {
+        format!(
+            "\n  ssh output: {}\n  if SSH needs a password or host key accept, use: gritty tunnel-create --foreground {}",
+            connect_out_path(&connection_name).display(),
+            opts.destination,
+        )
+    };
     tokio::select! {
         result = wait_for_socket(&local_sock, socket_wait_deadline(opts.connect_timeout)) => {
-            result?;
+            result.with_context(|| {
+                format!("ssh is running but never bound the -L forward\n  to diagnose: {diag}{fg_hint}")
+            })?;
             guard.child = Some(child);
         }
         status = child.wait() => {
             let status = status.context("failed to wait on ssh tunnel")?;
-            let diag = format_ssh_diag(&dest, &opts.ssh_options, opts.foreground, opts.connect_timeout);
-            let msg = if let Some(mut stderr) = child.stderr.take() {
-                use tokio::io::AsyncReadExt;
-                let mut buf = String::new();
-                let _ = stderr.read_to_string(&mut buf).await;
-                let buf = buf.trim().to_string();
-                if buf.is_empty() { None } else { Some(buf) }
-            } else {
-                None
-            };
-            let fg_hint = if opts.foreground {
-                String::new()
-            } else {
-                format!("\n  if SSH needs a password or host key accept, use: gritty tunnel-create --foreground {}", opts.destination)
-            };
-            match msg {
-                Some(err) => bail!("ssh tunnel failed: {err}\n  to diagnose: {diag}{fg_hint}"),
-                None => bail!("ssh tunnel exited ({status})\n  to diagnose: {diag}{fg_hint}"),
-            }
+            bail!("ssh tunnel exited ({status})\n  to diagnose: {diag}{fg_hint}");
         }
     }
-    debug!("tunnel socket ready");
+    info!("tunnel socket ready");
 
     // PID is already written (right after we got the lock, above). Record
     // the original destination so `restart` / auto-start can recover it.
@@ -1190,7 +1231,7 @@ pub fn get_tunnel_info() -> Vec<TunnelInfo> {
             destination: dest.trim().to_string(),
             status: status_str,
             pid: read_pid_hint(name),
-            log_path: crate::daemon::socket_dir().join(format!("connect-{name}.log")),
+            log_path: connect_log_path(name),
         });
     }
     infos
@@ -1733,7 +1774,9 @@ mod tests {
     async fn wait_for_socket_timeout() {
         let dir = tempfile::tempdir().unwrap();
         let sock_path = dir.path().join("never.sock");
-        let result = wait_for_socket(&sock_path, Duration::from_secs(1)).await;
-        assert!(result.is_err());
+        let err = wait_for_socket(&sock_path, Duration::from_secs(1)).await.unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("timed out after 1s"), "msg: {msg}");
+        assert!(msg.contains("not found") || msg.contains("No such file"), "msg: {msg}");
     }
 }

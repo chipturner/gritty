@@ -466,7 +466,7 @@ fn dup_ready_fd(ready_fd: &Option<OwnedFd>) -> Option<OwnedFd> {
 
 /// Write error to the readiness pipe (so the parent displays it), print to stderr, and exit.
 fn report_error(error_pipe: &Option<OwnedFd>, e: &anyhow::Error) -> ! {
-    let msg = format!("error: {e}");
+    let msg = format!("error: {e:#}");
     if let Some(fd) = error_pipe {
         let _ = nix::unistd::write(fd, msg.as_bytes());
     }
@@ -570,8 +570,8 @@ fn main() {
                 eprintln!("error: {e}");
                 std::process::exit(1);
             }
-            let out_path = socket_dir.join(format!("connect-{connection_name}.out"));
-            let log_path = socket_dir.join(format!("connect-{connection_name}.log"));
+            let out_path = gritty::connect::connect_out_path(&connection_name);
+            let log_path = gritty::connect::connect_log_path(&connection_name);
 
             // Merge CLI -o options with config-layer options so preflight
             // sees the same SSH option set the real tunnel will use.

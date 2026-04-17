@@ -234,10 +234,15 @@ impl ConfigFile {
                 hc.and_then(|c| c.no_server_start),
                 dc.and_then(|c| c.no_server_start),
             ),
-            isolate_control_path: pick(
-                hc.and_then(|c| c.isolate_control_path),
-                dc.and_then(|c| c.isolate_control_path),
-            ),
+            // Default true: a long-lived -L forward riding a ControlMaster
+            // mux ignores our ServerAliveInterval / ExitOnForwardFailure /
+            // StreamLocalBindUnlink, and the master can end up holding a
+            // listener on a deleted inode after we unlink the local socket.
+            // remote_exec() still rides the mux, so pre-checks stay fast.
+            isolate_control_path: hc
+                .and_then(|c| c.isolate_control_path)
+                .or(dc.and_then(|c| c.isolate_control_path))
+                .unwrap_or(true),
             connect_timeout: hc
                 .and_then(|c| c.connect_timeout)
                 .or(dc.and_then(|c| c.connect_timeout))
@@ -381,13 +386,14 @@ mod tests {
     fn tunnel_isolate_control_path() {
         let cfg: ConfigFile = toml::from_str(
             r#"
-            [host.prod.tunnel]
-            isolate-control-path = true
+            [host.mux.tunnel]
+            isolate-control-path = false
             "#,
         )
         .unwrap();
-        assert!(cfg.resolve_tunnel("prod").isolate_control_path);
-        assert!(!cfg.resolve_tunnel("devbox").isolate_control_path);
+        // Default is true; explicit false opts back into ControlMaster mux.
+        assert!(cfg.resolve_tunnel("devbox").isolate_control_path);
+        assert!(!cfg.resolve_tunnel("mux").isolate_control_path);
     }
 
     #[test]

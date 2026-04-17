@@ -326,10 +326,18 @@ async fn check_tunnels(socket_dir: &Path) -> Vec<Check> {
                 checks.push(Check::ok(format!("{name}: healthy{pid_str}{ver_note}")));
 
                 // Check tunnel log size
-                check_log_file(&mut checks, &socket_dir.join(format!("connect-{name}.log")));
+                check_log_file(&mut checks, &gritty::connect::connect_log_path(name));
             }
             TunnelStatus::Reconnecting => {
-                checks.push(Check::warn(format!("{name}: reconnecting{pid_str}")));
+                let log = gritty::connect::connect_log_path(name);
+                let out = gritty::connect::connect_out_path(name);
+                checks.push(Check::warn(format!("{name}: reconnecting{pid_str}")).with_hint(
+                    format!(
+                        "tracing: {}\n    \x1b[2m\u{2192} ssh output: {}",
+                        log.display(),
+                        out.display()
+                    ),
+                ));
             }
             TunnelStatus::Stale => {
                 checks.push(
