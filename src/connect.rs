@@ -424,10 +424,14 @@ async fn tunnel_monitor(
     probe_ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     probe_ticker.tick().await; // consume the immediate first tick
     let mut consecutive_probe_failures: u32 = 0;
+    // Track when the *current* ssh child was spawned. Updated only when a
+    // new child is successfully handed in, never on probe ticks -- otherwise
+    // the `HEALTHY_THRESHOLD` check below would measure time-since-last-
+    // probe (<=30s) instead of actual child uptime, and backoff would never
+    // reset on a long-lived tunnel.
+    let mut child_spawned_at = Instant::now();
 
     loop {
-        let spawned_at = Instant::now();
-
         tokio::select! {
             _ = stop.cancelled() => {
                 let _ = child.kill().await;
@@ -490,7 +494,7 @@ async fn tunnel_monitor(
                 }
 
                 // Reset backoff if the tunnel was alive long enough
-                if spawned_at.elapsed() >= HEALTHY_THRESHOLD {
+                if child_spawned_at.elapsed() >= HEALTHY_THRESHOLD {
                     backoff = Duration::from_secs(1);
                 }
 
@@ -534,6 +538,7 @@ async fn tunnel_monitor(
                     Ok(new_child) => {
                         info!("ssh tunnel respawned");
                         child = new_child;
+                        child_spawned_at = Instant::now();
                     }
                     Err(e) => {
                         warn!("failed to respawn ssh tunnel: {e}");

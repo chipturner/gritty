@@ -81,7 +81,7 @@ stateDiagram-v2
         ChildExited --> NonTransient: exit code in 1..=254\nexcluding 128..=159
         ChildExited --> Backoff: exit code 255,\nsignal death (128..=159),\nor no code (local signal)
         NonTransient --> [*]: warn, monitor returns
-        Backoff --> Backoff: sleep(backoff)\nreset to 1s if >=30s uptime,\nelse double to <=60s
+        Backoff --> Backoff: sleep(backoff)\nreset to 1s if child_spawned_at\nelapsed >=30s,\nelse double to <=60s
         Backoff --> EnsureRemoteRetry: timer fires
         EnsureRemoteRetry --> Backoff: ensure_remote_ready err\n(retry from top)
         EnsureRemoteRetry --> SpawnRetry: got fresh remote_sock
