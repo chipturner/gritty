@@ -36,6 +36,7 @@ A tunnel named `NAME` owns these files in `socket_dir()`:
 | `connect-NAME.dest`     | `run()` after socket is up               | Original destination string, for `restart` / auto-start recovery. |
 | `connect-NAME.log`      | tracing subscriber                       | Supervisor's own structured logs. |
 | `connect-NAME.out`      | daemonize stderr redirection             | ssh child's stderr (forward-setup errors, etc.). |
+| `connect-NAME.remote-sock` | `run()` after post-bind probe succeeds | Cache of remote `ctl.sock` path. Survives teardown so subsequent connects can skip the Preflight `ensure_remote_ready` SSH-exec. |
 
 Invariant: the flock held on the `.lock` *inode* is the single liveness truth.
 Everything else is advisory -- if the inode's flock is free, any other leftover
@@ -82,7 +83,7 @@ stateDiagram-v2
         Alive --> ProbeFailing: probe failed\n(counter++)
         ProbeFailing --> Alive: next probe ok
         ProbeFailing --> KillingChild: counter >= 2\n(kill ssh, reset counter)
-        Alive --> KillingChild: net path changed\n+ one-shot probe failed\n(macOS only)
+        Alive --> KillingChild: net path changed\n+ one-shot probe failed\n(macOS only; gated on uptime >= 5s)
         Alive --> ChildExited: child.wait() returned
         KillingChild --> ChildExited: child.wait() observes kill
 
@@ -176,11 +177,14 @@ backoff not trip the client's short socket-gone grace.
    supervisor role. Clean any stale `.sock`/`.pid`/`.dest` (we don't remove
    the lock we just acquired), then write the `.pid` file **immediately**
    so `disconnect` can find us during the startup window.
-3. **Starting.Preflight -> Starting.SpawnChild** -- `ensure_remote_ready`
-   returns `(remote_sock, remote_version)`. Version mismatch bails unless
-   `--ignore-version-mismatch`; this predates the in-band v15 mismatch
-   recovery in the daemon and is still used as a pre-flight for
-   `tunnel-create` since we can't talk to the remote daemon without ssh.
+3. **Starting.Preflight -> Starting.SpawnChild** -- if
+   `connect-NAME.remote-sock` exists, use its contents as `remote_sock`
+   and skip `ensure_remote_ready` entirely (saves one ~2s SSH-exec on
+   every connect after the first). Otherwise `ensure_remote_ready`
+   returns `(remote_sock, remote_version)`; version mismatch bails unless
+   `--ignore-version-mismatch` (predates the in-band v15 mismatch
+   recovery, still used as a pre-flight for `tunnel-create` since we
+   can't talk to the remote daemon without ssh).
 4. **Starting.SpawnChild -> Starting.WaitForSocket** -- ssh spawned with
    `exec sleep 2147483647` as its remote command. Not `-N`: a mux client
    with `-N` exits 0 immediately after the master accepts the forward. A
@@ -201,8 +205,15 @@ backoff not trip the client's short socket-gone grace.
      that additionally points at the `--foreground` hint (a password
      prompt that wasn't answered is the common cause).
 
-   On socket-ready first, write `.dest`, call `signal_ready` so the
-   parent `tunnel-create` process exits, and hand the ssh child to
+   On socket-ready first, run one `probe_tunnel_alive` against the local
+   socket to confirm the forward actually reaches a live remote daemon.
+   On the cached-`remote_sock` fast path this is the only liveness
+   check (we skipped `ensure_remote_ready`): probe failure re-runs
+   `ensure_remote_ready`; if it returns a different path the cache was
+   stale -- invalidate `.remote-sock` and bail so a retry takes the slow
+   path. On the slow path the probe is belt-and-suspenders. Then write
+   `.dest` + `.remote-sock`, call `signal_ready` so the parent
+   `tunnel-create` process exits, and hand the ssh child to
    `tunnel_monitor`.
 
 ### Supervisor loop (`tunnel_monitor`)
@@ -210,10 +221,19 @@ backoff not trip the client's short socket-gone grace.
 The monitor runs a `tokio::select!` with four arms:
 
 - **`stop.cancelled()`** -- kill ssh child and return.
-- **`net.changed()`** (macOS only) -- OS network path changed; run a single
-  `probe_tunnel_alive` now and kill ssh on failure (single-strike, no
-  2-count: the path *did* change, so one failure is sufficient evidence).
-  Advisory latency win over waiting ~6-9s for ssh's `ServerAlive*`.
+- **`net.changed()`** (macOS only) -- OS network path changed; record
+  whether any event in the burst reported `Unsatisfied`, and arm a
+  debounced probe (`NET_PROBE_DEBOUNCE`, 500ms). Each further event resets
+  the timer. When 500ms pass with no new event: if no `Unsatisfied` was
+  seen since the last successful probe, skip -- a purely-`Satisfied` burst
+  is interface-property noise, and a transient HelloAck timeout on such a
+  probe would kill a working SSH (ServerAlive still covers a genuine
+  seamless route switch in ~6-9s). Otherwise run one `probe_tunnel_alive`
+  and kill ssh on failure (single-strike). The debounce exists because
+  `nw_path_monitor` bursts during wifi renegotiation; probing on the first
+  event races the sub-second outage itself. The kill is further gated on
+  `state.past_spawn_grace()` (`uptime >= SPAWN_GRACE`, 5s) -- a fresh ssh
+  whose `-L` hasn't bound yet isn't killed by its own startup race.
 - **`probe_ticker.tick()`** -- every 30s, run `probe_tunnel_alive` against
   the local socket. The probe does `Hello -> HelloAck -> ListSessions` with
   a 3s outer timeout and 1s inner timeouts. This catches remote-daemon death
@@ -247,6 +267,12 @@ client Hello hits EOF. The re-prime runs `gritty ls local || (gritty server
 ssh at its ctl socket. If `ensure_remote_ready` itself fails (ssh auth
 problem, remote unreachable, etc.), we go back to `Backoff` -- we don't
 try to spawn ssh against a stale `remote_sock`.
+
+The re-prime is **skipped** when `last_healthy` (the most recent successful
+app-layer probe, seeded from the caller's initial `ensure_remote_ready`) is
+within `SKIP_ENSURE_REMOTE_THRESHOLD` (60s). A sub-minute network blip can't
+plausibly have rebooted the remote, and the ~2s SSH-exec round-trip is pure
+reconnect latency on the common path. Beyond 60s we re-verify.
 
 ### Shutdown
 

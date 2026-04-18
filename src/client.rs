@@ -2148,6 +2148,15 @@ pub async fn run(
                                 attempt = attempt_n,
                                 attempt_ms, "reconnect: attempt failed, will retry"
                             );
+                            // While the tunnel supervisor holds the lock,
+                            // it is the rate-limiter (1-60s backoff on SSH
+                            // respawn). The client's connect() is to a
+                            // local Unix socket and costs nothing; layering
+                            // our own backoff on top just delays noticing
+                            // the forward came back. Poll at 1s instead.
+                            if tunnel_supervisor_alive {
+                                backoff = Duration::ZERO;
+                            }
                             continue;
                         }
                         Err(_) => {
@@ -2156,6 +2165,9 @@ pub async fn run(
                                 timeout_s = RECONNECT_ATTEMPT_TIMEOUT.as_secs(),
                                 "reconnect: attempt timed out"
                             );
+                            if tunnel_supervisor_alive {
+                                backoff = Duration::ZERO;
+                            }
                             continue;
                         }
                     }

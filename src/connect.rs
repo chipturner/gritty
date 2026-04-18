@@ -404,6 +404,22 @@ const HEALTHY_CHILD_THRESHOLD: Duration = Duration::from_secs(30);
 const PROBE_INTERVAL: Duration = Duration::from_secs(30);
 /// Consecutive probe failures before we kill ssh to force a respawn.
 const PROBE_FAILURES_BEFORE_RESPAWN: u32 = 2;
+/// Debounce window for the net-change-triggered probe. macOS
+/// `nw_path_monitor` fires a burst of events (~100-200ms apart) during wifi
+/// renegotiation; probing on the first one races the outage itself and
+/// kills an SSH whose TCP would have survived a sub-second blip. Waiting
+/// for the burst to settle lets the probe test the post-transition state.
+const NET_PROBE_DEBOUNCE: Duration = Duration::from_millis(500);
+/// A freshly-spawned ssh needs this long to connect and bind its `-L`
+/// forward; a net-change probe failure before then means "not ready yet",
+/// not "broken", so the single-strike kill is suppressed.
+const SPAWN_GRACE: Duration = Duration::from_secs(5);
+/// If the tunnel last passed an app-layer probe within this window, skip
+/// `ensure_remote_ready` on respawn -- the remote daemon was just seen
+/// alive, so the ~2s SSH-exec round-trip to re-verify it is pure latency
+/// on a transient network blip. Beyond this window, re-verify (covers
+/// remote reboot / daemon upgrade).
+const SKIP_ENSURE_REMOTE_THRESHOLD: Duration = Duration::from_secs(60);
 
 /// Classification of an ssh child's exit status. The monitor retries on
 /// `Transient` and gives up on `NonTransient`.
@@ -466,6 +482,13 @@ impl ChildState {
         Self { child, spawned_at: Instant::now(), probe_failures: 0 }
     }
 
+    /// True once the `-L` forward has had time to bind. Gates the
+    /// net-change single-strike kill: before this, a probe failure means
+    /// "not ready yet", not "broken".
+    fn past_spawn_grace(&self) -> bool {
+        self.uptime() >= SPAWN_GRACE
+    }
+
     fn uptime(&self) -> Duration {
         self.spawned_at.elapsed()
     }
@@ -478,6 +501,7 @@ async fn tunnel_monitor(
     child: Child,
     dest: Destination,
     local_sock: PathBuf,
+    initial_remote_sock: String,
     extra_ssh_opts: Vec<String>,
     foreground: bool,
     no_server_start: bool,
@@ -485,18 +509,36 @@ async fn tunnel_monitor(
     connect_timeout: u64,
     stop: tokio_util::sync::CancellationToken,
 ) {
-    // The initial remote_sock was used by the caller to spawn the first
-    // child; on every respawn we re-derive it from ensure_remote_ready so
-    // a reboot / daemon upgrade / remote relocation is handled. The local
-    // state below is populated before the first respawn's spawn_tunnel.
-    #[allow(unused_assignments)]
-    let mut remote_sock = String::new();
+    // Seeded from the caller's initial ensure_remote_ready so a fast
+    // respawn can reuse it; re-derived via ensure_remote_ready whenever
+    // the tunnel has been down long enough that a reboot / daemon upgrade
+    // / remote relocation is plausible.
+    let mut remote_sock = initial_remote_sock;
     let mut backoff = MIN_RESPAWN_BACKOFF;
+    // Most recent time the remote daemon was confirmed alive (by an
+    // app-layer probe here, or by the caller's ensure_remote_ready that
+    // produced initial_remote_sock). Gates whether respawn re-runs
+    // ensure_remote_ready. Seeded now because the caller just verified it.
+    let mut last_healthy = if remote_sock.is_empty() { None } else { Some(Instant::now()) };
     let net = crate::net_watch::NetWatcher::spawn();
     let mut probe_ticker = tokio::time::interval(PROBE_INTERVAL);
     probe_ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     probe_ticker.tick().await; // consume the immediate first tick
     let mut state = ChildState::new(child);
+    // Debounced net-change probe: set on each net.changed(), cleared when
+    // the deadline elapses and the probe runs (or when the child is
+    // replaced). See NET_PROBE_DEBOUNCE.
+    let mut net_probe_at: Option<Instant> = None;
+    // Set when the supervisor itself killed the child (probe failure).
+    // Suppresses the respawn backoff: we already rate-limited via the
+    // debounce + probe timeout, and there's no flap to guard against.
+    let mut we_killed = false;
+    // Whether the OS has reported Unsatisfied since the last successful
+    // probe. A burst that stays Satisfied throughout is interface-property
+    // noise (not an outage) -- probing on it risks a transient HelloAck
+    // timeout killing a working SSH. ServerAliveInterval still covers a
+    // genuine seamless route switch in ~6-9s.
+    let mut saw_unsatisfied = false;
 
     loop {
         tokio::select! {
@@ -505,20 +547,56 @@ async fn tunnel_monitor(
                 return;
             }
             _ = net.changed() => {
-                // OS says the network path changed. ssh's ServerAlive* will
-                // self-detect a dead TCP socket in ~6-9s, but an immediate
-                // app-layer probe here gets us to respawn in ~3s instead.
-                // Single-strike: the path DID change, so one probe failure
-                // is sufficient evidence -- unlike the periodic ticker which
-                // tolerates one transient miss.
-                info!("network path changed; probing tunnel");
+                // OS says the network path changed. Don't probe yet --
+                // nw_path_monitor fires a burst during wifi renegotiation,
+                // and probing mid-burst races the outage itself. Arm a
+                // debounced probe; each further event pushes it out.
+                let status = net.status();
+                if status == crate::net_watch::PathStatus::Unsatisfied {
+                    saw_unsatisfied = true;
+                }
+                info!(?status, saw_unsatisfied, "network path changed; arming debounced probe");
+                net_probe_at = Some(Instant::now() + NET_PROBE_DEBOUNCE);
+                continue;
+            }
+            _ = async {
+                match net_probe_at {
+                    Some(at) => tokio::time::sleep_until(at.into()).await,
+                    None => std::future::pending().await,
+                }
+            } => {
+                // Debounce window elapsed with no further path changes --
+                // probe the post-transition state. ssh's ServerAlive* would
+                // self-detect a dead TCP socket in ~6-9s; this gets us to
+                // respawn in ~1.5s instead. Single-strike, but only once
+                // this child is past SPAWN_GRACE (so a fresh ssh whose -L
+                // hasn't bound yet isn't killed by its own startup race).
+                net_probe_at = None;
+                if !saw_unsatisfied {
+                    info!("debounced network probe: path never went unsatisfied; skipping");
+                    continue;
+                }
+                info!(
+                    status = ?net.status(),
+                    uptime_s = state.uptime().as_secs(),
+                    "debounced network probe"
+                );
                 match probe_tunnel_alive(&local_sock).await {
                     Ok(()) => {
                         state.probe_failures = 0;
+                        last_healthy = Some(Instant::now());
+                        saw_unsatisfied = false;
+                    }
+                    Err(why) if state.past_spawn_grace() => {
+                        info!("tunnel probe failed after path change ({why}); killing ssh to respawn");
+                        we_killed = true;
+                        let _ = state.child.kill().await;
                     }
                     Err(why) => {
-                        info!("tunnel probe failed after path change ({why}); killing ssh to respawn");
-                        let _ = state.child.kill().await;
+                        info!(
+                            uptime_s = state.uptime().as_secs(),
+                            "tunnel probe failed after path change ({why}); ssh still in spawn grace, not killing"
+                        );
                     }
                 }
                 continue;
@@ -530,6 +608,8 @@ async fn tunnel_monitor(
                             info!("tunnel probe recovered");
                         }
                         state.probe_failures = 0;
+                        last_healthy = Some(Instant::now());
+                        saw_unsatisfied = false;
                     }
                     Err(why) => {
                         state.probe_failures += 1;
@@ -542,6 +622,7 @@ async fn tunnel_monitor(
                                 "tunnel probe failed {}x; remote daemon looks dead, killing ssh to respawn",
                                 state.probe_failures
                             );
+                            we_killed = true;
                             let _ = state.child.kill().await;
                             // The failure counter is zeroed when the
                             // replacement ChildState is installed below;
@@ -567,8 +648,12 @@ async fn tunnel_monitor(
                 // This child is gone; zero the probe-failure counter so
                 // a later ensure_remote_ready / spawn_tunnel retry loop
                 // doesn't operate on stale failure history before a
-                // replacement ChildState gets installed.
+                // replacement ChildState gets installed. Also drop any
+                // pending debounced net-probe -- it was aimed at the dead
+                // child.
                 state.probe_failures = 0;
+                net_probe_at = None;
+                saw_unsatisfied = false;
 
                 let code = status.code();
                 info!("ssh tunnel exited: {:?}", code);
@@ -578,7 +663,12 @@ async fn tunnel_monitor(
                     return;
                 }
 
-                let (sleep, next) = next_backoff(backoff, state.uptime());
+                let (sleep, next) = if we_killed {
+                    we_killed = false;
+                    (Duration::ZERO, MIN_RESPAWN_BACKOFF)
+                } else {
+                    next_backoff(backoff, state.uptime())
+                };
                 backoff = next;
 
                 info!("ssh tunnel died, retrying in {}s", sleep.as_secs());
@@ -601,25 +691,37 @@ async fn tunnel_monitor(
                 // again before we point SSH at its ctl socket. Without
                 // this, spawn_tunnel succeeds (connects SSH + forwards)
                 // but the next client hits EOF on every handshake because
-                // no daemon is listening on the other side.
-                match ensure_remote_ready(
-                    &dest,
-                    no_server_start,
-                    &extra_ssh_opts,
-                    foreground,
-                    connect_timeout,
-                )
-                .await
-                {
-                    Ok((sock, _ver)) => {
-                        remote_sock = sock;
-                    }
-                    Err(e) => {
-                        warn!("ensure_remote_ready failed on respawn: {e}");
-                        // Treat like a spawn failure: back off and retry
-                        // from the top instead of racing SSH against a
-                        // stale remote_sock.
-                        continue;
+                // no daemon is listening on the other side. Skipped when
+                // the tunnel was just proven healthy -- a sub-minute
+                // network blip can't have rebooted the remote, and the
+                // ~2s SSH-exec round-trip is pure reconnect latency.
+                let recently_healthy = last_healthy
+                    .is_some_and(|t| t.elapsed() < SKIP_ENSURE_REMOTE_THRESHOLD);
+                if recently_healthy && !remote_sock.is_empty() {
+                    info!(
+                        ago_s = last_healthy.map(|t| t.elapsed().as_secs()),
+                        "skipping ensure_remote_ready (tunnel recently healthy)"
+                    );
+                } else {
+                    match ensure_remote_ready(
+                        &dest,
+                        no_server_start,
+                        &extra_ssh_opts,
+                        foreground,
+                        connect_timeout,
+                    )
+                    .await
+                    {
+                        Ok((sock, _ver)) => {
+                            remote_sock = sock;
+                        }
+                        Err(e) => {
+                            warn!("ensure_remote_ready failed on respawn: {e}");
+                            // Treat like a spawn failure: back off and retry
+                            // from the top instead of racing SSH against a
+                            // stale remote_sock.
+                            continue;
+                        }
                     }
                 }
 
@@ -627,6 +729,7 @@ async fn tunnel_monitor(
                     Ok(new_child) => {
                         info!("ssh tunnel respawned");
                         state = ChildState::new(new_child);
+                        net_probe_at = None;
                     }
                     Err(e) => {
                         warn!("failed to respawn ssh tunnel: {e}");
@@ -707,6 +810,15 @@ fn connect_lock_path(connection_name: &str) -> PathBuf {
 
 pub fn connect_dest_path(connection_name: &str) -> PathBuf {
     crate::daemon::socket_dir().join(format!("connect-{connection_name}.dest"))
+}
+
+/// Cache of the remote daemon's ctl socket path. Lets a subsequent
+/// `tunnel-create` skip the ~2s `ensure_remote_ready` SSH-exec when the
+/// path is known (it only changes if the remote UID / `XDG_RUNTIME_DIR`
+/// changes). Deliberately NOT removed on tunnel teardown -- it is a
+/// persistence cache, not live state.
+pub fn connect_remote_sock_path(connection_name: &str) -> PathBuf {
+    crate::daemon::socket_dir().join(format!("connect-{connection_name}.remote-sock"))
 }
 
 pub fn connect_log_path(connection_name: &str) -> PathBuf {
@@ -1141,15 +1253,33 @@ pub async fn run(opts: ConnectOpts, ready_fd: Option<OwnedFd>) -> anyhow::Result
     let mut sigterm = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
     let mut sigint = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::interrupt())?;
 
-    // 4. Ensure remote server is running and get socket path
-    let (remote_sock, remote_version) = ensure_remote_ready(
-        &dest,
-        opts.no_server_start,
-        &opts.ssh_options,
-        opts.foreground,
-        opts.connect_timeout,
-    )
-    .await?;
+    // 4. Ensure remote server is running and get socket path. If we have a
+    //    cached path from a prior connect, use it and skip the ~2s SSH-exec;
+    //    the post-wait_for_socket probe below falls back to the full
+    //    ensure_remote_ready if the cache turns out to be stale or the
+    //    remote daemon isn't running.
+    let remote_sock_cache = connect_remote_sock_path(&connection_name);
+    let cached_remote_sock = std::fs::read_to_string(&remote_sock_cache)
+        .ok()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty());
+    let used_cache = cached_remote_sock.is_some();
+    let (remote_sock, remote_version) = match cached_remote_sock {
+        Some(sock) => {
+            info!(remote_sock = %sock, "using cached remote socket path");
+            (sock, None)
+        }
+        None => {
+            ensure_remote_ready(
+                &dest,
+                opts.no_server_start,
+                &opts.ssh_options,
+                opts.foreground,
+                opts.connect_timeout,
+            )
+            .await?
+        }
+    };
     info!(remote_sock, ?remote_version, "remote socket path");
 
     // Check protocol version compatibility
@@ -1220,6 +1350,40 @@ pub async fn run(opts: ConnectOpts, ready_fd: Option<OwnedFd>) -> anyhow::Result
     }
     info!("tunnel socket ready");
 
+    // Verify the forward actually reaches a live remote daemon. On the
+    // cached-path fast path we skipped ensure_remote_ready, so the remote
+    // server may not be running yet (first connect after remote reboot) or
+    // the cached path may be stale. On the slow path this is a cheap
+    // belt-and-suspenders check.
+    if let Err(why) = probe_tunnel_alive(&local_sock).await {
+        if used_cache {
+            info!(why, "cached remote socket unreachable; running ensure_remote_ready");
+            let (fresh_sock, _) = ensure_remote_ready(
+                &dest,
+                opts.no_server_start,
+                &opts.ssh_options,
+                opts.foreground,
+                opts.connect_timeout,
+            )
+            .await?;
+            if fresh_sock != remote_sock {
+                // Stale cache (remote UID / runtime dir changed). Our -L is
+                // aimed at the wrong path; invalidate and error -- a retry
+                // will take the slow path with the fresh value.
+                let _ = std::fs::remove_file(&remote_sock_cache);
+                bail!("cached remote socket path is stale ({remote_sock} -> {fresh_sock}); retry");
+            }
+            // Server was down; ensure_remote_ready started it. The existing
+            // -L connects on-demand, so no respawn needed -- just re-probe.
+            if let Err(why) = probe_tunnel_alive(&local_sock).await {
+                bail!("remote daemon unreachable after start: {why}");
+            }
+        } else {
+            bail!("tunnel forward bound but remote daemon is not responding: {why}");
+        }
+    }
+    let _ = std::fs::write(&remote_sock_cache, &remote_sock);
+
     // PID is already written (right after we got the lock, above). Record
     // the original destination so `restart` / auto-start can recover it.
     let _ = std::fs::write(&dest_file, &opts.destination);
@@ -1235,6 +1399,7 @@ pub async fn run(opts: ConnectOpts, ready_fd: Option<OwnedFd>) -> anyhow::Result
             original_child,
             dest,
             local_sock.clone(),
+            remote_sock,
             opts.ssh_options,
             opts.foreground,
             opts.no_server_start,
@@ -1810,6 +1975,7 @@ mod tests {
                 child,
                 dest,
                 PathBuf::from("/tmp/nonexistent.sock"),
+                String::new(),
                 vec![],
                 false,
                 true,
@@ -1841,6 +2007,7 @@ mod tests {
                 child,
                 dest,
                 PathBuf::from("/tmp/nonexistent.sock"),
+                String::new(),
                 vec![],
                 false,
                 true,
@@ -1874,6 +2041,7 @@ mod tests {
                 child,
                 dest,
                 PathBuf::from("/tmp/nonexistent.sock"),
+                String::new(),
                 vec![],
                 false,
                 true,

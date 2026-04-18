@@ -344,6 +344,28 @@ enum Command {
 
 fn init_tracing(verbose: bool, log_path: Option<&Path>) {
     gritty::logging::init_tracing(verbose, log_path);
+    let argv: Vec<String> = std::env::args().collect();
+    tracing::info!(cmd = %argv.join(" "), pid = std::process::id(), "gritty invoked");
+}
+
+/// For long-lived client commands against a tunnel host, route tracing to
+/// that tunnel's log file so client-side reconnect/link-down events land
+/// alongside the supervisor's entries instead of spraying stderr into a
+/// raw-mode terminal. One-shot commands, `local`, and explicit
+/// `--ctl-socket` keep stderr.
+fn client_log_path(cmd: &Command, ctl_socket_override: bool) -> Option<PathBuf> {
+    if ctl_socket_override {
+        return None;
+    }
+    let target = match cmd {
+        Command::Connect { target, .. } | Command::Tail { target } => target.as_deref()?,
+        _ => return None,
+    };
+    let (host, _) = parse_target(target);
+    if host == "local" {
+        return None;
+    }
+    Some(gritty::connect::connect_log_path(&host))
 }
 
 /// Fork into background, returning the write end of the readiness pipe.
@@ -652,7 +674,8 @@ fn main() {
             }
         }
         _ => {
-            init_tracing(verbose, None);
+            let log_path = client_log_path(&cli.command, cli.ctl_socket.is_some());
+            init_tracing(verbose, log_path.as_deref());
             let rt = match tokio::runtime::Runtime::new() {
                 Ok(rt) => rt,
                 Err(e) => {
