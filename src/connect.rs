@@ -680,30 +680,30 @@ async fn tunnel_monitor(
 
                 let new_child = loop {
                     info!("respawn: sleeping {}s (backoff)", sleep.as_secs());
-                    tokio::select! {
-                        _ = tokio::time::sleep(sleep) => {}
-                        _ = net.changed() => {
-                            // Only short-circuit the backoff when the path
-                            // actually recovered from an observed outage.
-                            // nw_path_monitor fires Satisfied noise during
-                            // dark wakes too; letting that reset backoff
-                            // defeats the climb entirely.
-                            let status = net.status();
-                            if status == crate::net_watch::PathStatus::Unsatisfied {
-                                backoff_saw_unsatisfied = true;
-                                info!(?status, "network path changed during backoff (no route); continuing to wait");
-                                continue;
+                    // Fixed deadline so net.changed() noise re-entering the
+                    // select doesn't restart the sleep from scratch -- a
+                    // lid-open Satisfied burst after backoff has climbed to
+                    // 60s must neither reset the climb nor extend the wait.
+                    let deadline = tokio::time::Instant::now() + sleep;
+                    'wait: loop {
+                        tokio::select! {
+                            _ = tokio::time::sleep_until(deadline) => break 'wait,
+                            _ = net.changed() => {
+                                let status = net.status();
+                                if status == crate::net_watch::PathStatus::Unsatisfied {
+                                    backoff_saw_unsatisfied = true;
+                                    debug!(?status, "network path changed during backoff (no route); continuing to wait");
+                                } else if backoff_saw_unsatisfied {
+                                    info!(?status, "network path recovered during backoff; retrying now");
+                                    backoff_saw_unsatisfied = false;
+                                    sleep = MIN_RESPAWN_BACKOFF;
+                                    break 'wait;
+                                } else {
+                                    debug!(?status, "network path changed during backoff (noise); ignoring");
+                                }
                             }
-                            if backoff_saw_unsatisfied {
-                                info!(?status, "network path recovered during backoff; retrying now");
-                                backoff_saw_unsatisfied = false;
-                                sleep = MIN_RESPAWN_BACKOFF;
-                            } else {
-                                info!(?status, "network path changed during backoff (noise); ignoring");
-                                continue;
-                            }
+                            _ = stop.cancelled() => return,
                         }
-                        _ = stop.cancelled() => return,
                     }
                     backoff = (sleep.max(MIN_RESPAWN_BACKOFF) * 2).min(MAX_RESPAWN_BACKOFF);
 
