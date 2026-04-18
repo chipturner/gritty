@@ -414,6 +414,16 @@ const NET_PROBE_DEBOUNCE: Duration = Duration::from_millis(500);
 /// forward; a net-change probe failure before then means "not ready yet",
 /// not "broken", so the single-strike kill is suppressed.
 const SPAWN_GRACE: Duration = Duration::from_secs(5);
+/// If wall-clock time advanced this much more than monotonic time across a
+/// backoff sleep, the process was suspended (lid close / Power Nap). Used to
+/// reset the respawn backoff for one immediate attempt on wake, since the
+/// Unsatisfied->Satisfied edge detector can't observe the Unsatisfied that
+/// happened while the process was frozen. 5s is well above NTP slew/step
+/// noise and well below any real suspend.
+const SUSPEND_JUMP_THRESHOLD: Duration = Duration::from_secs(5);
+/// How often to sample for a suspend jump during backoff. Instant-based, so
+/// after a suspend this fires ~2s (monotonic) after wake.
+const SUSPEND_POLL: Duration = Duration::from_secs(2);
 /// If the tunnel last passed an app-layer probe within this window, skip
 /// `ensure_remote_ready` on respawn -- the remote daemon was just seen
 /// alive, so the ~2s SSH-exec round-trip to re-verify it is pure latency
@@ -685,9 +695,35 @@ async fn tunnel_monitor(
                     // lid-open Satisfied burst after backoff has climbed to
                     // 60s must neither reset the climb nor extend the wait.
                     let deadline = tokio::time::Instant::now() + sleep;
+                    // Anchors for suspend detection: if wall-clock advanced
+                    // far more than monotonic across the wait, the process
+                    // was frozen. Instant pauses during suspend on both
+                    // Linux (CLOCK_MONOTONIC) and macOS (CLOCK_UPTIME_RAW);
+                    // SystemTime (CLOCK_REALTIME) does not. Same assumption
+                    // client.rs::wall_elapsed() already relies on.
+                    let wall_anchor = std::time::SystemTime::now();
+                    let mono_anchor = Instant::now();
                     'wait: loop {
                         tokio::select! {
                             _ = tokio::time::sleep_until(deadline) => break 'wait,
+                            _ = tokio::time::sleep(SUSPEND_POLL) => {
+                                let wall = std::time::SystemTime::now()
+                                    .duration_since(wall_anchor)
+                                    .unwrap_or_default();
+                                let mono = mono_anchor.elapsed();
+                                if wall > mono + SUSPEND_JUMP_THRESHOLD {
+                                    // Cut this sleep short for one attempt;
+                                    // do NOT reset the climb -- a dark wake
+                                    // with a locked Keychain should cost
+                                    // exactly one failed auth and then
+                                    // resume the climbed backoff.
+                                    info!(
+                                        jump_s = wall.saturating_sub(mono).as_secs(),
+                                        "detected wake from suspend during backoff; retrying now"
+                                    );
+                                    break 'wait;
+                                }
+                            }
                             _ = net.changed() => {
                                 let status = net.status();
                                 if status == crate::net_watch::PathStatus::Unsatisfied {

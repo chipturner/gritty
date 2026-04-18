@@ -256,11 +256,18 @@ The monitor runs a `tokio::select!` with four arms:
   reset on every retry, which pinned backoff at 1s and hammered the remote
   with auth attempts during macOS dark wakes (Keychain agent refuses to
   sign while locked).
-- The `Backoff` sleep races `stop.cancelled()` and `net.changed()`. A
-  path-change only short-circuits the sleep on the
+- The `Backoff` sleep races `stop.cancelled()`, `net.changed()`, and a
+  2s suspend-detect ticker. A path-change only short-circuits on the
   `Unsatisfied -> Satisfied` edge; pure-`Satisfied` noise (which
   `nw_path_monitor` emits during dark wakes too) is ignored so it can't
-  defeat the climb.
+  defeat the climb. The suspend ticker compares wall-clock vs monotonic
+  elapsed since the sleep started; a gap > `SUSPEND_JUMP_THRESHOLD` (5s)
+  means the process was frozen -- cut this sleep short for one immediate
+  attempt, but keep `backoff` at its climbed value so a dark wake with a
+  locked Keychain costs exactly one failed auth before resuming the
+  climb. This closes the "up to 60s after lid-open" gap that the edge
+  detector alone can't, since the process can't observe the
+  `Unsatisfied` that happened while it was frozen.
 - Whenever a respawn succeeds, the "healthy threshold" logic
   (`spawned_at.elapsed() >= 30s` at the *next* exit) resets `backoff` back
   to 1s. That means a tunnel that dies five minutes into a stable run waits
