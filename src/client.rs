@@ -1,5 +1,5 @@
 use crate::alt_screen::AltScreenTracker;
-use crate::net_watch::NetWatcher;
+use crate::net_watch::{NetWatcher, PathStatus};
 use crate::protocol::{ErrorCode, Frame, FrameCodec};
 use bytes::Bytes;
 use futures_util::{SinkExt, StreamExt};
@@ -1830,7 +1830,7 @@ pub async fn run(
                 // don't corrupt its buffer; the server's post-reconnect
                 // force_tui_redraw will visibly repaint the TUI for the user.
                 let show_chrome = !alt_screen.in_alternate_screen();
-                let reconnect_started = Instant::now();
+                let mut reconnect_started = Instant::now();
                 // Timestamp of the most recent observation that ctl_path did
                 // NOT exist. Cleared whenever the socket reappears or a probe
                 // succeeds. If it persists past SOCKET_GONE_GRACE we treat
@@ -1839,6 +1839,10 @@ pub async fn run(
                 let mut socket_missing_since: Option<Instant> = None;
                 const SOCKET_GONE_GRACE: Duration = Duration::from_secs(3);
                 let mut backoff = Duration::ZERO;
+                let mut was_offline = false;
+                // Path-status gating only makes sense for tunnel sockets --
+                // a local Unix socket doesn't need a network route.
+                let is_remote = crate::connect::ctl_socket_lock_path(ctl_path).is_some();
                 if show_chrome {
                     write_stdout_async(
                         &async_stdout,
@@ -1898,6 +1902,31 @@ pub async fn run(
                             // so a user holding a key (>1 keystroke/sec)
                             // starved every reconnect attempt.
                         }
+                    }
+
+                    // Path-status gate: while the OS says there's no usable
+                    // route (lid closed / wifi down), don't burn 15s attempts
+                    // against a dead interface -- park on net.changed() via
+                    // the select above. On the unsatisfied->satisfied edge,
+                    // reset the elapsed counter and backoff so the user sees
+                    // "reconnecting 0s" from the moment the network actually
+                    // returned, not from whenever the loop first entered
+                    // (which may include hours of lid-closed time).
+                    if is_remote && net.status() == PathStatus::Unsatisfied {
+                        was_offline = true;
+                        if show_chrome {
+                            write_stdout_async(
+                                &async_stdout,
+                                b"\r\x1b[2;33m\xe2\x96\xb8 waiting for network... (Ctrl-C to abort)\x1b[0m\x1b[K",
+                            )
+                            .await?;
+                        }
+                        continue;
+                    }
+                    if was_offline {
+                        was_offline = false;
+                        reconnect_started = Instant::now();
+                        net_hint = true;
                     }
                     backoff = if net_hint { Duration::ZERO } else { sleep_for };
 
@@ -2206,8 +2235,10 @@ pub async fn tail(
             Some(code) => break code,
             None => {
                 let show_chrome = !alt_screen.in_alternate_screen();
-                let reconnect_started = Instant::now();
+                let mut reconnect_started = Instant::now();
                 let mut socket_missing_since: Option<Instant> = None;
+                let mut was_offline = false;
+                let is_remote = crate::connect::ctl_socket_lock_path(ctl_path).is_some();
                 const SOCKET_GONE_GRACE: Duration = Duration::from_secs(3);
                 if show_chrome {
                     eprint!("\x1b[2;33m\u{25b8} reconnecting... (Ctrl-C to abort)\x1b[0m");
@@ -2219,6 +2250,19 @@ pub async fn tail(
                         _ = sigint.recv() => { break 'outer 0; }
                         _ = sigterm.recv() => { break 'outer 1; }
                         _ = sighup.recv() => { break 'outer 1; }
+                    }
+                    if is_remote && net.status() == PathStatus::Unsatisfied {
+                        was_offline = true;
+                        if show_chrome {
+                            eprint!(
+                                "\r\x1b[2;33m\u{25b8} waiting for network... (Ctrl-C to abort)\x1b[0m\x1b[K"
+                            );
+                        }
+                        continue;
+                    }
+                    if was_offline {
+                        was_offline = false;
+                        reconnect_started = Instant::now();
                     }
                     let elapsed = reconnect_started.elapsed().as_secs();
                     if show_chrome {
