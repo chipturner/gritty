@@ -464,11 +464,11 @@ async fn timed_send(
             true
         }
         Ok(Err(e)) => {
-            debug!("send error: {e}");
+            info!("link down: send error: {e}");
             false
         }
         Err(_) => {
-            debug!("send timed out");
+            info!(timeout_s = SEND_TIMEOUT.as_secs(), "link down: send timed out");
             false
         }
     }
@@ -1063,11 +1063,11 @@ impl ClientRelay<'_> {
             }
             Some(Ok(_)) => {} // ignore control/resize frames
             Some(Err(e)) => {
-                debug!("server connection error: {e}");
+                info!("link down: server connection error: {e}");
                 return Ok(ControlFlow::Break(RelayExit::Disconnected));
             }
             None => {
-                debug!("server disconnected");
+                info!("link down: server stream closed");
                 return Ok(ControlFlow::Break(RelayExit::Disconnected));
             }
         }
@@ -1462,7 +1462,7 @@ async fn relay(
                         // reconnect. The keystroke is dropped -- that's fine;
                         // the user is about to see the reconnect banner.
                         if link_is_stale(*relay.last_activity, hb_timeout) {
-                            debug!("stdin after stale link; reconnecting without send");
+                            info!("link down: stdin after stale link (wall-clock gap); reconnecting without send");
                             return Ok(RelayExit::Disconnected);
                         }
                         if let Some(ref mut esc) = escape {
@@ -1632,7 +1632,7 @@ async fn relay(
                 // a send failure immediately and a live one round-trips a
                 // Pong that refreshes last_activity. The wall-clock heartbeat
                 // below remains the correctness backstop.
-                debug!("network path changed; probing link");
+                info!(status = ?net.status(), "network path changed during active relay; probing link");
                 *relay.last_ping_sent = Instant::now();
                 if !timed_send(framed, Frame::Ping, relay.last_outbound_at).await {
                     return Ok(RelayExit::Disconnected);
@@ -1645,7 +1645,10 @@ async fn relay(
                 // is frozen. No suspend heuristics -- just "have we heard from
                 // the server in the last N seconds of real time?"
                 if link_is_stale(*relay.last_activity, hb_timeout) {
-                    debug!("idle timeout");
+                    info!(
+                        idle_s = wall_elapsed(*relay.last_activity, std::time::SystemTime::now()).as_secs(),
+                        "link down: heartbeat idle timeout"
+                    );
                     return Ok(RelayExit::Disconnected);
                 }
 
@@ -1840,9 +1843,11 @@ pub async fn run(
                 const SOCKET_GONE_GRACE: Duration = Duration::from_secs(3);
                 let mut backoff = Duration::ZERO;
                 let mut was_offline = false;
+                let mut attempt_n = 0u32;
                 // Path-status gating only makes sense for tunnel sockets --
                 // a local Unix socket doesn't need a network route.
                 let is_remote = crate::connect::ctl_socket_lock_path(ctl_path).is_some();
+                info!(is_remote, path_status = ?net.status(), "entering reconnect loop");
                 if show_chrome {
                     write_stdout_async(
                         &async_stdout,
@@ -1870,7 +1875,7 @@ pub async fn run(
                             // and reset the backoff so a long outage
                             // followed by wifi-returns doesn't sit out the
                             // remainder of a 10s sleep.
-                            debug!("network path changed; retrying reconnect now");
+                            info!(status = ?net.status(), "network path changed during reconnect backoff");
                             net_hint = true;
                         }
                         _ = sigterm.recv() => {
@@ -1913,6 +1918,9 @@ pub async fn run(
                     // returned, not from whenever the loop first entered
                     // (which may include hours of lid-closed time).
                     if is_remote && net.status() == PathStatus::Unsatisfied {
+                        if !was_offline {
+                            info!("reconnect: path unsatisfied, parking until network returns");
+                        }
                         was_offline = true;
                         if show_chrome {
                             write_stdout_async(
@@ -1924,6 +1932,9 @@ pub async fn run(
                         continue;
                     }
                     if was_offline {
+                        info!(
+                            "reconnect: path available, resuming attempts (backoff and timer reset)"
+                        );
                         was_offline = false;
                         reconnect_started = Instant::now();
                         net_hint = true;
@@ -1982,6 +1993,15 @@ pub async fn run(
                         Retry,
                     }
 
+                    attempt_n += 1;
+                    let attempt_started = Instant::now();
+                    info!(
+                        attempt = attempt_n,
+                        backoff_s = backoff.as_secs_f64(),
+                        tunnel_supervisor_alive,
+                        socket_exists = ctl_path.exists(),
+                        "reconnect: attempting"
+                    );
                     let attempt = tokio::time::timeout(RECONNECT_ATTEMPT_TIMEOUT, async {
                         let stream = match crate::security::connect_verified(ctl_path).await {
                             Ok(s) => s,
@@ -2049,8 +2069,15 @@ pub async fn run(
                     })
                     .await;
 
+                    let attempt_ms = attempt_started.elapsed().as_millis();
                     match attempt {
                         Ok(Attempt::Connected(new_framed)) => {
+                            info!(
+                                attempt = attempt_n,
+                                attempt_ms,
+                                total_s = reconnect_started.elapsed().as_secs_f64(),
+                                "reconnect: connected"
+                            );
                             if show_chrome {
                                 write_stdout_async(
                                     &async_stdout,
@@ -2116,7 +2143,21 @@ pub async fn run(
                             .await?;
                             return Ok(1);
                         }
-                        Ok(Attempt::Retry) | Err(_) => continue,
+                        Ok(Attempt::Retry) => {
+                            info!(
+                                attempt = attempt_n,
+                                attempt_ms, "reconnect: attempt failed, will retry"
+                            );
+                            continue;
+                        }
+                        Err(_) => {
+                            info!(
+                                attempt = attempt_n,
+                                timeout_s = RECONNECT_ATTEMPT_TIMEOUT.as_secs(),
+                                "reconnect: attempt timed out"
+                            );
+                            continue;
+                        }
                     }
                 }
             }
