@@ -248,10 +248,19 @@ The monitor runs a `tokio::select!` with four arms:
     from the remote side: reboot, OOM, SIGTERM during shutdown), and `None`
     (local signal-kill, typically our own `child.kill()` from the probe
     arm) are all transient -- sleep the current `backoff`, then retry.
-- The `Backoff` sleep is itself a `select!` racing `stop.cancelled()` and
-  (on macOS) `net.changed()`: a path-change event during backoff resets
-  `backoff` to 1s and retries immediately, so wifi returning after a long
-  outage doesn't sit out the remainder of a 60s sleep.
+- The respawn sequence (`Backoff` sleep -> `ensure_remote_ready` ->
+  `spawn_tunnel`) is an **inner loop**: a failure in either step sleeps the
+  current `backoff`, doubles it (capped at 60s), and retries locally. It
+  does NOT `continue` to the outer select -- doing so re-resolved
+  `child.wait()` with the cached status and re-applied the healthy-uptime
+  reset on every retry, which pinned backoff at 1s and hammered the remote
+  with auth attempts during macOS dark wakes (Keychain agent refuses to
+  sign while locked).
+- The `Backoff` sleep races `stop.cancelled()` and `net.changed()`. A
+  path-change only short-circuits the sleep on the
+  `Unsatisfied -> Satisfied` edge; pure-`Satisfied` noise (which
+  `nw_path_monitor` emits during dark wakes too) is ignored so it can't
+  defeat the climb.
 - Whenever a respawn succeeds, the "healthy threshold" logic
   (`spawned_at.elapsed() >= 30s` at the *next* exit) resets `backoff` back
   to 1s. That means a tunnel that dies five minutes into a stable run waits

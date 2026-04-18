@@ -1632,7 +1632,7 @@ async fn relay(
                 // a send failure immediately and a live one round-trips a
                 // Pong that refreshes last_activity. The wall-clock heartbeat
                 // below remains the correctness backstop.
-                info!(status = ?net.status(), "network path changed during active relay; probing link");
+                debug!(status = ?net.status(), "network path changed during active relay; probing link");
                 *relay.last_ping_sent = Instant::now();
                 if !timed_send(framed, Frame::Ping, relay.last_outbound_at).await {
                     return Ok(RelayExit::Disconnected);
@@ -1875,7 +1875,7 @@ pub async fn run(
                             // and reset the backoff so a long outage
                             // followed by wifi-returns doesn't sit out the
                             // remainder of a 10s sleep.
-                            info!(status = ?net.status(), "network path changed during reconnect backoff");
+                            debug!(status = ?net.status(), "network path changed during reconnect backoff");
                             net_hint = true;
                         }
                         _ = sigterm.recv() => {
@@ -1995,7 +1995,7 @@ pub async fn run(
 
                     attempt_n += 1;
                     let attempt_started = Instant::now();
-                    info!(
+                    debug!(
                         attempt = attempt_n,
                         backoff_s = backoff.as_secs_f64(),
                         tunnel_supervisor_alive,
@@ -2144,7 +2144,7 @@ pub async fn run(
                             return Ok(1);
                         }
                         Ok(Attempt::Retry) => {
-                            info!(
+                            debug!(
                                 attempt = attempt_n,
                                 attempt_ms, "reconnect: attempt failed, will retry"
                             );
@@ -2160,7 +2160,7 @@ pub async fn run(
                             continue;
                         }
                         Err(_) => {
-                            info!(
+                            debug!(
                                 attempt = attempt_n,
                                 timeout_s = RECONNECT_ATTEMPT_TIMEOUT.as_secs(),
                                 "reconnect: attempt timed out"

@@ -645,14 +645,10 @@ async fn tunnel_monitor(
                     return;
                 }
 
-                // This child is gone; zero the probe-failure counter so
-                // a later ensure_remote_ready / spawn_tunnel retry loop
-                // doesn't operate on stale failure history before a
-                // replacement ChildState gets installed. Also drop any
-                // pending debounced net-probe -- it was aimed at the dead
-                // child.
-                state.probe_failures = 0;
-                net_probe_at = None;
+                // Drop any pending debounced net-probe and the Unsatisfied
+                // latch -- both were aimed at the dead child. probe_failures
+                // is reset by ChildState::new() when the replacement is
+                // installed below.
                 saw_unsatisfied = false;
 
                 let code = status.code();
@@ -663,81 +659,110 @@ async fn tunnel_monitor(
                     return;
                 }
 
-                let (sleep, next) = if we_killed {
+                // Apply the healthy-reset ONCE, based on how long the child
+                // that just died actually ran. Previously `state.uptime()`
+                // was re-evaluated on every retry (via `continue` to the
+                // outer select and `child.wait()` re-resolving the cached
+                // status), which meant a long-dead child's ever-growing
+                // uptime kept resetting backoff to MIN -- so
+                // ensure_remote_ready failures hammered the remote at ~1s
+                // with no climb, tripping its auth rate-limit during macOS
+                // dark wakes when the Keychain SSH agent refuses to sign.
+                let died_uptime = state.uptime();
+                let mut sleep = if we_killed {
                     we_killed = false;
-                    (Duration::ZERO, MIN_RESPAWN_BACKOFF)
+                    Duration::ZERO
                 } else {
-                    next_backoff(backoff, state.uptime())
+                    let (s, _) = next_backoff(backoff, died_uptime);
+                    s
                 };
-                backoff = next;
+                let mut backoff_saw_unsatisfied = false;
 
-                info!("ssh tunnel died, retrying in {}s", sleep.as_secs());
-
-                tokio::select! {
-                    _ = tokio::time::sleep(sleep) => {}
-                    _ = net.changed() => {
-                        // Connectivity may have returned while we were
-                        // backing off; retry now with a fresh backoff so a
-                        // long outage doesn't leave us sitting out the
-                        // remainder of a 60s sleep after wifi returns.
-                        info!("network path changed during backoff; retrying now");
-                        backoff = MIN_RESPAWN_BACKOFF;
+                let new_child = loop {
+                    info!("respawn: sleeping {}s (backoff)", sleep.as_secs());
+                    tokio::select! {
+                        _ = tokio::time::sleep(sleep) => {}
+                        _ = net.changed() => {
+                            // Only short-circuit the backoff when the path
+                            // actually recovered from an observed outage.
+                            // nw_path_monitor fires Satisfied noise during
+                            // dark wakes too; letting that reset backoff
+                            // defeats the climb entirely.
+                            let status = net.status();
+                            if status == crate::net_watch::PathStatus::Unsatisfied {
+                                backoff_saw_unsatisfied = true;
+                                info!(?status, "network path changed during backoff (no route); continuing to wait");
+                                continue;
+                            }
+                            if backoff_saw_unsatisfied {
+                                info!(?status, "network path recovered during backoff; retrying now");
+                                backoff_saw_unsatisfied = false;
+                                sleep = MIN_RESPAWN_BACKOFF;
+                            } else {
+                                info!(?status, "network path changed during backoff (noise); ignoring");
+                                continue;
+                            }
+                        }
+                        _ = stop.cancelled() => return,
                     }
-                    _ = stop.cancelled() => return,
-                }
+                    backoff = (sleep.max(MIN_RESPAWN_BACKOFF) * 2).min(MAX_RESPAWN_BACKOFF);
 
-                // Re-run ensure_remote_ready so a remote that rebooted,
-                // crashed, or was upgraded gets its gritty server started
-                // again before we point SSH at its ctl socket. Without
-                // this, spawn_tunnel succeeds (connects SSH + forwards)
-                // but the next client hits EOF on every handshake because
-                // no daemon is listening on the other side. Skipped when
-                // the tunnel was just proven healthy -- a sub-minute
-                // network blip can't have rebooted the remote, and the
-                // ~2s SSH-exec round-trip is pure reconnect latency.
-                let recently_healthy = last_healthy
-                    .is_some_and(|t| t.elapsed() < SKIP_ENSURE_REMOTE_THRESHOLD);
-                if recently_healthy && !remote_sock.is_empty() {
-                    info!(
-                        ago_s = last_healthy.map(|t| t.elapsed().as_secs()),
-                        "skipping ensure_remote_ready (tunnel recently healthy)"
-                    );
-                } else {
-                    match ensure_remote_ready(
+                    // Re-run ensure_remote_ready so a remote that rebooted,
+                    // crashed, or was upgraded gets its gritty server
+                    // started again before we point SSH at its ctl socket.
+                    // Skipped when the tunnel was just proven healthy -- a
+                    // sub-minute network blip can't have rebooted the
+                    // remote, and the ~2s SSH-exec is pure latency.
+                    let recently_healthy = last_healthy
+                        .is_some_and(|t| t.elapsed() < SKIP_ENSURE_REMOTE_THRESHOLD);
+                    if recently_healthy && !remote_sock.is_empty() {
+                        info!(
+                            ago_s = last_healthy.map(|t| t.elapsed().as_secs()),
+                            "skipping ensure_remote_ready (tunnel recently healthy)"
+                        );
+                    } else {
+                        match ensure_remote_ready(
+                            &dest,
+                            no_server_start,
+                            &extra_ssh_opts,
+                            foreground,
+                            connect_timeout,
+                        )
+                        .await
+                        {
+                            Ok((sock, _ver)) => {
+                                remote_sock = sock;
+                            }
+                            Err(e) => {
+                                warn!("ensure_remote_ready failed on respawn: {e}");
+                                sleep = backoff;
+                                continue;
+                            }
+                        }
+                    }
+
+                    match spawn_tunnel(
                         &dest,
-                        no_server_start,
+                        &local_sock,
+                        &remote_sock,
                         &extra_ssh_opts,
                         foreground,
+                        isolate_control_path,
                         connect_timeout,
                     )
                     .await
                     {
-                        Ok((sock, _ver)) => {
-                            remote_sock = sock;
-                        }
+                        Ok(c) => break c,
                         Err(e) => {
-                            warn!("ensure_remote_ready failed on respawn: {e}");
-                            // Treat like a spawn failure: back off and retry
-                            // from the top instead of racing SSH against a
-                            // stale remote_sock.
+                            warn!("failed to respawn ssh tunnel: {e}");
+                            sleep = backoff;
                             continue;
                         }
                     }
-                }
-
-                match spawn_tunnel(&dest, &local_sock, &remote_sock, &extra_ssh_opts, foreground, isolate_control_path, connect_timeout).await {
-                    Ok(new_child) => {
-                        info!("ssh tunnel respawned");
-                        state = ChildState::new(new_child);
-                        net_probe_at = None;
-                    }
-                    Err(e) => {
-                        warn!("failed to respawn ssh tunnel: {e}");
-                        // Even spawn failure is retried -- the tunnel process
-                        // might just not be available momentarily.
-                        continue;
-                    }
-                }
+                };
+                info!("ssh tunnel respawned");
+                state = ChildState::new(new_child);
+                net_probe_at = None;
             }
         }
     }
