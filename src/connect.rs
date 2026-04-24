@@ -529,7 +529,11 @@ async fn tunnel_monitor(
     // app-layer probe here, or by the caller's ensure_remote_ready that
     // produced initial_remote_sock). Gates whether respawn re-runs
     // ensure_remote_ready. Seeded now because the caller just verified it.
-    let mut last_healthy = if remote_sock.is_empty() { None } else { Some(Instant::now()) };
+    // SystemTime (not Instant) so a laptop suspend counts toward the
+    // SKIP_ENSURE_REMOTE_THRESHOLD -- Instant pauses across suspend, which
+    // made a 4-minute lid-close read as "recently healthy".
+    let mut last_healthy =
+        if remote_sock.is_empty() { None } else { Some(std::time::SystemTime::now()) };
     let net = crate::net_watch::NetWatcher::spawn();
     let mut probe_ticker = tokio::time::interval(PROBE_INTERVAL);
     probe_ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
@@ -594,7 +598,7 @@ async fn tunnel_monitor(
                 match probe_tunnel_alive(&local_sock).await {
                     Ok(()) => {
                         state.probe_failures = 0;
-                        last_healthy = Some(Instant::now());
+                        last_healthy = Some(std::time::SystemTime::now());
                         saw_unsatisfied = false;
                     }
                     Err(why) if state.past_spawn_grace() => {
@@ -618,7 +622,7 @@ async fn tunnel_monitor(
                             info!("tunnel probe recovered");
                         }
                         state.probe_failures = 0;
-                        last_healthy = Some(Instant::now());
+                        last_healthy = Some(std::time::SystemTime::now());
                         saw_unsatisfied = false;
                     }
                     Err(why) => {
@@ -749,11 +753,13 @@ async fn tunnel_monitor(
                     // Skipped when the tunnel was just proven healthy -- a
                     // sub-minute network blip can't have rebooted the
                     // remote, and the ~2s SSH-exec is pure latency.
-                    let recently_healthy = last_healthy
-                        .is_some_and(|t| t.elapsed() < SKIP_ENSURE_REMOTE_THRESHOLD);
+                    let healthy_ago =
+                        last_healthy.map(|t| t.elapsed().unwrap_or(Duration::ZERO));
+                    let recently_healthy =
+                        healthy_ago.is_some_and(|d| d < SKIP_ENSURE_REMOTE_THRESHOLD);
                     if recently_healthy && !remote_sock.is_empty() {
                         info!(
-                            ago_s = last_healthy.map(|t| t.elapsed().as_secs()),
+                            ago_s = healthy_ago.map(|d| d.as_secs()),
                             "skipping ensure_remote_ready (tunnel recently healthy)"
                         );
                     } else {

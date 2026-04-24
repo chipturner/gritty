@@ -288,7 +288,9 @@ The re-prime is **skipped** when `last_healthy` (the most recent successful
 app-layer probe, seeded from the caller's initial `ensure_remote_ready`) is
 within `SKIP_ENSURE_REMOTE_THRESHOLD` (60s). A sub-minute network blip can't
 plausibly have rebooted the remote, and the ~2s SSH-exec round-trip is pure
-reconnect latency on the common path. Beyond 60s we re-verify.
+reconnect latency on the common path. Beyond 60s we re-verify. `last_healthy`
+is a `SystemTime` (wall-clock), not `Instant`, so time spent in laptop
+suspend counts toward the threshold -- a 4-minute lid-close must re-prime.
 
 ### Shutdown
 

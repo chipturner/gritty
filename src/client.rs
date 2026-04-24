@@ -2124,14 +2124,28 @@ pub async fn run(
                             return Ok(1);
                         }
                         Ok(Attempt::HandshakeErr(msg)) => {
-                            write_stdout_async(
-                                &async_stdout,
-                                format!("\x1b[?1049l\r\x1b[31m\u{25b8} {msg}\x1b[0m\x1b[K\r\n")
-                                    .as_bytes(),
-                            )
-                            .await?;
                             if is_terminal_handshake_err(&msg, tunnel_supervisor_alive) {
+                                write_stdout_async(
+                                    &async_stdout,
+                                    format!("\x1b[?1049l\r\x1b[31m\u{25b8} {msg}\x1b[0m\x1b[K\r\n")
+                                        .as_bytes(),
+                                )
+                                .await?;
                                 return Ok(1);
+                            }
+                            // Transient accept-then-EOF from a dying ssh -L
+                            // during supervisor respawn -- identical to
+                            // Attempt::Retry, just reached via handshake()
+                            // instead of connect(). Do NOT write the red
+                            // error or ?1049l here: it kicks the user out of
+                            // alt-screen on every wake-from-suspend.
+                            info!(
+                                attempt = attempt_n,
+                                attempt_ms,
+                                "reconnect: transient handshake err ({msg}), will retry"
+                            );
+                            if tunnel_supervisor_alive {
+                                backoff = Duration::ZERO;
                             }
                             continue;
                         }
