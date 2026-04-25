@@ -185,11 +185,15 @@ backoff not trip the client's short socket-gone grace.
    `--ignore-version-mismatch` (predates the in-band v15 mismatch
    recovery, still used as a pre-flight for `tunnel-create` since we
    can't talk to the remote daemon without ssh).
-4. **Starting.SpawnChild -> Starting.WaitForSocket** -- ssh spawned with
-   `exec sleep 2147483647` as its remote command. Not `-N`: a mux client
-   with `-N` exits 0 immediately after the master accepts the forward. A
-   blocking remote command keeps a session channel open so the child's
-   lifetime tracks the forward in both mux and standalone modes. Stderr is
+4. **Starting.SpawnChild -> Starting.WaitForSocket** -- ssh spawned. With
+   `isolate_control_path` (the default) it uses `-N`: no remote process,
+   so a half-open drop (local ssh exits on `ServerAliveInterval`; remote
+   sshd waits ~2h for TCP keepalive) leaks nothing user-visible on the
+   remote. When riding a mux (`isolate_control_path=false`), `-N` would
+   make the mux client exit 0 immediately after the master accepts the
+   forward, so instead `exec sleep 2147483647` is used as the remote
+   command to keep a session channel open -- this can leak `sleep`
+   processes on the remote across half-open drops. Stderr is
    drained to our stderr (== `.out` in daemonized mode) so mux errors like
    `mux_client_forward: forwarding request failed` surface without waiting
    for `wait_for_socket` to time out.

@@ -292,11 +292,22 @@ fn tunnel_command(
     cmd.arg("-T");
     let forward = format!("{}:{}", local_sock.display(), remote_sock);
     cmd.arg("-L").arg(forward);
+    if isolate_control_path {
+        // Standalone ssh: -N blocks until the connection closes and spawns no
+        // remote process -- so a half-open TCP (ServerAliveInterval kills the
+        // local side; remote sshd waits ~2h for TCP keepalive) leaks nothing
+        // user-visible on the remote.
+        cmd.arg("-N");
+    }
     cmd.arg(dest.ssh_dest());
-    // Not -N: a mux client with -N exits 0 immediately after the master accepts
-    // the forward. A blocking remote command keeps a session channel open so the
-    // child's lifetime tracks the forward in both mux and standalone modes.
-    cmd.arg("exec sleep 2147483647");
+    if !isolate_control_path {
+        // Mux client: -N exits 0 immediately after the master accepts the
+        // forward, so the supervisor can't track the forward's lifetime. A
+        // blocking remote command keeps a session channel open so the child's
+        // lifetime tracks the forward. This can leak `sleep` processes on the
+        // remote across half-open drops -- documented opt-in footgun.
+        cmd.arg("exec sleep 2147483647");
+    }
     cmd.stdout(Stdio::null());
     cmd.stderr(Stdio::piped());
     cmd.stdin(Stdio::null());
@@ -1746,7 +1757,8 @@ mod tests {
         assert!(!args.contains(&"ControlPath=none".to_string()));
         assert!(args.contains(&"ForwardAgent=no".to_string()));
         assert!(args.contains(&"ForwardX11=no".to_string()));
-        // Tunnel flags and forward
+        // Tunnel flags and forward. Mux (non-isolated) mode keeps the remote
+        // sleep so the mux client's lifetime tracks the forward.
         assert!(!args.contains(&"-N".to_string()));
         assert!(args.contains(&"-T".to_string()));
         assert!(args.contains(&"/tmp/local.sock:/run/user/1000/gritty/ctl.sock".to_string()));
@@ -1788,6 +1800,10 @@ mod tests {
         let args: Vec<_> =
             cmd.as_std().get_args().map(|a| a.to_string_lossy().to_string()).collect();
         assert!(args.contains(&"ControlPath=none".to_string()));
+        // Isolated (default) path uses -N -- no remote sleep to leak across
+        // half-open drops.
+        assert!(args.contains(&"-N".to_string()));
+        assert!(!args.iter().any(|a| a.contains("sleep")));
     }
 
     #[test]
