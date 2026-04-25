@@ -1879,10 +1879,12 @@ pub async fn run(
                             net_hint = true;
                         }
                         _ = sigterm.recv() => {
+                            info!("reconnect: exiting -- SIGTERM");
                             write_stdout_async(&async_stdout, b"\r\n").await?;
                             return Ok(1);
                         }
                         _ = sighup.recv() => {
+                            info!("reconnect: exiting -- SIGHUP");
                             write_stdout_async(&async_stdout, b"\r\n").await?;
                             return Ok(1);
                         }
@@ -1891,11 +1893,12 @@ pub async fn run(
                             let mut peek = [0u8; 1];
                             match guard.try_io(|inner| inner.get_ref().read(&mut peek)) {
                                 Ok(Ok(1)) if peek[0] == 0x03 => {
+                                    info!("reconnect: exiting -- Ctrl-C");
                                     write_stdout_async(&async_stdout, b"\r\n").await?;
                                     return Ok(1);
                                 }
                                 Ok(Ok(0)) | Ok(Err(_)) => {
-                                    // stdin EOF or error -- terminal is gone
+                                    info!("reconnect: exiting -- stdin EOF/error");
                                     return Ok(1);
                                 }
                                 _ => {}
@@ -1965,6 +1968,10 @@ pub async fn run(
                     if !ctl_path.exists() && !tunnel_supervisor_alive {
                         let first_seen = *socket_missing_since.get_or_insert_with(Instant::now);
                         if first_seen.elapsed() >= SOCKET_GONE_GRACE {
+                            info!(
+                                gone_s = first_seen.elapsed().as_secs_f64(),
+                                "reconnect: exiting -- ctl socket gone and no supervisor"
+                            );
                             // `\x1b[?1049l` leaves alt-screen first so the
                             // error is visible on main screen -- otherwise
                             // RawModeGuard's Drop emits it after the fact
@@ -2089,6 +2096,10 @@ pub async fn run(
                             break;
                         }
                         Ok(Attempt::SessionGone(message)) => {
+                            info!(
+                                attempt = attempt_n,
+                                "reconnect: exiting -- session gone: {message}"
+                            );
                             write_stdout_async(
                                 &async_stdout,
                                 format!(
@@ -2100,6 +2111,10 @@ pub async fn run(
                             return Ok(1);
                         }
                         Ok(Attempt::ServerRestarted) => {
+                            info!(
+                                attempt = attempt_n,
+                                "reconnect: exiting -- server_id changed (remote daemon restarted)"
+                            );
                             write_stdout_async(
                                 &async_stdout,
                                 b"\x1b[?1049l\r\x1b[31m\xe2\x96\xb8 server restarted -- session is gone; reconnect manually\x1b[0m\x1b[K\r\n",
@@ -2108,6 +2123,10 @@ pub async fn run(
                             return Ok(1);
                         }
                         Ok(Attempt::OwnerChanged) => {
+                            info!(
+                                attempt = attempt_n,
+                                "reconnect: exiting -- owner_device_id mismatch (session taken over)"
+                            );
                             write_stdout_async(
                                 &async_stdout,
                                 b"\x1b[?1049l\r\x1b[31m\xe2\x96\xb8 session taken over by another client\x1b[0m\x1b[K\r\n",
@@ -2117,6 +2136,12 @@ pub async fn run(
                         }
                         Ok(Attempt::VersionMismatch { server_version }) => {
                             let local = crate::protocol::PROTOCOL_VERSION;
+                            info!(
+                                attempt = attempt_n,
+                                local,
+                                remote = server_version,
+                                "reconnect: exiting -- protocol version mismatch"
+                            );
                             let msg = format!(
                                 "\x1b[?1049l\r\x1b[31m\u{25b8} protocol version mismatch (local={local} remote={server_version}) -- run `gritty restart` to upgrade\x1b[0m\x1b[K\r\n"
                             );
@@ -2125,6 +2150,11 @@ pub async fn run(
                         }
                         Ok(Attempt::HandshakeErr(msg)) => {
                             if is_terminal_handshake_err(&msg, tunnel_supervisor_alive) {
+                                info!(
+                                    attempt = attempt_n,
+                                    tunnel_supervisor_alive,
+                                    "reconnect: exiting -- terminal handshake error: {msg}"
+                                );
                                 write_stdout_async(
                                     &async_stdout,
                                     format!("\x1b[?1049l\r\x1b[31m\u{25b8} {msg}\x1b[0m\x1b[K\r\n")
@@ -2150,6 +2180,10 @@ pub async fn run(
                             continue;
                         }
                         Ok(Attempt::DaemonGone) => {
+                            info!(
+                                attempt = attempt_n,
+                                "reconnect: exiting -- ECONNREFUSED on stale socket, no supervisor"
+                            );
                             write_stdout_async(
                                 &async_stdout,
                                 b"\x1b[?1049l\r\x1b[31m\xe2\x96\xb8 daemon appears to have crashed -- session is gone; run `gritty server` or `gritty restart`\x1b[0m\x1b[K\r\n",
@@ -2344,6 +2378,7 @@ pub async fn tail(
                     if !ctl_path.exists() && !tunnel_supervisor_alive {
                         let first_seen = *socket_missing_since.get_or_insert_with(Instant::now);
                         if first_seen.elapsed() >= SOCKET_GONE_GRACE {
+                            info!("tail reconnect: exiting -- ctl socket gone and no supervisor");
                             eprintln!(
                                 "\r\x1b[31m\u{25b8} server socket gone -- session is unreachable; reconnect manually\x1b[0m\x1b[K"
                             );
@@ -2420,6 +2455,7 @@ pub async fn tail(
 
                     match outcome {
                         Ok(Outcome::Connected(new_framed)) => {
+                            info!("tail reconnect: connected");
                             if show_chrome {
                                 eprintln!("\r\x1b[32m\u{25b8} reconnected\x1b[0m\x1b[K");
                             }
@@ -2429,26 +2465,36 @@ pub async fn tail(
                             break;
                         }
                         Ok(Outcome::ServerRestarted) => {
+                            info!("tail reconnect: exiting -- server_id changed");
                             eprintln!(
                                 "\r\x1b[31m\u{25b8} server restarted -- session is gone; reconnect manually\x1b[0m\x1b[K"
                             );
                             break 'outer 1;
                         }
                         Ok(Outcome::VersionMismatch { local, remote }) => {
+                            info!(
+                                local,
+                                remote, "tail reconnect: exiting -- protocol version mismatch"
+                            );
                             eprintln!(
                                 "\r\x1b[31m\u{25b8} protocol version mismatch (local={local} remote={remote}) -- run `gritty restart` to upgrade\x1b[0m\x1b[K"
                             );
                             break 'outer 1;
                         }
                         Ok(Outcome::HandshakeRejected(msg)) => {
+                            info!("tail reconnect: exiting -- terminal handshake error: {msg}");
                             eprintln!("\r\x1b[31m\u{25b8} {msg}\x1b[0m\x1b[K");
                             break 'outer 1;
                         }
                         Ok(Outcome::SessionGone(message)) => {
+                            info!("tail reconnect: exiting -- session gone: {message}");
                             eprintln!("\r\x1b[31m\u{25b8} session gone: {message}\x1b[0m\x1b[K");
                             break 'outer 1;
                         }
                         Ok(Outcome::DaemonGone) => {
+                            info!(
+                                "tail reconnect: exiting -- ECONNREFUSED on stale socket, no supervisor"
+                            );
                             eprintln!(
                                 "\r\x1b[31m\u{25b8} daemon appears to have crashed -- session is gone; run `gritty server` or `gritty restart`\x1b[0m\x1b[K"
                             );
