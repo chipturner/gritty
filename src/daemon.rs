@@ -608,6 +608,7 @@ async fn dispatch_control(
                         initial_rows: rows,
                         cwd: cwd_for_server,
                         initial_device_id: device_id,
+                        idle_evict_timeout: crate::protocol::IDLE_EVICT_TIMEOUT,
                     },
                 )
                 .instrument(session_span),

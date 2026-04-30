@@ -34,6 +34,7 @@ pub struct SessionConfig {
     pub initial_rows: u16,
     pub cwd: Option<String>,
     pub initial_device_id: u64,
+    pub idle_evict_timeout: Duration,
 }
 
 impl Default for SessionConfig {
@@ -50,6 +51,7 @@ impl Default for SessionConfig {
             initial_rows: 0,
             cwd: None,
             initial_device_id: 0,
+            idle_evict_timeout: IDLE_EVICT_TIMEOUT,
         }
     }
 }
@@ -1531,6 +1533,7 @@ pub async fn run(
         initial_rows,
         cwd,
         initial_device_id,
+        idle_evict_timeout,
     } = config;
     // Allocate PTY with initial window size when available
     let winsize = if initial_cols > 0 && initial_rows > 0 {
@@ -2106,17 +2109,25 @@ pub async fn run(
                     }
 
                     // Idle client eviction: if no frame (not even a Ping)
-                    // has arrived in IDLE_EVICT_TIMEOUT, treat the TCP link
+                    // has arrived in idle_evict_timeout, treat the TCP link
                     // as half-open and release the slot so a new client can
                     // attach. The client's heartbeat cadence (PING_IDLE=10s,
                     // PING_TIMEOUT=60s) means 120s of total silence already
                     // indicates the client has given up or the link is dead.
-                    () = tokio::time::sleep_until(last_client_frame_at + IDLE_EVICT_TIMEOUT) => {
+                    //
+                    // Close the socket -- do NOT send Frame::Detached. A
+                    // suspended laptop is the common cause of this timeout,
+                    // and a Detached frame would sit buffered in sshd's TCP
+                    // send queue until wake, at which point the client
+                    // reads it as a terminal "taken over" and exits 0
+                    // instead of reconnecting. EOF instead routes the
+                    // client to RelayExit::Disconnected -> auto-reconnect.
+                    () = tokio::time::sleep_until(last_client_frame_at + idle_evict_timeout) => {
                         warn!(
                             "client silent for {:?}, evicting to release attach slot",
-                            IDLE_EVICT_TIMEOUT
+                            idle_evict_timeout
                         );
-                        let _ = send_framed_timed(&mut framed, Frame::Detached).await;
+                        let _ = framed.close().await;
                         break RelayExit::ClientGone;
                     }
 

@@ -361,6 +361,93 @@ async fn second_client_detaches_first() {
 }
 
 #[tokio::test]
+async fn idle_evict_closes_socket_not_detached() {
+    // Regression: idle-evict used to send Frame::Detached, which a suspended
+    // laptop would read on wake as a terminal "taken over" and exit 0 instead
+    // of reconnecting. It must close the socket (EOF) so the client routes to
+    // its auto-reconnect loop, and the session must survive for that reconnect.
+    let (client_tx, client_rx) = mpsc::unbounded_channel();
+    let meta = Arc::new(OnceLock::new());
+    let meta_clone = Arc::clone(&meta);
+    let agent_path = unique_agent_socket_path();
+    let svc_path = unique_svc_socket_path();
+    let server = tokio::spawn(async move {
+        gritty::server::run(
+            client_rx,
+            meta_clone,
+            SessionConfig {
+                agent_socket_path: agent_path,
+                svc_socket_path: svc_path,
+                idle_evict_timeout: Duration::from_secs(2),
+                ..Default::default()
+            },
+        )
+        .await
+    });
+
+    let (server_stream, client_stream) = UnixStream::pair().unwrap();
+    client_tx
+        .send(ClientConn::Active {
+            framed: Framed::new(server_stream, FrameCodec),
+            client_name: String::new(),
+            capabilities: 0,
+            cols: 0,
+            rows: 0,
+        })
+        .unwrap();
+    let mut client1 = Framed::new(client_stream, FrameCodec);
+    client1.send(Frame::Env { vars: vec![] }).await.unwrap();
+    wait_for_shell(&mut client1).await;
+    read_available_data(&mut client1, Duration::from_millis(200)).await;
+
+    // Anchor last_client_frame_at so the evict window starts now, not at the
+    // Resize sent inside wait_for_shell.
+    client1.send(Frame::Ping).await.unwrap();
+
+    // Go silent: the idle-evict arm should fire after ~2s. The client must
+    // observe EOF (None), never Frame::Detached.
+    loop {
+        match timeout(Duration::from_secs(5), client1.next()).await {
+            Ok(Some(Ok(Frame::Detached))) => {
+                panic!("idle-evict sent Frame::Detached; client would exit instead of reconnecting")
+            }
+            Ok(Some(Ok(Frame::Data(_)))) => continue,
+            Ok(Some(Ok(_))) => continue,
+            Ok(Some(Err(_))) | Ok(None) => break,
+            Err(_) => panic!("idle-evict did not fire within 5s"),
+        }
+    }
+    assert!(
+        !meta.get().map(|m| m.attached.load(Ordering::Relaxed)).unwrap_or(true),
+        "session should be marked detached after idle-evict",
+    );
+
+    // Session must survive: a fresh client can attach and interact.
+    let (server_stream2, client_stream2) = UnixStream::pair().unwrap();
+    client_tx
+        .send(ClientConn::Active {
+            framed: Framed::new(server_stream2, FrameCodec),
+            client_name: String::new(),
+            capabilities: 0,
+            cols: 0,
+            rows: 0,
+        })
+        .unwrap();
+    let mut client2 = Framed::new(client_stream2, FrameCodec);
+    client2.send(Frame::Resize { cols: 80, rows: 24 }).await.unwrap();
+    client2.send(Frame::Data(Bytes::from("echo EVICT_OK\n"))).await.unwrap();
+    let output = read_available_data(&mut client2, Duration::from_secs(2)).await;
+    let output_str = String::from_utf8_lossy(&output);
+    assert!(
+        output_str.contains("EVICT_OK"),
+        "reconnecting client should be able to use the session, got: {output_str}",
+    );
+
+    let _ = client2.send(Frame::Data(Bytes::from("exit\n"))).await;
+    let _ = timeout(Duration::from_secs(3), server).await;
+}
+
+#[tokio::test]
 async fn exit_code_zero_sends_exit_frame() {
     let (_tx, mut framed, _server, _meta) = setup_session().await;
     wait_for_shell(&mut framed).await;
