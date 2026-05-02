@@ -725,12 +725,15 @@ impl ClientRelay<'_> {
                     match tokio::net::UnixStream::connect(sock_path).await {
                         Ok(stream) => {
                             let (read_half, write_half) = stream.into_split();
+                            let (writer_tx, writer_rx) = crate::relay_writer_channel();
+                            self.agent.channels.insert(channel_id, writer_tx);
                             let data_tx = self.agent_event_tx.clone();
                             let close_tx = self.agent_event_tx.clone();
-                            let writer_tx = crate::spawn_channel_relay(
+                            crate::spawn_channel_relay(
                                 channel_id,
                                 read_half,
                                 write_half,
+                                writer_rx,
                                 move |id, data| {
                                     data_tx.send(AgentEvent::Data { channel_id: id, data }).is_ok()
                                 },
@@ -738,7 +741,6 @@ impl ClientRelay<'_> {
                                     let _ = close_tx.send(AgentEvent::Closed { channel_id: id });
                                 },
                             );
-                            self.agent.channels.insert(channel_id, writer_tx);
                         }
                         Err(e) => {
                             debug!("failed to connect to local agent: {e}");
@@ -834,6 +836,7 @@ impl ClientRelay<'_> {
                                         tokio::time::timeout_at(deadline, listener.accept()).await;
                                     match accept {
                                         Ok(Ok((stream, _))) => {
+                                            let _ = stream.set_nodelay(true);
                                             let channel_id =
                                                 next_id.fetch_add(1, Ordering::Relaxed);
                                             let (read_half, write_half) = stream.into_split();
@@ -974,13 +977,17 @@ impl ClientRelay<'_> {
                 }
                 match tokio::net::TcpStream::connect(("127.0.0.1", expected_port)).await {
                     Ok(stream) => {
+                        let _ = stream.set_nodelay(true);
                         let (read_half, write_half) = stream.into_split();
+                        let (writer_tx, writer_rx) = crate::relay_writer_channel();
+                        self.pf.channels.insert(channel_id, (forward_id, writer_tx));
                         let data_tx = self.pf_event_tx.clone();
                         let close_tx = self.pf_event_tx.clone();
-                        let writer_tx = crate::spawn_channel_relay(
+                        crate::spawn_channel_relay(
                             channel_id,
                             read_half,
                             write_half,
+                            writer_rx,
                             move |id, data| {
                                 data_tx
                                     .send(ClientPortForwardEvent::Data { channel_id: id, data })
@@ -991,7 +998,6 @@ impl ClientRelay<'_> {
                                     .send(ClientPortForwardEvent::Closed { channel_id: id });
                             },
                         );
-                        self.pf.channels.insert(channel_id, (forward_id, writer_tx));
                     }
                     Err(e) => {
                         debug!(channel_id, expected_port, "pf connect failed: {e}");
@@ -1248,24 +1254,13 @@ impl ClientRelay<'_> {
                                 Ok(conn) => conn,
                                 Err(_) => break,
                             };
+                            let _ = stream.set_nodelay(true);
                             let channel_id = nid.fetch_add(2, Ordering::Relaxed);
                             let (read_half, write_half) = stream.into_split();
-                            let data_tx = tx.clone();
-                            let close_tx = tx.clone();
-                            let writer_tx = crate::spawn_channel_relay(
-                                channel_id,
-                                read_half,
-                                write_half,
-                                move |id, data| {
-                                    data_tx
-                                        .send(ClientPortForwardEvent::Data { channel_id: id, data })
-                                        .is_ok()
-                                },
-                                move |id| {
-                                    let _ = close_tx
-                                        .send(ClientPortForwardEvent::Closed { channel_id: id });
-                                },
-                            );
+                            let (writer_tx, writer_rx) = crate::relay_writer_channel();
+                            // Accepted MUST be enqueued before the reader task
+                            // can enqueue Data, or the relay loop drops Data
+                            // for an unknown channel.
                             if tx
                                 .send(ClientPortForwardEvent::Accepted {
                                     forward_id: fwd_id,
@@ -1276,6 +1271,23 @@ impl ClientRelay<'_> {
                             {
                                 break;
                             }
+                            let data_tx = tx.clone();
+                            let close_tx = tx.clone();
+                            crate::spawn_channel_relay(
+                                channel_id,
+                                read_half,
+                                write_half,
+                                writer_rx,
+                                move |id, data| {
+                                    data_tx
+                                        .send(ClientPortForwardEvent::Data { channel_id: id, data })
+                                        .is_ok()
+                                },
+                                move |id| {
+                                    let _ = close_tx
+                                        .send(ClientPortForwardEvent::Closed { channel_id: id });
+                                },
+                            );
                         }
                     });
                     self.pf.forwards.insert(

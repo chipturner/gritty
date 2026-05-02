@@ -172,8 +172,6 @@ enum ClipboardEvent {
 
 /// Events from tunnel TCP connection tasks to the main relay loop.
 enum TunnelEvent {
-    Connected { channel_id: u32, stream: tokio::net::TcpStream },
-    ConnectFailed { channel_id: u32 },
     Data { channel_id: u32, data: Bytes },
     Closed { channel_id: u32 },
 }
@@ -182,10 +180,6 @@ enum TunnelEvent {
 enum PortForwardEvent {
     /// TCP connection accepted on a listening port.
     Accepted { forward_id: u32, channel_id: u32, writer_tx: mpsc::Sender<Bytes> },
-    /// Background TCP connect completed (remote-fwd PortForwardOpen).
-    Connected { forward_id: u32, channel_id: u32, stream: tokio::net::TcpStream },
-    /// Background TCP connect failed.
-    ConnectFailed { channel_id: u32 },
     /// Data from a TCP connection.
     Data { channel_id: u32, data: Bytes },
     /// TCP connection closed.
@@ -406,22 +400,24 @@ fn spawn_agent_acceptor(
             let channel_id = next_channel_id.fetch_add(1, Ordering::Relaxed);
 
             let (read_half, write_half) = stream.into_split();
+            let (writer_tx, writer_rx) = crate::relay_writer_channel();
+            // Accepted MUST be enqueued before the reader task can enqueue
+            // Data, or the relay loop drops Data for an unknown channel.
+            if event_tx.send(AgentEvent::Accepted { channel_id, writer_tx }).is_err() {
+                break; // relay loop is gone
+            }
             let data_tx = event_tx.clone();
             let close_tx = event_tx.clone();
-            let writer_tx = crate::spawn_channel_relay(
+            crate::spawn_channel_relay(
                 channel_id,
                 read_half,
                 write_half,
+                writer_rx,
                 move |id, data| data_tx.send(AgentEvent::Data { channel_id: id, data }).is_ok(),
                 move |id| {
                     let _ = close_tx.send(AgentEvent::Closed { channel_id: id });
                 },
             );
-
-            // Notify the relay loop about the new connection
-            if event_tx.send(AgentEvent::Accepted { channel_id, writer_tx }).is_err() {
-                break; // relay loop is gone
-            }
         }
     })
 }
@@ -445,14 +441,25 @@ fn spawn_pf_tcp_acceptor(
                 }
             };
 
+            let _ = stream.set_nodelay(true);
             let channel_id = next_channel_id.fetch_add(2, Ordering::Relaxed);
             let (read_half, write_half) = stream.into_split();
+            let (writer_tx, writer_rx) = crate::relay_writer_channel();
+            // Accepted MUST be enqueued before the reader task can enqueue
+            // Data, or the relay loop drops Data for an unknown channel.
+            if event_tx
+                .send(PortForwardEvent::Accepted { forward_id, channel_id, writer_tx })
+                .is_err()
+            {
+                break;
+            }
             let data_tx = event_tx.clone();
             let close_tx = event_tx.clone();
-            let writer_tx = crate::spawn_channel_relay(
+            crate::spawn_channel_relay(
                 channel_id,
                 read_half,
                 write_half,
+                writer_rx,
                 move |id, data| {
                     data_tx.send(PortForwardEvent::Data { channel_id: id, data }).is_ok()
                 },
@@ -460,13 +467,6 @@ fn spawn_pf_tcp_acceptor(
                     let _ = close_tx.send(PortForwardEvent::Closed { channel_id: id });
                 },
             );
-
-            if event_tx
-                .send(PortForwardEvent::Accepted { forward_id, channel_id, writer_tx })
-                .is_err()
-            {
-                break;
-            }
         }
     })
 }
@@ -967,17 +967,19 @@ impl ServerRelay<'_> {
             Some(Ok(Frame::TunnelOpen { channel_id })) => {
                 if let Some(port) = self.tunnel.port {
                     self.tunnel.idle_deadline = None;
-                    let tx = self.tunnel_event_tx.clone();
-                    tokio::spawn(async move {
-                        match tokio::net::TcpStream::connect(("127.0.0.1", port)).await {
-                            Ok(stream) => {
-                                let _ = tx.send(TunnelEvent::Connected { channel_id, stream });
-                            }
-                            Err(_) => {
-                                let _ = tx.send(TunnelEvent::ConnectFailed { channel_id });
-                            }
+                    // Inline connect + register so the follow-up TunnelData
+                    // (next frame, and `biased` polls `framed.next()` first)
+                    // finds a writer instead of being dropped.
+                    match tokio::net::TcpStream::connect(("127.0.0.1", port)).await {
+                        Ok(stream) => {
+                            let _ = stream.set_nodelay(true);
+                            self.register_tunnel_channel(channel_id, stream);
                         }
-                    });
+                        Err(_) => {
+                            let _ =
+                                send_framed_timed(framed, Frame::TunnelClose { channel_id }).await;
+                        }
+                    }
                 }
             }
             Some(Ok(Frame::TunnelData { channel_id, data })) => {
@@ -1010,22 +1012,47 @@ impl ServerRelay<'_> {
                 }
             }
             Some(Ok(Frame::PortForwardOpen { forward_id, channel_id, target_port })) => {
+                // Connect inline (loopback is instant -- success or
+                // ECONNREFUSED) so the channel is registered before the next
+                // frame. Spawning this lets a biased `framed.next()` read the
+                // follow-up PortForwardData first and drop it on the floor,
+                // which is why rf web page loads stalled: the browser's GET
+                // arrived before the connect task ran.
                 if self.pf.forwards.contains_key(&forward_id) {
-                    let tx = self.pf_event_tx.clone();
-                    tokio::spawn(async move {
-                        match tokio::net::TcpStream::connect(("127.0.0.1", target_port)).await {
-                            Ok(stream) => {
-                                let _ = tx.send(PortForwardEvent::Connected {
-                                    forward_id,
-                                    channel_id,
-                                    stream,
-                                });
+                    match tokio::net::TcpStream::connect(("127.0.0.1", target_port)).await {
+                        Ok(stream) => {
+                            let _ = stream.set_nodelay(true);
+                            let (read_half, write_half) = stream.into_split();
+                            let (writer_tx, writer_rx) = crate::relay_writer_channel();
+                            self.pf.channels.insert(channel_id, (forward_id, writer_tx.clone()));
+                            if let Some(fwd) = self.pf.forwards.get_mut(&forward_id) {
+                                fwd.channels.insert(channel_id, writer_tx);
                             }
-                            Err(_) => {
-                                let _ = tx.send(PortForwardEvent::ConnectFailed { channel_id });
-                            }
+                            let data_tx = self.pf_event_tx.clone();
+                            let close_tx = self.pf_event_tx.clone();
+                            crate::spawn_channel_relay(
+                                channel_id,
+                                read_half,
+                                write_half,
+                                writer_rx,
+                                move |id, data| {
+                                    data_tx
+                                        .send(PortForwardEvent::Data { channel_id: id, data })
+                                        .is_ok()
+                                },
+                                move |id| {
+                                    let _ =
+                                        close_tx.send(PortForwardEvent::Closed { channel_id: id });
+                                },
+                            );
                         }
-                    });
+                        Err(e) => {
+                            debug!(channel_id, target_port, "rf connect failed: {e}");
+                            let _ =
+                                send_framed_timed(framed, Frame::PortForwardClose { channel_id })
+                                    .await;
+                        }
+                    }
                 }
             }
             Some(Ok(Frame::PortForwardData { channel_id, data })) => {
@@ -1200,6 +1227,25 @@ impl ServerRelay<'_> {
         }
     }
 
+    fn register_tunnel_channel(&mut self, channel_id: u32, stream: tokio::net::TcpStream) {
+        debug!(channel_id, "tunnel channel connected");
+        let (read_half, write_half) = stream.into_split();
+        let (writer_tx, writer_rx) = crate::relay_writer_channel();
+        self.tunnel.channels.insert(channel_id, writer_tx);
+        let tx = self.tunnel_event_tx.clone();
+        let close_tx = self.tunnel_event_tx.clone();
+        crate::spawn_channel_relay(
+            channel_id,
+            read_half,
+            write_half,
+            writer_rx,
+            move |id, data| tx.send(TunnelEvent::Data { channel_id: id, data }).is_ok(),
+            move |id| {
+                let _ = close_tx.send(TunnelEvent::Closed { channel_id: id });
+            },
+        );
+    }
+
     #[allow(clippy::collapsible_match)]
     async fn handle_tunnel_event(
         &mut self,
@@ -1207,50 +1253,6 @@ impl ServerRelay<'_> {
         event: Option<TunnelEvent>,
     ) {
         match event {
-            Some(TunnelEvent::Connected { channel_id, stream }) => {
-                if self.tunnel.port.is_some() {
-                    debug!(channel_id, "tunnel channel connected");
-                    self.tunnel.idle_deadline = None;
-                    let (mut read_half, write_half) = stream.into_split();
-                    let (writer_tx, mut writer_rx) =
-                        mpsc::channel::<Bytes>(crate::CHANNEL_RELAY_BUFFER);
-                    self.tunnel.channels.insert(channel_id, writer_tx);
-
-                    // Writer task: channel -> TCP
-                    tokio::spawn(async move {
-                        use tokio::io::AsyncWriteExt;
-                        let mut writer = write_half;
-                        while let Some(data) = writer_rx.recv().await {
-                            if writer.write_all(&data).await.is_err() {
-                                break;
-                            }
-                        }
-                    });
-
-                    // Reader task: TCP -> TunnelEvent
-                    let tx = self.tunnel_event_tx.clone();
-                    tokio::spawn(async move {
-                        let mut buf = vec![0u8; 4096];
-                        loop {
-                            match read_half.read(&mut buf).await {
-                                Ok(0) | Err(_) => {
-                                    let _ = tx.send(TunnelEvent::Closed { channel_id });
-                                    break;
-                                }
-                                Ok(n) => {
-                                    let data = Bytes::copy_from_slice(&buf[..n]);
-                                    if tx.send(TunnelEvent::Data { channel_id, data }).is_err() {
-                                        break;
-                                    }
-                                }
-                            }
-                        }
-                    });
-                }
-            }
-            Some(TunnelEvent::ConnectFailed { channel_id }) => {
-                let _ = send_framed_timed(framed, Frame::TunnelClose { channel_id }).await;
-            }
             Some(TunnelEvent::Data { channel_id, data }) => {
                 // Gate on channels map membership, mirroring agent/pf
                 // siblings. Without this, a stale reader task from a
@@ -1309,31 +1311,6 @@ impl ServerRelay<'_> {
                         })
                         .await;
                 }
-            }
-            Some(PortForwardEvent::Connected { forward_id, channel_id, stream }) => {
-                if self.pf.forwards.contains_key(&forward_id) {
-                    let (read_half, write_half) = stream.into_split();
-                    let data_tx = self.pf_event_tx.clone();
-                    let close_tx = self.pf_event_tx.clone();
-                    let writer_tx = crate::spawn_channel_relay(
-                        channel_id,
-                        read_half,
-                        write_half,
-                        move |id, data| {
-                            data_tx.send(PortForwardEvent::Data { channel_id: id, data }).is_ok()
-                        },
-                        move |id| {
-                            let _ = close_tx.send(PortForwardEvent::Closed { channel_id: id });
-                        },
-                    );
-                    self.pf.channels.insert(channel_id, (forward_id, writer_tx.clone()));
-                    if let Some(fwd) = self.pf.forwards.get_mut(&forward_id) {
-                        fwd.channels.insert(channel_id, writer_tx);
-                    }
-                }
-            }
-            Some(PortForwardEvent::ConnectFailed { channel_id }) => {
-                let _ = send_framed_timed(framed, Frame::PortForwardClose { channel_id }).await;
             }
             Some(PortForwardEvent::Data { channel_id, data }) => {
                 if self.pf.channels.contains_key(&channel_id) {

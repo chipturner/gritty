@@ -2145,10 +2145,8 @@ async fn remote_forward_data_roundtrip() {
     let channel_id = 42u32;
     framed.send(Frame::PortForwardOpen { forward_id, channel_id, target_port }).await.unwrap();
 
-    // Server should connect to target_port and start relaying.
-    // Send data client -> server -> echo server -> server -> client
-    tokio::time::sleep(Duration::from_millis(200)).await;
-
+    // Server connects inline on PortForwardOpen, so the channel is
+    // registered before the next frame -- no sleep needed.
     let payload = b"echo test data";
     framed
         .send(Frame::PortForwardData { channel_id, data: Bytes::from_static(payload) })
@@ -2176,6 +2174,69 @@ async fn remote_forward_data_roundtrip() {
     framed.send(Frame::PortForwardStop { forward_id }).await.unwrap();
 
     echo_handle.abort();
+    let _ = framed.send(Frame::Data(Bytes::from("exit\n"))).await;
+    let _ = timeout(Duration::from_secs(3), server).await;
+}
+
+/// Regression for the rf slowness bug: PortForwardOpen used to spawn the
+/// loopback connect in a task, and the biased select would read the next
+/// frame (the browser's request as PortForwardData) before that task ran --
+/// so the request was dropped because the channel wasn't registered yet.
+/// A real browser sends its GET immediately after connect, so this race is
+/// the common case, not the exception. The sibling test above still carries
+/// a 200ms sleep; this one deliberately does not.
+#[tokio::test]
+async fn remote_forward_open_then_immediate_data() {
+    let (_tx, mut framed, server, _meta, _svc_path) = setup_session_with_svc_path().await;
+    wait_for_shell(&mut framed).await;
+    read_available_data(&mut framed, Duration::from_secs(1)).await;
+
+    let target = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let target_port = target.local_addr().unwrap().port();
+    let target_handle = tokio::spawn(async move {
+        let (mut stream, _) = target.accept().await.unwrap();
+        let mut buf = [0u8; 64];
+        loop {
+            match stream.read(&mut buf).await {
+                Ok(0) | Err(_) => break,
+                Ok(n) => {
+                    if stream.write_all(&buf[..n]).await.is_err() {
+                        break;
+                    }
+                }
+            }
+        }
+    });
+
+    let forward_id = 201;
+    send_port_forward_request(&mut framed, forward_id, 1, find_free_port(), target_port).await;
+
+    // Open + Data back-to-back, no sleep: this is what the client relay
+    // actually produces when a browser connects and immediately writes.
+    let channel_id = 7u32;
+    framed.send(Frame::PortForwardOpen { forward_id, channel_id, target_port }).await.unwrap();
+    framed
+        .send(Frame::PortForwardData { channel_id, data: Bytes::from_static(b"hello") })
+        .await
+        .unwrap();
+
+    let mut got = Vec::new();
+    while got.len() < 5 {
+        match timeout(Duration::from_secs(3), framed.next()).await {
+            Ok(Some(Ok(Frame::PortForwardData { data, .. }))) => got.extend_from_slice(&data),
+            Ok(Some(Ok(Frame::Data(_)))) => continue,
+            Ok(Some(Ok(Frame::PortForwardClose { .. }))) => {
+                panic!("channel closed without echoing -- initial data was dropped")
+            }
+            Err(_) => panic!("initial PortForwardData was dropped (no echo within 3s)"),
+            other => panic!("unexpected frame: {other:?}"),
+        }
+    }
+    assert_eq!(&got, b"hello");
+
+    framed.send(Frame::PortForwardClose { channel_id }).await.unwrap();
+    framed.send(Frame::PortForwardStop { forward_id }).await.unwrap();
+    target_handle.abort();
     let _ = framed.send(Frame::Data(Bytes::from("exit\n"))).await;
     let _ = timeout(Duration::from_secs(3), server).await;
 }

@@ -69,7 +69,7 @@ just quicktest                        # manual 3-pane tmux test
 
 Single-socket: all communication (control + session relay) through one Unix domain socket per server. Hello/HelloAck version handshake, then control frame declares intent, server routes accordingly.
 
-Ten modules behind a lib crate (`src/lib.rs` hosts `collect_env_vars()`, `spawn_channel_relay()`, `handshake()`, `get_or_create_device_id()`) with thin binary entry (`src/main.rs`):
+Ten modules behind a lib crate (`src/lib.rs` hosts `collect_env_vars()`, `relay_writer_channel()` + `spawn_channel_relay()`, `handshake()`, `get_or_create_device_id()`) with thin binary entry (`src/main.rs`):
 
 - **`security`** -- Socket/dir creation with 0700/0600 perms, ownership validation, symlink rejection, `SO_PEERCRED`. **All socket binding and dir creation MUST go through this module.**
 - **`config`** -- TOML config (`$XDG_CONFIG_HOME/gritty/config.toml`). `[defaults]` + `[host.<name>]`. Precedence: CLI > host > defaults > built-in.
@@ -123,7 +123,7 @@ File transfer manifest (svc socket, not Frame protocol): sender writes `[file_co
 - **Self-daemonizing**: Fork before tokio runtime. Parent waits on pipe for readiness. PID file at `socket_dir()/daemon.pid`.
 - **Signal handlers (daemon)**: SIGTERM/SIGINT = shutdown. SIGUSR1 = cycle log level (info -> debug -> trace -> info) without restart. SIGUSR2 = reopen log file (for external logrotate). `kill -USR1 $(cat $SOCKET_DIR/daemon.pid)` to toggle debug logging on a running daemon.
 - **Lockfile-based liveness**: `flock()` on `connect-{name}.lock`. Non-blocking probe distinguishes live vs dead tunnels.
-- **Multi-channel forwarding**: Agent, tunnel, and port forwarding use `channel_id: u32` + `spawn_channel_relay<R, W>()`. State cleared on disconnect/takeover.
+- **Multi-channel forwarding**: Agent, tunnel, and port forwarding use `channel_id: u32` + `relay_writer_channel()` / `spawn_channel_relay<R, W>()`. The writer channel is created and registered (via an `Accepted` event or direct map insert) BEFORE `spawn_channel_relay` is called so the reader task cannot emit `Data` for an unregistered channel. Server-side `PortForwardOpen`/`TunnelOpen` connect to `127.0.0.1` inline (not spawned) for the same reason: the biased select reads the peer's first `Data` frame next, and a spawned connect loses that race -- the browser's initial GET was being silently dropped. All forwarded `TcpStream`s set `TCP_NODELAY`. State cleared on disconnect/takeover.
 - **Terminal guards**: `RawModeGuard` + `NonBlockGuard`. Drop order matters: `NonBlockGuard` must outlive `AsyncFd`.
 - **Auto-start**: `connect` auto-starts server on failure (`local` runs `gritty server`, others run `gritty tunnel-create`). Other commands fail immediately.
 - **Host routing**: `parse_target()` splits `host:session`. `resolve_ctl_path()`: `--ctl-socket` > `"local"` > connect socket. `"local"` reserved keyword.

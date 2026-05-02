@@ -142,22 +142,39 @@ pub fn collect_env_vars() -> Vec<(String, String)> {
         .collect()
 }
 
+/// Writer-side mpsc depth for `spawn_channel_relay`. At 32KB per read,
+/// 64 entries caps buffered bytes at ~2MB per channel.
+const CHANNEL_RELAY_BUFFER: usize = 64;
+
+/// Read chunk size for the relay reader task. Matches SSH's channel packet
+/// size so a forwarded response isn't shredded into many tiny frames.
+const CHANNEL_RELAY_READ_SIZE: usize = 32 * 1024;
+
+/// Construct the writer-side channel for `spawn_channel_relay`. Split out so
+/// accept loops can enqueue their `Accepted` event (carrying the sender)
+/// *before* the reader task is spawned -- otherwise on a multi-thread
+/// runtime the reader can win the race and enqueue `Data` for a channel the
+/// select loop hasn't registered yet, which gets dropped.
+pub fn relay_writer_channel()
+-> (tokio::sync::mpsc::Sender<bytes::Bytes>, tokio::sync::mpsc::Receiver<bytes::Bytes>) {
+    tokio::sync::mpsc::channel(CHANNEL_RELAY_BUFFER)
+}
+
 /// Spawn bidirectional relay tasks for a stream channel.
 ///
 /// Reader task reads from the stream and calls `on_data`/`on_close`.
-/// Writer task drains the returned sender and writes to the stream.
-/// Channel buffer size for `spawn_channel_relay` writer channels.
-/// At 8KB per read, 256 entries ≈ 2MB per channel.
-const CHANNEL_RELAY_BUFFER: usize = 256;
-
+/// Writer task drains `writer_rx` and writes to the stream. Callers obtain
+/// `writer_rx` from `relay_writer_channel()`; doing that (and registering the
+/// returned sender) *before* calling this function guarantees no `on_data`
+/// can fire for an unregistered channel.
 pub fn spawn_channel_relay<R, W, F, G>(
     channel_id: u32,
     read_half: R,
     write_half: W,
+    writer_rx: tokio::sync::mpsc::Receiver<bytes::Bytes>,
     on_data: F,
     on_close: G,
-) -> tokio::sync::mpsc::Sender<bytes::Bytes>
-where
+) where
     R: tokio::io::AsyncRead + Unpin + Send + 'static,
     W: tokio::io::AsyncWrite + Unpin + Send + 'static,
     F: Fn(u32, bytes::Bytes) -> bool + Send + 'static,
@@ -165,12 +182,21 @@ where
 {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
-    let (writer_tx, mut writer_rx) =
-        tokio::sync::mpsc::channel::<bytes::Bytes>(CHANNEL_RELAY_BUFFER);
+    let mut writer_rx = writer_rx;
+    tokio::spawn(async move {
+        let mut write_half = write_half;
+        while let Some(data) = writer_rx.recv().await {
+            if write_half.write_all(&data).await.is_err() {
+                break;
+            }
+        }
+        // Graceful half-close: send FIN instead of RST
+        let _ = write_half.shutdown().await;
+    });
 
     tokio::spawn(async move {
         let mut read_half = read_half;
-        let mut buf = vec![0u8; 8192];
+        let mut buf = vec![0u8; CHANNEL_RELAY_READ_SIZE];
         loop {
             match read_half.read(&mut buf).await {
                 Ok(0) | Err(_) => {
@@ -185,19 +211,6 @@ where
             }
         }
     });
-
-    tokio::spawn(async move {
-        let mut write_half = write_half;
-        while let Some(data) = writer_rx.recv().await {
-            if write_half.write_all(&data).await.is_err() {
-                break;
-            }
-        }
-        // Graceful half-close: send FIN instead of RST
-        let _ = write_half.shutdown().await;
-    });
-
-    writer_tx
 }
 
 #[cfg(test)]
@@ -247,10 +260,12 @@ mod tests {
         let closed = Arc::new(Mutex::new(false));
         let closed_clone = closed.clone();
 
-        let _writer_tx = spawn_channel_relay(
+        let (_writer_tx, writer_rx) = relay_writer_channel();
+        spawn_channel_relay(
             42,
             read_half,
             write_half,
+            writer_rx,
             move |ch, data| {
                 received_clone.lock().unwrap().push((ch, data));
                 true
@@ -289,7 +304,8 @@ mod tests {
         let (read_half, _) = read_stream.into_split();
         let (_, write_half) = write_stream.into_split();
 
-        let writer_tx = spawn_channel_relay(7, read_half, write_half, |_, _| true, |_| {});
+        let (writer_tx, writer_rx) = relay_writer_channel();
+        spawn_channel_relay(7, read_half, write_half, writer_rx, |_, _| true, |_| {});
 
         writer_tx.try_send(bytes::Bytes::from_static(b"hello")).unwrap();
 
@@ -313,7 +329,8 @@ mod tests {
         let (read_half, _) = read_stream.into_split();
         let (_, write_half) = write_stream.into_split();
 
-        let writer_tx = spawn_channel_relay(7, read_half, write_half, |_, _| true, |_| {});
+        let (writer_tx, writer_rx) = relay_writer_channel();
+        spawn_channel_relay(7, read_half, write_half, writer_rx, |_, _| true, |_| {});
 
         // Send data then drop the sender (triggers half-close)
         writer_tx.try_send(bytes::Bytes::from_static(b"request")).unwrap();
