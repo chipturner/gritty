@@ -383,6 +383,15 @@ fn roundtrip_detached() {
 }
 
 #[test]
+fn roundtrip_server_shutdown() {
+    let mut codec = FrameCodec;
+    let mut buf = BytesMut::new();
+    codec.encode(Frame::ServerShutdown, &mut buf).unwrap();
+    let decoded = codec.decode(&mut buf).unwrap().unwrap();
+    assert_eq!(Frame::ServerShutdown, decoded);
+}
+
+#[test]
 fn roundtrip_kill_session() {
     let mut codec = FrameCodec;
     let mut buf = BytesMut::new();

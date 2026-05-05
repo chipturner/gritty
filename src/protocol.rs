@@ -16,6 +16,7 @@ const TYPE_PONG: u8 = 0x15;
 const TYPE_ENV: u8 = 0x16;
 const TYPE_DIAG_REQUEST: u8 = 0x17;
 const TYPE_DIAG_RESPONSE: u8 = 0x18;
+const TYPE_SERVER_SHUTDOWN: u8 = 0x19;
 
 // Agent forwarding
 const TYPE_AGENT_FORWARD: u8 = 0x20;
@@ -73,7 +74,7 @@ const HEADER_LEN: usize = 5; // type(1) + length(4)
 const MAX_FRAME_SIZE: usize = 1 << 20; // 1 MB
 
 /// Protocol version for handshake negotiation.
-pub const PROTOCOL_VERSION: u16 = 19;
+pub const PROTOCOL_VERSION: u16 = 20;
 
 /// Capability bit: client/server supports clipboard forwarding.
 pub const CAP_CLIPBOARD: u32 = 0x01;
@@ -209,6 +210,13 @@ pub enum Frame {
     DiagResponse {
         text: String,
     },
+    /// Sent to attached/tail clients when the daemon is shutting down
+    /// (kill-server / SIGTERM). Terminal -- the session is gone, the client
+    /// should exit instead of reconnecting. Distinguishes intentional
+    /// shutdown from a transient disconnect, which for a remote host would
+    /// otherwise spin the reconnect loop until the tunnel supervisor happens
+    /// to restart the server minutes later.
+    ServerShutdown,
     /// Client signals it can handle agent forwarding (client → server).
     AgentForward,
     /// New agent connection on the remote side (server → client).
@@ -906,6 +914,7 @@ impl Decoder for FrameCodec {
 
             // Empty frames
             TYPE_DETACHED => Ok(Some(Frame::Detached)),
+            TYPE_SERVER_SHUTDOWN => Ok(Some(Frame::ServerShutdown)),
             TYPE_PING => Ok(Some(Frame::Ping)),
             TYPE_PONG => Ok(Some(Frame::Pong)),
             TYPE_AGENT_FORWARD => Ok(Some(Frame::AgentForward)),
@@ -1181,6 +1190,7 @@ impl Encoder<Frame> for FrameCodec {
 
             // Empty frames
             Frame::Detached => encode_empty(dst, TYPE_DETACHED),
+            Frame::ServerShutdown => encode_empty(dst, TYPE_SERVER_SHUTDOWN),
             Frame::Ping => encode_empty(dst, TYPE_PING),
             Frame::Pong => encode_empty(dst, TYPE_PONG),
             Frame::AgentForward => encode_empty(dst, TYPE_AGENT_FORWARD),

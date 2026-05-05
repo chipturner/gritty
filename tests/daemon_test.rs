@@ -558,6 +558,50 @@ async fn daemon_unexpected_frame() {
 }
 
 #[tokio::test]
+async fn kill_server_notifies_attached_client() {
+    // A client attached when the daemon is killed should receive
+    // Frame::ServerShutdown so it can exit cleanly instead of spinning in
+    // its reconnect loop. Without the explicit goodbye, a remote client
+    // (tunnel still alive) retries for ~1-2 minutes until the supervisor
+    // finally respawns the remote daemon with a new server_id.
+    let (_tmp, ctl_path) = test_ctl();
+
+    let ctl = ctl_path.clone();
+    let daemon = tokio::spawn(async move { gritty::daemon::run(&ctl, None).await });
+    wait_for_daemon(&ctl_path).await;
+
+    create_session(&ctl_path, "doomed").await;
+    let mut attached = attach_session(&ctl_path, "doomed").await;
+
+    let resp = control_request(&ctl_path, Frame::KillServer).await;
+    assert_eq!(resp, Frame::Ok);
+
+    // The attached client must see ServerShutdown (possibly after some
+    // remaining Data frames from the PTY) before the stream closes.
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(3);
+    let mut got_shutdown = false;
+    loop {
+        match timeout(Duration::from_millis(500), attached.next()).await {
+            Ok(Some(Ok(Frame::ServerShutdown))) => {
+                got_shutdown = true;
+                break;
+            }
+            Ok(Some(Ok(Frame::Data(_)))) => continue,
+            Ok(Some(Ok(other))) => panic!("expected ServerShutdown, got {other:?}"),
+            Ok(Some(Err(e))) => panic!("decode error before ServerShutdown: {e}"),
+            Ok(None) => break, // EOF without ServerShutdown -- the old bug
+            Err(_) if tokio::time::Instant::now() < deadline => continue,
+            Err(_) => break,
+        }
+    }
+    assert!(got_shutdown, "attached client should receive ServerShutdown on kill-server");
+
+    let result = timeout(Duration::from_secs(3), daemon).await;
+    assert!(result.is_ok(), "daemon should exit after kill-server");
+    assert!(!ctl_path.exists(), "control socket should be removed");
+}
+
+#[tokio::test]
 async fn kill_server_no_sessions() {
     let (_tmp, ctl_path) = test_ctl();
 

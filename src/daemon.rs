@@ -248,10 +248,30 @@ fn build_session_entries(
     entries
 }
 
-fn shutdown(sessions: &mut HashMap<u32, SessionState>, ctl_path: &Path) {
+/// Graceful daemon shutdown. Sends `ClientConn::Shutdown` to every session so
+/// they can tell their attached/tail clients `Frame::ServerShutdown` before
+/// exiting -- a client that sees that frame exits immediately instead of
+/// spinning in its reconnect loop against a socket that will never answer
+/// (which, for a remote host behind a live tunnel, can take minutes to
+/// resolve). Waits a bounded window for all sessions to flush, then aborts
+/// any stragglers so `kill-server` stays prompt.
+async fn shutdown(sessions: &mut HashMap<u32, SessionState>, ctl_path: &Path) {
+    // Signal first, collect handles, then await -- so sessions drain
+    // concurrently under a single shared deadline rather than serially.
+    let mut handles = Vec::with_capacity(sessions.len());
     for (id, state) in sessions.drain() {
-        state.handle.abort();
-        info!(id, "session aborted");
+        let _ = state.client_tx.send(ClientConn::Shutdown);
+        handles.push((id, state.handle));
+    }
+    let deadline = tokio::time::Instant::now() + Duration::from_millis(500);
+    for (id, mut handle) in handles {
+        match tokio::time::timeout_at(deadline, &mut handle).await {
+            Ok(_) => info!(id, "session shut down gracefully"),
+            Err(_) => {
+                handle.abort();
+                info!(id, "session did not shut down in time; aborted");
+            }
+        }
     }
     let _ = std::fs::remove_file(ctl_path);
     let _ = std::fs::remove_file(pid_file_path(ctl_path));
@@ -474,12 +494,12 @@ pub async fn run(ctl_path: &Path, ready_fd: Option<OwnedFd>) -> anyhow::Result<(
             }
             _ = sigterm.recv() => {
                 info!("SIGTERM received, shutting down");
-                shutdown(&mut sessions, ctl_path);
+                shutdown(&mut sessions, ctl_path).await;
                 true
             }
             _ = sigint.recv() => {
                 info!("SIGINT received, shutting down");
-                shutdown(&mut sessions, ctl_path);
+                shutdown(&mut sessions, ctl_path).await;
                 true
             }
             _ = sigusr1.recv() => {
@@ -946,7 +966,7 @@ async fn dispatch_control(
         }
         Frame::KillServer => {
             info!("kill-server received, shutting down");
-            shutdown(sessions, ctl_path);
+            shutdown(sessions, ctl_path).await;
             let _ = timed_send(&mut framed, Frame::Ok).await;
             true
         }

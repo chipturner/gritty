@@ -718,6 +718,25 @@ impl ClientRelay<'_> {
                 write_stdout_async(self.async_stdout, status_msg("detached").as_bytes()).await?;
                 return Ok(ControlFlow::Break(RelayExit::Exit(0)));
             }
+            Some(Ok(Frame::ServerShutdown)) => {
+                // Daemon told us it's going away (kill-server / SIGTERM).
+                // Terminal: the session is gone, reconnecting won't help.
+                // Without this explicit goodbye a remote client would spin
+                // the reconnect loop for minutes until the tunnel supervisor
+                // happens to restart the server with a new server_id.
+                info!("server shutting down");
+                self.agent.teardown();
+                self.tunnel.teardown();
+                self.pf.teardown();
+                // Leave alt-screen first so the message is visible and not
+                // clobbered by RawModeGuard's Drop. No-op on main screen.
+                write_stdout_async(
+                    self.async_stdout,
+                    b"\x1b[?1049l\r\x1b[31m\xe2\x96\xb8 server shut down -- session is gone; run `gritty connect` to start fresh\x1b[0m\x1b[K\r\n",
+                )
+                .await?;
+                return Ok(ControlFlow::Break(RelayExit::Exit(1)));
+            }
             Some(Ok(Frame::AgentOpen { channel_id })) => {
                 if let Some(sock_path) =
                     self.agent_socket.filter(|_| self.agent_open_limiter.check())
@@ -2301,6 +2320,13 @@ pub async fn tail(
                         Some(Ok(Frame::Pong)) => {}
                         Some(Ok(Frame::Exit { code })) => {
                             break 'relay Some(code);
+                        }
+                        Some(Ok(Frame::ServerShutdown)) => {
+                            info!("tail: server shutting down");
+                            eprintln!(
+                                "\r\x1b[31m\u{25b8} server shut down -- session is gone\x1b[0m\x1b[K"
+                            );
+                            break 'relay Some(1);
                         }
                         Some(Ok(_)) => {}
                         Some(Err(e)) => {

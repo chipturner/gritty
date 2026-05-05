@@ -249,6 +249,58 @@ async fn server_sends_exit_frame_on_shell_exit() {
 }
 
 #[tokio::test]
+async fn server_sends_shutdown_frame_on_client_conn_shutdown() {
+    // `daemon::shutdown()` sends `ClientConn::Shutdown` to each session on
+    // kill-server / SIGTERM. The session task must forward `Frame::ServerShutdown`
+    // to the attached client so it exits cleanly instead of spinning in its
+    // reconnect loop.
+    let (client_tx, mut framed, server, _meta) = setup_session().await;
+    wait_for_shell(&mut framed).await;
+    read_available_data(&mut framed, Duration::from_secs(1)).await;
+
+    client_tx.send(ClientConn::Shutdown).unwrap();
+
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(3);
+    let mut got_shutdown = false;
+    loop {
+        match timeout(Duration::from_millis(500), framed.next()).await {
+            Ok(Some(Ok(Frame::ServerShutdown))) => {
+                got_shutdown = true;
+                break;
+            }
+            Ok(Some(Ok(Frame::Data(_)))) => continue,
+            Ok(Some(Ok(other))) => panic!("expected ServerShutdown, got {other:?}"),
+            Ok(Some(Err(e))) => panic!("decode error: {e}"),
+            Ok(None) => break,
+            Err(_) if tokio::time::Instant::now() < deadline => continue,
+            Err(_) => break,
+        }
+    }
+    assert!(got_shutdown, "attached client should receive ServerShutdown");
+
+    let result = timeout(Duration::from_secs(3), server).await;
+    assert!(result.is_ok(), "session task should exit after ClientConn::Shutdown");
+}
+
+#[tokio::test]
+async fn server_shutdown_while_detached_exits_cleanly() {
+    // ClientConn::Shutdown while no client is attached (the 'drain loop)
+    // should cause the session task to exit promptly.
+    let (client_tx, mut framed, server, _meta) = setup_session().await;
+    wait_for_shell(&mut framed).await;
+    read_available_data(&mut framed, Duration::from_secs(1)).await;
+
+    // Detach.
+    drop(framed);
+    tokio::time::sleep(Duration::from_millis(300)).await;
+
+    client_tx.send(ClientConn::Shutdown).unwrap();
+
+    let result = timeout(Duration::from_secs(3), server).await;
+    assert!(result.is_ok(), "session task should exit after ClientConn::Shutdown while detached");
+}
+
+#[tokio::test]
 async fn reconnect_preserves_shell_session() {
     let (client_tx, mut framed, server, _meta) = setup_session().await;
     wait_for_shell(&mut framed).await;

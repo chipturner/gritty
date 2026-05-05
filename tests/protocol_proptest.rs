@@ -129,6 +129,7 @@ fn arb_frame() -> impl Strategy<Value = Frame> {
             .prop_map(|(channel_id, data)| Frame::PortForwardData { channel_id, data }),
         // Empty frames
         Just(Frame::Detached),
+        Just(Frame::ServerShutdown),
         Just(Frame::Ping),
         Just(Frame::Pong),
         Just(Frame::AgentForward),

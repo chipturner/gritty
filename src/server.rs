@@ -71,6 +71,11 @@ pub enum ClientConn {
     Tail(Framed<UnixStream, FrameCodec>),
     /// Raw stream for file transfer (local-side commands routed through daemon).
     Send(UnixStream),
+    /// Daemon is shutting down (kill-server / SIGTERM). Notify the attached
+    /// client with `Frame::ServerShutdown` and exit cleanly so the client
+    /// stops reconnecting instead of spinning against a socket that will
+    /// never answer.
+    Shutdown,
 }
 
 /// Events broadcast to tail clients.
@@ -78,6 +83,7 @@ pub enum ClientConn {
 enum TailEvent {
     Data(Bytes),
     Exit { code: i32 },
+    Shutdown,
 }
 
 pub struct SessionMetadata {
@@ -148,6 +154,8 @@ enum RelayExit {
     ClientGone,
     /// Shell exited with a code — we're done.
     ShellExited(i32),
+    /// Daemon is shutting down — notify client, tear down, exit.
+    Shutdown,
 }
 
 /// Events from agent connection tasks to the main relay loop.
@@ -775,6 +783,10 @@ async fn tail_relay(
                 }
                 Ok(TailEvent::Exit { code }) => {
                     let _ = send_framed_timed(&mut framed, Frame::Exit { code }).await;
+                    break;
+                }
+                Ok(TailEvent::Shutdown) => {
+                    let _ = send_framed_timed(&mut framed, Frame::ServerShutdown).await;
                     break;
                 }
                 Err(broadcast::error::RecvError::Lagged(n)) => {
@@ -1656,6 +1668,11 @@ pub async fn run(
                     handle_send_stream(stream, &send_event_tx);
                     continue;
                 }
+                Some(ClientConn::Shutdown) => {
+                    info!("daemon shutting down before first client");
+                    let _ = tail_tx.send(TailEvent::Shutdown);
+                    return Ok(());
+                }
                 None => {
                     info!("client channel closed before first client");
                     return Ok(());
@@ -1808,6 +1825,11 @@ pub async fn run(
                             Some(ClientConn::Send(stream)) => {
                                 handle_send_stream(stream, &send_event_tx);
                                 continue;
+                            }
+                            Some(ClientConn::Shutdown) => {
+                                info!("daemon shutting down while detached");
+                                let _ = tail_tx.send(TailEvent::Shutdown);
+                                return Ok(());
                             }
                             None => {
                                 info!("client channel closed");
@@ -2215,6 +2237,10 @@ pub async fn run(
                             Some(ClientConn::Send(stream)) => {
                                 handle_send_stream(stream, &send_event_tx);
                             }
+                            Some(ClientConn::Shutdown) => {
+                                info!("daemon shutting down, notifying attached client");
+                                break RelayExit::Shutdown;
+                            }
                             None => {}
                         }
                     }
@@ -2406,6 +2432,15 @@ pub async fn run(
                 let _ = tail_tx.send(TailEvent::Exit { code });
                 let _ = send_framed_timed(&mut framed, Frame::Exit { code }).await;
                 info!(code, "session ended");
+                break;
+            }
+            RelayExit::Shutdown => {
+                // Tell the attached client and any tail observers the daemon
+                // is going away so they exit instead of auto-reconnecting.
+                let _ = tail_tx.send(TailEvent::Shutdown);
+                let _ = send_framed_timed(&mut framed, Frame::ServerShutdown).await;
+                let _ = framed.close().await;
+                info!("session shut down by daemon");
                 break;
             }
         }
