@@ -1027,6 +1027,28 @@ pub async fn bootstrap(
     Ok(())
 }
 
+/// Run `gritty <args>` on a remote host interactively (stdin/stdout/stderr
+/// inherited so the user sees progress live). Used by `gritty refresh <host>`
+/// to delegate the remote-side daemon refresh to the remote binary rather
+/// than reimplementing it over the wire -- keeps the remote the source of
+/// truth about its own daemon staleness.
+pub async fn run_remote_gritty(
+    dest_str: &str,
+    gritty_args: &[&str],
+    ssh_options: &[String],
+    connect_timeout: u64,
+) -> anyhow::Result<std::process::ExitStatus> {
+    let dest = Destination::parse(dest_str)?;
+    // Prefix PATH so `gritty` resolves even when SSH's non-interactive shell
+    // skips the user's profile (same rationale as `remote_exec_command`).
+    let remote_cmd = format!("PATH=\"{REMOTE_PATH_PREFIX}\" gritty {}", gritty_args.join(" "));
+    let mut cmd = Command::new("ssh");
+    cmd.args(base_ssh_args(&dest, ssh_options, true, connect_timeout));
+    cmd.arg(dest.ssh_dest());
+    cmd.arg(&remote_cmd);
+    cmd.status().await.context("failed to run ssh")
+}
+
 // ---------------------------------------------------------------------------
 // Lockfile-based liveness
 // ---------------------------------------------------------------------------

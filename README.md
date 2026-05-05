@@ -93,6 +93,7 @@ Local-only sessions (`gritty connect local:scratch`) are available for testing b
 | `gritty rename <host:session> <name>` | | Rename a session |
 | `gritty kill-server [host]` | | Kill the server and all sessions (works across a protocol version mismatch) |
 | `gritty restart [host]` | | Kill + restart server (and tunnel, for remote hosts). One-shot upgrade recovery |
+| `gritty refresh [host]` | | Restart only processes running stale code (idempotent). No args = local + all tunnels |
 | `gritty tunnels` | `tun` | List active SSH tunnels |
 | `gritty tunnel-create <destination>` | | Set up SSH tunnel to remote host |
 | `gritty tunnel-destroy <name>` | | Tear down an SSH tunnel |
@@ -263,7 +264,7 @@ gritty completions fish > ~/.config/fish/completions/gritty.fish
 
 **"[reconnecting...]" forever** -- the SSH tunnel is down and not coming back. Check `gritty tunnels` for tunnel status. If the tunnel shows as stale, `gritty tunnel-destroy <name>` to clean it up and `gritty tunnel-create <dest>` to re-establish. Check `gritty info` for log file paths if you need to dig deeper. See [docs/tunnel-state-machine.md](docs/tunnel-state-machine.md) for the `healthy` / `reconnecting` / `stale` state definitions and the full supervisor state diagram.
 
-**Protocol version mismatch after upgrade** -- after upgrading gritty on one side the other side's daemon still speaks the old protocol, so session operations fail with `protocol version mismatch`. Upgrade both binaries to matching versions (`gritty protocol-version` prints the local version), then run `gritty restart <host>` (or `gritty restart local`) to tear down the old daemon and bring a fresh one up on both sides. `restart` tolerates the mismatched handshake so it works without falling back to SSH; under the hood it calls `kill-server` (which is itself tolerant of the mismatch), destroys the tunnel, and `tunnel-create`s a new one.
+**Protocol version mismatch after upgrade** -- after upgrading gritty on one side the other side's daemon still speaks the old protocol, so session operations fail with `protocol version mismatch`. Upgrade both binaries to matching versions (`gritty protocol-version` prints the local version), then run `gritty refresh` to restart whatever is stale -- the local daemon, each tunnel supervisor, and (over SSH) each remote daemon. `refresh` is idempotent: it reads each process's `.info` sidecar and only restarts what is actually behind the binary on disk, so a second run is a no-op and running it when nothing needs upgrading does nothing. `gritty restart <host>` is the scorched-earth variant that restarts unconditionally; both tolerate the mismatched handshake so neither falls back to raw SSH. `gritty doctor` shows which processes are stale without touching anything.
 
 ## Debugging
 

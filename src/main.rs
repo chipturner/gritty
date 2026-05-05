@@ -174,6 +174,15 @@ enum Command {
         /// Target host (defaults to `local`)
         target: Option<String>,
     },
+    /// Restart only the processes running stale code (daemon, tunnel
+    /// supervisor, remote daemon). Idempotent: a second run is a no-op.
+    /// Use after upgrading the gritty binary to pick it up everywhere
+    /// without the scorched-earth `restart`.
+    #[command(display_order = 7)]
+    Refresh {
+        /// Target host (defaults to `local` plus all active tunnels)
+        target: Option<String>,
+    },
     /// Rename a session
     #[command(display_order = 4)]
     Rename {
@@ -836,6 +845,10 @@ async fn run(cli: Cli, config: gritty::config::ConfigFile) -> anyhow::Result<()>
         Command::Restart { target } => {
             let host = target.as_deref().map(|t| parse_target(t).0);
             restart(host, cli.ctl_socket).await
+        }
+        Command::Refresh { target } => {
+            let host = target.as_deref().map(|t| parse_target(t).0);
+            refresh(host, cli.ctl_socket, &config).await
         }
         Command::SocketPath => {
             let ctl_path = cli.ctl_socket.unwrap_or_else(gritty::daemon::control_socket_path);

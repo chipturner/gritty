@@ -17,6 +17,7 @@ Persistent TTY sessions over Unix domain sockets. Single binary, tmux-like CLI. 
 | `rename <host:session> <name>` | | Rename a session |
 | `kill-server [host]` | | Kill the server and all sessions (tolerates version mismatch) |
 | `restart [host]` | | Kill + restart server (and tunnel, for remote hosts) -- upgrade recovery |
+| `refresh [host]` | | Restart only stale processes (daemon, supervisor, remote daemon) -- idempotent |
 | `tunnels` | `tun` | List active SSH tunnels |
 | `tunnel-create <destination>` | | SSH tunnel to remote host |
 | `tunnel-destroy <name>` | | Tear down SSH tunnel |
@@ -149,7 +150,7 @@ File transfer manifest (svc socket, not Frame protocol): sender writes `[file_co
 - **Fork before tokio** -- `daemonize()` MUST fork before creating the tokio runtime. `main()` is sync (no `#[tokio::main]`).
 
 ### Changing protocol/signatures
-- **`PROTOCOL_VERSION`** -- bump whenever frame types, encoding, or `SessionEntry` fields change. Currently v20. Version mismatch is **not** a hard gate at the handshake layer: the daemon always sends `HelloAck` with its own version so the client can see it, then rejects any non-`KillServer` follow-up frame with `ErrorCode::VersionMismatch`. This is deliberate -- `kill-server` and `restart` need to work across a mismatched handshake so users can recover without SSH. `tunnel-create --ignore-version-mismatch` still exists for the SSH-level pre-check but its value is mostly superseded by the in-band recovery flow.
+- **`PROTOCOL_VERSION`** -- bump whenever frame types, encoding, or `SessionEntry` fields change. Currently v20. Version mismatch is **not** a hard gate at the handshake layer: the daemon always sends `HelloAck` with its own version so the client can see it, then rejects any non-`KillServer` follow-up frame with `ErrorCode::VersionMismatch`. This is deliberate -- `kill-server` and `restart` need to work across a mismatched handshake so users can recover without SSH. `tunnel-create --ignore-version-mismatch` still exists for the SSH-level pre-check but its value is mostly superseded by the in-band recovery flow. `gritty refresh` is the porcelain: it reads each long-lived process's `.info` sidecar (see `runinfo`) and restarts only what is stale; `refresh local` is also what `refresh <host>` runs *on the remote* over SSH, so the remote daemon is measured against the remote's own on-disk binary (not ours), which is what works for source-built remotes where `bootstrap` doesn't apply.
 - **`expect_min_len`** -- all fixed-field decoders use `expect_min_len` (not exact length checks), so trailing bytes are tolerated for forward extensibility.
 - **`Frame` enum** -- update: encoder, decoder, protocol tests, all `match frame` in server.rs, client.rs, daemon.rs, main.rs.
 - **`SessionInfo`** -- entry count `u32`. Changing `SessionEntry` fields requires updating both encoder and decoder in protocol.rs.
