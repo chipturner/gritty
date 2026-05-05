@@ -3,6 +3,7 @@ use std::path::Path;
 
 use gritty::connect::{TunnelStatus, enumerate_tunnels, probe_tunnel_status, read_pid_hint};
 use gritty::protocol::{Frame, PROTOCOL_VERSION};
+use gritty::runinfo::{RunInfo, Staleness};
 
 use super::util::server_request;
 
@@ -38,6 +39,28 @@ impl Check {
 }
 
 // ---- Rendering --------------------------------------------------------------
+
+/// Read a long-lived process's `.info` sidecar and flag it if the on-disk
+/// binary has been replaced since the process started. This is the only way
+/// to catch a same-protocol rebuild -- the wire handshake can't see it, and
+/// for the tunnel supervisor (a pure byte proxy) no handshake ever touches
+/// its code at all.
+fn check_staleness(info_path: &Path, label: &str, restart_hint: &str, checks: &mut Vec<Check>) {
+    let Ok(info) = RunInfo::read(info_path) else {
+        // No `.info` file -- process predates this feature or wrote it to a
+        // different socket dir. Not an error, just no staleness signal.
+        return;
+    };
+    match info.staleness_vs_current() {
+        None => {}
+        Some(s @ Staleness::Protocol { .. }) => {
+            checks.push(Check::fail(format!("{label}: {s}")).with_hint(restart_hint));
+        }
+        Some(s @ Staleness::Build { .. }) => {
+            checks.push(Check::warn(format!("{label}: {s}")).with_hint(restart_hint));
+        }
+    }
+}
 
 fn status_symbol(s: Status) -> &'static str {
     match s {
@@ -221,6 +244,12 @@ async fn check_local_server(
                     "server protocol v{version} differs from local v{PROTOCOL_VERSION}"
                 )));
             }
+            check_staleness(
+                &gritty::runinfo::daemon_info_path(&ctl_path),
+                "server",
+                "gritty restart local",
+                &mut checks,
+            );
 
             // Check per-session sockets
             for entry in &sessions {
@@ -261,8 +290,16 @@ async fn check_local_server(
                 None => String::new(),
             };
             checks.push(
-                Check::warn(format!("server{pid_str}: {msg}"))
-                    .with_hint("restart the server: gritty kill-server local && gritty server"),
+                Check::warn(format!("server{pid_str}: {msg}")).with_hint("gritty restart local"),
+            );
+            // The handshake detected the protocol mismatch; the `.info`
+            // sidecar can say which side is stale (running daemon vs on-disk
+            // binary) -- often more actionable than the raw version numbers.
+            check_staleness(
+                &gritty::runinfo::daemon_info_path(&ctl_path),
+                "server",
+                "gritty restart local",
+                &mut checks,
             );
         }
         Err(_) => {
@@ -345,6 +382,19 @@ async fn check_tunnels(socket_dir: &Path) -> Vec<Check> {
                         .with_hint(format!("gritty tunnel-destroy {name}")),
                 );
             }
+        }
+
+        // Supervisor staleness is orthogonal to tunnel health -- a perfectly
+        // healthy tunnel can be running code from last month. Check it for any
+        // live supervisor (Healthy or Reconnecting; a Stale one is already
+        // flagged for teardown).
+        if status != TunnelStatus::Stale {
+            check_staleness(
+                &gritty::runinfo::connect_info_path(name),
+                &format!("{name} supervisor"),
+                &format!("gritty restart {name}"),
+                &mut checks,
+            );
         }
     }
 

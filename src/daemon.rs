@@ -275,6 +275,7 @@ async fn shutdown(sessions: &mut HashMap<u32, SessionState>, ctl_path: &Path) {
     }
     let _ = std::fs::remove_file(ctl_path);
     let _ = std::fs::remove_file(pid_file_path(ctl_path));
+    let _ = std::fs::remove_file(crate::runinfo::daemon_info_path(ctl_path));
 }
 
 /// Outcome of the version check during `connection_handshake`. A mismatched
@@ -402,6 +403,10 @@ pub async fn run(ctl_path: &Path, ready_fd: Option<OwnedFd>) -> anyhow::Result<(
     // fully-initialized daemon should report ready.
     let pid_path = pid_file_path(ctl_path);
     std::fs::write(&pid_path, std::process::id().to_string())?;
+    // Record our identity so `gritty doctor` can detect a stale daemon
+    // (binary replaced on disk after we started). Best-effort -- a missing
+    // `.info` just means doctor can't flag staleness, not a hard failure.
+    let _ = crate::runinfo::RunInfo::current().write(&crate::runinfo::daemon_info_path(ctl_path));
 
     let mut sessions: HashMap<u32, SessionState> = HashMap::new();
     let mut next_id: u32 = 0;

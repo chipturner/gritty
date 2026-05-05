@@ -619,6 +619,29 @@ async fn kill_server_no_sessions() {
 }
 
 #[tokio::test]
+async fn daemon_writes_and_removes_info_file() {
+    // The `.info` sidecar records protocol version + git hash so `gritty
+    // doctor` can flag a daemon running stale code after a rebuild. It must
+    // exist while the daemon runs and be cleaned up on shutdown.
+    let (_tmp, ctl_path) = test_ctl();
+    let info_path = gritty::runinfo::daemon_info_path(&ctl_path);
+
+    let ctl = ctl_path.clone();
+    let daemon = tokio::spawn(async move { gritty::daemon::run(&ctl, None).await });
+    wait_for_daemon(&ctl_path).await;
+
+    let info = gritty::runinfo::RunInfo::read(&info_path).expect("daemon.info should exist");
+    assert_eq!(info.protocol, PROTOCOL_VERSION);
+    assert_eq!(info.git_hash, gritty::runinfo::GIT_HASH);
+    assert!(info.pid > 0);
+    assert_eq!(info.staleness_vs_current(), None, "running daemon should not be stale");
+
+    control_request(&ctl_path, Frame::KillServer).await;
+    timeout(Duration::from_secs(3), daemon).await.expect("daemon should exit").unwrap().unwrap();
+    assert!(!info_path.exists(), "daemon.info should be removed on shutdown");
+}
+
+#[tokio::test]
 async fn kill_nonexistent_session() {
     let (_tmp, ctl_path) = test_ctl();
 

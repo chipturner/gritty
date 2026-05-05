@@ -825,19 +825,55 @@ async fn tunnel_monitor(
 // Remote server management
 // ---------------------------------------------------------------------------
 
-// Stdout contract: EXACTLY two lines -- socket path, then protocol
-// version (optional on older remotes). Any command before the final
-// `echo` must redirect its stdout to /dev/null; otherwise its output
-// becomes the first line and ensure_remote_ready parses it as the
-// socket path. `gritty server` today only prints to stderr, but
-// redirecting defensively keeps the contract from silently breaking
-// if that ever changes.
+// Stdout contract: socket path, protocol version, then an optional third
+// line. On success the third line is absent. On failure it starts with
+// `ERR:` and carries the stderr of the `gritty ls local` probe -- which is
+// the most useful diagnostic because `ls` already produces precise errors
+// like "protocol version mismatch: run gritty restart" or "no server
+// running". Previously, any failure in the `ls || server` fallback collapsed
+// the whole `&&` chain to empty stdout and the user got the unhelpful
+// "remote host returned empty socket path" with no clue which step broke.
+//
+// Any command before the `echo`s must redirect stdout to /dev/null so its
+// output doesn't leak into the line protocol. `gritty server` today only
+// prints to stderr, but redirecting defensively keeps the contract from
+// silently breaking if that ever changes.
 const REMOTE_ENSURE_CMD: &str = "\
     SOCK=$(gritty socket-path) && \
-    (gritty ls local >/dev/null 2>&1 || \
-     { gritty server >/dev/null 2>&1 && sleep 0.3; }) && \
-    echo \"$SOCK\" && \
-    { gritty protocol-version 2>/dev/null || true; }";
+    V=$(gritty protocol-version 2>/dev/null || true) && \
+    LS_ERR=$(gritty ls local 2>&1 >/dev/null) && \
+    { echo \"$SOCK\"; echo \"$V\"; exit 0; }; \
+    gritty server >/dev/null 2>&1 && sleep 0.3 && \
+    { echo \"$SOCK\"; echo \"$V\"; exit 0; }; \
+    echo \"$SOCK\"; echo \"$V\"; echo \"ERR:$LS_ERR\"";
+
+/// Parse the 2-or-3-line `REMOTE_ENSURE_CMD` output. Factored out so the
+/// line-protocol contract can be tested without an SSH host.
+fn parse_ensure_remote_output(output: &str) -> anyhow::Result<(String, Option<u16>)> {
+    let mut lines = output.lines();
+    let sock_path = lines.next().unwrap_or("").trim().to_string();
+    let remote_version = lines.next().and_then(|s| s.trim().parse::<u16>().ok());
+    // Third line, if present, is an error tag the remote shell emitted because
+    // the daemon couldn't be reached or started. Surface it verbatim -- it's
+    // usually the `gritty ls` error message, which already tells the user what
+    // to do (e.g. "protocol version mismatch: run `gritty restart`").
+    if let Some(err_line) = lines.next()
+        && let Some(reason) = err_line.strip_prefix("ERR:")
+    {
+        let reason = reason.trim();
+        if reason.is_empty() {
+            bail!("remote daemon is unusable and could not be started");
+        }
+        bail!(
+            "remote daemon is unusable and could not be started: {reason}\n  \
+             hint: `gritty restart <host>` kills the remote daemon and respawns the tunnel"
+        );
+    }
+    if sock_path.is_empty() {
+        bail!("remote host returned empty socket path");
+    }
+    Ok((sock_path, remote_version))
+}
 
 /// Get the remote socket path and optionally auto-start the server.
 /// Returns (socket_path, remote_protocol_version).
@@ -852,17 +888,7 @@ async fn ensure_remote_ready(
     info!("ensuring remote server (no_server_start={no_server_start})");
 
     let output = remote_exec(dest, remote_cmd, extra_ssh_opts, foreground, connect_timeout).await?;
-
-    // Output is "socket_path\nversion" (version line may be absent for old remotes)
-    let mut lines = output.lines();
-    let sock_path = lines.next().unwrap_or("").to_string();
-    let remote_version = lines.next().and_then(|s| s.trim().parse::<u16>().ok());
-
-    if sock_path.is_empty() {
-        bail!("remote host returned empty socket path");
-    }
-
-    Ok((sock_path, remote_version))
+    parse_ensure_remote_output(&output)
 }
 
 // ---------------------------------------------------------------------------
@@ -1102,6 +1128,7 @@ pub fn read_pid_hint(name: &str) -> Option<u32> {
 fn cleanup_stale_files(name: &str, remove_lock: bool) {
     let _ = std::fs::remove_file(local_socket_path(name));
     let _ = std::fs::remove_file(connect_pid_path(name));
+    let _ = std::fs::remove_file(crate::runinfo::connect_info_path(name));
     let _ = std::fs::remove_file(connect_dest_path(name));
     // Callers that hold the flock (run()) must NOT remove the lock file out
     // from under themselves; external callers (disconnect, get_tunnel_info)
@@ -1138,6 +1165,7 @@ struct ConnectGuard {
     child: Option<Child>,
     local_sock: PathBuf,
     pid_file: PathBuf,
+    info_file: PathBuf,
     lock_file: PathBuf,
     dest_file: PathBuf,
     _lock: Option<nix::fcntl::Flock<std::fs::File>>,
@@ -1168,6 +1196,7 @@ impl Drop for ConnectGuard {
         let _ = self._lock.take();
         let _ = std::fs::remove_file(&self.local_sock);
         let _ = std::fs::remove_file(&self.pid_file);
+        let _ = std::fs::remove_file(&self.info_file);
         let _ = std::fs::remove_file(&self.lock_file);
         let _ = std::fs::remove_file(&self.dest_file);
     }
@@ -1248,6 +1277,12 @@ pub async fn run(opts: ConnectOpts, ready_fd: Option<OwnedFd>) -> anyhow::Result
             // disconnect saw lock-held-but-no-PID and failed with
             // "cannot read PID".
             let _ = std::fs::write(&pid_file, std::process::id().to_string());
+            // Record our identity so `gritty doctor` can detect a stale
+            // supervisor (binary rebuilt after we daemonized). This is the
+            // only way to catch it -- the supervisor is a pure byte proxy,
+            // so handshake version checks never see its code at all.
+            let _ = crate::runinfo::RunInfo::current()
+                .write(&crate::runinfo::connect_info_path(&connection_name));
             lock
         }
         Err(_) => {
@@ -1393,6 +1428,7 @@ pub async fn run(opts: ConnectOpts, ready_fd: Option<OwnedFd>) -> anyhow::Result
         child: Some(child),
         local_sock: local_sock.clone(),
         pid_file: pid_file.clone(),
+        info_file: crate::runinfo::connect_info_path(&connection_name),
         lock_file: lock_path,
         dest_file: dest_file.clone(),
         _lock: Some(lock_fd),
@@ -2265,5 +2301,63 @@ mod tests {
         let (sleep, next) = next_backoff(MIN_RESPAWN_BACKOFF, Duration::from_secs(2));
         assert_eq!(sleep, MIN_RESPAWN_BACKOFF);
         assert_eq!(next, Duration::from_secs(2));
+    }
+
+    // --- ensure_remote_ready output parsing -------------------------------
+
+    #[test]
+    fn parse_ensure_remote_two_lines() {
+        let (sock, ver) = parse_ensure_remote_output("/run/user/1000/gritty/ctl.sock\n20").unwrap();
+        assert_eq!(sock, "/run/user/1000/gritty/ctl.sock");
+        assert_eq!(ver, Some(20));
+    }
+
+    #[test]
+    fn parse_ensure_remote_socket_only() {
+        // Older remotes that don't emit a version line.
+        let (sock, ver) = parse_ensure_remote_output("/tmp/gritty/ctl.sock").unwrap();
+        assert_eq!(sock, "/tmp/gritty/ctl.sock");
+        assert_eq!(ver, None);
+    }
+
+    #[test]
+    fn parse_ensure_remote_garbage_version_ignored() {
+        let (sock, ver) = parse_ensure_remote_output("/tmp/ctl.sock\nnot-a-number").unwrap();
+        assert_eq!(sock, "/tmp/ctl.sock");
+        assert_eq!(ver, None);
+    }
+
+    #[test]
+    fn parse_ensure_remote_empty_fails() {
+        let err = parse_ensure_remote_output("").unwrap_err();
+        assert!(err.to_string().contains("empty socket path"), "{err}");
+    }
+
+    #[test]
+    fn parse_ensure_remote_err_line_surfaces_reason() {
+        let out = "/run/user/1000/gritty/ctl.sock\n20\nERR:error: protocol version mismatch: local=20 remote=19; run `gritty restart`";
+        let err = parse_ensure_remote_output(out).unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("protocol version mismatch"), "{msg}");
+        assert!(msg.contains("gritty restart"), "{msg}");
+        assert!(msg.contains("remote daemon is unusable"), "{msg}");
+    }
+
+    #[test]
+    fn parse_ensure_remote_err_line_with_no_reason() {
+        let err = parse_ensure_remote_output("/tmp/ctl.sock\n20\nERR:").unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("remote daemon is unusable"), "{msg}");
+        // Don't emit a dangling colon when the reason is empty.
+        assert!(!msg.contains(": \n"), "{msg}");
+    }
+
+    #[test]
+    fn parse_ensure_remote_trailing_non_err_line_ignored() {
+        // A spurious third line without the ERR: prefix should not be treated
+        // as an error -- it's probably a shell profile leaking into stdout.
+        let (sock, ver) = parse_ensure_remote_output("/tmp/ctl.sock\n20\nsome noise").unwrap();
+        assert_eq!(sock, "/tmp/ctl.sock");
+        assert_eq!(ver, Some(20));
     }
 }
