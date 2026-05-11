@@ -2,6 +2,28 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 
+/// `FormatTime` impl that renders timestamps in the local timezone.
+///
+/// The default `tracing_subscriber` timer emits UTC, which forces timezone
+/// math every time a log file is read alongside wall-clock observations
+/// ("I saw it break around 7am"). `jiff` is already a dependency (see
+/// `commands/util.rs`), its `TimeZone::system()` reads the tzdb safely, and
+/// it tracks DST transitions for a daemon that runs for weeks.
+struct LocalTimer;
+
+/// Write `ts` as `YYYY-MM-DDTHH:MM:SS.ffffff±HH:MM` in the local timezone.
+/// Split out from the trait impl so it is directly testable.
+fn write_local_timestamp(out: &mut impl std::fmt::Write, ts: jiff::Timestamp) -> std::fmt::Result {
+    let zoned = ts.to_zoned(jiff::tz::TimeZone::system());
+    write!(out, "{}", zoned.strftime("%Y-%m-%dT%H:%M:%S.%6f%:z"))
+}
+
+impl tracing_subscriber::fmt::time::FormatTime for LocalTimer {
+    fn format_time(&self, w: &mut tracing_subscriber::fmt::format::Writer<'_>) -> std::fmt::Result {
+        write_local_timestamp(w, jiff::Timestamp::now())
+    }
+}
+
 type ReloadFn = Box<dyn Fn(&str) + Send + Sync>;
 
 /// Type-erased handle for reloading the tracing filter at runtime.
@@ -130,6 +152,7 @@ pub fn init_tracing(verbose: bool, log_path: Option<&Path>) {
                     tracing_subscriber::fmt::layer()
                         .with_writer(writer)
                         .with_ansi(false)
+                        .with_timer(LocalTimer)
                         .with_line_number(true)
                         .with_file(true)
                         .with_target(true),
@@ -137,7 +160,40 @@ pub fn init_tracing(verbose: bool, log_path: Option<&Path>) {
                 .init();
         }
         None => {
-            tracing_subscriber::fmt().with_env_filter(filter).with_writer(std::io::stderr).init();
+            tracing_subscriber::fmt()
+                .with_env_filter(filter)
+                .with_writer(std::io::stderr)
+                .with_timer(LocalTimer)
+                .init();
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn local_timestamp_has_rfc3339_shape_and_offset() {
+        let mut s = String::new();
+        // 2024-03-10T12:34:56.789000Z
+        let ts = jiff::Timestamp::new(1_710_074_096, 789_000_000).unwrap();
+        write_local_timestamp(&mut s, ts).unwrap();
+        // YYYY-MM-DDTHH:MM:SS.ffffff±HH:MM -- exact wall-clock values depend on
+        // the host TZ, so assert shape, not content.
+        assert_eq!(s.len(), "2024-03-10T05:34:56.789000-07:00".len(), "{s}");
+        assert_eq!(&s[4..5], "-");
+        assert_eq!(&s[10..11], "T");
+        assert_eq!(&s[19..20], ".");
+        assert_eq!(&s[20..26], "789000");
+        assert!(matches!(&s[26..27], "+" | "-"), "expected offset sign in {s}");
+        assert_eq!(&s[29..30], ":");
+    }
+
+    #[test]
+    fn local_timestamp_microsecond_padding() {
+        let mut s = String::new();
+        write_local_timestamp(&mut s, jiff::Timestamp::new(0, 1_000).unwrap()).unwrap();
+        assert!(s.contains(".000001"), "micros not zero-padded: {s}");
     }
 }
