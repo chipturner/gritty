@@ -517,6 +517,13 @@ impl ChildState {
 
 /// Background task: monitor SSH child, respawn on transient failure.
 /// Uses exponential backoff (1s..60s) and never gives up on transient errors.
+///
+/// `lock_path` + `lock_identity` let the monitor notice when it has become a
+/// ghost: if the lock file is unlinked or replaced (another supervisor now
+/// owns the path), this process keeps holding an flock on a deleted inode that
+/// no one else can observe. Rather than silently compete with the real owner
+/// over the `-L` socket, it exits on the next probe tick; `ConnectGuard::drop`
+/// then sees `!matches_path` and leaves the owner's files alone.
 #[allow(clippy::too_many_arguments)]
 async fn tunnel_monitor(
     child: Child,
@@ -528,6 +535,8 @@ async fn tunnel_monitor(
     no_server_start: bool,
     isolate_control_path: bool,
     connect_timeout: u64,
+    lock_path: PathBuf,
+    lock_identity: Option<LockIdentity>,
     stop: tokio_util::sync::CancellationToken,
 ) {
     // Seeded from the caller's initial ensure_remote_ready so a fast
@@ -627,6 +636,15 @@ async fn tunnel_monitor(
                 continue;
             }
             _ = probe_ticker.tick() => {
+                if !lock_still_owned(lock_identity, &lock_path) {
+                    warn!(
+                        lock_path = %lock_path.display(),
+                        "lock file replaced or removed; another supervisor owns this \
+                         tunnel -- exiting"
+                    );
+                    let _ = state.child.kill().await;
+                    return;
+                }
                 match probe_tunnel_alive(&local_sock).await {
                     Ok(()) => {
                         if state.probe_failures > 0 {
@@ -1081,6 +1099,80 @@ pub fn is_lock_held(lock_path: &Path) -> bool {
     nix::fcntl::Flock::lock(file, nix::fcntl::FlockArg::LockExclusiveNonblock).is_err()
 }
 
+/// Device + inode pair that uniquely names the file a supervisor flock'd at
+/// startup. An flock is held on an *inode*, not a *path*: if the lock file
+/// is unlinked out from under the supervisor (an external `rm`, a racy
+/// cleanup, or another supervisor's Drop), our flock keeps existing on a
+/// deleted inode while `is_lock_held(path)` reports false and a fresh
+/// `tunnel-create` O_CREATs a new inode at the same path. Comparing
+/// `(dev, ino)` against the on-disk path is the only way to tell whether
+/// the lock we hold is the one the rest of the system can observe.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct LockIdentity {
+    dev: u64,
+    ino: u64,
+}
+
+impl LockIdentity {
+    /// Identity of the open file backing a held flock.
+    fn of_held(lock: &nix::fcntl::Flock<std::fs::File>) -> Option<Self> {
+        use std::os::unix::fs::MetadataExt;
+        let m = lock.metadata().ok()?;
+        Some(Self { dev: m.dev(), ino: m.ino() })
+    }
+
+    /// Identity of whatever is currently at `path` (if anything).
+    fn of_path(path: &Path) -> Option<Self> {
+        use std::os::unix::fs::MetadataExt;
+        let m = std::fs::metadata(path).ok()?;
+        Some(Self { dev: m.dev(), ino: m.ino() })
+    }
+
+    /// Does this held-lock identity still match the file at `path`?
+    /// False if `path` is gone or points at a different inode (a fresh
+    /// supervisor re-created it) -- either way, we no longer own the path
+    /// and must not disturb it.
+    fn matches_path(self, path: &Path) -> bool {
+        Self::of_path(path) == Some(self)
+    }
+}
+
+/// Is the lock at `path` still the one we flock'd at startup? Treats an
+/// unknown startup identity (a failed `fstat` -- pathological, never
+/// observed) as "still owned" so a one-off stat failure can't make the
+/// supervisor exit and tear down a working tunnel.
+fn lock_still_owned(held: Option<LockIdentity>, path: &Path) -> bool {
+    held.is_none_or(|id| id.matches_path(path))
+}
+
+/// Remove a stale tunnel's sidecar files, but only after proving no live
+/// supervisor holds the lock. Acquiring the flock non-blocking both verifies
+/// staleness *and* guards the unlink window: while we hold the flock on this
+/// inode, no concurrent `try_acquire_lock` can observe the lock as free (it
+/// opens the same path, same inode), so nothing can sneak in and re-create
+/// sidecar files between our check and our unlink. Returns `true` if cleanup
+/// ran, `false` if a live supervisor held the lock.
+///
+/// This replaces the old pattern of `is_lock_held(p)` followed by
+/// `cleanup_stale_files(name, true)`, which had a TOCTOU window: a new
+/// supervisor could acquire the lock between the probe and the unlink, and
+/// the unlink would then yank the winner's fresh lock file.
+fn cleanup_if_unheld(name: &str) -> bool {
+    let lock_path = connect_lock_path(name);
+    let lock = match try_acquire_lock(&lock_path) {
+        Ok(lock) => lock,
+        Err(_) => return false,
+    };
+    cleanup_stale_files(name);
+    // Unlink *before* releasing: a racer that O_CREATs the path after the
+    // unlink gets a brand-new inode and flocks it independently of ours, so
+    // there is never a window where the path points at an inode we're about
+    // to delete. See `ConnectGuard::drop` for the same ordering rationale.
+    let _ = std::fs::remove_file(&lock_path);
+    drop(lock);
+    true
+}
+
 /// Tunnel health status.
 #[derive(Debug, PartialEq, Eq)]
 pub enum TunnelStatus {
@@ -1147,17 +1239,17 @@ pub fn read_pid_hint(name: &str) -> Option<u32> {
     std::fs::read_to_string(connect_pid_path(name)).ok().and_then(|s| s.trim().parse().ok())
 }
 
-fn cleanup_stale_files(name: &str, remove_lock: bool) {
+/// Remove the non-lock sidecar files (`.sock`, `.pid`, `.info`, `.dest`).
+/// Callers must hold the tunnel flock -- either they just acquired it
+/// (`run()`, `cleanup_if_unheld()`) or they verified ownership via
+/// `LockIdentity::matches_path` (`ConnectGuard::drop`). The lock file itself
+/// is never removed here: it is the thing that *makes* this call safe, and
+/// its removal has its own inode-ownership rules.
+fn cleanup_stale_files(name: &str) {
     let _ = std::fs::remove_file(local_socket_path(name));
     let _ = std::fs::remove_file(connect_pid_path(name));
     let _ = std::fs::remove_file(crate::runinfo::connect_info_path(name));
     let _ = std::fs::remove_file(connect_dest_path(name));
-    // Callers that hold the flock (run()) must NOT remove the lock file out
-    // from under themselves; external callers (disconnect, get_tunnel_info)
-    // pass true so stale locks don't accumulate forever.
-    if remove_lock {
-        let _ = std::fs::remove_file(connect_lock_path(name));
-    }
 }
 
 /// Extract tunnel connection names by globbing lock files in the socket dir.
@@ -1206,21 +1298,42 @@ impl Drop for ConnectGuard {
             }
         }
 
-        // Release the flock *before* unlinking the lock file. If we
-        // unlink first while still holding the flock, a racing
-        // try_acquire_lock can O_CREAT a new inode at the same path
-        // and flock it successfully -- two supervisors then hold
-        // "the lock" on different inodes until we release ours. The
-        // flock-on-inode is the real ground truth; by dropping it
-        // first, any racing acquirer observes a consistent "lock free"
-        // state, O_CREAT either the old inode (which is now unlocked)
-        // or a new one.
+        // Only touch the sidecar files if we still own the inode at the lock
+        // path. Two supervisors can end up concurrently alive when the lock
+        // file is unlinked out from under one of them (external `rm`, a /tmp
+        // sweeper, or a pre-fix racy cleanup): the loser keeps its flock on a
+        // *deleted* inode while a fresh `tunnel-create` O_CREATs a new one and
+        // becomes the real owner. If the loser's Drop blindly `remove_file`s
+        // the path, it yanks the winner's fresh lock file and strands it with
+        // `is_lock_held() == false` -- which the client interprets as
+        // "tunnel destroyed, give up" instead of "transient, retry".
+        //
+        // Ordering once we've confirmed ownership:
+        //   1. Check + unlink *while still holding the flock*. A racer that
+        //      O_CREATs the path after our unlink gets a brand-new inode and
+        //      flocks it independently; there is never a window where the path
+        //      points at an inode we're about to delete.
+        //   2. Release the flock last. It only covers a deleted inode at that
+        //      point, so releasing it is invisible to everyone else.
+        let owns_lock = self
+            ._lock
+            .as_ref()
+            .and_then(LockIdentity::of_held)
+            .is_some_and(|id| id.matches_path(&self.lock_file));
+        if owns_lock {
+            let _ = std::fs::remove_file(&self.local_sock);
+            let _ = std::fs::remove_file(&self.pid_file);
+            let _ = std::fs::remove_file(&self.info_file);
+            let _ = std::fs::remove_file(&self.dest_file);
+            let _ = std::fs::remove_file(&self.lock_file);
+        } else {
+            warn!(
+                lock_path = %self.lock_file.display(),
+                "lock file was replaced or removed out from under us; \
+                 leaving sidecar files for the current owner"
+            );
+        }
         let _ = self._lock.take();
-        let _ = std::fs::remove_file(&self.local_sock);
-        let _ = std::fs::remove_file(&self.pid_file);
-        let _ = std::fs::remove_file(&self.info_file);
-        let _ = std::fs::remove_file(&self.lock_file);
-        let _ = std::fs::remove_file(&self.dest_file);
     }
 }
 
@@ -1291,7 +1404,7 @@ pub async fn run(opts: ConnectOpts, ready_fd: Option<OwnedFd>) -> anyhow::Result
         Ok(lock) => {
             // We got the lock -- any leftover files are stale (process died).
             debug!("cleaning stale tunnel files for {connection_name}");
-            cleanup_stale_files(&connection_name, false);
+            cleanup_stale_files(&connection_name);
             // Write PID immediately so `tunnel-destroy` can find us even
             // during the startup window (ensure_remote_ready + spawn_tunnel
             // + wait_for_socket can take tens of seconds on WAN links).
@@ -1433,6 +1546,10 @@ pub async fn run(opts: ConnectOpts, ready_fd: Option<OwnedFd>) -> anyhow::Result
         }
     }
 
+    // Snapshot the inode we flock'd so the monitor can detect the lock file
+    // being replaced or removed out from under us. See `LockIdentity`.
+    let lock_identity = LockIdentity::of_held(&lock_fd);
+
     // 5. Spawn SSH tunnel
     let child = spawn_tunnel(
         &dest,
@@ -1541,6 +1658,8 @@ pub async fn run(opts: ConnectOpts, ready_fd: Option<OwnedFd>) -> anyhow::Result
             opts.no_server_start,
             opts.isolate_control_path,
             opts.connect_timeout,
+            guard.lock_file.clone(),
+            lock_identity,
             stop.clone(),
         )
         .instrument(tunnel_span),
@@ -1582,13 +1701,15 @@ fn signal_ready(ready_fd: &Option<OwnedFd>) {
 
 pub async fn disconnect(name: &str) -> anyhow::Result<()> {
     validate_connection_name(name)?;
-    match probe_tunnel_status(name) {
-        TunnelStatus::Stale => {
-            cleanup_stale_files(name, true);
-            eprintln!("\x1b[2;33m\u{25b8} tunnel {name} already stopped\x1b[0m");
-            return Ok(());
-        }
-        TunnelStatus::Healthy | TunnelStatus::Reconnecting => {}
+    // `cleanup_if_unheld` is the race-safe "acquire flock, sweep, unlink lock"
+    // primitive. If it succeeds, nothing was holding the lock; if it fails,
+    // something live holds it and we must SIGTERM it. A plain `is_lock_held`
+    // probe followed by `cleanup_stale_files` would have a TOCTOU window
+    // where a fresh `tunnel-create` could slip in between the probe and the
+    // unlink and get its lock file yanked.
+    if cleanup_if_unheld(name) {
+        eprintln!("\x1b[2;33m\u{25b8} tunnel {name} already stopped\x1b[0m");
+        return Ok(());
     }
 
     // Read PID and send SIGTERM (let the process handle graceful shutdown)
@@ -1599,22 +1720,18 @@ pub async fn disconnect(name: &str) -> anyhow::Result<()> {
         .map(|p| p as i32)
         .ok_or_else(|| anyhow::anyhow!("cannot read PID for tunnel {name}"))?;
 
-    let lock_path = connect_lock_path(name);
-    if !is_lock_held(&lock_path) {
-        cleanup_stale_files(name, true);
-        eprintln!("\x1b[2;33m\u{25b8} tunnel {name} already stopped\x1b[0m");
-        return Ok(());
-    }
     unsafe {
         libc::kill(pid, libc::SIGTERM);
     }
 
-    // Poll lock for up to 2s to confirm exit
+    // Poll for up to 2s for the supervisor to release the lock and clean up
+    // its own files via ConnectGuard::drop. Once `cleanup_if_unheld` succeeds
+    // the lock is genuinely free and any remaining files are stragglers.
+    let lock_path = connect_lock_path(name);
     let deadline = Instant::now() + Duration::from_secs(2);
     loop {
         tokio::time::sleep(Duration::from_millis(100)).await;
-        if !is_lock_held(&lock_path) {
-            cleanup_stale_files(name, true);
+        if cleanup_if_unheld(name) {
             eprintln!("\x1b[32m\u{25b8} tunnel {name} stopped\x1b[0m");
             return Ok(());
         }
@@ -1623,7 +1740,7 @@ pub async fn disconnect(name: &str) -> anyhow::Result<()> {
         }
     }
 
-    // Still alive after timeout — escalate to SIGKILL + killpg
+    // Still alive after timeout -- escalate to SIGKILL + killpg.
     if is_lock_held(&lock_path) {
         unsafe {
             libc::kill(pid, libc::SIGKILL);
@@ -1631,8 +1748,17 @@ pub async fn disconnect(name: &str) -> anyhow::Result<()> {
         }
     }
     tokio::time::sleep(Duration::from_millis(100)).await;
-    cleanup_stale_files(name, true);
-    eprintln!("\x1b[32m\u{25b8} tunnel {name} killed\x1b[0m");
+    // SIGKILL means ConnectGuard::drop never ran -- force the sweep. If the
+    // process is somehow still holding the flock (kill raced), skip rather
+    // than risk yanking a lock out from under a live supervisor.
+    if cleanup_if_unheld(name) {
+        eprintln!("\x1b[32m\u{25b8} tunnel {name} killed\x1b[0m");
+    } else {
+        eprintln!(
+            "\x1b[33m\u{25b8} tunnel {name} still holding its lock after SIGKILL; \
+             files left in place\x1b[0m"
+        );
+    }
     Ok(())
 }
 
@@ -1656,7 +1782,10 @@ pub fn get_tunnel_info() -> Vec<TunnelInfo> {
         let status = probe_tunnel_status(name);
         if status == TunnelStatus::Stale {
             debug!("cleaning stale tunnel: {name}");
-            cleanup_stale_files(name, true);
+            // Race-safe: takes the flock before touching anything. If a
+            // supervisor slipped in between `probe_tunnel_status` and here,
+            // this is a no-op instead of yanking its fresh lock file.
+            cleanup_if_unheld(name);
             continue;
         }
         let dest =
@@ -2079,8 +2208,73 @@ mod tests {
         let _dir = tempfile::tempdir().unwrap();
         // We can't easily override socket_dir(), so test that cleanup_stale_files
         // at least doesn't panic on nonexistent files
-        cleanup_stale_files("nonexistent-cleanup-test-xyz", true);
+        cleanup_stale_files("nonexistent-cleanup-test-xyz");
         // No panic = success
+    }
+
+    #[test]
+    fn lock_identity_detects_replaced_inode() {
+        let dir = tempfile::tempdir().unwrap();
+        let lock_path = dir.path().join("test.lock");
+
+        // Supervisor A acquires the lock.
+        let a = try_acquire_lock(&lock_path).unwrap();
+        let a_id = LockIdentity::of_held(&a).unwrap();
+        assert!(a_id.matches_path(&lock_path), "A should own the path it just created");
+        assert!(lock_still_owned(Some(a_id), &lock_path));
+
+        // Someone unlinks the lock path out from under A (the root-cause
+        // scenario: external rm, /tmp sweeper, or a pre-fix racy cleanup).
+        std::fs::remove_file(&lock_path).unwrap();
+        assert!(!a_id.matches_path(&lock_path), "A's inode is gone; it no longer owns the path");
+        assert!(!lock_still_owned(Some(a_id), &lock_path));
+
+        // Supervisor B acquires a *fresh* inode at the same path.
+        let b = try_acquire_lock(&lock_path).unwrap();
+        let b_id = LockIdentity::of_held(&b).unwrap();
+        assert_ne!(a_id, b_id, "fresh O_CREAT must produce a different inode");
+        assert!(!a_id.matches_path(&lock_path), "A still does not own the path");
+        assert!(b_id.matches_path(&lock_path), "B is the real owner");
+
+        // The critical invariant: A dropping must not disturb B's lock file.
+        // ConnectGuard::drop gates `remove_file` on `matches_path`, so A's
+        // drop is a no-op here and B's lock file survives.
+        assert!(is_lock_held(&lock_path), "B's flock is observable via the path");
+        drop(a);
+        assert!(is_lock_held(&lock_path), "B's flock must survive A releasing its ghost lock");
+        drop(b);
+        assert!(!is_lock_held(&lock_path));
+    }
+
+    #[test]
+    fn lock_still_owned_treats_unknown_as_owned() {
+        // A failed startup fstat must not cause the supervisor to self-destruct.
+        let dir = tempfile::tempdir().unwrap();
+        let missing = dir.path().join("never-created.lock");
+        assert!(lock_still_owned(None, &missing));
+    }
+
+    #[test]
+    fn cleanup_if_unheld_skips_live_lock() {
+        // Use the real socket_dir() so the connect_*_path helpers line up;
+        // pick a name that can't collide with a real tunnel.
+        let name = "test-cleanup-live-xyz";
+        let lock_path = connect_lock_path(name);
+        let pid_path = connect_pid_path(name);
+        let _ = std::fs::create_dir_all(lock_path.parent().unwrap());
+        std::fs::write(&pid_path, "1").unwrap();
+        let lock = try_acquire_lock(&lock_path).unwrap();
+
+        // A live supervisor holds the flock -- cleanup must refuse.
+        assert!(!cleanup_if_unheld(name));
+        assert!(lock_path.exists(), "live lock file must not be removed");
+        assert!(pid_path.exists(), "sidecar files of a live supervisor must not be removed");
+
+        // Once the lock is released, cleanup proceeds.
+        drop(lock);
+        assert!(cleanup_if_unheld(name));
+        assert!(!lock_path.exists());
+        assert!(!pid_path.exists());
     }
 
     #[test]
@@ -2122,6 +2316,8 @@ mod tests {
                 true,
                 false,
                 30,
+                PathBuf::from("/tmp/nonexistent.lock"),
+                None,
                 stop,
             ),
         )
@@ -2154,6 +2350,8 @@ mod tests {
                 true,
                 false,
                 30,
+                PathBuf::from("/tmp/nonexistent.lock"),
+                None,
                 stop,
             ),
         )
@@ -2188,6 +2386,8 @@ mod tests {
                 true,
                 false,
                 30,
+                PathBuf::from("/tmp/nonexistent.lock"),
+                None,
                 stop,
             ),
         )

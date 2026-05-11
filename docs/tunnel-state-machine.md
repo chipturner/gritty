@@ -40,11 +40,39 @@ A tunnel named `NAME` owns these files in `socket_dir()`:
 
 Invariant: the flock held on the `.lock` *inode* is the single liveness truth.
 Everything else is advisory -- if the inode's flock is free, any other leftover
-file is stale by definition. `ConnectGuard::drop` releases the flock **before**
-unlinking the lock file, so a racing `try_acquire_lock` never observes a
-"file unlinked but inode still locked" window in which it could `O_CREAT` a
-new inode at the path and end up holding a valid flock concurrently with the
-departing supervisor.
+file is stale by definition.
+
+The subtle corollary: the flock is held on an *inode*, but `is_lock_held()`
+probes the *path*. If the lock file is unlinked out from under a running
+supervisor (external `rm`, a `/tmp` sweeper, or a pre-fix racy cleanup), the
+supervisor keeps a valid flock on a deleted inode while the path reports the
+lock as free. A fresh `tunnel-create` then `O_CREAT`s a new inode and becomes
+the observable owner -- two supervisors exist concurrently, only one visible.
+
+Three guards keep that state from becoming destructive:
+
+1. **`ConnectGuard::drop` ownership check.** At startup the supervisor snapshots
+   `LockIdentity { dev, ino }` from its held flock fd. On drop it compares
+   that against `stat(lock_path)`: if they differ (the path was replaced or
+   removed), the supervisor is a ghost and removes **nothing** -- the real
+   owner's `.sock`/`.pid`/`.info`/`.dest`/`.lock` all survive. When the
+   identities match, it unlinks the sidecar files *while still holding the
+   flock* (a racing `O_CREAT` after the unlink gets a brand-new inode and
+   flocks it independently) and releases the flock last.
+
+2. **`cleanup_if_unheld` for external observers.** `disconnect` and
+   `get_tunnel_info` used to probe `is_lock_held()` and then unlink by path,
+   a TOCTOU window where a new supervisor could acquire the lock between probe
+   and unlink. `cleanup_if_unheld` instead acquires the flock non-blocking: if
+   it succeeds, nothing live held the lock *and* nothing can sneak in while we
+   hold it; if it fails, a supervisor is alive and cleanup is a no-op.
+
+3. **Monitor self-heal.** On each probe tick the monitor calls
+   `lock_still_owned(lock_identity, lock_path)`. If the lock path no longer
+   points at the snapshotted inode, the supervisor exits; `ConnectGuard::drop`
+   then sees the mismatch and leaves the owner's files alone. This converges a
+   ghost-supervisor state within one `PROBE_INTERVAL` (30s) instead of letting
+   a pair of duelling supervisors run indefinitely.
 
 ## State diagram
 
@@ -126,9 +154,11 @@ stateDiagram-v2
         direction TB
         [*] --> CancelMonitor: stop.cancel()
         CancelMonitor --> KillChild: monitor awaits child.kill()
-        KillChild --> ReleaseFlock: ConnectGuard.drop\n(SIGTERM ssh, drop Flock)
-        ReleaseFlock --> CleanupFiles: flock released\n(no racing O_CREAT can double-lock)
-        CleanupFiles --> [*]: rm sock/pid/lock/dest
+        KillChild --> CheckOwnership: ConnectGuard.drop\n(SIGTERM ssh)
+        CheckOwnership --> CleanupFiles: LockIdentity matches path
+        CheckOwnership --> ReleaseFlock: path replaced / gone\n(ghost; leave owner's files alone)
+        CleanupFiles --> ReleaseFlock: rm sock/pid/info/dest/lock\n(while flock still held)
+        ReleaseFlock --> [*]: drop Flock
     }
 
     Stopping --> [*]
@@ -146,7 +176,7 @@ values via `probe_tunnel_status(name) -> TunnelStatus`:
 |----------------------------------------------|-----------------|---------------------------------|
 | lock held + `.sock` connectable              | `Healthy`       | `Running.Alive`, `Running.ProbeFailing` (socket stays bound during probe; a failing probe has not yet killed the ssh child) |
 | lock held + `.sock` not connectable          | `Reconnecting`  | `Starting.Preflight`, `Starting.SpawnChild`, `Starting.WaitForSocket` (initial setup), plus `Running.KillingChild`, `Running.ChildExited`, `Running.Backoff`, `Running.EnsureRemoteRetry`, `Running.SpawnRetry` (respawn cycle) |
-| lock free                                    | `Stale`         | Supervisor absent / dead; `.sock`/`.pid` orphaned. `get_tunnel_info` GCs stale files as a side effect. |
+| lock free                                    | `Stale`         | Supervisor absent / dead; `.sock`/`.pid` orphaned. `get_tunnel_info` GCs stale files as a side effect via `cleanup_if_unheld` (acquires the flock before touching anything, so a supervisor that races in between the probe and the GC is unaffected). |
 
 The `Starting.*` row matters for the client observer: during a slow
 initial tunnel setup (cellular RTT, remote cold-start), the client sees
