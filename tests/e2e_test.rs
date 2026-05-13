@@ -18,6 +18,11 @@ static TEST_ID: AtomicU32 = AtomicU32::new(0);
 /// Shared temp directory for all e2e test sockets (isolated from /tmp).
 static TEST_DIR: LazyLock<tempfile::TempDir> = LazyLock::new(|| tempfile::tempdir().unwrap());
 
+/// Distinctive prefix of the server's reconnect replay divider: dim SGR followed
+/// by the first box-drawing rule character. Used to assert presence/absence and
+/// ordering without coupling tests to the full rule width.
+const RECONNECT_DIVIDER: &str = "\x1b[2m\u{2500}";
+
 fn unique_agent_socket_path() -> PathBuf {
     let id = TEST_ID.fetch_add(1, Ordering::Relaxed);
     let pid = std::process::id();
@@ -1317,13 +1322,13 @@ async fn ring_buffer_overflow_shows_truncation_marker() {
     let mut framed = Framed::new(client_stream, FrameCodec);
     framed.send(Frame::Resize { cols: 80, rows: 24 }).await.unwrap();
 
-    // First Data frame should contain the truncation marker
+    // First Data frame should carry the truncation annotation on the divider.
     let output = read_available_data(&mut framed, Duration::from_secs(3)).await;
     let output_str = String::from_utf8_lossy(&output);
     assert!(
-        output_str.contains("bytes of output dropped"),
+        output_str.contains("dropped while detached"),
         "reconnect should show truncation marker when ring buffer overflows, got first 200 chars: {}",
-        &output_str[..output_str.len().min(200)]
+        output_str.chars().take(200).collect::<String>()
     );
     assert!(output_str.contains("TRUNC_DONE"), "tail of output should still be preserved");
 
@@ -2539,7 +2544,7 @@ async fn reconnect_sends_separator_on_main_screen() {
     let output = read_available_data(&mut framed, Duration::from_secs(2)).await;
     let output_str = String::from_utf8_lossy(&output);
     assert!(
-        output_str.contains("[gritty: reconnected]"),
+        output_str.contains(RECONNECT_DIVIDER),
         "main screen reconnect should show separator, got: {output_str}"
     );
 
@@ -2583,7 +2588,7 @@ async fn reconnect_sends_ctrl_l_on_alternate_screen() {
     let output_str = String::from_utf8_lossy(&output);
     // Should NOT contain the separator
     assert!(
-        !output_str.contains("[gritty: reconnected]"),
+        !output_str.contains(RECONNECT_DIVIDER),
         "alternate screen reconnect should not show separator, got: {output_str}"
     );
 
@@ -2719,15 +2724,15 @@ async fn reconnect_replays_scrollback_lines() {
     );
 
     assert!(
-        output_str.contains("[gritty: reconnected]"),
-        "reconnect banner should appear, got: {output_str}"
+        output_str.contains(RECONNECT_DIVIDER),
+        "reconnect divider should appear, got: {output_str}"
     );
 
-    // Banner precedes scrollback so replayed output ends with the cursor where
+    // Divider precedes scrollback so replayed output ends with the cursor where
     // the shell left it.
     let scrollback_pos = output_str.find("SCROLLBACK_LINE_2").unwrap();
-    let separator_pos = output_str.find("[gritty: reconnected]").unwrap();
-    assert!(separator_pos < scrollback_pos, "banner should appear before scrollback");
+    let separator_pos = output_str.find(RECONNECT_DIVIDER).unwrap();
+    assert!(separator_pos < scrollback_pos, "divider should appear before scrollback");
 
     let _ = framed.send(Frame::Data(Bytes::from("exit\n"))).await;
     let _ = timeout(Duration::from_secs(3), server).await;

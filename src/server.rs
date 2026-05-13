@@ -790,7 +790,7 @@ async fn tail_relay(
                     break;
                 }
                 Err(broadcast::error::RecvError::Lagged(n)) => {
-                    let marker = format!("\r\n\x1b[2;33m[tail: dropped {n} events]\x1b[0m\r\n");
+                    let marker = format!("\r\n\x1b[2m\u{25b8} tail fell behind \u{b7} {n} events dropped\x1b[0m\r\n");
                     if framed.send(Frame::Data(Bytes::from(marker))).await.is_err() { break; }
                     continue;
                 }
@@ -1360,6 +1360,27 @@ impl ServerRelay<'_> {
 
 /// Apply a new PTY window size and signal the foreground process group.
 /// Centralized so reconnect flows and the `Resize` frame handler share one path.
+/// Dim horizontal rule sent to the client right before a main-screen scrollback
+/// replay. It marks "below this line is replayed context, not fresh output" --
+/// the client already printed a `▸ reconnected` / `▸ attached` line, so we
+/// don't re-announce the event, we just fence the replay. The rule spans the
+/// client's terminal width (falling back when the client didn't send one) and
+/// carries an optional left-aligned annotation (e.g. dropped byte count).
+fn replay_divider(cols: u16, annotation: Option<&str>) -> String {
+    const RULE: char = '\u{2500}'; // ─
+    const FALLBACK_WIDTH: usize = 40;
+    let width = if cols > 0 { cols as usize } else { FALLBACK_WIDTH };
+    let rule: String = match annotation {
+        Some(text) => {
+            let prefix = format!("{RULE}{RULE} {text} ");
+            let fill = width.saturating_sub(prefix.chars().count());
+            format!("{prefix}{}", String::from_iter(std::iter::repeat_n(RULE, fill)))
+        }
+        None => String::from_iter(std::iter::repeat_n(RULE, width)),
+    };
+    format!("\r\x1b[2m{rule}\x1b[0m\r\n")
+}
+
 fn apply_winsize(master: &tokio::io::unix::AsyncFd<std::os::fd::OwnedFd>, cols: u16, rows: u16) {
     let (cols, rows) = crate::security::clamp_winsize(cols, rows);
     let ws = libc::winsize { ws_row: rows, ws_col: cols, ws_xpixel: 0, ws_ypixel: 0 };
@@ -2007,20 +2028,20 @@ pub async fn run(
             }
         } else if is_reconnect {
             // Main screen: single winsize apply (no toggle needed), then a
-            // status banner and scrollback replay. Banner-first means the
-            // last bytes written are real PTY output, so the cursor lands
-            // where the shell expects it.
+            // divider and scrollback replay. The client already printed its
+            // own "reconnected"/"attached" line; the divider just fences off
+            // the replayed context. Divider-first means the last bytes written
+            // are real PTY output, so the cursor lands where the shell expects.
             if attach_cols > 0 && attach_rows > 0 {
                 apply_winsize(&async_master, attach_cols, attach_rows);
             }
-            let msg = if ring_buf_dropped > 0 {
+            let annotation = (ring_buf_dropped > 0).then(|| {
                 format!(
-                    "\r\n\x1b[2;33m[gritty: reconnected -- {} bytes of output dropped]\x1b[0m\r\n",
-                    ring_buf_dropped
+                    "{} dropped while detached",
+                    humansize::format_size(ring_buf_dropped as u64, humansize::BINARY)
                 )
-            } else {
-                "\r\n\x1b[2;33m[gritty: reconnected]\x1b[0m\r\n".to_string()
-            };
+            });
+            let msg = replay_divider(attach_cols, annotation.as_deref());
             if let Err(e) = send_framed_timed(&mut framed, Frame::Data(Bytes::from(msg))).await {
                 warn!(error = %e, "client send failed during reconnect banner, detaching");
                 flush_failed = true;
@@ -2198,11 +2219,12 @@ pub async fn run(
                                             Some(now.saturating_sub(hb))
                                         });
                                     let hb_str = match hb_age {
-                                        Some(s) => format!("{s}s ago"),
-                                        None => "n/a".to_string(),
+                                        Some(s) => format!("last seen {s}s ago"),
+                                        None => "last seen unknown".to_string(),
                                     };
                                     let msg = format!(
-                                        "\r\n\x1b[2;33m[gritty: took over session (was active, heartbeat {hb_str})]\x1b[0m\r\n"
+                                        "\r\n\x1b[33m\u{25b8} took over session \u{b7} {hb_str}\x1b[0m\r\n{}",
+                                        replay_divider(new_cols, None)
                                     );
                                     let mut replay_ok =
                                         send_framed_timed(&mut framed, Frame::Data(Bytes::from(msg)))
@@ -2576,6 +2598,50 @@ fn cleanup_socket(path: &Path) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Display-width in cells of a divider string, ignoring ANSI SGR wrapping.
+    fn rule_width(s: &str) -> usize {
+        s.trim_start_matches('\r')
+            .trim_end_matches("\r\n")
+            .trim_start_matches("\x1b[2m")
+            .trim_end_matches("\x1b[0m")
+            .chars()
+            .count()
+    }
+
+    #[test]
+    fn replay_divider_spans_client_width() {
+        assert_eq!(rule_width(&replay_divider(80, None)), 80);
+        assert_eq!(rule_width(&replay_divider(20, None)), 20);
+    }
+
+    #[test]
+    fn replay_divider_falls_back_when_width_unknown() {
+        assert_eq!(rule_width(&replay_divider(0, None)), 40);
+    }
+
+    #[test]
+    fn replay_divider_annotation_keeps_width() {
+        let d = replay_divider(80, Some("3.2 KiB dropped while detached"));
+        assert_eq!(rule_width(&d), 80);
+        assert!(d.contains("3.2 KiB dropped while detached"));
+        // Annotation is offset from the left edge.
+        assert!(d.contains("\u{2500}\u{2500} 3.2 KiB"));
+    }
+
+    #[test]
+    fn replay_divider_annotation_wider_than_terminal() {
+        // Never panic and never emit a negative fill; just print the prefix.
+        let d = replay_divider(5, Some("this annotation is far too long"));
+        assert!(d.contains("this annotation is far too long"));
+    }
+
+    #[test]
+    fn replay_divider_is_dim_and_inline() {
+        let d = replay_divider(10, None);
+        assert!(d.starts_with("\r\x1b[2m"), "{d:?}");
+        assert!(d.ends_with("\x1b[0m\r\n"), "{d:?}");
+    }
 
     #[test]
     fn extract_redirect_port_basic() {

@@ -310,6 +310,54 @@ fn next_reconnect_delay(prev: Duration) -> Duration {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Reconnect status-line chrome
+//
+// The reconnect loop owns one line at the bottom of the terminal and repaints
+// it in place (`\r` + `\x1b[K`). These helpers are the single source of truth
+// for that line's look so the interactive and tail paths stay in lockstep.
+// ---------------------------------------------------------------------------
+
+/// Braille spinner frames -- same set cargo, npm, et al. use.
+const SPINNER: &[char] = &['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏'];
+
+/// Cosmetic refresh cadence for the reconnect status line. Drives the spinner
+/// and keeps the elapsed counter advancing smoothly between attempts (backoff
+/// sleeps are 1..10s, long enough to otherwise look frozen).
+const RECONNECT_SPIN_INTERVAL: Duration = Duration::from_millis(120);
+
+/// What the reconnect status line is reporting. Determines the body text.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ReconnectPhase {
+    /// Actively retrying; show elapsed seconds.
+    Retrying,
+    /// OS reports no usable route; parked on `net.changed()`.
+    WaitingForNetwork,
+}
+
+/// Render the in-place reconnect status line. `spin` indexes the spinner
+/// frames (any monotonically increasing counter); `elapsed_s` is seconds since
+/// the loop started (or since the network came back).
+fn reconnect_status_line(spin: usize, elapsed_s: u64, phase: ReconnectPhase) -> String {
+    let glyph = SPINNER[spin % SPINNER.len()];
+    let body = match phase {
+        ReconnectPhase::Retrying => format!("reconnecting {elapsed_s}s"),
+        ReconnectPhase::WaitingForNetwork => "waiting for network".to_string(),
+    };
+    format!("\r\x1b[2m{glyph} {body} \u{b7} ^C aborts\x1b[0m\x1b[K")
+}
+
+/// Terminal success line: replaces the status line, then newline.
+fn reconnect_ok_line() -> &'static str {
+    "\r\x1b[32m\u{25b8} reconnected\x1b[0m\x1b[K\r\n"
+}
+
+/// Terminal failure line: replaces the status line, then newline. Caller is
+/// responsible for leaving alt-screen first if needed.
+fn reconnect_err_line(text: &str) -> String {
+    format!("\r\x1b[31m\u{25b8} {text}\x1b[0m\x1b[K\r\n")
+}
+
 struct NonBlockGuard {
     fd: BorrowedFd<'static>,
     original_flags: nix::fcntl::OFlag,
@@ -732,7 +780,13 @@ impl ClientRelay<'_> {
                 // clobbered by RawModeGuard's Drop. No-op on main screen.
                 write_stdout_async(
                     self.async_stdout,
-                    b"\x1b[?1049l\r\x1b[31m\xe2\x96\xb8 server shut down -- session is gone; run `gritty connect` to start fresh\x1b[0m\x1b[K\r\n",
+                    format!(
+                        "\x1b[?1049l{}",
+                        reconnect_err_line(
+                            "server shut down -- session is gone; run `gritty connect` to start fresh"
+                        )
+                    )
+                    .as_bytes(),
                 )
                 .await?;
                 return Ok(ControlFlow::Break(RelayExit::Exit(1)));
@@ -1877,12 +1931,21 @@ pub async fn run(
                 let mut attempt_n = 0u32;
                 // Path-status gating only makes sense for tunnel sockets --
                 // a local Unix socket doesn't need a network route.
+                // Spinner / elapsed counter. Purely cosmetic -- keeps the
+                // status line visibly alive between attempts (backoff sleeps
+                // run 1..10s) and during a slow attempt (tunnel up but remote
+                // handshake stalled).
+                let mut spin: usize = 0;
+                let mut tick = tokio::time::interval(RECONNECT_SPIN_INTERVAL);
+                tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
                 let is_remote = crate::connect::ctl_socket_lock_path(ctl_path).is_some();
                 info!(is_remote, path_status = ?net.status(), "entering reconnect loop");
                 if show_chrome {
+                    // Reserve a fresh line; the tick arm repaints it in place.
+                    write_stdout_async(&async_stdout, b"\r\n").await?;
                     write_stdout_async(
                         &async_stdout,
-                        b"\r\n\x1b[2;33m\xe2\x96\xb8 reconnecting... (Ctrl-C to abort)\x1b[0m",
+                        reconnect_status_line(spin, 0, ReconnectPhase::Retrying).as_bytes(),
                     )
                     .await?;
                 }
@@ -1896,50 +1959,72 @@ pub async fn run(
                     // `continue` below and doubled the backoff without ever
                     // attempting to connect.
                     let sleep_for = next_reconnect_delay(backoff);
+                    let deadline = tokio::time::Instant::now() + sleep_for;
                     let mut net_hint = false;
-                    // Race sleep against stdin so Ctrl-C is instant
-                    tokio::select! {
-                        _ = tokio::time::sleep(sleep_for) => {}
-                        _ = net.changed() => {
-                            // Network path changed while backing off --
-                            // connectivity may have returned. Attempt now
-                            // and reset the backoff so a long outage
-                            // followed by wifi-returns doesn't sit out the
-                            // remainder of a 10s sleep.
-                            debug!(status = ?net.status(), "network path changed during reconnect backoff");
-                            net_hint = true;
-                        }
-                        _ = sigterm.recv() => {
-                            info!("reconnect: exiting -- SIGTERM");
-                            write_stdout_async(&async_stdout, b"\r\n").await?;
-                            return Ok(1);
-                        }
-                        _ = sighup.recv() => {
-                            info!("reconnect: exiting -- SIGHUP");
-                            write_stdout_async(&async_stdout, b"\r\n").await?;
-                            return Ok(1);
-                        }
-                        ready = async_stdin.readable() => {
-                            let mut guard = ready?;
-                            let mut peek = [0u8; 1];
-                            match guard.try_io(|inner| inner.get_ref().read(&mut peek)) {
-                                Ok(Ok(1)) if peek[0] == 0x03 => {
-                                    info!("reconnect: exiting -- Ctrl-C");
-                                    write_stdout_async(&async_stdout, b"\r\n").await?;
-                                    return Ok(1);
+                    // Wait out the backoff, animating the status line. Each
+                    // arm either breaks to attempt a connect or returns.
+                    loop {
+                        tokio::select! {
+                            _ = tokio::time::sleep_until(deadline) => break,
+                            _ = tick.tick() => {
+                                spin = spin.wrapping_add(1);
+                                if show_chrome {
+                                    let phase = if is_remote && net.status() == PathStatus::Unsatisfied {
+                                        ReconnectPhase::WaitingForNetwork
+                                    } else {
+                                        ReconnectPhase::Retrying
+                                    };
+                                    let elapsed = reconnect_started.elapsed().as_secs();
+                                    write_stdout_async(
+                                        &async_stdout,
+                                        reconnect_status_line(spin, elapsed, phase).as_bytes(),
+                                    )
+                                    .await?;
                                 }
-                                Ok(Ok(0)) | Ok(Err(_)) => {
-                                    info!("reconnect: exiting -- stdin EOF/error");
-                                    return Ok(1);
-                                }
-                                _ => {}
                             }
-                            // Fall through: impatient keystroke (not Ctrl-C)
-                            // cuts the current sleep short and triggers an
-                            // attempt now rather than restarting the outer
-                            // loop. Restarting here re-raced the same sleep,
-                            // so a user holding a key (>1 keystroke/sec)
-                            // starved every reconnect attempt.
+                            _ = net.changed() => {
+                                // Network path changed while backing off --
+                                // connectivity may have returned. Attempt now
+                                // and reset the backoff so a long outage
+                                // followed by wifi-returns doesn't sit out the
+                                // remainder of a 10s sleep.
+                                debug!(status = ?net.status(), "network path changed during reconnect backoff");
+                                net_hint = true;
+                                break;
+                            }
+                            _ = sigterm.recv() => {
+                                info!("reconnect: exiting -- SIGTERM");
+                                write_stdout_async(&async_stdout, b"\r\n").await?;
+                                return Ok(1);
+                            }
+                            _ = sighup.recv() => {
+                                info!("reconnect: exiting -- SIGHUP");
+                                write_stdout_async(&async_stdout, b"\r\n").await?;
+                                return Ok(1);
+                            }
+                            ready = async_stdin.readable() => {
+                                let mut guard = ready?;
+                                let mut peek = [0u8; 1];
+                                match guard.try_io(|inner| inner.get_ref().read(&mut peek)) {
+                                    Ok(Ok(1)) if peek[0] == 0x03 => {
+                                        info!("reconnect: exiting -- Ctrl-C");
+                                        write_stdout_async(&async_stdout, b"\r\n").await?;
+                                        return Ok(1);
+                                    }
+                                    Ok(Ok(0)) | Ok(Err(_)) => {
+                                        info!("reconnect: exiting -- stdin EOF/error");
+                                        return Ok(1);
+                                    }
+                                    _ => {}
+                                }
+                                // Impatient keystroke (not Ctrl-C) cuts the
+                                // current sleep short and triggers an attempt
+                                // now rather than restarting the outer loop --
+                                // restarting re-raced the same sleep, so a
+                                // user holding a key (>1 keystroke/sec)
+                                // starved every reconnect attempt.
+                                break;
+                            }
                         }
                     }
 
@@ -1956,13 +2041,6 @@ pub async fn run(
                             info!("reconnect: path unsatisfied, parking until network returns");
                         }
                         was_offline = true;
-                        if show_chrome {
-                            write_stdout_async(
-                                &async_stdout,
-                                b"\r\x1b[2;33m\xe2\x96\xb8 waiting for network... (Ctrl-C to abort)\x1b[0m\x1b[K",
-                            )
-                            .await?;
-                        }
                         continue;
                     }
                     if was_offline {
@@ -1974,16 +2052,6 @@ pub async fn run(
                         net_hint = true;
                     }
                     backoff = if net_hint { Duration::ZERO } else { sleep_for };
-
-                    let elapsed = reconnect_started.elapsed().as_secs();
-                    if show_chrome {
-                        write_stdout_async(
-                            &async_stdout,
-                            format!("\r\x1b[2;33m\u{25b8} reconnecting... {elapsed}s (Ctrl-C to abort)\x1b[0m\x1b[K")
-                                .as_bytes(),
-                        )
-                        .await?;
-                    }
 
                     // For tunnels, the supervisor holds an flock on a
                     // companion `.lock` even while it's respawning the SSH
@@ -2010,7 +2078,13 @@ pub async fn run(
                             // screen.
                             write_stdout_async(
                                 &async_stdout,
-                                b"\x1b[?1049l\r\x1b[31m\xe2\x96\xb8 server socket gone -- session is unreachable; reconnect manually\x1b[0m\x1b[K\r\n",
+                                format!(
+                                    "\x1b[?1049l{}",
+                                    reconnect_err_line(
+                                        "server socket gone -- session is unreachable; reconnect manually"
+                                    )
+                                )
+                                .as_bytes(),
                             )
                             .await?;
                             return Ok(1);
@@ -2040,7 +2114,7 @@ pub async fn run(
                         socket_exists = ctl_path.exists(),
                         "reconnect: attempting"
                     );
-                    let attempt = tokio::time::timeout(RECONNECT_ATTEMPT_TIMEOUT, async {
+                    let attempt_fut = tokio::time::timeout(RECONNECT_ATTEMPT_TIMEOUT, async {
                         let stream = match crate::security::connect_verified(ctl_path).await {
                             Ok(s) => s,
                             Err(e) => {
@@ -2104,8 +2178,43 @@ pub async fn run(
                             Some(Ok(Frame::Error { message, .. })) => Attempt::SessionGone(message),
                             _ => Attempt::Retry,
                         }
-                    })
-                    .await;
+                    });
+                    tokio::pin!(attempt_fut);
+                    // Keep the spinner alive during a slow attempt (e.g. tunnel
+                    // socket up but remote handshake stalled). The attempt
+                    // future owns the wire; the tick arm only touches stdout.
+                    let attempt = loop {
+                        tokio::select! {
+                            r = &mut attempt_fut => break r,
+                            _ = tick.tick() => {
+                                spin = spin.wrapping_add(1);
+                                if show_chrome {
+                                    let elapsed = reconnect_started.elapsed().as_secs();
+                                    write_stdout_async(
+                                        &async_stdout,
+                                        reconnect_status_line(spin, elapsed, ReconnectPhase::Retrying)
+                                            .as_bytes(),
+                                    )
+                                    .await?;
+                                }
+                            }
+                        }
+                    };
+
+                    // Emit a terminal red line on stdout. `\x1b[?1049l` leaves
+                    // alt-screen first so the error is visible on main screen
+                    // -- otherwise RawModeGuard's Drop emits it after the fact
+                    // and clobbers the message. No-op on main screen.
+                    macro_rules! bail_reconnect {
+                        ($text:expr) => {{
+                            write_stdout_async(
+                                &async_stdout,
+                                format!("\x1b[?1049l{}", reconnect_err_line($text)).as_bytes(),
+                            )
+                            .await?;
+                            return Ok(1);
+                        }};
+                    }
 
                     let attempt_ms = attempt_started.elapsed().as_millis();
                     match attempt {
@@ -2117,11 +2226,8 @@ pub async fn run(
                                 "reconnect: connected"
                             );
                             if show_chrome {
-                                write_stdout_async(
-                                    &async_stdout,
-                                    b"\r\x1b[32m\xe2\x96\xb8 reconnected\x1b[0m\x1b[K\r\n",
-                                )
-                                .await?;
+                                write_stdout_async(&async_stdout, reconnect_ok_line().as_bytes())
+                                    .await?;
                             }
                             framed = new_framed;
                             break;
@@ -2131,39 +2237,23 @@ pub async fn run(
                                 attempt = attempt_n,
                                 "reconnect: exiting -- session gone: {message}"
                             );
-                            write_stdout_async(
-                                &async_stdout,
-                                format!(
-                                    "\x1b[?1049l\r\x1b[31m\u{25b8} session gone: {message}\x1b[0m\x1b[K\r\n"
-                                )
-                                .as_bytes(),
-                            )
-                            .await?;
-                            return Ok(1);
+                            bail_reconnect!(&format!("session gone: {message}"));
                         }
                         Ok(Attempt::ServerRestarted) => {
                             info!(
                                 attempt = attempt_n,
                                 "reconnect: exiting -- server_id changed (remote daemon restarted)"
                             );
-                            write_stdout_async(
-                                &async_stdout,
-                                b"\x1b[?1049l\r\x1b[31m\xe2\x96\xb8 server restarted -- session is gone; reconnect manually\x1b[0m\x1b[K\r\n",
-                            )
-                            .await?;
-                            return Ok(1);
+                            bail_reconnect!(
+                                "server restarted -- session is gone; reconnect manually"
+                            );
                         }
                         Ok(Attempt::OwnerChanged) => {
                             info!(
                                 attempt = attempt_n,
                                 "reconnect: exiting -- owner_device_id mismatch (session taken over)"
                             );
-                            write_stdout_async(
-                                &async_stdout,
-                                b"\x1b[?1049l\r\x1b[31m\xe2\x96\xb8 session taken over by another client\x1b[0m\x1b[K\r\n",
-                            )
-                            .await?;
-                            return Ok(1);
+                            bail_reconnect!("session taken over by another client");
                         }
                         Ok(Attempt::VersionMismatch { server_version }) => {
                             let local = crate::protocol::PROTOCOL_VERSION;
@@ -2173,11 +2263,9 @@ pub async fn run(
                                 remote = server_version,
                                 "reconnect: exiting -- protocol version mismatch"
                             );
-                            let msg = format!(
-                                "\x1b[?1049l\r\x1b[31m\u{25b8} protocol version mismatch (local={local} remote={server_version}) -- run `gritty restart` to upgrade\x1b[0m\x1b[K\r\n"
-                            );
-                            write_stdout_async(&async_stdout, msg.as_bytes()).await?;
-                            return Ok(1);
+                            bail_reconnect!(&format!(
+                                "protocol version mismatch (local={local} remote={server_version}) -- run `gritty restart` to upgrade"
+                            ));
                         }
                         Ok(Attempt::HandshakeErr(msg)) => {
                             if is_terminal_handshake_err(&msg, tunnel_supervisor_alive) {
@@ -2186,13 +2274,7 @@ pub async fn run(
                                     tunnel_supervisor_alive,
                                     "reconnect: exiting -- terminal handshake error: {msg}"
                                 );
-                                write_stdout_async(
-                                    &async_stdout,
-                                    format!("\x1b[?1049l\r\x1b[31m\u{25b8} {msg}\x1b[0m\x1b[K\r\n")
-                                        .as_bytes(),
-                                )
-                                .await?;
-                                return Ok(1);
+                                bail_reconnect!(&msg);
                             }
                             // Transient accept-then-EOF from a dying ssh -L
                             // during supervisor respawn -- identical to
@@ -2215,12 +2297,9 @@ pub async fn run(
                                 attempt = attempt_n,
                                 "reconnect: exiting -- ECONNREFUSED on stale socket, no supervisor"
                             );
-                            write_stdout_async(
-                                &async_stdout,
-                                b"\x1b[?1049l\r\x1b[31m\xe2\x96\xb8 daemon appears to have crashed -- session is gone; run `gritty server` or `gritty restart`\x1b[0m\x1b[K\r\n",
-                            )
-                            .await?;
-                            return Ok(1);
+                            bail_reconnect!(
+                                "daemon appears to have crashed -- session is gone; run `gritty server` or `gritty restart`"
+                            );
                         }
                         Ok(Attempt::Retry) => {
                             debug!(
@@ -2323,9 +2402,7 @@ pub async fn tail(
                         }
                         Some(Ok(Frame::ServerShutdown)) => {
                             info!("tail: server shutting down");
-                            eprintln!(
-                                "\r\x1b[31m\u{25b8} server shut down -- session is gone\x1b[0m\x1b[K"
-                            );
+                            eprint!("{}", reconnect_err_line("server shut down -- session is gone"));
                             break 'relay Some(1);
                         }
                         Some(Ok(_)) => {}
@@ -2377,37 +2454,44 @@ pub async fn tail(
                 let mut reconnect_started = Instant::now();
                 let mut socket_missing_since: Option<Instant> = None;
                 let mut was_offline = false;
+                let mut spin: usize = 0;
+                let mut tick = tokio::time::interval(RECONNECT_SPIN_INTERVAL);
+                tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
                 let is_remote = crate::connect::ctl_socket_lock_path(ctl_path).is_some();
                 const SOCKET_GONE_GRACE: Duration = Duration::from_secs(3);
                 if show_chrome {
-                    eprint!("\x1b[2;33m\u{25b8} reconnecting... (Ctrl-C to abort)\x1b[0m");
+                    eprint!("{}", reconnect_status_line(spin, 0, ReconnectPhase::Retrying));
                 }
                 loop {
-                    tokio::select! {
-                        _ = tokio::time::sleep(Duration::from_secs(1)) => {}
-                        _ = net.changed() => {}
-                        _ = sigint.recv() => { break 'outer 0; }
-                        _ = sigterm.recv() => { break 'outer 1; }
-                        _ = sighup.recv() => { break 'outer 1; }
+                    let deadline = tokio::time::Instant::now() + Duration::from_secs(1);
+                    loop {
+                        tokio::select! {
+                            _ = tokio::time::sleep_until(deadline) => break,
+                            _ = tick.tick() => {
+                                spin = spin.wrapping_add(1);
+                                if show_chrome {
+                                    let phase = if is_remote && net.status() == PathStatus::Unsatisfied {
+                                        ReconnectPhase::WaitingForNetwork
+                                    } else {
+                                        ReconnectPhase::Retrying
+                                    };
+                                    let elapsed = reconnect_started.elapsed().as_secs();
+                                    eprint!("{}", reconnect_status_line(spin, elapsed, phase));
+                                }
+                            }
+                            _ = net.changed() => break,
+                            _ = sigint.recv() => { break 'outer 0; }
+                            _ = sigterm.recv() => { break 'outer 1; }
+                            _ = sighup.recv() => { break 'outer 1; }
+                        }
                     }
                     if is_remote && net.status() == PathStatus::Unsatisfied {
                         was_offline = true;
-                        if show_chrome {
-                            eprint!(
-                                "\r\x1b[2;33m\u{25b8} waiting for network... (Ctrl-C to abort)\x1b[0m\x1b[K"
-                            );
-                        }
                         continue;
                     }
                     if was_offline {
                         was_offline = false;
                         reconnect_started = Instant::now();
-                    }
-                    let elapsed = reconnect_started.elapsed().as_secs();
-                    if show_chrome {
-                        eprint!(
-                            "\r\x1b[2;33m\u{25b8} reconnecting... {elapsed}s (Ctrl-C to abort)\x1b[0m\x1b[K"
-                        );
                     }
 
                     let tunnel_supervisor_alive = crate::connect::ctl_socket_lock_path(ctl_path)
@@ -2417,8 +2501,11 @@ pub async fn tail(
                         let first_seen = *socket_missing_since.get_or_insert_with(Instant::now);
                         if first_seen.elapsed() >= SOCKET_GONE_GRACE {
                             info!("tail reconnect: exiting -- ctl socket gone and no supervisor");
-                            eprintln!(
-                                "\r\x1b[31m\u{25b8} server socket gone -- session is unreachable; reconnect manually\x1b[0m\x1b[K"
+                            eprint!(
+                                "{}",
+                                reconnect_err_line(
+                                    "server socket gone -- session is unreachable; reconnect manually"
+                                )
                             );
                             break 'outer 1;
                         }
@@ -2440,7 +2527,7 @@ pub async fn tail(
                         DaemonGone,
                         Retry,
                     }
-                    let outcome = tokio::time::timeout(RECONNECT_ATTEMPT_TIMEOUT, async {
+                    let outcome_fut = tokio::time::timeout(RECONNECT_ATTEMPT_TIMEOUT, async {
                         let stream = match crate::security::connect_verified(ctl_path).await {
                             Ok(s) => s,
                             Err(e) => {
@@ -2488,14 +2575,33 @@ pub async fn tail(
                             Some(Ok(Frame::Error { message, .. })) => Outcome::SessionGone(message),
                             _ => Outcome::Retry,
                         }
-                    })
-                    .await;
+                    });
+                    tokio::pin!(outcome_fut);
+                    let outcome = loop {
+                        tokio::select! {
+                            r = &mut outcome_fut => break r,
+                            _ = tick.tick() => {
+                                spin = spin.wrapping_add(1);
+                                if show_chrome {
+                                    let elapsed = reconnect_started.elapsed().as_secs();
+                                    eprint!("{}", reconnect_status_line(spin, elapsed, ReconnectPhase::Retrying));
+                                }
+                            }
+                        }
+                    };
+
+                    macro_rules! bail_tail {
+                        ($text:expr) => {{
+                            eprint!("{}", reconnect_err_line($text));
+                            break 'outer 1;
+                        }};
+                    }
 
                     match outcome {
                         Ok(Outcome::Connected(new_framed)) => {
                             info!("tail reconnect: connected");
                             if show_chrome {
-                                eprintln!("\r\x1b[32m\u{25b8} reconnected\x1b[0m\x1b[K");
+                                eprint!("{}", reconnect_ok_line());
                             }
                             framed = new_framed;
                             heartbeat_interval.reset();
@@ -2504,39 +2610,32 @@ pub async fn tail(
                         }
                         Ok(Outcome::ServerRestarted) => {
                             info!("tail reconnect: exiting -- server_id changed");
-                            eprintln!(
-                                "\r\x1b[31m\u{25b8} server restarted -- session is gone; reconnect manually\x1b[0m\x1b[K"
-                            );
-                            break 'outer 1;
+                            bail_tail!("server restarted -- session is gone; reconnect manually");
                         }
                         Ok(Outcome::VersionMismatch { local, remote }) => {
                             info!(
                                 local,
                                 remote, "tail reconnect: exiting -- protocol version mismatch"
                             );
-                            eprintln!(
-                                "\r\x1b[31m\u{25b8} protocol version mismatch (local={local} remote={remote}) -- run `gritty restart` to upgrade\x1b[0m\x1b[K"
-                            );
-                            break 'outer 1;
+                            bail_tail!(&format!(
+                                "protocol version mismatch (local={local} remote={remote}) -- run `gritty restart` to upgrade"
+                            ));
                         }
                         Ok(Outcome::HandshakeRejected(msg)) => {
                             info!("tail reconnect: exiting -- terminal handshake error: {msg}");
-                            eprintln!("\r\x1b[31m\u{25b8} {msg}\x1b[0m\x1b[K");
-                            break 'outer 1;
+                            bail_tail!(&msg);
                         }
                         Ok(Outcome::SessionGone(message)) => {
                             info!("tail reconnect: exiting -- session gone: {message}");
-                            eprintln!("\r\x1b[31m\u{25b8} session gone: {message}\x1b[0m\x1b[K");
-                            break 'outer 1;
+                            bail_tail!(&format!("session gone: {message}"));
                         }
                         Ok(Outcome::DaemonGone) => {
                             info!(
                                 "tail reconnect: exiting -- ECONNREFUSED on stale socket, no supervisor"
                             );
-                            eprintln!(
-                                "\r\x1b[31m\u{25b8} daemon appears to have crashed -- session is gone; run `gritty server` or `gritty restart`\x1b[0m\x1b[K"
+                            bail_tail!(
+                                "daemon appears to have crashed -- session is gone; run `gritty server` or `gritty restart`"
                             );
-                            break 'outer 1;
                         }
                         Ok(Outcome::Retry) | Err(_) => continue,
                     }
@@ -2749,6 +2848,46 @@ mod tests {
         assert_eq!(next_reconnect_delay(Duration::from_secs(8)), RECONNECT_BACKOFF_MAX);
         assert_eq!(next_reconnect_delay(RECONNECT_BACKOFF_MAX), RECONNECT_BACKOFF_MAX);
         assert_eq!(next_reconnect_delay(Duration::from_secs(300)), RECONNECT_BACKOFF_MAX);
+    }
+
+    #[test]
+    fn reconnect_status_line_retrying() {
+        let line = reconnect_status_line(0, 4, ReconnectPhase::Retrying);
+        // In-place repaint: CR to column 0, dim, clear-to-eol, SGR reset.
+        assert!(line.starts_with("\r\x1b[2m"), "{line:?}");
+        assert!(line.ends_with("\x1b[0m\x1b[K"), "{line:?}");
+        assert!(line.contains("reconnecting 4s"), "{line:?}");
+        assert!(line.contains("^C aborts"), "{line:?}");
+        // Spinner glyph is the frame at index 0.
+        assert!(line.contains(SPINNER[0]), "{line:?}");
+    }
+
+    #[test]
+    fn reconnect_status_line_waiting() {
+        let line = reconnect_status_line(3, 99, ReconnectPhase::WaitingForNetwork);
+        assert!(line.contains("waiting for network"), "{line:?}");
+        // No elapsed counter while parked offline.
+        assert!(!line.contains("99s"), "{line:?}");
+        assert!(line.contains(SPINNER[3]), "{line:?}");
+    }
+
+    #[test]
+    fn reconnect_status_line_spinner_wraps() {
+        let a = reconnect_status_line(1, 0, ReconnectPhase::Retrying);
+        let b = reconnect_status_line(1 + SPINNER.len(), 0, ReconnectPhase::Retrying);
+        assert_eq!(a, b);
+        let c = reconnect_status_line(2, 0, ReconnectPhase::Retrying);
+        assert_ne!(a, c);
+    }
+
+    #[test]
+    fn reconnect_ok_and_err_lines_repaint_in_place() {
+        assert!(reconnect_ok_line().starts_with('\r'));
+        assert!(reconnect_ok_line().ends_with("\x1b[K\r\n"));
+        let err = reconnect_err_line("boom");
+        assert!(err.starts_with("\r\x1b[31m"), "{err:?}");
+        assert!(err.contains("boom"), "{err:?}");
+        assert!(err.ends_with("\x1b[K\r\n"), "{err:?}");
     }
 
     #[test]
