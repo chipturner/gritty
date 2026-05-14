@@ -151,51 +151,61 @@ impl ConfigFile {
         let d = &self.defaults;
         let h = host.and_then(|name| self.host.get(name));
 
+        // Resolve heartbeat_interval first and cap it so the three invariants
+        // the client and server both rely on stay jointly satisfiable:
+        //   interval >= 1, timeout > interval, interval + timeout <= ceiling.
+        // That requires interval + (interval + 1) <= ceiling, i.e.
+        // interval <= (ceiling - 1) / 2. Without the cap a large interval
+        // drives the timeout clamp below the interval (or to 0), and the
+        // client's link_is_stale() check then trips on the first heartbeat
+        // tick -- an endless reconnect loop.
+        let heartbeat_interval = {
+            let raw = h.and_then(|h| h.heartbeat_interval).or(d.heartbeat_interval).unwrap_or(10);
+            let max_interval = (idle_evict_ceiling_secs().saturating_sub(1) / 2).max(1);
+            let clamped = raw.clamp(1, max_interval);
+            if clamped != raw {
+                eprintln!("warning: heartbeat_interval clamped to {clamped}s (was {raw}s)");
+            }
+            clamped
+        };
+
+        let heartbeat_timeout = {
+            let iv = heartbeat_interval;
+            let v = h.and_then(|h| h.heartbeat_timeout).or(d.heartbeat_timeout).unwrap_or(60);
+            let v = if v <= iv {
+                eprintln!(
+                    "warning: heartbeat_timeout ({v}s) must exceed heartbeat_interval ({iv}s); clamped to {}s",
+                    iv + 1
+                );
+                iv + 1
+            } else {
+                v
+            };
+            // The server's idle-evict fires after IDLE_EVICT_TIMEOUT of client
+            // silence. Keep interval + timeout under that (less a safety
+            // margin) so a healthy client always sends a Ping before the
+            // server gives up on it. The interval cap above guarantees
+            // max_timeout >= iv + 1, so this clamp can never undo `v > iv`.
+            let max_timeout = idle_evict_ceiling_secs().saturating_sub(iv);
+            if v > max_timeout {
+                let evict = IDLE_EVICT_TIMEOUT.as_secs();
+                eprintln!(
+                    "warning: heartbeat_interval ({iv}s) + heartbeat_timeout ({v}s) exceeds server idle-evict ({evict}s); timeout clamped to {max_timeout}s"
+                );
+                max_timeout
+            } else {
+                v
+            }
+        };
+
         SessionSettings {
             forward_agent: h.and_then(|h| h.forward_agent).or(d.forward_agent).unwrap_or(false),
             forward_open: h.and_then(|h| h.forward_open).or(d.forward_open).unwrap_or(true),
             no_escape: pick(h.and_then(|h| h.no_escape), d.no_escape),
             oauth_redirect: h.and_then(|h| h.oauth_redirect).or(d.oauth_redirect).unwrap_or(true),
             oauth_timeout: h.and_then(|h| h.oauth_timeout).or(d.oauth_timeout).unwrap_or(180),
-            heartbeat_interval: {
-                let v = h.and_then(|h| h.heartbeat_interval).or(d.heartbeat_interval).unwrap_or(10);
-                if v < 1 {
-                    eprintln!("warning: heartbeat_interval clamped to 1s (was {v})");
-                }
-                v.max(1)
-            },
-            heartbeat_timeout: {
-                let iv = h
-                    .and_then(|h| h.heartbeat_interval)
-                    .or(d.heartbeat_interval)
-                    .unwrap_or(10)
-                    .max(1);
-                let v = h.and_then(|h| h.heartbeat_timeout).or(d.heartbeat_timeout).unwrap_or(60);
-                let v = if v <= iv {
-                    eprintln!(
-                        "warning: heartbeat_timeout ({v}s) must exceed heartbeat_interval ({iv}s); clamped to {}s",
-                        iv + 1
-                    );
-                    iv + 1
-                } else {
-                    v
-                };
-                // The server's idle-evict fires after IDLE_EVICT_TIMEOUT of
-                // client silence. Keep interval + timeout under that (less a
-                // safety margin) so a healthy client always sends a Ping
-                // before the server gives up on it.
-                let ceiling = idle_evict_ceiling_secs();
-                let max_timeout = ceiling.saturating_sub(iv);
-                if v > max_timeout {
-                    let evict = IDLE_EVICT_TIMEOUT.as_secs();
-                    eprintln!(
-                        "warning: heartbeat_interval ({iv}s) + heartbeat_timeout ({v}s) exceeds server idle-evict ({evict}s); timeout clamped to {max_timeout}s"
-                    );
-                    max_timeout
-                } else {
-                    v
-                }
-            },
+            heartbeat_interval,
+            heartbeat_timeout,
             ring_buffer_size: h
                 .and_then(|h| h.ring_buffer_size)
                 .or(d.ring_buffer_size)
@@ -548,5 +558,32 @@ mod tests {
         assert!(s.heartbeat_interval + s.heartbeat_timeout <= idle_evict_ceiling_secs());
         assert_eq!(s.heartbeat_interval, 10);
         assert_eq!(s.heartbeat_timeout, 60);
+    }
+
+    // A large heartbeat_interval must not drive the resolved timeout below
+    // the interval (or to 0) via the idle-evict ceiling clamp. Exercise a
+    // range that includes values above the old un-capped behavior's break
+    // point (~40s) and assert all three invariants hold for every one.
+    #[test]
+    fn heartbeat_interval_capped_so_timeout_stays_valid() {
+        let ceiling = idle_evict_ceiling_secs();
+        for interval in [1, 10, 40, 41, 60, 80, 1000] {
+            let cfg: ConfigFile =
+                toml::from_str(&format!("[defaults]\nheartbeat-interval = {interval}\n")).unwrap();
+            let s = cfg.resolve_session(None);
+            assert!(s.heartbeat_interval >= 1, "interval={interval}");
+            assert!(
+                s.heartbeat_timeout > s.heartbeat_interval,
+                "interval={interval}: timeout {} must exceed interval {}",
+                s.heartbeat_timeout,
+                s.heartbeat_interval,
+            );
+            assert!(
+                s.heartbeat_interval + s.heartbeat_timeout <= ceiling,
+                "interval={interval}: {} + {} > ceiling {ceiling}",
+                s.heartbeat_interval,
+                s.heartbeat_timeout,
+            );
+        }
     }
 }

@@ -97,6 +97,11 @@ enum TailEvent {
     Shutdown,
 }
 
+/// Upper bound on the bytes `History::line_prefix` will return. Keeps the
+/// reconnect line-repaint `Notice` well under `MAX_FRAME_SIZE` even when the
+/// ring is configured larger than 1 MiB and holds a newline-free tail.
+const LINE_PREFIX_CAP: usize = 4096;
+
 /// Always-on trailing byte ring of PTY output plus a monotonic `total_out`
 /// counter. Together they let a reconnecting client resume the stream by
 /// absolute offset: `history` covers `[base(), total()]`, so a client that
@@ -160,6 +165,14 @@ impl History {
     /// Bytes of the current (in-progress) line up to `upto`: everything after
     /// the last `\n` at or before `upto`, clamped to what's retained. Used to
     /// repaint the cursor's line when a client's reconnect widget disturbed it.
+    ///
+    /// The result is capped at `LINE_PREFIX_CAP` bytes. A newline-free tail
+    /// (base64, `jq -c`, a `\r`-based progress bar) in a ring configured
+    /// larger than 1 MiB would otherwise produce a `Notice` frame above
+    /// `MAX_FRAME_SIZE`, which the client's decoder rejects -- and since the
+    /// rejection leaves `rendered_offset` unchanged, every reconnect would
+    /// recompute the same oversized prefix: a permanent reconnect loop. Only
+    /// the bytes nearest the cursor matter for a repaint anyway.
     fn line_prefix(&self, upto: u64) -> Bytes {
         let upto_idx = upto.saturating_sub(self.base()).min(self.size as u64) as usize;
         let mut flat: Vec<u8> = Vec::with_capacity(upto_idx);
@@ -170,7 +183,8 @@ impl History {
             let take = (upto_idx - flat.len()).min(chunk.len());
             flat.extend_from_slice(&chunk[..take]);
         }
-        let start = flat.iter().rposition(|&b| b == b'\n').map_or(0, |nl| nl + 1);
+        let nl_start = flat.iter().rposition(|&b| b == b'\n').map_or(0, |nl| nl + 1);
+        let start = nl_start.max(flat.len().saturating_sub(LINE_PREFIX_CAP));
         Bytes::copy_from_slice(&flat[start..])
     }
 
@@ -2906,6 +2920,21 @@ mod tests {
         h.push(&Bytes::from_static(b"ab\ncd"));
         h.push(&Bytes::from_static(b"ef"));
         assert_eq!(&h.line_prefix(h.total())[..], b"cdef");
+    }
+
+    #[test]
+    fn history_line_prefix_capped_for_newline_free_tail() {
+        // A ring larger than 1 MiB with a newline-free tail must not produce
+        // a prefix that would overflow MAX_FRAME_SIZE as a single Notice.
+        let mut h = History::new(4 << 20);
+        h.push(&Bytes::from(vec![b'x'; 3 << 20]));
+        let prefix = h.line_prefix(h.total());
+        assert_eq!(prefix.len(), LINE_PREFIX_CAP);
+        assert!(LINE_PREFIX_CAP < (1 << 20), "must stay under MAX_FRAME_SIZE");
+        // A short line is still returned whole.
+        let mut h2 = History::new(4 << 20);
+        h2.push(&Bytes::from_static(b"\nshort tail"));
+        assert_eq!(&h2.line_prefix(h2.total())[..], b"short tail");
     }
 
     #[test]
