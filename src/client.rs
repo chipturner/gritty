@@ -602,6 +602,13 @@ impl ClientAgentState {
 }
 
 /// Grouped state for the OAuth callback tunnel on the client side (multi-channel).
+/// Channel id reserved as the "declined TunnelListen" sentinel. The client
+/// sends `TunnelClose { channel_id: TUNNEL_DECLINE_CHANNEL }` when it refuses
+/// or fails a `TunnelListen`; accepted connections are numbered from
+/// `TUNNEL_DECLINE_CHANNEL + 1` so the sentinel can never collide with a live
+/// channel (a decline must not tear down an in-flight OAuth callback).
+const TUNNEL_DECLINE_CHANNEL: u32 = 0;
+
 struct ClientTunnelState {
     listener: Option<tokio::task::JoinHandle<()>>,
     channels: HashMap<u32, mpsc::Sender<Bytes>>,
@@ -613,7 +620,7 @@ impl ClientTunnelState {
         Self {
             listener: None,
             channels: HashMap::new(),
-            next_channel_id: Arc::new(AtomicU32::new(0)),
+            next_channel_id: Arc::new(AtomicU32::new(TUNNEL_DECLINE_CHANNEL + 1)),
         }
     }
 
@@ -907,7 +914,7 @@ impl ClientRelay<'_> {
                     debug!(port, "tunnel: oauth-redirect disabled, declining");
                     let _ = timed_send(
                         framed,
-                        Frame::TunnelClose { channel_id: 0 },
+                        Frame::TunnelClose { channel_id: TUNNEL_DECLINE_CHANNEL },
                         self.last_outbound_at,
                     )
                     .await;
@@ -915,11 +922,20 @@ impl ClientRelay<'_> {
                     warn!(port, "rate limited TunnelListen");
                     let _ = timed_send(
                         framed,
-                        Frame::TunnelClose { channel_id: 0 },
+                        Frame::TunnelClose { channel_id: TUNNEL_DECLINE_CHANNEL },
                         self.last_outbound_at,
                     )
                     .await;
                 } else {
+                    // A prior TunnelListen within the rate window may have left
+                    // an accept loop running. Dropping a JoinHandle detaches
+                    // rather than cancels, so abort it before binding/replacing
+                    // -- otherwise the task and its bound port leak until the
+                    // old deadline elapses (and a same-port rebind hits
+                    // EADDRINUSE). Mirrors ClientTunnelState::teardown().
+                    if let Some(old) = self.tunnel.listener.take() {
+                        old.abort();
+                    }
                     // Bind synchronously to guarantee port is ready before OpenUrl
                     match std::net::TcpListener::bind(("127.0.0.1", port)) {
                         Ok(std_listener) => {
@@ -1006,7 +1022,7 @@ impl ClientRelay<'_> {
                             debug!(port, "tunnel: bind failed: {e}");
                             let _ = timed_send(
                                 framed,
-                                Frame::TunnelClose { channel_id: 0 },
+                                Frame::TunnelClose { channel_id: TUNNEL_DECLINE_CHANNEL },
                                 self.last_outbound_at,
                             )
                             .await;

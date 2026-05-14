@@ -1380,6 +1380,11 @@ impl ServerRelay<'_> {
                     {
                         debug!(port, "setting up reverse tunnel for OAuth callback");
                         self.tunnel.port = Some(port);
+                        // Clear any idle deadline left armed by a prior flow's
+                        // TunnelClose. Otherwise it fires mid-setup, teardown()
+                        // nulls the port, and this flow's TunnelOpen is dropped
+                        // at the `if let Some(port)` check. Mirrors TunnelOpen.
+                        self.tunnel.idle_deadline = None;
                         let _ = send_framed_timed(framed, Frame::TunnelListen { port }).await;
                     }
                     info!(url, "forwarding URL to client");
