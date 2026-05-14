@@ -1805,11 +1805,21 @@ async fn relay(
                     return Ok(RelayExit::Disconnected);
                 }
 
-                // Fire a Ping whenever we've been outbound-silent for a tick.
-                // Keying off last_outbound_at (not last_activity) is what
-                // proves liveness to the server's idle-evict: steady inbound
-                // server output does not prove the client can still send.
-                if relay.last_outbound_at.elapsed() >= hb_interval {
+                // Fire a Ping when we've been outbound-silent for a tick (so
+                // the server's idle-evict sees us alive -- steady inbound
+                // server output does not prove the client can still send), OR
+                // inbound-silent for a tick (so a Pong refreshes last_activity
+                // before it ages out to hb_timeout). Keying only off
+                // last_outbound_at let a sustained one-way client->server
+                // stream (a port-forward upload, no-echo typing) refresh
+                // last_outbound_at on every send and suppress Pings
+                // indefinitely, while last_activity aged into a spurious
+                // disconnect that tore down all forwarding state.
+                let inbound_idle = wall_elapsed(
+                    *relay.last_activity,
+                    std::time::SystemTime::now(),
+                ) >= hb_interval;
+                if relay.last_outbound_at.elapsed() >= hb_interval || inbound_idle {
                     *relay.last_ping_sent = Instant::now();
                     if !timed_send(framed, Frame::Ping, relay.last_outbound_at).await {
                         return Ok(RelayExit::Disconnected);

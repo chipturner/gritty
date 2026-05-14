@@ -2431,6 +2431,13 @@ pub async fn run(
                                     .map(|m| m.attached.load(Ordering::Relaxed))
                                     .unwrap_or(false);
                                 framed = new_framed;
+                                // Give the new client a full idle-evict budget.
+                                // Without this it inherits the old client's
+                                // last_client_frame_at, and a near-silent old
+                                // client (the usual reason for a force
+                                // reattach) would get the new one evicted
+                                // seconds after takeover, before its first Ping.
+                                last_client_frame_at = tokio::time::Instant::now();
                                 // Announce the takeover on the main screen (the
                                 // `send_reconnect_replay` below fences the
                                 // replayed context and handles alt-screen).
