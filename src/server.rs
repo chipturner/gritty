@@ -1700,12 +1700,12 @@ async fn send_reconnect_replay(
     match plan {
         ReplayPlan::AltRedraw { offset } => {
             send_framed_timed(framed, Frame::Resume { offset }).await?;
-            // A status line painted on the main screen must be cleared before
-            // we switch the client into the alt screen, or it reappears when
-            // the TUI later exits.
-            if line_dirty {
-                send_framed_timed(framed, Frame::Notice(Bytes::from_static(b"\r\x1b[K"))).await?;
-            }
+            // No `\r\x1b[K` here even when `line_dirty`: a client that painted
+            // a status line has already erased it and stepped the cursor back
+            // up onto its original row (`\r\x1b[K\x1b[A` on the reconnect
+            // success path). Clearing again would wipe the user's last
+            // main-screen line, and `\x1b[?1049h` below would then commit that
+            // blank to the saved buffer.
             // Prime the client terminal into a clean alt screen. A byte suffix
             // can't reconstruct a TUI, so history is not replayed -- the
             // `Resume` already advanced the client's offset past those bytes,
@@ -1780,8 +1780,17 @@ async fn send_reconnect_replay(
             // Reuse the status line's row for the marker if there is one,
             // otherwise open a fresh line for it.
             let lead = if line_dirty { "\r\x1b[K" } else { "\r\n" };
-            send_framed_timed(framed, Frame::Notice(Bytes::from(format!("{lead}{marker}"))))
-                .await?;
+            // Leave alt-screen first. This arm is only reachable on the main
+            // screen (alt-screen takes the AltRedraw path), but the client may
+            // still be stuck in alt-screen: if it disconnected inside a TUI,
+            // the TUI exited during the outage, and >1 ring of output then
+            // evicted the `\x1b[?1049l` from history, the client never saw the
+            // exit. Re-sending it is idempotent on the main screen.
+            send_framed_timed(
+                framed,
+                Frame::Notice(Bytes::from(format!("\x1b[?1049l{lead}{marker}"))),
+            )
+            .await?;
             for chunk in history.slice_from(offset) {
                 send_framed_timed(framed, Frame::Data(chunk)).await?;
             }
@@ -2427,7 +2436,9 @@ pub async fn run(
                                 // replayed context and handles alt-screen).
                                 // Send failures are swallowed -- the relay loop
                                 // detects the dead socket next iteration.
-                                if was_attached && !alt_screen.in_alternate_screen() {
+                                let banner_sent = if was_attached
+                                    && !alt_screen.in_alternate_screen()
+                                {
                                     let hb_age = relay.metadata_slot.get()
                                         .and_then(|m| {
                                             let hb = m.last_heartbeat.load(Ordering::Relaxed);
@@ -2450,7 +2461,15 @@ pub async fn run(
                                         Frame::Notice(Bytes::from(banner)),
                                     )
                                     .await;
-                                }
+                                    true
+                                } else {
+                                    false
+                                };
+                                // The banner's trailing \r\n left the cursor on
+                                // a fresh line. Force the replay to repaint the
+                                // current line so a Clean plan doesn't stream
+                                // Data assuming the cursor never moved.
+                                let line_dirty = line_dirty || banner_sent;
                                 let _ = send_reconnect_replay(
                                     &mut framed,
                                     &async_master,

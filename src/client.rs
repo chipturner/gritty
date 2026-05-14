@@ -1623,7 +1623,15 @@ async fn relay(
                                         return Ok(RelayExit::Exit(0));
                                     }
                                     EscapeAction::Reconnect => {
-                                        write_stdout_async(async_stdout, status_msg("force reconnect").as_bytes()).await?;
+                                        // No immediate banner. A status_msg here
+                                        // moves the cursor (\r\n...\r\n), but a
+                                        // sub-second ~R reconnect sends
+                                        // line_dirty=false and never repairs it,
+                                        // splitting the resumed line. The normal
+                                        // reconnect chrome (animated status line
+                                        // after RECONNECT_CHROME_DELAY) is the
+                                        // feedback; a fast ~R stays invisible,
+                                        // like any other seamless reconnect.
                                         return Ok(RelayExit::Disconnected);
                                     }
                                     EscapeAction::Suspend => {
@@ -2017,21 +2025,35 @@ pub async fn run(
                 // only once the reconnect has dragged past the chrome-delay
                 // grace period -- a fast reconnect leaves the terminal
                 // untouched. A no-op in alt-screen or inside the grace window.
+                //
+                // `$first_paint_ok` gates the *first* paint -- the `\r\n` that
+                // opens the status line's row and moves the cursor. It must be
+                // false while a reconnect attempt is in flight: that attempt's
+                // Attach frame already carried `line_dirty = chrome_shown`, and
+                // first-painting mid-attempt would move the cursor without the
+                // server knowing to repaint the line on resume. Deferred first
+                // paints land in the next backoff wait, before the following
+                // attempt snapshots `line_dirty`.
                 macro_rules! paint_reconnect_status {
-                    ($phase:expr) => {{
+                    ($phase:expr) => {
+                        paint_reconnect_status!($phase, true)
+                    };
+                    ($phase:expr, $first_paint_ok:expr) => {{
                         if show_chrome && reconnect_started.elapsed() >= RECONNECT_CHROME_DELAY {
-                            if !chrome_shown {
+                            if !chrome_shown && $first_paint_ok {
                                 // Open a fresh line below the user's content;
                                 // we repaint it in place from here on.
                                 write_stdout_async(&async_stdout, b"\r\n").await?;
                                 chrome_shown = true;
                             }
-                            let elapsed = reconnect_started.elapsed().as_secs();
-                            write_stdout_async(
-                                &async_stdout,
-                                reconnect_status_line(spin, elapsed, $phase).as_bytes(),
-                            )
-                            .await?;
+                            if chrome_shown {
+                                let elapsed = reconnect_started.elapsed().as_secs();
+                                write_stdout_async(
+                                    &async_stdout,
+                                    reconnect_status_line(spin, elapsed, $phase).as_bytes(),
+                                )
+                                .await?;
+                            }
                         }
                     }};
                 }
@@ -2193,11 +2215,14 @@ pub async fn run(
                         socket_exists = ctl_path.exists(),
                         "reconnect: attempting"
                     );
-                    // Snapshot the chrome state *now* so the async block below
-                    // doesn't borrow `chrome_shown` (which the attempt-loop
-                    // tick arm may still flip mid-flight). `line_dirty` tells
-                    // the server our cursor left `rendered_offset`'s position
-                    // and the current line needs a repaint on resume.
+                    // Snapshot the chrome state for this attempt. The
+                    // attempt-loop tick arm below paints with
+                    // `first_paint_ok = false`, so `chrome_shown` cannot flip
+                    // while the attempt is in flight -- this snapshot stays
+                    // accurate through the Attach send and the success path.
+                    // `line_dirty` tells the server our cursor left
+                    // `rendered_offset`'s position and the current line needs
+                    // a repaint on resume.
                     let line_dirty = chrome_shown;
                     let resume_offset = rendered_offset;
                     let attempt_fut = tokio::time::timeout(RECONNECT_ATTEMPT_TIMEOUT, async {
@@ -2278,7 +2303,10 @@ pub async fn run(
                             r = &mut attempt_fut => break r,
                             _ = tick.tick() => {
                                 spin = spin.wrapping_add(1);
-                                paint_reconnect_status!(ReconnectPhase::Retrying);
+                                // first_paint_ok = false: see the macro -- the
+                                // Attach is already on the wire with a fixed
+                                // `line_dirty`, so the cursor must not move now.
+                                paint_reconnect_status!(ReconnectPhase::Retrying, false);
                             }
                         }
                     };
