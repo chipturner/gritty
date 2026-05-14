@@ -67,6 +67,17 @@ pub enum ClientConn {
         /// the shell regenerates its last line at the right winsize.
         cols: u16,
         rows: u16,
+        /// How far the client has rendered into the PTY output stream. Drives
+        /// offset-based reconnect replay (see `plan_replay`).
+        rendered_offset: u64,
+        /// The client painted a reconnect status line, so its cursor is no
+        /// longer where `rendered_offset` left it and the current line needs a
+        /// repaint before the stream resumes.
+        line_dirty: bool,
+        /// `true` for a fresh explicit `connect` (no prior stream position);
+        /// `false` for an auto-reconnect. A fresh client gets scrollback
+        /// context instead of an incremental resume.
+        is_fresh: bool,
     },
     Tail(Framed<UnixStream, FrameCodec>),
     /// Raw stream for file transfer (local-side commands routed through daemon).
@@ -84,6 +95,131 @@ enum TailEvent {
     Data(Bytes),
     Exit { code: i32 },
     Shutdown,
+}
+
+/// Always-on trailing byte ring of PTY output plus a monotonic `total_out`
+/// counter. Together they let a reconnecting client resume the stream by
+/// absolute offset: `history` covers `[base(), total()]`, so a client that
+/// rendered up to byte `R` gets exactly `Data[R..total()]` replayed -- no
+/// redundant repaint. When the ring overflows its cap the oldest chunks are
+/// evicted and `base()` advances, which is how truncation is detected.
+struct History {
+    chunks: VecDeque<Bytes>,
+    size: usize,
+    cap: usize,
+    total_out: u64,
+}
+
+impl History {
+    fn new(cap: usize) -> Self {
+        Self { chunks: VecDeque::new(), size: 0, cap: cap.max(1), total_out: 0 }
+    }
+
+    /// Append a chunk of PTY output, evicting oldest chunks past the cap.
+    fn push(&mut self, chunk: &Bytes) {
+        if chunk.is_empty() {
+            return;
+        }
+        self.total_out += chunk.len() as u64;
+        self.size += chunk.len();
+        self.chunks.push_back(chunk.clone());
+        while self.size > self.cap {
+            match self.chunks.pop_front() {
+                Some(old) => self.size -= old.len(),
+                None => break,
+            }
+        }
+    }
+
+    /// Total PTY bytes ever produced by the session.
+    fn total(&self) -> u64 {
+        self.total_out
+    }
+
+    /// Offset of the oldest byte still retained. A client whose rendered
+    /// offset is below this has lost content (truncation).
+    fn base(&self) -> u64 {
+        self.total_out - self.size as u64
+    }
+
+    /// Chunks covering `[from, total())`. `from` is clamped to `base()`.
+    fn slice_from(&self, from: u64) -> Vec<Bytes> {
+        let mut skip = from.saturating_sub(self.base()) as usize;
+        let mut out = Vec::new();
+        for chunk in &self.chunks {
+            if skip >= chunk.len() {
+                skip -= chunk.len();
+                continue;
+            }
+            out.push(if skip > 0 { chunk.slice(skip..) } else { chunk.clone() });
+            skip = 0;
+        }
+        out
+    }
+
+    /// Bytes of the current (in-progress) line up to `upto`: everything after
+    /// the last `\n` at or before `upto`, clamped to what's retained. Used to
+    /// repaint the cursor's line when a client's reconnect widget disturbed it.
+    fn line_prefix(&self, upto: u64) -> Bytes {
+        let upto_idx = upto.saturating_sub(self.base()).min(self.size as u64) as usize;
+        let mut flat: Vec<u8> = Vec::with_capacity(upto_idx);
+        for chunk in &self.chunks {
+            if flat.len() >= upto_idx {
+                break;
+            }
+            let take = (upto_idx - flat.len()).min(chunk.len());
+            flat.extend_from_slice(&chunk[..take]);
+        }
+        let start = flat.iter().rposition(|&b| b == b'\n').map_or(0, |nl| nl + 1);
+        Bytes::copy_from_slice(&flat[start..])
+    }
+
+    fn chunks(&self) -> &VecDeque<Bytes> {
+        &self.chunks
+    }
+}
+
+/// What a reconnecting / attaching client should receive, decided purely from
+/// offsets + screen mode so it can be unit-tested. The executor
+/// (`send_reconnect_replay`) turns a plan into wire frames.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ReplayPlan {
+    /// Alt-screen: a byte suffix can't reconstruct a TUI screen, so force a
+    /// full repaint. The client's offset jumps to `offset`.
+    AltRedraw { offset: u64 },
+    /// Fresh viewer (explicit connect / takeover): show scrollback context
+    /// under a divider. The client's offset jumps to `offset` (current total).
+    Fresh { offset: u64 },
+    /// Clean incremental resume: replay exactly `Data[offset..total]`.
+    Clean { offset: u64 },
+    /// Truncated resume: the client's position fell out of the retained
+    /// history. Replay from `offset` (= history base); `dropped` bytes lost.
+    Truncated { offset: u64, dropped: u64 },
+}
+
+/// Decide how to bring a client back in sync. Pure: no I/O, fully testable.
+fn plan_replay(
+    rendered_offset: u64,
+    is_fresh: bool,
+    in_alt_screen: bool,
+    history_base: u64,
+    history_total: u64,
+) -> ReplayPlan {
+    if in_alt_screen {
+        return ReplayPlan::AltRedraw { offset: history_total };
+    }
+    if is_fresh || rendered_offset > history_total {
+        // Fresh connect, or a nonsense offset ahead of the stream -- treat as
+        // a fresh viewer rather than trusting the offset.
+        return ReplayPlan::Fresh { offset: history_total };
+    }
+    if rendered_offset < history_base {
+        return ReplayPlan::Truncated {
+            offset: history_base,
+            dropped: history_base - rendered_offset,
+        };
+    }
+    ReplayPlan::Clean { offset: rendered_offset }
 }
 
 pub struct SessionMetadata {
@@ -807,11 +943,11 @@ async fn tail_relay(
 /// Drain ring buffer contents to a tail client, then subscribe to broadcast and spawn relay.
 fn spawn_tail(
     mut framed: Framed<UnixStream, FrameCodec>,
-    ring_buf: &VecDeque<Bytes>,
+    history: &History,
     tail_tx: &broadcast::Sender<TailEvent>,
 ) {
     let rx = tail_tx.subscribe();
-    let chunks: Vec<Bytes> = ring_buf.iter().cloned().collect();
+    let chunks: Vec<Bytes> = history.chunks().iter().cloned().collect();
     tokio::spawn(async move {
         for chunk in chunks {
             if framed.send(Frame::Data(chunk)).await.is_err() {
@@ -1421,12 +1557,14 @@ async fn send_framed_timed(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn force_tui_redraw(
     master: &AsyncFd<OwnedFd>,
     framed: &mut Framed<UnixStream, FrameCodec>,
     tail_tx: &broadcast::Sender<TailEvent>,
     alt_screen: &mut AltScreenTracker,
     scrollback: &mut ScrollbackBuffer,
+    history: &mut History,
     cols: u16,
     rows: u16,
 ) -> anyhow::Result<()> {
@@ -1464,6 +1602,10 @@ async fn force_tui_redraw(
                             if !alt_screen.in_alternate_screen() {
                                 scrollback.push(&chunk);
                             }
+                            // These bytes go to the client as Data, so they
+                            // advance the stream offset -- they must land in
+                            // history too or the client's counter drifts.
+                            history.push(&chunk);
                             if tail_tx.receiver_count() > 0 {
                                 let _ = tail_tx.send(TailEvent::Data(chunk.clone()));
                             }
@@ -1482,12 +1624,129 @@ async fn force_tui_redraw(
     result
 }
 
+/// Bring a reconnecting / attaching client back in sync with the PTY stream.
+/// Sends a `Resume` frame (the client's new authoritative offset) followed by
+/// whatever replay the `plan_replay` decision calls for. `line_dirty` means the
+/// client painted a reconnect status line, so the chrome here also repairs the
+/// cursor's line before resuming. Returns `Err` if the client socket rejects a
+/// send so the caller can re-enter the detached-drain path.
 #[allow(clippy::too_many_arguments)]
+async fn send_reconnect_replay(
+    framed: &mut Framed<UnixStream, FrameCodec>,
+    async_master: &AsyncFd<OwnedFd>,
+    tail_tx: &broadcast::Sender<TailEvent>,
+    history: &mut History,
+    scrollback: &mut ScrollbackBuffer,
+    alt_screen: &mut AltScreenTracker,
+    rendered_offset: u64,
+    line_dirty: bool,
+    is_fresh: bool,
+    cols: u16,
+    rows: u16,
+) -> io::Result<()> {
+    let plan = plan_replay(
+        rendered_offset,
+        is_fresh,
+        alt_screen.in_alternate_screen(),
+        history.base(),
+        history.total(),
+    );
+    debug!(?plan, rendered_offset, line_dirty, is_fresh, "reconnect replay");
+    match plan {
+        ReplayPlan::AltRedraw { offset } => {
+            send_framed_timed(framed, Frame::Resume { offset }).await?;
+            // A status line painted on the main screen must be cleared before
+            // we switch the client into the alt screen, or it reappears when
+            // the TUI later exits.
+            if line_dirty {
+                send_framed_timed(framed, Frame::Notice(Bytes::from_static(b"\r\x1b[K"))).await?;
+            }
+            // Prime the client terminal into a clean alt screen. A byte suffix
+            // can't reconstruct a TUI, so history is not replayed -- the
+            // `Resume` already advanced the client's offset past those bytes,
+            // and `force_tui_redraw` regenerates the screen from TUI state.
+            send_framed_timed(
+                framed,
+                Frame::Notice(Bytes::from_static(b"\x1b[?1049h\x1b[H\x1b[2J")),
+            )
+            .await?;
+            if cols > 0 && rows > 0 {
+                force_tui_redraw(
+                    async_master,
+                    framed,
+                    tail_tx,
+                    alt_screen,
+                    scrollback,
+                    history,
+                    cols,
+                    rows,
+                )
+                .await
+                .map_err(|e| io::Error::other(e.to_string()))?;
+            }
+        }
+        ReplayPlan::Fresh { offset } => {
+            if cols > 0 && rows > 0 {
+                apply_winsize(async_master, cols, rows);
+            }
+            send_framed_timed(framed, Frame::Resume { offset }).await?;
+            // Fence the replayed context with a dim rule. Reuse the status
+            // line's row if the client painted one; the rule starts with `\r`.
+            let divider = replay_divider(cols, None);
+            let msg = if line_dirty { format!("\r\x1b[K{divider}") } else { divider };
+            send_framed_timed(framed, Frame::Notice(Bytes::from(msg))).await?;
+            for line in scrollback.lines_and_partial() {
+                send_framed_timed(framed, Frame::Notice(line)).await?;
+            }
+            scrollback.clear();
+        }
+        ReplayPlan::Clean { offset } => {
+            if cols > 0 && rows > 0 {
+                apply_winsize(async_master, cols, rows);
+            }
+            send_framed_timed(framed, Frame::Resume { offset }).await?;
+            if line_dirty {
+                // The client erased its status line and moved the cursor back
+                // up onto the line where `offset` left it (see the reconnect
+                // success path in client.rs). Clear that line and repaint its
+                // prefix so the incremental `Data` below continues from the
+                // right column.
+                send_framed_timed(framed, Frame::Notice(Bytes::from_static(b"\r\x1b[K"))).await?;
+                let prefix = history.line_prefix(offset);
+                if !prefix.is_empty() {
+                    send_framed_timed(framed, Frame::Notice(prefix)).await?;
+                }
+            }
+            // The heart of the seamless resume: exactly the bytes produced
+            // while the client was gone, nothing it has already rendered.
+            for chunk in history.slice_from(offset) {
+                send_framed_timed(framed, Frame::Data(chunk)).await?;
+            }
+        }
+        ReplayPlan::Truncated { offset, dropped } => {
+            if cols > 0 && rows > 0 {
+                apply_winsize(async_master, cols, rows);
+            }
+            send_framed_timed(framed, Frame::Resume { offset }).await?;
+            let marker = format!(
+                "\x1b[2m\u{25b8} {} lost while disconnected\x1b[0m\r\n",
+                humansize::format_size(dropped, humansize::BINARY),
+            );
+            // Reuse the status line's row for the marker if there is one,
+            // otherwise open a fresh line for it.
+            let lead = if line_dirty { "\r\x1b[K" } else { "\r\n" };
+            send_framed_timed(framed, Frame::Notice(Bytes::from(format!("{lead}{marker}"))))
+                .await?;
+            for chunk in history.slice_from(offset) {
+                send_framed_timed(framed, Frame::Data(chunk)).await?;
+            }
+        }
+    }
+    Ok(())
+}
+
 fn format_server_diag(
-    ring_buf: &VecDeque<bytes::Bytes>,
-    ring_buf_size: usize,
-    ring_buf_dropped: usize,
-    ring_buffer_cap: usize,
+    history: &History,
     alt_screen: &AltScreenTracker,
     scrollback: &ScrollbackBuffer,
     relay: &ServerRelay<'_>,
@@ -1510,8 +1769,11 @@ fn format_server_diag(
     let _ = write!(s, "\n  scrollback lines: {}", scrollback.lines().len());
     let _ = write!(
         s,
-        "\n  ring buffer: {ring_buf_size} bytes in {} chunks ({ring_buf_dropped} dropped, cap {ring_buffer_cap})",
-        ring_buf.len(),
+        "\n  history: {} bytes in {} chunks (offset {}, cap {})",
+        history.size,
+        history.chunks().len(),
+        history.total(),
+        history.cap,
     );
     let _ = write!(s, "\n  pending pty input: {} bytes", relay.pending_input_bytes,);
     let _ = write!(s, "\n  agent channels: {}", relay.agent.channels.len(),);
@@ -1605,9 +1867,10 @@ pub async fn run(
 
     let async_master = AsyncFd::new(master)?;
     let mut buf = vec![0u8; 4096];
-    let mut ring_buf: VecDeque<Bytes> = VecDeque::new();
-    let mut ring_buf_size: usize = 0;
-    let mut ring_buf_dropped: usize = 0;
+    // Always-on byte history of PTY output. Unlike the old detached-only ring
+    // buffer, this is populated whether or not a client is attached, so a
+    // reconnecting client can resume the stream by absolute offset.
+    let mut history = History::new(ring_buffer_cap);
 
     // Agent forwarding state. The listener is bound unconditionally so the
     // shell's SSH_AUTH_SOCK always resolves; connections are refused at accept
@@ -1674,7 +1937,7 @@ pub async fn run(
         tokio::select! {
             client = client_rx.recv() => match client {
                 Some(ClientConn::Active {
-                    framed: f, client_name: cn, capabilities: caps, cols: _, rows: _
+                    framed: f, client_name: cn, capabilities: caps, ..
                 }) => {
                     info!("first client connected via channel");
                     negotiated_caps.store(caps, std::sync::atomic::Ordering::Relaxed);
@@ -1682,7 +1945,7 @@ pub async fn run(
                 }
                 Some(ClientConn::Tail(f)) => {
                     info!("tail client connected before shell spawn");
-                    spawn_tail(f, &ring_buf, &tail_tx);
+                    spawn_tail(f, &history, &tail_tx);
                     continue;
                 }
                 Some(ClientConn::Send(stream)) => {
@@ -1810,11 +2073,17 @@ pub async fn run(
     let mut pending_input: VecDeque<Bytes> = VecDeque::new();
     let mut pending_input_bytes: usize = 0;
     loop {
-        // Winsize hint from the Attach frame of the client we're about to
-        // serve. Applied before replay so regenerated prompts / TUI repaints
-        // use the current terminal dimensions. 0 = unknown / first client.
+        // Hints from the Attach frame of the client we're about to serve.
+        // Applied before replay so regenerated prompts / TUI repaints use the
+        // current terminal dimensions. 0 = unknown / first client.
         let mut attach_cols: u16 = 0;
         let mut attach_rows: u16 = 0;
+        // How far the reconnecting client has rendered into the PTY stream,
+        // whether its cursor line needs a repaint, and whether it's a fresh
+        // explicit connect -- drives `plan_replay`.
+        let mut attach_offset: u64 = 0;
+        let mut attach_line_dirty = false;
+        let mut attach_is_fresh = false;
         if !first_client {
             let mut detached_exit: Option<i32> = None;
             let got_client = 'drain: loop {
@@ -1825,12 +2094,16 @@ pub async fn run(
                             Some(ClientConn::Active {
                                 framed: f, client_name: cn, capabilities: caps,
                                 cols: new_cols, rows: new_rows,
+                                rendered_offset, line_dirty, is_fresh,
                             }) => {
                                 info!("client connected via channel");
                                 negotiated_caps.store(caps, std::sync::atomic::Ordering::Relaxed);
                                 framed = f;
                                 attach_cols = new_cols;
                                 attach_rows = new_rows;
+                                attach_offset = rendered_offset;
+                                attach_line_dirty = line_dirty;
+                                attach_is_fresh = is_fresh;
                                 if let Some(meta) = metadata_slot.get()
                                     && let Ok(mut n) = meta.client_name.lock()
                                 {
@@ -1840,7 +2113,7 @@ pub async fn run(
                             }
                             Some(ClientConn::Tail(f)) => {
                                 info!("tail client connected while disconnected");
-                                spawn_tail(f, &ring_buf, &tail_tx);
+                                spawn_tail(f, &history, &tail_tx);
                                 continue;
                             }
                             Some(ClientConn::Send(stream)) => {
@@ -1871,23 +2144,15 @@ pub async fn run(
                             Ok(Ok(n)) => {
                                 let chunk = Bytes::copy_from_slice(&buf[..n]);
                                 alt_screen.scan(&chunk);
-                                // Do NOT push to `scrollback` while detached:
-                                // detached bytes are captured in `ring_buf`
-                                // and replayed verbatim on reconnect, while
-                                // `scrollback` holds pre-detach lines (last
-                                // prompt etc.) that we prepend to the flush.
-                                // Pushing to both duplicates every chunk on
-                                // main-screen reconnect.
+                                // Capture detached output into both history
+                                // (for offset-based resume) and scrollback
+                                // (main-screen context for a fresh viewer).
+                                if !alt_screen.in_alternate_screen() {
+                                    scrollback.push(&chunk);
+                                }
+                                history.push(&chunk);
                                 if tail_tx.receiver_count() > 0 {
                                     let _ = tail_tx.send(TailEvent::Data(chunk.clone()));
-                                }
-                                ring_buf_size += chunk.len();
-                                ring_buf.push_back(chunk);
-                                while ring_buf_size > ring_buffer_cap {
-                                    if let Some(old) = ring_buf.pop_front() {
-                                        ring_buf_size -= old.len();
-                                        ring_buf_dropped += old.len();
-                                    }
                                 }
                             }
                             Ok(Err(e)) => {
@@ -1905,11 +2170,14 @@ pub async fn run(
                         let code = status?.code().unwrap_or(1);
                         info!(code, "shell exited while awaiting client");
                         for chunk in drain_pty_final(&async_master, &mut buf) {
+                            alt_screen.scan(&chunk);
+                            if !alt_screen.in_alternate_screen() {
+                                scrollback.push(&chunk);
+                            }
                             if tail_tx.receiver_count() > 0 {
                                 let _ = tail_tx.send(TailEvent::Data(chunk.clone()));
                             }
-                            ring_buf_size += chunk.len();
-                            ring_buf.push_back(chunk);
+                            history.push(&chunk);
                         }
                         detached_exit = Some(code);
                         break 'drain false;
@@ -1982,101 +2250,32 @@ pub async fn run(
         let is_reconnect = !first_client;
         first_client = false;
 
-        // Apply the new client's terminal size BEFORE any replay. The shell
-        // (or TUI) will regenerate its last line / full screen at the correct
-        // winsize. If we waited for the inline `Resize` frame from the
-        // relay loop, replayed bytes would be produced at the stale size and
-        // wrap/cursor positioning would be wrong on the client.
-        //
-        // A send failure anywhere in this block (client dropped mid-flush)
-        // must re-enter drain, not kill the session.
+        // Bring the reconnecting client back in sync. `send_reconnect_replay`
+        // applies the client's winsize before any replay, sends a `Resume`
+        // frame carrying its new authoritative stream offset, and then replays
+        // exactly what the `plan_replay` decision calls for -- an incremental
+        // `Data` tail, a truncation marker, scrollback context, or a full TUI
+        // repaint. A send failure (client dropped mid-flush) re-enters drain
+        // rather than killing the session.
         let mut flush_failed = false;
-        if is_reconnect && alt_screen.in_alternate_screen() {
-            // A full repaint is coming via SIGWINCH; stale alt-screen deltas
-            // captured while detached would paint garbage onto the freshly
-            // cleared client terminal, so drop them.
-            ring_buf.clear();
-            ring_buf_size = 0;
-            ring_buf_dropped = 0;
-            // Prime the client's terminal into alt-screen and clear it. For
-            // an auto-reconnect this is idempotent; for a fresh `connect`
-            // it's required -- the new terminal has never seen `?1049h`, so
-            // without this the repaint would land on the main screen.
-            if let Err(e) = send_framed_timed(
+        if is_reconnect
+            && let Err(e) = send_reconnect_replay(
                 &mut framed,
-                Frame::Data(Bytes::from_static(b"\x1b[?1049h\x1b[H\x1b[2J")),
+                &async_master,
+                &tail_tx,
+                &mut history,
+                &mut scrollback,
+                &mut alt_screen,
+                attach_offset,
+                attach_line_dirty,
+                attach_is_fresh,
+                attach_cols,
+                attach_rows,
             )
             .await
-            {
-                warn!(error = %e, "client send failed during alt-screen priming, detaching");
-                flush_failed = true;
-            } else if attach_cols > 0
-                && attach_rows > 0
-                && let Err(e) = force_tui_redraw(
-                    &async_master,
-                    &mut framed,
-                    &tail_tx,
-                    &mut alt_screen,
-                    &mut scrollback,
-                    attach_cols,
-                    attach_rows,
-                )
-                .await
-            {
-                warn!(error = %e, "client send failed during redraw drain, detaching");
-                flush_failed = true;
-            }
-        } else if is_reconnect {
-            // Main screen: single winsize apply (no toggle needed), then a
-            // divider and scrollback replay. The client already printed its
-            // own "reconnected"/"attached" line; the divider just fences off
-            // the replayed context. Divider-first means the last bytes written
-            // are real PTY output, so the cursor lands where the shell expects.
-            if attach_cols > 0 && attach_rows > 0 {
-                apply_winsize(&async_master, attach_cols, attach_rows);
-            }
-            let annotation = (ring_buf_dropped > 0).then(|| {
-                format!(
-                    "{} dropped while detached",
-                    humansize::format_size(ring_buf_dropped as u64, humansize::BINARY)
-                )
-            });
-            let msg = replay_divider(attach_cols, annotation.as_deref());
-            if let Err(e) = send_framed_timed(&mut framed, Frame::Data(Bytes::from(msg))).await {
-                warn!(error = %e, "client send failed during reconnect banner, detaching");
-                flush_failed = true;
-            } else {
-                ring_buf_dropped = 0;
-                for line in scrollback.lines_and_partial() {
-                    if let Err(e) = send_framed_timed(&mut framed, Frame::Data(line)).await {
-                        warn!(error = %e, "client send failed during scrollback replay, detaching");
-                        flush_failed = true;
-                        break;
-                    }
-                }
-                if !flush_failed {
-                    scrollback.clear();
-                }
-            }
-        }
-
-        if !flush_failed && !ring_buf.is_empty() {
-            debug!(
-                chunks = ring_buf.len(),
-                bytes = ring_buf_size,
-                dropped = ring_buf_dropped,
-                "flushing ring buffer"
-            );
-            while !flush_failed {
-                let Some(chunk) = ring_buf.pop_front() else { break };
-                ring_buf_size -= chunk.len();
-                if let Err(e) = send_framed_timed(&mut framed, Frame::Data(chunk.clone())).await {
-                    warn!(error = %e, "client send failed during ring-buffer flush, detaching");
-                    ring_buf_size += chunk.len();
-                    ring_buf.push_front(chunk);
-                    flush_failed = true;
-                }
-            }
+        {
+            warn!(error = %e, "client send failed during reconnect replay, detaching");
+            flush_failed = true;
         }
         if flush_failed {
             if let Some(meta) = metadata_slot.get() {
@@ -2115,8 +2314,7 @@ pub async fn run(
                         last_client_frame_at = tokio::time::Instant::now();
                         if matches!(&frame, Some(Ok(Frame::DiagRequest))) {
                             let text = format_server_diag(
-                                &ring_buf, ring_buf_size, ring_buf_dropped, ring_buffer_cap,
-                                &alt_screen, &scrollback, &relay, &managed,
+                                &history, &alt_screen, &scrollback, &relay, &managed,
                             );
                             let _ = send_framed_timed(&mut framed, Frame::DiagResponse { text }).await;
                         } else if let ControlFlow::Break(exit) = relay.handle_client_frame(&mut framed, frame).await? {
@@ -2156,6 +2354,7 @@ pub async fn run(
                             Some(ClientConn::Active {
                                 framed: new_framed, client_name: cn, capabilities: caps,
                                 cols: new_cols, rows: new_rows,
+                                rendered_offset, line_dirty, is_fresh,
                             }) => {
                                 info!("new client via channel, detaching old client");
                                 relay.negotiated_caps.store(caps, std::sync::atomic::Ordering::Relaxed);
@@ -2174,39 +2373,15 @@ pub async fn run(
                                 {
                                     *n = cn;
                                 }
-                                // Inform the new client about the takeover
                                 let was_attached = relay.metadata_slot.get()
                                     .map(|m| m.attached.load(Ordering::Relaxed))
                                     .unwrap_or(false);
                                 framed = new_framed;
-                                // Apply new client's winsize before any further
-                                // output reaches their terminal. Alt-screen gets
-                                // primed (?1049h + clear) then a SIGWINCH toggle
-                                // to force a TUI repaint; drained bytes go to the
-                                // new client. Send failures are swallowed -- the
-                                // relay loop will detect the dead socket on the
-                                // next iteration.
-                                if alt_screen.in_alternate_screen() {
-                                    let _ = framed
-                                        .send(Frame::Data(Bytes::from_static(
-                                            b"\x1b[?1049h\x1b[H\x1b[2J",
-                                        )))
-                                        .await;
-                                    if new_cols > 0 && new_rows > 0 {
-                                        let _ = force_tui_redraw(
-                                            &async_master,
-                                            &mut framed,
-                                            relay.tail_tx,
-                                            &mut alt_screen,
-                                            &mut scrollback,
-                                            new_cols,
-                                            new_rows,
-                                        )
-                                        .await;
-                                    }
-                                } else if new_cols > 0 && new_rows > 0 {
-                                    apply_winsize(&async_master, new_cols, new_rows);
-                                }
+                                // Announce the takeover on the main screen (the
+                                // `send_reconnect_replay` below fences the
+                                // replayed context and handles alt-screen).
+                                // Send failures are swallowed -- the relay loop
+                                // detects the dead socket next iteration.
                                 if was_attached && !alt_screen.in_alternate_screen() {
                                     let hb_age = relay.metadata_slot.get()
                                         .and_then(|m| {
@@ -2222,39 +2397,33 @@ pub async fn run(
                                         Some(s) => format!("last seen {s}s ago"),
                                         None => "last seen unknown".to_string(),
                                     };
-                                    let msg = format!(
-                                        "\r\n\x1b[33m\u{25b8} took over session \u{b7} {hb_str}\x1b[0m\r\n{}",
-                                        replay_divider(new_cols, None)
+                                    let banner = format!(
+                                        "\r\n\x1b[33m\u{25b8} took over session \u{b7} {hb_str}\x1b[0m\r\n",
                                     );
-                                    let mut replay_ok =
-                                        send_framed_timed(&mut framed, Frame::Data(Bytes::from(msg)))
-                                            .await
-                                            .is_ok();
-                                    // Replay scrollback so the taking-over client
-                                    // lands with context (shell prompt, last few
-                                    // lines of output). The outer-loop reconnect
-                                    // path already does this; in-relay takeover
-                                    // used to drop the new client onto a blank
-                                    // screen.
-                                    if replay_ok {
-                                        for line in scrollback.lines_and_partial() {
-                                            if send_framed_timed(&mut framed, Frame::Data(line))
-                                                .await
-                                                .is_err()
-                                            {
-                                                replay_ok = false;
-                                                break;
-                                            }
-                                        }
-                                    }
-                                    if replay_ok {
-                                        scrollback.clear();
-                                    }
+                                    let _ = send_framed_timed(
+                                        &mut framed,
+                                        Frame::Notice(Bytes::from(banner)),
+                                    )
+                                    .await;
                                 }
+                                let _ = send_reconnect_replay(
+                                    &mut framed,
+                                    &async_master,
+                                    relay.tail_tx,
+                                    &mut history,
+                                    &mut scrollback,
+                                    &mut alt_screen,
+                                    rendered_offset,
+                                    line_dirty,
+                                    is_fresh,
+                                    new_cols,
+                                    new_rows,
+                                )
+                                .await;
                             }
                             Some(ClientConn::Tail(f)) => {
                                 info!("tail client connected while active");
-                                spawn_tail(f, &ring_buf, relay.tail_tx);
+                                spawn_tail(f, &history, relay.tail_tx);
                             }
                             Some(ClientConn::Send(stream)) => {
                                 handle_send_stream(stream, &send_event_tx);
@@ -2370,6 +2539,10 @@ pub async fn run(
                                 if !alt_screen.in_alternate_screen() {
                                     scrollback.push(&chunk);
                                 }
+                                // Every byte sent as Data advances the stream
+                                // offset, so it must land in history -- that's
+                                // what a reconnecting client resumes against.
+                                history.push(&chunk);
                                 if relay.tail_tx.receiver_count() > 0 {
                                     let _ = relay.tail_tx.send(TailEvent::Data(chunk.clone()));
                                 }
@@ -2425,9 +2598,9 @@ pub async fn run(
                     let _ = reply.send(None);
                 }
                 info!(
-                    ring_buf_bytes = ring_buf_size,
-                    ring_buf_chunks = ring_buf.len(),
-                    ring_buf_dropped = ring_buf_dropped,
+                    history_bytes = history.size,
+                    history_chunks = history.chunks().len(),
+                    stream_offset = history.total(),
                     alt_screen = alt_screen.in_alternate_screen(),
                     "client disconnected, waiting for reconnect",
                 );
@@ -2641,6 +2814,99 @@ mod tests {
         let d = replay_divider(10, None);
         assert!(d.starts_with("\r\x1b[2m"), "{d:?}");
         assert!(d.ends_with("\x1b[0m\r\n"), "{d:?}");
+    }
+
+    fn flatten(chunks: &[Bytes]) -> Vec<u8> {
+        chunks.iter().flat_map(|c| c.iter().copied()).collect()
+    }
+
+    #[test]
+    fn history_tracks_total_and_base() {
+        let mut h = History::new(1024);
+        assert_eq!(h.total(), 0);
+        assert_eq!(h.base(), 0);
+        h.push(&Bytes::from_static(b"hello"));
+        h.push(&Bytes::from_static(b" world"));
+        assert_eq!(h.total(), 11);
+        assert_eq!(h.base(), 0);
+        assert_eq!(flatten(&h.slice_from(0)), b"hello world");
+        assert_eq!(flatten(&h.slice_from(5)), b" world");
+        assert_eq!(flatten(&h.slice_from(11)), b"");
+    }
+
+    #[test]
+    fn history_evicts_past_cap_and_advances_base() {
+        let mut h = History::new(8);
+        h.push(&Bytes::from_static(b"aaaa")); // total 4
+        h.push(&Bytes::from_static(b"bbbb")); // total 8
+        h.push(&Bytes::from_static(b"cccc")); // total 12, evict "aaaa"
+        assert_eq!(h.total(), 12);
+        assert_eq!(h.base(), 4);
+        assert_eq!(flatten(&h.slice_from(4)), b"bbbbcccc");
+        // A request below base is clamped to base (truncation is detected by
+        // the caller via `plan_replay`, not here).
+        assert_eq!(flatten(&h.slice_from(0)), b"bbbbcccc");
+    }
+
+    #[test]
+    fn history_empty_push_is_noop() {
+        let mut h = History::new(64);
+        h.push(&Bytes::new());
+        assert_eq!(h.total(), 0);
+        assert_eq!(h.chunks().len(), 0);
+    }
+
+    #[test]
+    fn history_line_prefix_returns_current_line() {
+        let mut h = History::new(1024);
+        h.push(&Bytes::from_static(b"first line\nsecond li"));
+        // Prefix up to the current total: everything after the last newline.
+        assert_eq!(&h.line_prefix(h.total())[..], b"second li");
+        // Prefix mid-first-line: no newline before it yet.
+        assert_eq!(&h.line_prefix(5)[..], b"first");
+        // Prefix exactly at a newline boundary: the line up to and including
+        // the newline, so the "current line" is empty.
+        assert_eq!(&h.line_prefix(11)[..], b"");
+    }
+
+    #[test]
+    fn history_line_prefix_spans_chunk_boundaries() {
+        let mut h = History::new(1024);
+        h.push(&Bytes::from_static(b"ab\ncd"));
+        h.push(&Bytes::from_static(b"ef"));
+        assert_eq!(&h.line_prefix(h.total())[..], b"cdef");
+    }
+
+    #[test]
+    fn plan_replay_alt_screen_always_redraws() {
+        // Alt-screen wins regardless of offset or freshness.
+        assert_eq!(plan_replay(50, false, true, 0, 100), ReplayPlan::AltRedraw { offset: 100 },);
+        assert_eq!(plan_replay(0, true, true, 10, 100), ReplayPlan::AltRedraw { offset: 100 },);
+    }
+
+    #[test]
+    fn plan_replay_fresh_viewer_gets_scrollback() {
+        assert_eq!(plan_replay(0, true, false, 0, 100), ReplayPlan::Fresh { offset: 100 },);
+        // A nonsense offset ahead of the stream is treated as fresh, not
+        // trusted.
+        assert_eq!(plan_replay(500, false, false, 0, 100), ReplayPlan::Fresh { offset: 100 },);
+    }
+
+    #[test]
+    fn plan_replay_clean_resume_within_history() {
+        assert_eq!(plan_replay(60, false, false, 20, 100), ReplayPlan::Clean { offset: 60 },);
+        // Offset exactly at the tail: clean resume of zero bytes.
+        assert_eq!(plan_replay(100, false, false, 20, 100), ReplayPlan::Clean { offset: 100 },);
+        // Offset exactly at the base edge is still clean (not truncated).
+        assert_eq!(plan_replay(20, false, false, 20, 100), ReplayPlan::Clean { offset: 20 },);
+    }
+
+    #[test]
+    fn plan_replay_truncated_when_offset_fell_out_of_history() {
+        assert_eq!(
+            plan_replay(5, false, false, 40, 100),
+            ReplayPlan::Truncated { offset: 40, dropped: 35 },
+        );
     }
 
     #[test]

@@ -29,7 +29,7 @@ flowchart LR
 
 <sub>Orange = SSH tunnel (TCP) · Blue = Unix domain socket</sub>
 
-A daemon listens on a single Unix socket (`ctl.sock`). Clients send a control frame declaring intent (new session, attach, list); the daemon hands off the raw socket connection to the target session and gets out of the loop. Each session owns a PTY with a login shell that persists across disconnects -- while no client is attached, the server drains PTY output into a ring buffer so the shell never blocks. On reconnect, buffered output is flushed to the new client.
+A daemon listens on a single Unix socket (`ctl.sock`). Clients send a control frame declaring intent (new session, attach, list); the daemon hands off the raw socket connection to the target session and gets out of the loop. Each session owns a PTY with a login shell that persists across disconnects. The server keeps an always-on, offset-indexed byte history of PTY output (a trailing ~1MB ring plus a monotonic stream offset) so the shell never blocks and a reconnecting client can resume the stream by absolute position. On reconnect the client reports how far it rendered and the server replays exactly the bytes it missed -- nothing already on screen is re-sent.
 
 For remote access, `gritty tunnel-create` forwards the remote socket over SSH. All commands work identically over the tunnel. `gritty bootstrap <host>` installs gritty on the remote host by running the install script over SSH.
 
@@ -54,16 +54,17 @@ sequenceDiagram
     C--xT: connect (tunnel down)
     Note over T: Monitor detects exit,<br/>respawns SSH
     C->>T: connect (tunnel back)
-    C->>S: Attach (cols, rows, attach_token)
+    C->>S: Attach (cols, rows, attach_token,<br/>rendered_offset, line_dirty)
     Note over S: Validate token<br/>Apply winsize +<br/>SIGWINCH (toggle if alt-screen)
     S->>C: AttachAck (token)
     end
 
-    Note over C: [reconnected]
-    Note over S: Replay scrollback<br/>+ partial line,<br/>then buffer drains
+    Note over S: Resume (offset)<br/>then replay Data[offset..]<br/>— only what was missed
 ```
 
-The client probes for liveness on idle and declares the link dead after 60s with no server frame. It then enters a reconnect loop with exponential backoff (1s..10s) and a per-attempt handshake+Attach budget of 15s -- generous enough to absorb cellular RTT plus a retransmit. The loop paints a single dim status line in place (spinner, elapsed seconds, `^C aborts`) so the user can tell it is alive; on success the client prints a green `▸ reconnected` and the server follows with a dim horizontal rule that fences off the scrollback replay. Meanwhile the tunnel monitor detects the SSH process exit and respawns it. The client reconnects through the restored tunnel transparently.
+The client probes for liveness on idle and declares the link dead after 60s with no server frame. It then enters a reconnect loop with exponential backoff (1s..10s) and a per-attempt handshake+Attach budget of 15s -- generous enough to absorb cellular RTT plus a retransmit.
+
+Resumption is offset-based. The client tracks how far it has rendered into the PTY output stream; the `Attach` frame carries that `rendered_offset`, and the server replays exactly `Data[rendered_offset..]` -- the bytes produced while the client was gone, and nothing else. A sub-second blip is therefore byte-exact and invisible: the client paints no status line at all unless the reconnect drags past a one-second grace period, so the terminal is never even touched. Only a longer outage gets chrome -- a single dim animated status line, erased on success. If the client's position fell out of the server's ~1MB history window it gets a truncation marker instead; a fresh `connect` (not an auto-reconnect) gets scrollback context under a dim divider; and an alt-screen session gets a full TUI repaint (a byte suffix can't reconstruct a live TUI). Meanwhile the tunnel monitor detects the SSH process exit and respawns it. The client reconnects through the restored tunnel transparently.
 
 On macOS, both the client and the tunnel supervisor subscribe to `nw_path_monitor` (Network.framework) for OS-level network path-change hints -- wifi join/leave, ethernet plug/unplug, VPN up/down, wake-from-sleep route restore. A path-change event is advisory: the client sends an immediate Ping (surfacing a dead socket without waiting 60s), and any in-progress backoff sleep is cut short with backoff reset to the minimum. This is a latency optimization only; the wall-clock heartbeat and ssh's `ServerAliveInterval` remain the correctness backstops on every platform.
 

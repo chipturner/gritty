@@ -80,6 +80,11 @@ pub(crate) async fn connect_session(
             cols: attach_cols,
             rows: attach_rows,
             attach_token: 0,
+            // Explicit connect: no prior stream position. attach_token == 0
+            // already signals "fresh viewer" to the server, so it replays
+            // scrollback context rather than an incremental resume.
+            rendered_offset: 0,
+            line_dirty: false,
         })
         .await?;
 

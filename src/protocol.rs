@@ -17,6 +17,8 @@ const TYPE_ENV: u8 = 0x16;
 const TYPE_DIAG_REQUEST: u8 = 0x17;
 const TYPE_DIAG_RESPONSE: u8 = 0x18;
 const TYPE_SERVER_SHUTDOWN: u8 = 0x19;
+const TYPE_RESUME: u8 = 0x1A;
+const TYPE_NOTICE: u8 = 0x1B;
 
 // Agent forwarding
 const TYPE_AGENT_FORWARD: u8 = 0x20;
@@ -74,7 +76,7 @@ const HEADER_LEN: usize = 5; // type(1) + length(4)
 const MAX_FRAME_SIZE: usize = 1 << 20; // 1 MB
 
 /// Protocol version for handshake negotiation.
-pub const PROTOCOL_VERSION: u16 = 20;
+pub const PROTOCOL_VERSION: u16 = 21;
 
 /// Capability bit: client/server supports clipboard forwarding.
 pub const CAP_CLIPBOARD: u32 = 0x01;
@@ -217,6 +219,22 @@ pub enum Frame {
     /// otherwise spin the reconnect loop until the tunnel supervisor happens
     /// to restart the server minutes later.
     ServerShutdown,
+    /// Server tells the client its authoritative position in the PTY output
+    /// stream (server → client). Sent as the first frame after a reconnect /
+    /// takeover handoff: the client sets its `rendered_offset` to this value,
+    /// then counts subsequent `Data` payload bytes up from it. Lets a clean
+    /// resume replay exactly `Data[offset..]` with no redundant repaint, and
+    /// lets a truncated / full-repaint resume jump the client's counter
+    /// forward past bytes it will never render byte-for-byte.
+    Resume {
+        offset: u64,
+    },
+    /// Server chrome written to the client's terminal but NOT counted toward
+    /// `rendered_offset` (server → client). Used for reconnect dividers,
+    /// truncation markers, takeover banners, alt-screen priming, and partial-
+    /// line repaints -- bytes to display that are not part of the client's
+    /// authoritative position in the live PTY stream.
+    Notice(Bytes),
     /// Client signals it can handle agent forwarding (client → server).
     AgentForward,
     /// New agent connection on the remote side (server → client).
@@ -355,7 +373,7 @@ pub enum Frame {
         /// connection to the session task (no ring-buffer flush, no takeover).
         no_replay: bool,
         /// Client's current terminal size. The server applies these before
-        /// replaying scrollback/ring buffer so replayed bytes are produced at
+        /// replaying scrollback/history so replayed bytes are produced at
         /// the right winsize. Zero = unknown (probe-only clients).
         cols: u16,
         rows: u16,
@@ -365,6 +383,18 @@ pub enum Frame {
         /// Hello's `device_id` against the stored owner and rejects with
         /// `ErrorCode::OwnerChanged` if they differ.
         attach_token: u64,
+        /// How far the client has rendered into the session's PTY output
+        /// stream. The server replays `Data[rendered_offset..]` on a clean
+        /// resume so only content produced while disconnected is sent. `0`
+        /// for a fresh explicit connect (which instead gets scrollback
+        /// context). Older clients that omit this default to `0`.
+        rendered_offset: u64,
+        /// The client painted a reconnect status line (it was gone long
+        /// enough to cross the chrome-delay threshold), so its cursor is no
+        /// longer where `rendered_offset` left it. The server repaints the
+        /// current line before resuming the stream. Older clients default to
+        /// `false`.
+        line_dirty: bool,
     },
     /// Read-only tail of a session's PTY output (client → server).
     Tail {
@@ -789,6 +819,11 @@ impl Decoder for FrameCodec {
         match frame_type {
             // Blob frames
             TYPE_DATA => Ok(Some(Frame::Data(payload.freeze()))),
+            TYPE_NOTICE => Ok(Some(Frame::Notice(payload.freeze()))),
+            TYPE_RESUME => {
+                expect_min_len(&payload, 8, "resume")?;
+                Ok(Some(Frame::Resume { offset: PayloadReader::new(&payload).u64() }))
+            }
             TYPE_CLIPBOARD_SET => Ok(Some(Frame::ClipboardSet { data: payload.freeze() })),
             TYPE_CLIPBOARD_DATA => Ok(Some(Frame::ClipboardData { data: payload.freeze() })),
 
@@ -1024,19 +1059,23 @@ impl Decoder for FrameCodec {
                 off += 1;
                 let no_replay = p.get(off).copied().unwrap_or(0) != 0;
                 off += 1;
-                // cols/rows appended in protocol v12, attach_token in v14.
-                // Missing trailing fields default to 0 for forward compat.
+                // cols/rows appended in protocol v12, attach_token in v14,
+                // rendered_offset + line_dirty in v21. Missing trailing fields
+                // default to 0 for forward compat.
                 let cols = if off + 2 <= p.len() { read_u16(p, off) } else { 0 };
                 off += 2;
                 let rows = if off + 2 <= p.len() { read_u16(p, off) } else { 0 };
                 off += 2;
-                let attach_token = if off + 8 <= p.len() {
+                let read_u64 = |p: &[u8], off: usize| {
                     let mut b = [0u8; 8];
                     b.copy_from_slice(&p[off..off + 8]);
                     u64::from_be_bytes(b)
-                } else {
-                    0
                 };
+                let attach_token = if off + 8 <= p.len() { read_u64(p, off) } else { 0 };
+                off += 8;
+                let rendered_offset = if off + 8 <= p.len() { read_u64(p, off) } else { 0 };
+                off += 8;
+                let line_dirty = p.get(off).copied().unwrap_or(0) != 0;
                 Ok(Some(Frame::Attach {
                     session,
                     client_name,
@@ -1045,6 +1084,8 @@ impl Decoder for FrameCodec {
                     cols,
                     rows,
                     attach_token,
+                    rendered_offset,
+                    line_dirty,
                 }))
             }
             TYPE_ATTACH_ACK => {
@@ -1112,6 +1153,12 @@ impl Encoder<Frame> for FrameCodec {
         match frame {
             // Blob frames
             Frame::Data(data) => encode_blob(dst, TYPE_DATA, &data),
+            Frame::Notice(data) => encode_blob(dst, TYPE_NOTICE, &data),
+            Frame::Resume { offset } => {
+                dst.put_u8(TYPE_RESUME);
+                dst.put_u32(8);
+                dst.put_u64(offset);
+            }
             Frame::ClipboardSet { data } => encode_blob(dst, TYPE_CLIPBOARD_SET, &data),
             Frame::ClipboardData { data } => encode_blob(dst, TYPE_CLIPBOARD_DATA, &data),
 
@@ -1239,10 +1286,20 @@ impl Encoder<Frame> for FrameCodec {
                 dst.put_u16(cnb.len() as u16);
                 dst.extend_from_slice(cnb);
             }
-            Frame::Attach { session, client_name, force, no_replay, cols, rows, attach_token } => {
+            Frame::Attach {
+                session,
+                client_name,
+                force,
+                no_replay,
+                cols,
+                rows,
+                attach_token,
+                rendered_offset,
+                line_dirty,
+            } => {
                 let sb = session.as_bytes();
                 let cnb = client_name.as_bytes();
-                let payload_len = 2 + sb.len() + 2 + cnb.len() + 2 + 4 + 8;
+                let payload_len = 2 + sb.len() + 2 + cnb.len() + 2 + 4 + 8 + 8 + 1;
                 dst.put_u8(TYPE_ATTACH);
                 dst.put_u32(payload_len as u32);
                 dst.put_u16(sb.len() as u16);
@@ -1254,6 +1311,8 @@ impl Encoder<Frame> for FrameCodec {
                 dst.put_u16(cols);
                 dst.put_u16(rows);
                 dst.put_u64(attach_token);
+                dst.put_u64(rendered_offset);
+                dst.put_u8(if line_dirty { 1 } else { 0 });
             }
             Frame::AttachAck { token, session_id } => {
                 dst.put_u8(TYPE_ATTACH_ACK);

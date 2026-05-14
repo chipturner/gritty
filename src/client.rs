@@ -326,6 +326,13 @@ const SPINNER: &[char] = &['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧
 /// sleeps are 1..10s, long enough to otherwise look frozen).
 const RECONNECT_SPIN_INTERVAL: Duration = Duration::from_millis(120);
 
+/// Grace period before the reconnect status line is painted at all. A
+/// reconnect that completes within this window leaves the terminal untouched
+/// -- no line reserved, no cursor moved -- so the common sub-second blip (lid
+/// crack, wifi handoff) resumes seamlessly. Only a reconnect that visibly
+/// drags gets chrome.
+const RECONNECT_CHROME_DELAY: Duration = Duration::from_secs(1);
+
 /// What the reconnect status line is reporting. Determines the body text.
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum ReconnectPhase {
@@ -345,11 +352,6 @@ fn reconnect_status_line(spin: usize, elapsed_s: u64, phase: ReconnectPhase) -> 
         ReconnectPhase::WaitingForNetwork => "waiting for network".to_string(),
     };
     format!("\r\x1b[2m{glyph} {body} \u{b7} ^C aborts\x1b[0m\x1b[K")
-}
-
-/// Terminal success line: replaces the status line, then newline.
-fn reconnect_ok_line() -> &'static str {
-    "\r\x1b[32m\u{25b8} reconnected\x1b[0m\x1b[K\r\n"
 }
 
 /// Terminal failure line: replaces the status line, then newline. Caller is
@@ -723,6 +725,8 @@ struct ClientRelay<'a> {
     last_rtt: &'a mut Option<Duration>,
     connected_at: Instant,
     bytes_relayed: &'a mut u64,
+    /// Authoritative position in the PTY output stream -- see `client::run`.
+    rendered_offset: &'a mut u64,
     url_limiter: &'a mut RateLimiter,
     clipboard_set_limiter: &'a mut RateLimiter,
     tunnel_listen_limiter: &'a mut RateLimiter,
@@ -747,6 +751,26 @@ impl ClientRelay<'_> {
             Some(Ok(Frame::Data(data))) => {
                 debug!(len = data.len(), "socket → stdout");
                 *self.bytes_relayed += data.len() as u64;
+                // Data is the live PTY stream: advance our rendered position
+                // so the next reconnect's Attach can ask for exactly the tail
+                // we missed.
+                *self.rendered_offset += data.len() as u64;
+                self.alt_screen.scan(&data);
+                write_stdout_async(self.async_stdout, &data).await?;
+            }
+            Some(Ok(Frame::Resume { offset })) => {
+                // The server is telling us our authoritative stream position
+                // after a reconnect handoff. Trust it verbatim: on a clean
+                // resume it equals what we counted; on a truncated or
+                // full-repaint resume it jumps us forward past bytes we will
+                // never render byte-for-byte.
+                debug!(offset, "resume offset from server");
+                *self.rendered_offset = offset;
+            }
+            Some(Ok(Frame::Notice(data))) => {
+                // Server chrome (dividers, truncation markers, takeover
+                // banners, alt-screen priming, line repaints). Render it but
+                // do NOT count it -- it is not part of the PTY stream.
                 self.alt_screen.scan(&data);
                 write_stdout_async(self.async_stdout, &data).await?;
             }
@@ -1472,6 +1496,7 @@ async fn relay(
     limiters: &mut SecurityLimiters,
     alt_screen: &mut AltScreenTracker,
     net: &NetWatcher,
+    rendered_offset: &mut u64,
 ) -> anyhow::Result<RelayExit> {
     let mut heartbeat_interval = tokio::time::interval(hb_interval);
     heartbeat_interval.reset(); // first tick is immediate otherwise; delay it
@@ -1522,6 +1547,7 @@ async fn relay(
         last_rtt: &mut last_rtt,
         connected_at: Instant::now(),
         bytes_relayed: &mut bytes_relayed,
+        rendered_offset,
         url_limiter: &mut limiters.url,
         clipboard_set_limiter: &mut limiters.clipboard_set,
         tunnel_listen_limiter: &mut limiters.tunnel_listen,
@@ -1861,10 +1887,14 @@ pub async fn run(
 
     let mut limiters = SecurityLimiters::new();
     let net = NetWatcher::spawn();
+    // How far we have rendered into the session's PTY output stream. Counts
+    // `Data` payload bytes; a `Resume` frame from the server overrides it on
+    // reconnect. Persists across reconnects so the next `Attach` can ask the
+    // server to replay only what we missed.
+    let mut rendered_offset: u64 = 0;
     // Mirrors the server's alt-screen tracker so we can suppress our own
-    // reconnect chrome (▸ reconnecting..., ▸ reconnected) when a TUI is
-    // running -- those writes would otherwise land directly in the alt
-    // screen buffer and corrupt it.
+    // reconnect chrome when a TUI is running -- those writes would otherwise
+    // land directly in the alt screen buffer and corrupt it.
     let mut alt_screen = AltScreenTracker::new();
 
     loop {
@@ -1903,6 +1933,7 @@ pub async fn run(
                 &mut limiters,
                 &mut alt_screen,
                 &net,
+                &mut rendered_offset,
             )
             .await?
         } else {
@@ -1918,6 +1949,13 @@ pub async fn run(
                 // don't corrupt its buffer; the server's post-reconnect
                 // force_tui_redraw will visibly repaint the TUI for the user.
                 let show_chrome = !alt_screen.in_alternate_screen();
+                // Whether the reconnect status line is currently on screen.
+                // Stays false until the reconnect drags past
+                // `RECONNECT_CHROME_DELAY`; once painted it stays for the rest
+                // of this reconnect episode. `line_dirty` in the Attach frame
+                // is derived from it so the server knows to repaint the
+                // cursor's line.
+                let mut chrome_shown = false;
                 let mut reconnect_started = Instant::now();
                 // Timestamp of the most recent observation that ctl_path did
                 // NOT exist. Cleared whenever the socket reappears or a probe
@@ -1940,14 +1978,28 @@ pub async fn run(
                 tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
                 let is_remote = crate::connect::ctl_socket_lock_path(ctl_path).is_some();
                 info!(is_remote, path_status = ?net.status(), "entering reconnect loop");
-                if show_chrome {
-                    // Reserve a fresh line; the tick arm repaints it in place.
-                    write_stdout_async(&async_stdout, b"\r\n").await?;
-                    write_stdout_async(
-                        &async_stdout,
-                        reconnect_status_line(spin, 0, ReconnectPhase::Retrying).as_bytes(),
-                    )
-                    .await?;
+
+                // Paint (or first-time open) the reconnect status line, but
+                // only once the reconnect has dragged past the chrome-delay
+                // grace period -- a fast reconnect leaves the terminal
+                // untouched. A no-op in alt-screen or inside the grace window.
+                macro_rules! paint_reconnect_status {
+                    ($phase:expr) => {{
+                        if show_chrome && reconnect_started.elapsed() >= RECONNECT_CHROME_DELAY {
+                            if !chrome_shown {
+                                // Open a fresh line below the user's content;
+                                // we repaint it in place from here on.
+                                write_stdout_async(&async_stdout, b"\r\n").await?;
+                                chrome_shown = true;
+                            }
+                            let elapsed = reconnect_started.elapsed().as_secs();
+                            write_stdout_async(
+                                &async_stdout,
+                                reconnect_status_line(spin, elapsed, $phase).as_bytes(),
+                            )
+                            .await?;
+                        }
+                    }};
                 }
 
                 loop {
@@ -1968,19 +2020,12 @@ pub async fn run(
                             _ = tokio::time::sleep_until(deadline) => break,
                             _ = tick.tick() => {
                                 spin = spin.wrapping_add(1);
-                                if show_chrome {
-                                    let phase = if is_remote && net.status() == PathStatus::Unsatisfied {
-                                        ReconnectPhase::WaitingForNetwork
-                                    } else {
-                                        ReconnectPhase::Retrying
-                                    };
-                                    let elapsed = reconnect_started.elapsed().as_secs();
-                                    write_stdout_async(
-                                        &async_stdout,
-                                        reconnect_status_line(spin, elapsed, phase).as_bytes(),
-                                    )
-                                    .await?;
-                                }
+                                let phase = if is_remote && net.status() == PathStatus::Unsatisfied {
+                                    ReconnectPhase::WaitingForNetwork
+                                } else {
+                                    ReconnectPhase::Retrying
+                                };
+                                paint_reconnect_status!(phase);
                             }
                             _ = net.changed() => {
                                 // Network path changed while backing off --
@@ -2114,6 +2159,13 @@ pub async fn run(
                         socket_exists = ctl_path.exists(),
                         "reconnect: attempting"
                     );
+                    // Snapshot the chrome state *now* so the async block below
+                    // doesn't borrow `chrome_shown` (which the attempt-loop
+                    // tick arm may still flip mid-flight). `line_dirty` tells
+                    // the server our cursor left `rendered_offset`'s position
+                    // and the current line needs a repaint on resume.
+                    let line_dirty = chrome_shown;
+                    let resume_offset = rendered_offset;
                     let attempt_fut = tokio::time::timeout(RECONNECT_ATTEMPT_TIMEOUT, async {
                         let stream = match crate::security::connect_verified(ctl_path).await {
                             Ok(s) => s,
@@ -2159,6 +2211,10 @@ pub async fn run(
                                 rows,
                                 // Non-zero = auto-reconnect ownership claim.
                                 attach_token: device_id,
+                                // Resume the PTY stream from where we left off;
+                                // the server replays only what we missed.
+                                rendered_offset: resume_offset,
+                                line_dirty,
                             })
                             .await
                             .is_err()
@@ -2188,15 +2244,7 @@ pub async fn run(
                             r = &mut attempt_fut => break r,
                             _ = tick.tick() => {
                                 spin = spin.wrapping_add(1);
-                                if show_chrome {
-                                    let elapsed = reconnect_started.elapsed().as_secs();
-                                    write_stdout_async(
-                                        &async_stdout,
-                                        reconnect_status_line(spin, elapsed, ReconnectPhase::Retrying)
-                                            .as_bytes(),
-                                    )
-                                    .await?;
-                                }
+                                paint_reconnect_status!(ReconnectPhase::Retrying);
                             }
                         }
                     };
@@ -2204,12 +2252,16 @@ pub async fn run(
                     // Emit a terminal red line on stdout. `\x1b[?1049l` leaves
                     // alt-screen first so the error is visible on main screen
                     // -- otherwise RawModeGuard's Drop emits it after the fact
-                    // and clobbers the message. No-op on main screen.
+                    // and clobbers the message. No-op on main screen. `lead`
+                    // opens a fresh line when no status line was ever painted,
+                    // so the error doesn't overwrite the user's last output.
                     macro_rules! bail_reconnect {
                         ($text:expr) => {{
+                            let lead = if chrome_shown { "" } else { "\r\n" };
                             write_stdout_async(
                                 &async_stdout,
-                                format!("\x1b[?1049l{}", reconnect_err_line($text)).as_bytes(),
+                                format!("\x1b[?1049l{lead}{}", reconnect_err_line($text))
+                                    .as_bytes(),
                             )
                             .await?;
                             return Ok(1);
@@ -2225,9 +2277,13 @@ pub async fn run(
                                 total_s = reconnect_started.elapsed().as_secs_f64(),
                                 "reconnect: connected"
                             );
-                            if show_chrome {
-                                write_stdout_async(&async_stdout, reconnect_ok_line().as_bytes())
-                                    .await?;
+                            if chrome_shown {
+                                // Erase the status line and reclaim its row:
+                                // clear the line, then step the cursor back up
+                                // onto the line where the stream left off. The
+                                // server's Resume/Notice/Data replay takes it
+                                // from there.
+                                write_stdout_async(&async_stdout, b"\r\x1b[K\x1b[A").await?;
                             }
                             framed = new_framed;
                             break;
@@ -2451,6 +2507,10 @@ pub async fn tail(
             Some(code) => break code,
             None => {
                 let show_chrome = !alt_screen.in_alternate_screen();
+                // Delayed-chrome flag, same contract as the interactive
+                // reconnect loop: nothing is painted until the reconnect drags
+                // past `RECONNECT_CHROME_DELAY`.
+                let mut chrome_shown = false;
                 let mut reconnect_started = Instant::now();
                 let mut socket_missing_since: Option<Instant> = None;
                 let mut was_offline = false;
@@ -2459,9 +2519,22 @@ pub async fn tail(
                 tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
                 let is_remote = crate::connect::ctl_socket_lock_path(ctl_path).is_some();
                 const SOCKET_GONE_GRACE: Duration = Duration::from_secs(3);
-                if show_chrome {
-                    eprint!("{}", reconnect_status_line(spin, 0, ReconnectPhase::Retrying));
+
+                // Paint (or first-time open) the tail reconnect status line
+                // once the reconnect has dragged past the grace period.
+                macro_rules! paint_tail_status {
+                    ($phase:expr) => {{
+                        if show_chrome && reconnect_started.elapsed() >= RECONNECT_CHROME_DELAY {
+                            if !chrome_shown {
+                                eprint!("\r\n");
+                                chrome_shown = true;
+                            }
+                            let elapsed = reconnect_started.elapsed().as_secs();
+                            eprint!("{}", reconnect_status_line(spin, elapsed, $phase));
+                        }
+                    }};
                 }
+
                 loop {
                     let deadline = tokio::time::Instant::now() + Duration::from_secs(1);
                     loop {
@@ -2469,15 +2542,12 @@ pub async fn tail(
                             _ = tokio::time::sleep_until(deadline) => break,
                             _ = tick.tick() => {
                                 spin = spin.wrapping_add(1);
-                                if show_chrome {
-                                    let phase = if is_remote && net.status() == PathStatus::Unsatisfied {
-                                        ReconnectPhase::WaitingForNetwork
-                                    } else {
-                                        ReconnectPhase::Retrying
-                                    };
-                                    let elapsed = reconnect_started.elapsed().as_secs();
-                                    eprint!("{}", reconnect_status_line(spin, elapsed, phase));
-                                }
+                                let phase = if is_remote && net.status() == PathStatus::Unsatisfied {
+                                    ReconnectPhase::WaitingForNetwork
+                                } else {
+                                    ReconnectPhase::Retrying
+                                };
+                                paint_tail_status!(phase);
                             }
                             _ = net.changed() => break,
                             _ = sigint.recv() => { break 'outer 0; }
@@ -2582,17 +2652,15 @@ pub async fn tail(
                             r = &mut outcome_fut => break r,
                             _ = tick.tick() => {
                                 spin = spin.wrapping_add(1);
-                                if show_chrome {
-                                    let elapsed = reconnect_started.elapsed().as_secs();
-                                    eprint!("{}", reconnect_status_line(spin, elapsed, ReconnectPhase::Retrying));
-                                }
+                                paint_tail_status!(ReconnectPhase::Retrying);
                             }
                         }
                     };
 
                     macro_rules! bail_tail {
                         ($text:expr) => {{
-                            eprint!("{}", reconnect_err_line($text));
+                            let lead = if chrome_shown { "" } else { "\r\n" };
+                            eprint!("{lead}{}", reconnect_err_line($text));
                             break 'outer 1;
                         }};
                     }
@@ -2600,8 +2668,10 @@ pub async fn tail(
                     match outcome {
                         Ok(Outcome::Connected(new_framed)) => {
                             info!("tail reconnect: connected");
-                            if show_chrome {
-                                eprint!("{}", reconnect_ok_line());
+                            if chrome_shown {
+                                // Erase the status line; the fresh tail stream
+                                // flows onto the reclaimed row.
+                                eprint!("\r\x1b[K");
                             }
                             framed = new_framed;
                             heartbeat_interval.reset();
@@ -2881,9 +2951,7 @@ mod tests {
     }
 
     #[test]
-    fn reconnect_ok_and_err_lines_repaint_in_place() {
-        assert!(reconnect_ok_line().starts_with('\r'));
-        assert!(reconnect_ok_line().ends_with("\x1b[K\r\n"));
+    fn reconnect_err_line_repaints_in_place() {
         let err = reconnect_err_line("boom");
         assert!(err.starts_with("\r\x1b[31m"), "{err:?}");
         assert!(err.contains("boom"), "{err:?}");

@@ -678,6 +678,11 @@ async fn dispatch_control(
                 capabilities,
                 cols: 0,
                 rows: 0,
+                // The creator auto-attaches to a brand-new session: no prior
+                // stream position, nothing to replay.
+                rendered_offset: 0,
+                line_dirty: false,
+                is_fresh: true,
             });
             false
         }
@@ -689,6 +694,8 @@ async fn dispatch_control(
             cols,
             rows,
             attach_token: provided_token,
+            rendered_offset,
+            line_dirty,
         } => {
             reap_sessions(sessions);
             if let Some(id) = resolve_session(sessions, &session, *last_attached) {
@@ -803,6 +810,12 @@ async fn dispatch_control(
                                 capabilities,
                                 cols,
                                 rows,
+                                rendered_offset,
+                                line_dirty,
+                                // attach_token == 0 is an explicit `connect`
+                                // (fresh viewer); non-zero is an auto-reconnect
+                                // that resumes from `rendered_offset`.
+                                is_fresh: provided_token == 0,
                             });
                         }
                     }

@@ -69,6 +69,9 @@ async fn setup_session() -> (
             capabilities: 0,
             cols: 0,
             rows: 0,
+            rendered_offset: 0,
+            line_dirty: false,
+            is_fresh: false,
         })
         .unwrap();
 
@@ -114,6 +117,9 @@ async fn setup_session_with_svc_path() -> (
             capabilities: 0,
             cols: 0,
             rows: 0,
+            rendered_offset: 0,
+            line_dirty: false,
+            is_fresh: false,
         })
         .unwrap();
 
@@ -159,6 +165,9 @@ async fn setup_session_with_env(
             capabilities: 0,
             cols: 0,
             rows: 0,
+            rendered_offset: 0,
+            line_dirty: false,
+            is_fresh: false,
         })
         .unwrap();
 
@@ -186,14 +195,21 @@ async fn wait_for_shell(framed: &mut Framed<UnixStream, FrameCodec>) {
     }
 }
 
-/// Drain all available Data frames within a timeout, return concatenated bytes.
+/// Drain all available terminal-output frames within a timeout, return the
+/// concatenated bytes. Collects both `Data` (the live PTY stream) and `Notice`
+/// (server reconnect chrome: dividers, truncation markers, priming) since both
+/// render to the user's terminal -- a test asserting on what the user sees
+/// shouldn't care which frame type carried a given byte.
 async fn read_available_data(
     framed: &mut Framed<UnixStream, FrameCodec>,
     wait: Duration,
 ) -> Vec<u8> {
     let mut out = Vec::new();
-    while let Ok(Some(Ok(Frame::Data(data)))) = timeout(wait, framed.next()).await {
-        out.extend_from_slice(&data);
+    while let Ok(Some(Ok(frame))) = timeout(wait, framed.next()).await {
+        match frame {
+            Frame::Data(data) | Frame::Notice(data) => out.extend_from_slice(&data),
+            _ => {}
+        }
     }
     out
 }
@@ -329,6 +345,9 @@ async fn reconnect_preserves_shell_session() {
             capabilities: 0,
             cols: 0,
             rows: 0,
+            rendered_offset: 0,
+            line_dirty: false,
+            is_fresh: false,
         })
         .unwrap();
     let mut framed = Framed::new(client_stream, FrameCodec);
@@ -382,6 +401,9 @@ async fn second_client_detaches_first() {
             capabilities: 0,
             cols: 0,
             rows: 0,
+            rendered_offset: 0,
+            line_dirty: false,
+            is_fresh: false,
         })
         .unwrap();
     let mut client2 = Framed::new(client_stream2, FrameCodec);
@@ -450,6 +472,9 @@ async fn idle_evict_closes_socket_not_detached() {
             capabilities: 0,
             cols: 0,
             rows: 0,
+            rendered_offset: 0,
+            line_dirty: false,
+            is_fresh: false,
         })
         .unwrap();
     let mut client1 = Framed::new(client_stream, FrameCodec);
@@ -488,6 +513,9 @@ async fn idle_evict_closes_socket_not_detached() {
             capabilities: 0,
             cols: 0,
             rows: 0,
+            rendered_offset: 0,
+            line_dirty: false,
+            is_fresh: false,
         })
         .unwrap();
     let mut client2 = Framed::new(client_stream2, FrameCodec);
@@ -558,6 +586,9 @@ async fn rapid_reconnect_cycles() {
                 capabilities: 0,
                 cols: 0,
                 rows: 0,
+                rendered_offset: 0,
+                line_dirty: false,
+                is_fresh: false,
             })
             .unwrap();
         framed = Framed::new(client_stream, FrameCodec);
@@ -640,6 +671,9 @@ async fn pty_buffer_saturation_and_resume() {
             capabilities: 0,
             cols: 0,
             rows: 0,
+            rendered_offset: 0,
+            line_dirty: false,
+            is_fresh: false,
         })
         .unwrap();
     let mut framed = Framed::new(client_stream, FrameCodec);
@@ -686,6 +720,9 @@ async fn pty_ring_buffer_drains_during_disconnect() {
             capabilities: 0,
             cols: 0,
             rows: 0,
+            rendered_offset: 0,
+            line_dirty: false,
+            is_fresh: false,
         })
         .unwrap();
     let mut framed = Framed::new(client_stream, FrameCodec);
@@ -730,6 +767,9 @@ async fn pty_ring_buffer_caps_at_limit() {
             capabilities: 0,
             cols: 0,
             rows: 0,
+            rendered_offset: 0,
+            line_dirty: false,
+            is_fresh: false,
         })
         .unwrap();
     let mut framed = Framed::new(client_stream, FrameCodec);
@@ -804,6 +844,9 @@ async fn metadata_reflects_attached_state() {
             capabilities: 0,
             cols: 0,
             rows: 0,
+            rendered_offset: 0,
+            line_dirty: false,
+            is_fresh: false,
         })
         .unwrap();
     let mut framed = Framed::new(client_stream, FrameCodec);
@@ -834,6 +877,9 @@ async fn client_explicit_exit_frame() {
             capabilities: 0,
             cols: 0,
             rows: 0,
+            rendered_offset: 0,
+            line_dirty: false,
+            is_fresh: false,
         })
         .unwrap();
     let mut framed = Framed::new(client_stream, FrameCodec);
@@ -1032,6 +1078,9 @@ async fn setup_session_with_agent_path() -> (
             capabilities: 0,
             cols: 0,
             rows: 0,
+            rendered_offset: 0,
+            line_dirty: false,
+            is_fresh: false,
         })
         .unwrap();
 
@@ -1317,17 +1366,21 @@ async fn ring_buffer_overflow_shows_truncation_marker() {
             capabilities: 0,
             cols: 0,
             rows: 0,
+            rendered_offset: 0,
+            line_dirty: false,
+            is_fresh: false,
         })
         .unwrap();
     let mut framed = Framed::new(client_stream, FrameCodec);
     framed.send(Frame::Resize { cols: 80, rows: 24 }).await.unwrap();
 
-    // First Data frame should carry the truncation annotation on the divider.
+    // The reconnect should carry a truncation marker: the client's offset (0)
+    // fell out of the 1 MB history window, so some bytes are unrecoverable.
     let output = read_available_data(&mut framed, Duration::from_secs(3)).await;
     let output_str = String::from_utf8_lossy(&output);
     assert!(
-        output_str.contains("dropped while detached"),
-        "reconnect should show truncation marker when ring buffer overflows, got first 200 chars: {}",
+        output_str.contains("lost while disconnected"),
+        "reconnect should show truncation marker when history overflows, got first 200 chars: {}",
         output_str.chars().take(200).collect::<String>()
     );
     assert!(output_str.contains("TRUNC_DONE"), "tail of output should still be preserved");
@@ -2349,6 +2402,9 @@ async fn port_forward_client_disconnect_cleanup() {
             capabilities: 0,
             cols: 0,
             rows: 0,
+            rendered_offset: 0,
+            line_dirty: false,
+            is_fresh: false,
         })
         .unwrap();
     let mut framed2 = Framed::new(client_stream2, FrameCodec);
@@ -2514,12 +2570,12 @@ async fn local_forward_different_listen_and_target_ports() {
 }
 
 #[tokio::test]
-async fn reconnect_sends_separator_on_main_screen() {
+async fn fresh_connect_shows_divider_on_main_screen() {
     let (client_tx, mut framed, server, _meta) = setup_session().await;
     wait_for_shell(&mut framed).await;
     read_available_data(&mut framed, Duration::from_secs(1)).await;
 
-    // Run a command so ring buffer has content
+    // Run a command so there is scrollback context to fence off.
     framed.send(Frame::Data(Bytes::from("echo MAIN_SCREEN_TEST\n"))).await.unwrap();
     read_available_data(&mut framed, Duration::from_millis(500)).await;
 
@@ -2527,7 +2583,9 @@ async fn reconnect_sends_separator_on_main_screen() {
     drop(framed);
     tokio::time::sleep(Duration::from_millis(300)).await;
 
-    // Reconnect
+    // Reconnect as a FRESH viewer (explicit `connect`, attach_token == 0). A
+    // fresh viewer has no stream position, so it gets scrollback context under
+    // a divider rather than an incremental resume.
     let (server_stream, client_stream) = UnixStream::pair().unwrap();
     client_tx
         .send(ClientConn::Active {
@@ -2536,6 +2594,9 @@ async fn reconnect_sends_separator_on_main_screen() {
             capabilities: 0,
             cols: 0,
             rows: 0,
+            rendered_offset: 0,
+            line_dirty: false,
+            is_fresh: true,
         })
         .unwrap();
     let mut framed = Framed::new(client_stream, FrameCodec);
@@ -2545,7 +2606,79 @@ async fn reconnect_sends_separator_on_main_screen() {
     let output_str = String::from_utf8_lossy(&output);
     assert!(
         output_str.contains(RECONNECT_DIVIDER),
-        "main screen reconnect should show separator, got: {output_str}"
+        "fresh connect on main screen should show a divider, got: {output_str}"
+    );
+
+    let _ = framed.send(Frame::Data(Bytes::from("exit\n"))).await;
+    let _ = timeout(Duration::from_secs(3), server).await;
+}
+
+#[tokio::test]
+async fn reconnect_resumes_incrementally_from_offset() {
+    let (client_tx, mut framed, server, _meta) = setup_session().await;
+    wait_for_shell(&mut framed).await;
+    // Consume the shell banner / first prompt and count how far we've rendered.
+    let pre = read_available_data(&mut framed, Duration::from_secs(1)).await;
+    let mut rendered: u64 = pre.len() as u64;
+
+    // Produce a line, render it, advance our offset past it.
+    framed.send(Frame::Data(Bytes::from("echo BEFORE_DISCONNECT\n"))).await.unwrap();
+    let seen = read_available_data(&mut framed, Duration::from_millis(800)).await;
+    rendered += seen.len() as u64;
+    assert!(
+        String::from_utf8_lossy(&seen).contains("BEFORE_DISCONNECT"),
+        "should have rendered the pre-disconnect line"
+    );
+
+    // Disconnect.
+    drop(framed);
+    tokio::time::sleep(Duration::from_millis(300)).await;
+
+    // Reconnect as an auto-reconnect (is_fresh: false) carrying our rendered
+    // offset. The server should resume the stream, not re-dump what we saw.
+    let (server_stream, client_stream) = UnixStream::pair().unwrap();
+    client_tx
+        .send(ClientConn::Active {
+            framed: Framed::new(server_stream, FrameCodec),
+            client_name: String::new(),
+            capabilities: 0,
+            cols: 80,
+            rows: 24,
+            rendered_offset: rendered,
+            line_dirty: false,
+            is_fresh: false,
+        })
+        .unwrap();
+    let mut framed = Framed::new(client_stream, FrameCodec);
+
+    // The first frame after handoff is Resume, carrying our offset back.
+    match timeout(Duration::from_secs(2), framed.next()).await {
+        Ok(Some(Ok(Frame::Resume { offset }))) => {
+            assert_eq!(offset, rendered, "clean resume should echo our offset");
+        }
+        other => panic!("expected Resume frame first, got {other:?}"),
+    }
+
+    // A clean resume of a quiet session replays nothing -- no divider, no
+    // re-dump of BEFORE_DISCONNECT.
+    let replayed = read_available_data(&mut framed, Duration::from_millis(500)).await;
+    let replayed_str = String::from_utf8_lossy(&replayed);
+    assert!(
+        !replayed_str.contains("BEFORE_DISCONNECT"),
+        "clean resume must not re-dump already-rendered output, got: {replayed_str:?}"
+    );
+    assert!(
+        !replayed_str.contains(RECONNECT_DIVIDER),
+        "clean resume must not emit a divider, got: {replayed_str:?}"
+    );
+
+    // The resumed session is live: new output flows normally.
+    framed.send(Frame::Data(Bytes::from("echo AFTER_RESUME\n"))).await.unwrap();
+    let after = read_available_data(&mut framed, Duration::from_secs(2)).await;
+    assert!(
+        String::from_utf8_lossy(&after).contains("AFTER_RESUME"),
+        "resumed session should carry new output, got: {}",
+        String::from_utf8_lossy(&after)
     );
 
     let _ = framed.send(Frame::Data(Bytes::from("exit\n"))).await;
@@ -2579,6 +2712,9 @@ async fn reconnect_sends_ctrl_l_on_alternate_screen() {
             capabilities: 0,
             cols: 0,
             rows: 0,
+            rendered_offset: 0,
+            line_dirty: false,
+            is_fresh: false,
         })
         .unwrap();
     let mut framed = Framed::new(client_stream, FrameCodec);
@@ -2632,6 +2768,9 @@ async fn reconnect_alt_screen_primes_client_and_discards_ring_buf() {
             capabilities: 0,
             cols: 0,
             rows: 0,
+            rendered_offset: 0,
+            line_dirty: false,
+            is_fresh: false,
         })
         .unwrap();
     let mut framed = Framed::new(client_stream, FrameCodec);
@@ -2660,6 +2799,9 @@ async fn reconnect_alt_screen_primes_client_and_discards_ring_buf() {
             capabilities: 0,
             cols: 80,
             rows: 24,
+            rendered_offset: 0,
+            line_dirty: false,
+            is_fresh: false,
         })
         .unwrap();
     let mut framed = Framed::new(client_stream, FrameCodec);
@@ -2696,7 +2838,7 @@ async fn reconnect_replays_scrollback_lines() {
     drop(framed);
     tokio::time::sleep(Duration::from_millis(300)).await;
 
-    // Reconnect
+    // Reconnect as a fresh viewer so we get scrollback context + a divider.
     let (server_stream, client_stream) = UnixStream::pair().unwrap();
     client_tx
         .send(ClientConn::Active {
@@ -2705,6 +2847,9 @@ async fn reconnect_replays_scrollback_lines() {
             capabilities: 0,
             cols: 0,
             rows: 0,
+            rendered_offset: 0,
+            line_dirty: false,
+            is_fresh: true,
         })
         .unwrap();
     let mut framed = Framed::new(client_stream, FrameCodec);

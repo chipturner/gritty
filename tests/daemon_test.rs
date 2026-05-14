@@ -105,6 +105,8 @@ async fn attach_session(
             cols: 0,
             rows: 0,
             attach_token: 0,
+            rendered_offset: 0,
+            line_dirty: false,
         })
         .await
         .unwrap();
@@ -885,6 +887,8 @@ async fn attach_nonexistent_returns_error() {
             cols: 0,
             rows: 0,
             attach_token: 0,
+            rendered_offset: 0,
+            line_dirty: false,
         },
     )
     .await;
@@ -941,6 +945,8 @@ async fn attach_dead_session_returns_error() {
             cols: 0,
             rows: 0,
             attach_token: 0,
+            rendered_offset: 0,
+            line_dirty: false,
         },
     )
     .await;
@@ -1068,6 +1074,8 @@ async fn reconnect_via_daemon_after_disconnect() {
             cols: 0,
             rows: 0,
             attach_token: 0,
+            rendered_offset: 0,
+            line_dirty: false,
         })
         .await
         .unwrap();
@@ -1142,6 +1150,8 @@ async fn reconnect_after_session_killed_returns_error() {
             cols: 0,
             rows: 0,
             attach_token: 0,
+            rendered_offset: 0,
+            line_dirty: false,
         },
     )
     .await;
@@ -1362,6 +1372,8 @@ async fn attach_dash_resolves_to_last_session() {
             cols: 0,
             rows: 0,
             attach_token: 0,
+            rendered_offset: 0,
+            line_dirty: false,
         },
     )
     .await;
@@ -1379,6 +1391,8 @@ async fn attach_dash_resolves_to_last_session() {
             cols: 0,
             rows: 0,
             attach_token: 0,
+            rendered_offset: 0,
+            line_dirty: false,
         },
     )
     .await;
@@ -1454,6 +1468,8 @@ async fn different_device_rejected_with_owner_changed() {
             cols: 0,
             rows: 0,
             attach_token: 0,
+            rendered_offset: 0,
+            line_dirty: false,
         },
         200,
     )
@@ -1472,6 +1488,8 @@ async fn different_device_rejected_with_owner_changed() {
             cols: 0,
             rows: 0,
             attach_token: 100, // non-zero = auto-reconnect
+            rendered_offset: 0,
+            line_dirty: false,
         },
         100,
     )
@@ -1510,6 +1528,8 @@ async fn same_device_reconnect_succeeds() {
             cols: 0,
             rows: 0,
             attach_token: 100, // non-zero = auto-reconnect
+            rendered_offset: 0,
+            line_dirty: false,
         },
         100,
     )
@@ -1574,6 +1594,8 @@ async fn already_attached_error_names_current_client() {
             cols: 0,
             rows: 0,
             attach_token: 0,
+            rendered_offset: 0,
+            line_dirty: false,
         },
     )
     .await;
@@ -1610,6 +1632,8 @@ async fn attach_dash_no_previous_session() {
             cols: 0,
             rows: 0,
             attach_token: 0,
+            rendered_offset: 0,
+            line_dirty: false,
         },
     )
     .await;

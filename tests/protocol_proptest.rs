@@ -80,9 +80,11 @@ fn arb_frame() -> impl Strategy<Value = Frame> {
     prop_oneof![
         // Blob frames
         arb_bytes().prop_map(Frame::Data),
+        arb_bytes().prop_map(Frame::Notice),
         arb_bytes().prop_map(|data| Frame::ClipboardSet { data }),
         arb_bytes().prop_map(|data| Frame::ClipboardData { data }),
         // Fixed-field frames
+        any::<u64>().prop_map(|offset| Frame::Resume { offset }),
         (any::<u16>(), any::<u16>()).prop_map(|(cols, rows)| Frame::Resize { cols, rows }),
         any::<i32>().prop_map(|code| Frame::Exit { code }),
         (any::<u16>(), any::<u32>(), any::<u64>()).prop_map(
@@ -165,9 +167,21 @@ fn arb_frame() -> impl Strategy<Value = Frame> {
             any::<u16>(),
             any::<u16>(),
             any::<u64>(),
+            any::<u64>(),
+            any::<bool>(),
         )
             .prop_map(
-                |(session, client_name, force, no_replay, cols, rows, attach_token)| {
+                |(
+                    session,
+                    client_name,
+                    force,
+                    no_replay,
+                    cols,
+                    rows,
+                    attach_token,
+                    rendered_offset,
+                    line_dirty,
+                )| {
                     Frame::Attach {
                         session,
                         client_name,
@@ -176,6 +190,8 @@ fn arb_frame() -> impl Strategy<Value = Frame> {
                         cols,
                         rows,
                         attach_token,
+                        rendered_offset,
+                        line_dirty,
                     }
                 },
             ),

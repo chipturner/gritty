@@ -186,6 +186,8 @@ fn roundtrip_attach() {
         cols: 80,
         rows: 24,
         attach_token: 0,
+        rendered_offset: 0,
+        line_dirty: false,
     };
     codec.encode(original.clone(), &mut buf).unwrap();
     let decoded = codec.decode(&mut buf).unwrap().unwrap();
@@ -204,6 +206,8 @@ fn roundtrip_attach_by_name() {
         cols: 0,
         rows: 0,
         attach_token: 0,
+        rendered_offset: 0,
+        line_dirty: false,
     };
     codec.encode(original.clone(), &mut buf).unwrap();
     let decoded = codec.decode(&mut buf).unwrap().unwrap();
@@ -222,7 +226,39 @@ fn roundtrip_attach_with_token() {
         cols: 120,
         rows: 40,
         attach_token: 0xdead_beef_cafe_babe,
+        rendered_offset: 0x0011_2233_4455_6677,
+        line_dirty: true,
     };
+    codec.encode(original.clone(), &mut buf).unwrap();
+    let decoded = codec.decode(&mut buf).unwrap().unwrap();
+    assert_eq!(original, decoded);
+}
+
+#[test]
+fn roundtrip_resume() {
+    let mut codec = FrameCodec;
+    let mut buf = BytesMut::new();
+    let original = Frame::Resume { offset: 0xdead_beef_0000_0001 };
+    codec.encode(original.clone(), &mut buf).unwrap();
+    let decoded = codec.decode(&mut buf).unwrap().unwrap();
+    assert_eq!(original, decoded);
+}
+
+#[test]
+fn roundtrip_notice() {
+    let mut codec = FrameCodec;
+    let mut buf = BytesMut::new();
+    let original = Frame::Notice(Bytes::from("\r\x1b[2m-- replayed --\x1b[0m\r\n"));
+    codec.encode(original.clone(), &mut buf).unwrap();
+    let decoded = codec.decode(&mut buf).unwrap().unwrap();
+    assert_eq!(original, decoded);
+}
+
+#[test]
+fn roundtrip_notice_empty() {
+    let mut codec = FrameCodec;
+    let mut buf = BytesMut::new();
+    let original = Frame::Notice(Bytes::new());
     codec.encode(original.clone(), &mut buf).unwrap();
     let decoded = codec.decode(&mut buf).unwrap().unwrap();
     assert_eq!(original, decoded);
@@ -276,6 +312,37 @@ fn legacy_attach_without_token_decodes_as_zero() {
             assert_eq!(session, "alpha");
             assert_eq!(cols, 80);
             assert_eq!(rows, 24);
+        }
+        other => panic!("expected Attach, got {other:?}"),
+    }
+}
+
+#[test]
+fn legacy_attach_without_offset_decodes_as_zero() {
+    // A v14..v20 client sends an Attach frame with attach_token but without
+    // the trailing rendered_offset + line_dirty (added in v21). The decoder
+    // should tolerate the shorter payload and default both to 0 / false.
+    let mut codec = FrameCodec;
+    let mut buf = BytesMut::new();
+    let session = b"beta";
+    #[allow(clippy::identity_op)]
+    let payload_len = 2 + session.len() + 2 + 0 + 1 + 1 + 2 + 2 + 8;
+    buf.put_u8(0x51); // TYPE_ATTACH
+    buf.put_u32(payload_len as u32);
+    buf.put_u16(session.len() as u16);
+    buf.put_slice(session);
+    buf.put_u16(0); // client_name
+    buf.put_u8(0); // force
+    buf.put_u8(0); // no_replay
+    buf.put_u16(80); // cols
+    buf.put_u16(24); // rows
+    buf.put_u64(0xabc); // attach_token
+    let decoded = codec.decode(&mut buf).unwrap().unwrap();
+    match decoded {
+        Frame::Attach { attach_token, rendered_offset, line_dirty, .. } => {
+            assert_eq!(attach_token, 0xabc);
+            assert_eq!(rendered_offset, 0);
+            assert!(!line_dirty);
         }
         other => panic!("expected Attach, got {other:?}"),
     }

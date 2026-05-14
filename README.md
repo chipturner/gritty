@@ -280,7 +280,7 @@ kill -USR1 $(cat $(gritty socket-path | xargs dirname)/daemon.pid)
 kill -USR2 $(cat $(gritty socket-path | xargs dirname)/daemon.pid)
 ```
 
-**In-session diagnostics:** Press `~#` during a session to see both client-side status (RTT, uptime, bytes relayed) and server-side diagnostics (ring buffer state, alt-screen mode, channel counts, shell PID).
+**In-session diagnostics:** Press `~#` during a session to see both client-side status (RTT, uptime, bytes relayed) and server-side diagnostics (output history state + stream offset, alt-screen mode, channel counts, shell PID).
 
 **Log file locations:** `gritty info` shows the paths to `daemon.log` and `daemon.out`. `gritty doctor` checks log file sizes and warns if they grow past 50 MB.
 
@@ -288,7 +288,7 @@ kill -USR2 $(cat $(gritty socket-path | xargs dirname)/daemon.pid)
 
 gritty contains zero networking code. Sessions live on Unix domain sockets; for remote access, you forward the socket over SSH -- the same SSH that already handles your keys, `.ssh/config`, bastion hosts, and MFA. No ports to open, no firewall rules, no TLS certificates, no authentication system to trust beyond the one you already use.
 
-All communication -- control and session relay -- flows through a single server socket. When a client connects, the server hands off the raw connection and gets out of the loop. The PTY and shell keep running when the client disconnects; output drains into a ring buffer so the shell never blocks. On reconnect, buffered output is flushed before the relay resumes.
+All communication -- control and session relay -- flows through a single server socket. When a client connects, the server hands off the raw connection and gets out of the loop. The PTY and shell keep running when the client disconnects; the server keeps an offset-indexed byte history of output so the shell never blocks. On reconnect the client reports how far it rendered and the server replays exactly the bytes it missed -- a brief blip resumes byte-for-byte with nothing redrawn.
 
 Locally, the socket is `0600`, the directory is `0700`, and every `accept()` verifies the peer UID. The attack surface is small because there's very little to attack.
 

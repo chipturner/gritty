@@ -179,6 +179,8 @@ async fn attach_session(proxy_path: &Path, session: &str) -> Framed<UnixStream, 
             cols: 0,
             rows: 0,
             attach_token: 0,
+            rendered_offset: 0,
+            line_dirty: false,
         })
         .await
         .unwrap();
@@ -1214,6 +1216,8 @@ async fn attach_nonexistent_session_through_proxy() {
             cols: 0,
             rows: 0,
             attach_token: 0,
+            rendered_offset: 0,
+            line_dirty: false,
         },
     )
     .await;
