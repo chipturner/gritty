@@ -722,6 +722,23 @@ async fn tunnel_monitor(
                 let mut backoff_saw_unsatisfied = false;
 
                 let new_child = loop {
+                    // Re-check lock ownership every iteration. The outer
+                    // select's probe_ticker arm -- the only other place this
+                    // is checked -- never runs while control is inside this
+                    // respawn loop, so during a prolonged outage a ghost
+                    // supervisor whose lock file was replaced externally would
+                    // otherwise spin here for hours and eventually spawn_tunnel
+                    // -> remove_file() the legitimate supervisor's socket out
+                    // from under it. ConnectGuard::drop gates its own cleanup
+                    // on the same identity, so a plain return is safe here.
+                    if !lock_still_owned(lock_identity, &lock_path) {
+                        warn!(
+                            lock_path = %lock_path.display(),
+                            "lock ownership lost during respawn; another supervisor \
+                             owns this tunnel -- exiting"
+                        );
+                        return;
+                    }
                     info!("respawn: sleeping {}s (backoff)", sleep.as_secs());
                     // Fixed deadline so net.changed() noise re-entering the
                     // select doesn't restart the sleep from scratch -- a

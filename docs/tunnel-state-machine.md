@@ -72,7 +72,13 @@ Three guards keep that state from becoming destructive:
    points at the snapshotted inode, the supervisor exits; `ConnectGuard::drop`
    then sees the mismatch and leaves the owner's files alone. This converges a
    ghost-supervisor state within one `PROBE_INTERVAL` (30s) instead of letting
-   a pair of duelling supervisors run indefinitely.
+   a pair of duelling supervisors run indefinitely. The same
+   `lock_still_owned` check also runs at the top of every respawn-loop
+   iteration: the `probe_ticker` arm does not fire while control is inside the
+   respawn loop, so without this a ghost stuck respawning through a long
+   outage could spin for hours and then `spawn_tunnel` -> `remove_file` the
+   real owner's socket. On a lost-ownership result the supervisor returns
+   immediately.
 
 ## State diagram
 
