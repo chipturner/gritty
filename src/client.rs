@@ -860,6 +860,10 @@ impl ClientRelay<'_> {
                 {
                     warn!(channel_id, "agent channel backpressured, closing");
                     self.agent.channels.remove(&channel_id);
+                    // Notify the server so its half tears down too.
+                    let _ =
+                        timed_send(framed, Frame::AgentClose { channel_id }, self.last_outbound_at)
+                            .await;
                 }
             }
             Some(Ok(Frame::AgentClose { channel_id })) => {
@@ -1039,6 +1043,13 @@ impl ClientRelay<'_> {
                 {
                     warn!(channel_id, "tunnel channel backpressured, closing");
                     self.tunnel.channels.remove(&channel_id);
+                    // Notify the server so its half tears down too.
+                    let _ = timed_send(
+                        framed,
+                        Frame::TunnelClose { channel_id },
+                        self.last_outbound_at,
+                    )
+                    .await;
                 }
             }
             Some(Ok(Frame::TunnelClose { channel_id })) => {
@@ -1117,6 +1128,13 @@ impl ClientRelay<'_> {
                 {
                     warn!(channel_id, "pf channel backpressured, closing");
                     self.pf.channels.remove(&channel_id);
+                    // Notify the server so its half tears down too.
+                    let _ = timed_send(
+                        framed,
+                        Frame::PortForwardClose { channel_id },
+                        self.last_outbound_at,
+                    )
+                    .await;
                 }
             }
             // Port forward: channel closed by server

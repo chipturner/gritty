@@ -1100,6 +1100,10 @@ impl ServerRelay<'_> {
                 {
                     warn!(channel_id, "agent channel backpressured, closing");
                     self.agent.channels.remove(&channel_id);
+                    // Tell the peer so its half (socket + relay task) tears
+                    // down too -- the AgentEvent::Closed recovery is gated on
+                    // a successful remove that has now already happened.
+                    let _ = send_framed_timed(framed, Frame::AgentClose { channel_id }).await;
                 }
             }
             Some(Ok(Frame::AgentClose { channel_id })) => {
@@ -1139,6 +1143,13 @@ impl ServerRelay<'_> {
                 {
                     warn!(channel_id, "tunnel channel backpressured, closing");
                     self.tunnel.channels.remove(&channel_id);
+                    // Mirror the TunnelClose handler: notify the peer and arm
+                    // the idle teardown once the last channel is gone.
+                    let _ = send_framed_timed(framed, Frame::TunnelClose { channel_id }).await;
+                    if self.tunnel.channels.is_empty() && self.tunnel.port.is_some() {
+                        self.tunnel.idle_deadline =
+                            Some(tokio::time::Instant::now() + self.tunnel.idle_timeout);
+                    }
                 }
             }
             Some(Ok(Frame::TunnelClose { channel_id })) => {
@@ -1211,7 +1222,16 @@ impl ServerRelay<'_> {
                     .is_some_and(|(_, tx)| tx.try_send(data).is_err())
                 {
                     warn!(channel_id, "pf channel backpressured, closing");
-                    self.pf.channels.remove(&channel_id);
+                    // Mirror the PortForwardClose handler: drop the per-forward
+                    // writer_tx clone too (otherwise the relay task never FINs)
+                    // and notify the peer.
+                    if let Some((forward_id, _)) = self.pf.channels.remove(&channel_id) {
+                        if let Some(fwd) = self.pf.forwards.get_mut(&forward_id) {
+                            fwd.channels.remove(&channel_id);
+                        }
+                        let _ =
+                            send_framed_timed(framed, Frame::PortForwardClose { channel_id }).await;
+                    }
                 }
             }
             Some(Ok(Frame::PortForwardClose { channel_id })) => {
