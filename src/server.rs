@@ -915,7 +915,9 @@ async fn tail_relay(
         tokio::select! {
             event = rx.recv() => match event {
                 Ok(TailEvent::Data(chunk)) => {
-                    if framed.send(Frame::Data(chunk)).await.is_err() { break; }
+                    // Timed send: a stalled tail reader must not park this task
+                    // forever (it holds a Framed<UnixStream> and a broadcast rx).
+                    if send_framed_timed(&mut framed, Frame::Data(chunk)).await.is_err() { break; }
                 }
                 Ok(TailEvent::Exit { code }) => {
                     let _ = send_framed_timed(&mut framed, Frame::Exit { code }).await;
@@ -927,7 +929,7 @@ async fn tail_relay(
                 }
                 Err(broadcast::error::RecvError::Lagged(n)) => {
                     let marker = format!("\r\n\x1b[2m\u{25b8} tail fell behind \u{b7} {n} events dropped\x1b[0m\r\n");
-                    if framed.send(Frame::Data(Bytes::from(marker))).await.is_err() { break; }
+                    if send_framed_timed(&mut framed, Frame::Data(Bytes::from(marker))).await.is_err() { break; }
                     continue;
                 }
                 Err(broadcast::error::RecvError::Closed) => break,
@@ -950,7 +952,9 @@ fn spawn_tail(
     let chunks: Vec<Bytes> = history.chunks().iter().cloned().collect();
     tokio::spawn(async move {
         for chunk in chunks {
-            if framed.send(Frame::Data(chunk)).await.is_err() {
+            // Timed send: a stalled reader must not wedge the initial history
+            // replay and leak this task + its Framed<UnixStream>.
+            if send_framed_timed(&mut framed, Frame::Data(chunk)).await.is_err() {
                 return;
             }
         }
@@ -1476,13 +1480,15 @@ impl ServerRelay<'_> {
                 if let Some(fwd) = self.pf.forwards.get_mut(&forward_id) {
                     fwd.channels.insert(channel_id, writer_tx.clone());
                     self.pf.channels.insert(channel_id, (forward_id, writer_tx));
-                    let _ = framed
-                        .send(Frame::PortForwardOpen {
-                            forward_id,
-                            channel_id,
-                            target_port: fwd.target_port,
-                        })
-                        .await;
+                    let target_port = fwd.target_port;
+                    // Timed send: this runs in the main relay select loop, so a
+                    // raw send against a half-open client parks the whole loop
+                    // -- idle-evict, takeover, and shell-exit all stop firing.
+                    let _ = send_framed_timed(
+                        framed,
+                        Frame::PortForwardOpen { forward_id, channel_id, target_port },
+                    )
+                    .await;
                 }
             }
             Some(PortForwardEvent::Data { channel_id, data }) => {
