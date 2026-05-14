@@ -20,6 +20,11 @@ pub struct AltScreenTracker {
     param_buf: [u8; 8],
     param_len: usize,
     in_alt: bool,
+    /// Set when a parameter in the CSI currently being parsed matched a tracked
+    /// alt-screen mode. The enter/leave direction is only known at the `h`/`l`
+    /// terminator, so the match is remembered across `;` separators and the
+    /// direction is applied once, at the terminator.
+    pending_alt: bool,
 }
 
 impl Default for AltScreenTracker {
@@ -30,7 +35,13 @@ impl Default for AltScreenTracker {
 
 impl AltScreenTracker {
     pub fn new() -> Self {
-        Self { state: ScanState::Normal, param_buf: [0; 8], param_len: 0, in_alt: false }
+        Self {
+            state: ScanState::Normal,
+            param_buf: [0; 8],
+            param_len: 0,
+            in_alt: false,
+            pending_alt: false,
+        }
     }
 
     pub fn in_alternate_screen(&self) -> bool {
@@ -55,6 +66,8 @@ impl AltScreenTracker {
                 }
                 ScanState::Bracket => {
                     if b == b'?' {
+                        // Start of a fresh `\x1b[?...` private-mode sequence.
+                        self.pending_alt = false;
                         self.state = ScanState::Question;
                     } else {
                         self.state = ScanState::Normal;
@@ -80,17 +93,22 @@ impl AltScreenTracker {
                             self.param_len = 0;
                         }
                     } else if b == b';' {
-                        self.check_param(true);
+                        // Parameter separator: the h/l direction is not known
+                        // yet. Remember whether this param was a tracked mode
+                        // and apply the direction at the terminator -- a
+                        // multi-param DECRST like `\x1b[?1049;2004l` must leave
+                        // alt-screen, not enter it.
+                        if self.param_is_tracked() {
+                            self.pending_alt = true;
+                        }
                         self.param_len = 0;
-                        // Stay in Param state for next param
+                        // Stay in the param-parsing machine for the next param.
                         self.state = ScanState::Question;
                     } else if b == b'h' {
-                        self.check_param(true);
-                        self.param_len = 0;
+                        self.commit_param(true);
                         self.state = ScanState::Normal;
                     } else if b == b'l' {
-                        self.check_param(false);
-                        self.param_len = 0;
+                        self.commit_param(false);
                         self.state = ScanState::Normal;
                     } else {
                         self.param_len = 0;
@@ -101,19 +119,25 @@ impl AltScreenTracker {
         }
     }
 
-    fn check_param(&mut self, entering: bool) {
-        let param = &self.param_buf[..self.param_len];
-        if param == b"1049" || param == b"1047" || param == b"47" {
+    /// Whether the param currently in `param_buf` names a tracked alt-screen
+    /// mode (standard `1049`, legacy `1047` / `47`).
+    fn param_is_tracked(&self) -> bool {
+        matches!(&self.param_buf[..self.param_len], b"1049" | b"1047" | b"47")
+    }
+
+    /// Apply the CSI terminator: if any param in this sequence named a tracked
+    /// mode, set `in_alt` to the terminator's direction (`h` = enter, `l` =
+    /// leave). Resets the per-sequence parse state.
+    fn commit_param(&mut self, entering: bool) {
+        if self.pending_alt || self.param_is_tracked() {
             let prev = self.in_alt;
             self.in_alt = entering;
             if prev != entering {
-                tracing::trace!(
-                    entering,
-                    param = std::str::from_utf8(param).unwrap_or("?"),
-                    "alt-screen transition",
-                );
+                tracing::trace!(entering, "alt-screen transition");
             }
         }
+        self.param_len = 0;
+        self.pending_alt = false;
     }
 }
 
@@ -203,6 +227,34 @@ mod tests {
         // Some terminals send multiple params separated by ;
         t.scan(b"\x1b[?1049;1h");
         assert!(t.in_alternate_screen());
+    }
+
+    #[test]
+    fn multi_param_csi_reset_leaves_alt_screen() {
+        let mut t = AltScreenTracker::new();
+        t.scan(b"\x1b[?1049h");
+        assert!(t.in_alternate_screen());
+        // DECRST with the tracked mode *not* in the last position. The `;`
+        // must not be treated as an enter -- the `l` terminator governs.
+        t.scan(b"\x1b[?1049;2004l");
+        assert!(!t.in_alternate_screen());
+    }
+
+    #[test]
+    fn multi_param_csi_set_with_trailing_param() {
+        let mut t = AltScreenTracker::new();
+        // Tracked mode first, untracked trailing param, `h` terminator.
+        t.scan(b"\x1b[?1049;2004h");
+        assert!(t.in_alternate_screen());
+    }
+
+    #[test]
+    fn multi_param_csi_untracked_modes_do_not_trigger() {
+        let mut t = AltScreenTracker::new();
+        t.scan(b"\x1b[?2004;1000h");
+        assert!(!t.in_alternate_screen());
+        t.scan(b"\x1b[?2004;1000l");
+        assert!(!t.in_alternate_screen());
     }
 
     #[test]

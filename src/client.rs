@@ -794,7 +794,14 @@ impl ClientRelay<'_> {
                 self.agent.teardown();
                 self.tunnel.teardown();
                 self.pf.teardown();
-                write_stdout_async(self.async_stdout, status_msg("detached").as_bytes()).await?;
+                // Leave alt-screen first, mirroring the ServerShutdown arm: if
+                // this client was in a TUI the message would otherwise land in
+                // the alt-screen buffer and be discarded by TerminalResetGuard.
+                write_stdout_async(
+                    self.async_stdout,
+                    format!("\x1b[?1049l{}", status_msg("detached")).as_bytes(),
+                )
+                .await?;
                 return Ok(ControlFlow::Break(RelayExit::Exit(0)));
             }
             Some(Ok(Frame::ServerShutdown)) => {
@@ -1619,7 +1626,13 @@ async fn relay(
                                         }
                                     }
                                     EscapeAction::Detach => {
-                                        write_stdout_async(async_stdout, status_msg("detached").as_bytes()).await?;
+                                        // Leave alt-screen first so the message
+                                        // isn't discarded from the alt buffer
+                                        // by TerminalResetGuard on exit.
+                                        write_stdout_async(
+                                            async_stdout,
+                                            format!("\x1b[?1049l{}", status_msg("detached")).as_bytes(),
+                                        ).await?;
                                         return Ok(RelayExit::Exit(0));
                                     }
                                     EscapeAction::Reconnect => {
