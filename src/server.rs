@@ -2427,9 +2427,6 @@ pub async fn run(
                                 {
                                     *n = cn;
                                 }
-                                let was_attached = relay.metadata_slot.get()
-                                    .map(|m| m.attached.load(Ordering::Relaxed))
-                                    .unwrap_or(false);
                                 framed = new_framed;
                                 // Give the new client a full idle-evict budget.
                                 // Without this it inherits the old client's
@@ -2438,45 +2435,12 @@ pub async fn run(
                                 // reattach) would get the new one evicted
                                 // seconds after takeover, before its first Ping.
                                 last_client_frame_at = tokio::time::Instant::now();
-                                // Announce the takeover on the main screen (the
-                                // `send_reconnect_replay` below fences the
-                                // replayed context and handles alt-screen).
-                                // Send failures are swallowed -- the relay loop
-                                // detects the dead socket next iteration.
-                                let banner_sent = if was_attached
-                                    && !alt_screen.in_alternate_screen()
-                                {
-                                    let hb_age = relay.metadata_slot.get()
-                                        .and_then(|m| {
-                                            let hb = m.last_heartbeat.load(Ordering::Relaxed);
-                                            if hb == 0 { return None; }
-                                            let now = std::time::SystemTime::now()
-                                                .duration_since(std::time::UNIX_EPOCH)
-                                                .unwrap_or_default()
-                                                .as_secs();
-                                            Some(now.saturating_sub(hb))
-                                        });
-                                    let hb_str = match hb_age {
-                                        Some(s) => format!("last seen {s}s ago"),
-                                        None => "last seen unknown".to_string(),
-                                    };
-                                    let banner = format!(
-                                        "\r\n\x1b[33m\u{25b8} took over session \u{b7} {hb_str}\x1b[0m\r\n",
-                                    );
-                                    let _ = send_framed_timed(
-                                        &mut framed,
-                                        Frame::Notice(Bytes::from(banner)),
-                                    )
-                                    .await;
-                                    true
-                                } else {
-                                    false
-                                };
-                                // The banner's trailing \r\n left the cursor on
-                                // a fresh line. Force the replay to repaint the
-                                // current line so a Clean plan doesn't stream
-                                // Data assuming the cursor never moved.
-                                let line_dirty = line_dirty || banner_sent;
+                                // No takeover banner: the displaced client got
+                                // a `Detached` frame, and for the client doing
+                                // the takeover the session simply reappearing
+                                // is confirmation enough. `send_reconnect_replay`
+                                // fences the replayed context and handles
+                                // alt-screen.
                                 let _ = send_reconnect_replay(
                                     &mut framed,
                                     &async_master,

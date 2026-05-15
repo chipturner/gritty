@@ -231,9 +231,9 @@ pub enum Frame {
     },
     /// Server chrome written to the client's terminal but NOT counted toward
     /// `rendered_offset` (server → client). Used for reconnect dividers,
-    /// truncation markers, takeover banners, alt-screen priming, and partial-
-    /// line repaints -- bytes to display that are not part of the client's
-    /// authoritative position in the live PTY stream.
+    /// truncation markers, alt-screen priming, and partial-line repaints --
+    /// bytes to display that are not part of the client's authoritative
+    /// position in the live PTY stream.
     Notice(Bytes),
     /// Client signals it can handle agent forwarding (client → server).
     AgentForward,
