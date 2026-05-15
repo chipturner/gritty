@@ -2951,7 +2951,7 @@ mod tests {
         h.push(&Bytes::from(vec![b'x'; 3 << 20]));
         let prefix = h.line_prefix(h.total());
         assert_eq!(prefix.len(), LINE_PREFIX_CAP);
-        assert!(LINE_PREFIX_CAP < (1 << 20), "must stay under MAX_FRAME_SIZE");
+        const { assert!(LINE_PREFIX_CAP < (1 << 20), "must stay under MAX_FRAME_SIZE") };
         // A short line is still returned whole.
         let mut h2 = History::new(4 << 20);
         h2.push(&Bytes::from_static(b"\nshort tail"));
