@@ -135,9 +135,38 @@ pub fn get_or_create_device_id() -> u64 {
     id
 }
 
-/// Collect TERM/LANG/COLORTERM from the environment for forwarding to remote sessions.
+/// Environment variables forwarded from the client to a remote session's login
+/// shell. `TERM`/`COLORTERM` drive terminal rendering; `LANG` and the `LC_*`
+/// locale categories stop a remote that lacks the user's locale (a daemon
+/// started over non-interactive SSH, where `LC_*` is often unset) from falling
+/// back to `C`/`POSIX` and producing UTF-8 mojibake. Mirrors SSH's default
+/// `SendEnv LANG LC_*`.
+///
+/// Shared by the client's [`collect_env_vars`] and the server's env allowlist
+/// so the two can never drift apart.
+pub const FORWARDED_ENV_KEYS: &[&str] = &[
+    "TERM",
+    "COLORTERM",
+    "LANG",
+    "LC_ALL",
+    "LC_CTYPE",
+    "LC_COLLATE",
+    "LC_MESSAGES",
+    "LC_MONETARY",
+    "LC_NUMERIC",
+    "LC_TIME",
+    "LC_PAPER",
+    "LC_NAME",
+    "LC_ADDRESS",
+    "LC_TELEPHONE",
+    "LC_MEASUREMENT",
+    "LC_IDENTIFICATION",
+];
+
+/// Collect the [`FORWARDED_ENV_KEYS`] that are set, for forwarding to remote
+/// sessions.
 pub fn collect_env_vars() -> Vec<(String, String)> {
-    ["TERM", "LANG", "COLORTERM"]
+    FORWARDED_ENV_KEYS
         .iter()
         .filter_map(|k| std::env::var(k).ok().map(|v| (k.to_string(), v)))
         .collect()
@@ -243,7 +272,16 @@ mod tests {
     fn collect_env_vars_only_known_keys() {
         let vars = collect_env_vars();
         for (k, _) in &vars {
-            assert!(["TERM", "LANG", "COLORTERM"].contains(&k.as_str()), "unexpected key: {k}");
+            assert!(FORWARDED_ENV_KEYS.contains(&k.as_str()), "unexpected key: {k}");
+        }
+    }
+
+    // The locale categories must be forwarded, or a remote login shell lacking
+    // the user's LC_* falls back to C/POSIX and renders UTF-8 as mojibake.
+    #[test]
+    fn forwarded_env_keys_include_locale_categories() {
+        for k in ["LANG", "LC_ALL", "LC_CTYPE"] {
+            assert!(FORWARDED_ENV_KEYS.contains(&k), "missing locale key: {k}");
         }
     }
 

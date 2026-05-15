@@ -158,6 +158,8 @@ gritty receive - | tar xzf -
 
 **Environment inside sessions:** `GRITTY_SOCK` (svc socket for `gritty open`/`send`/`receive`/port forwarding), `GRITTY_SESSION` (session ID), and `GRITTY_SESSION_NAME` (if named) are set in the shell environment. Useful for prompt customization or scripts that need to know which session they're in.
 
+**Environment forwarded to sessions:** `TERM`, `COLORTERM`, `LANG`, and the `LC_*` locale categories are carried from the client to the session's login shell (mirroring SSH's default `SendEnv LANG LC_*`), so a remote session renders UTF-8 correctly even when the remote daemon's own environment lacks your locale.
+
 **Port forwarding:** `gritty lf <target> <port>` and `gritty rf <target> <port>` where `<target>` is a `host:session` specifier (e.g. `devbox:work`). Port spec is `PORT` (same on both ends) or `LISTEN_PORT:TARGET_PORT`. Port forwards are client-initiated -- they communicate with the client process through a local forward socket, and the client sends `PortForwardRequest` frames to the server. A compromised server cannot initiate port forwards. Ctrl-C stops the forward. All forwarding binds to `127.0.0.1` only -- there is no bind-address option (unlike SSH's `-L`/`-R`). These are transient, on-demand forwards -- great for quick checks during development. For always-on port forwarding, configure it on the SSH tunnel instead: `gritty tunnel-create devbox -o "LocalForward=8080 localhost:8080"` or add it to `ssh-options` in your config file.
 
 ## Comparison

@@ -2066,9 +2066,8 @@ pub async fn run(
         cmd.current_dir(dir);
     }
     let client_name = initial_client_name;
-    const ALLOWED_ENV_KEYS: &[&str] = &["TERM", "LANG", "COLORTERM"];
     for (k, v) in &env_vars {
-        if ALLOWED_ENV_KEYS.contains(&k.as_str()) {
+        if crate::FORWARDED_ENV_KEYS.contains(&k.as_str()) {
             cmd.env(k, v);
         } else {
             warn!(key = k, "ignoring disallowed env var from client");
