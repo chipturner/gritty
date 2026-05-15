@@ -1074,6 +1074,23 @@ pub fn preflight_ssh(
 const INSTALL_SCRIPT_URL: &str =
     "https://raw.githubusercontent.com/chipturner/gritty/main/install.sh";
 
+/// Quote `--install-dir` for safe interpolation into the remote bootstrap
+/// shell command. A leading `~` becomes `"$HOME"` so it still expands on the
+/// remote; the rest is single-quoted so spaces and shell metacharacters in the
+/// path are inert. (A naive "just single-quote it" would break the shipped
+/// `~/.local/bin` default, which only works because it is unquoted.)
+fn quote_remote_install_dir(install_dir: &str) -> String {
+    let quote =
+        |s: &str| shlex::try_quote(s).map(|c| c.into_owned()).unwrap_or_else(|_| s.to_string());
+    if install_dir == "~" {
+        "\"$HOME\"".to_string()
+    } else if let Some(rest) = install_dir.strip_prefix("~/") {
+        format!("\"$HOME\"/{}", quote(rest))
+    } else {
+        quote(install_dir)
+    }
+}
+
 /// Install gritty on a remote host by running the install script via SSH.
 pub async fn bootstrap(
     dest_str: &str,
@@ -1085,8 +1102,10 @@ pub async fn bootstrap(
 
     eprintln!("\x1b[2m\u{25b8} installing gritty on {}...\x1b[0m", dest.ssh_dest());
 
-    let install_cmd =
-        format!("GRITTY_INSTALL_DIR={install_dir} sh -c \"$(curl -sSfL {INSTALL_SCRIPT_URL})\"");
+    let install_cmd = format!(
+        "GRITTY_INSTALL_DIR={} sh -c \"$(curl -sSfL {INSTALL_SCRIPT_URL})\"",
+        quote_remote_install_dir(install_dir)
+    );
 
     // Run interactively (foreground=true) so SSH can prompt if needed,
     // and pipe stdout/stderr through so the user sees install progress.
@@ -1908,6 +1927,35 @@ mod tests {
         assert_eq!(d.user.as_deref(), Some("user"));
         assert_eq!(d.host, "host");
         assert_eq!(d.port, None);
+    }
+
+    #[test]
+    fn quote_install_dir_default_expands_tilde() {
+        // The shipped default must still resolve $HOME on the remote.
+        assert_eq!(quote_remote_install_dir("~/.local/bin"), "\"$HOME\"/.local/bin");
+        assert_eq!(quote_remote_install_dir("~"), "\"$HOME\"");
+    }
+
+    #[test]
+    fn quote_install_dir_absolute_is_quoted() {
+        assert_eq!(quote_remote_install_dir("/opt/gritty/bin"), "/opt/gritty/bin");
+    }
+
+    #[test]
+    fn quote_install_dir_with_space_is_safe() {
+        // A space must not split the GRITTY_INSTALL_DIR assignment.
+        let q = quote_remote_install_dir("/opt/gritty tools/bin");
+        assert!(!q.contains("tools/bin sh"), "unquoted space: {q}");
+        assert_eq!(q, "'/opt/gritty tools/bin'");
+        // Tilde form with a space: $HOME stays live, the rest is quoted.
+        assert_eq!(quote_remote_install_dir("~/my tools"), "\"$HOME\"/'my tools'");
+    }
+
+    #[test]
+    fn quote_install_dir_neutralizes_metacharacters() {
+        // Command substitution in the path must be inert -- single-quoted,
+        // so the remote shell treats `$(...)` as literal characters.
+        assert_eq!(quote_remote_install_dir("/opt/$(touch pwned)"), "'/opt/$(touch pwned)'");
     }
 
     #[test]
