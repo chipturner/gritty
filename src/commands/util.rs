@@ -389,11 +389,28 @@ pub(crate) fn config_edit() -> anyhow::Result<()> {
     let editor = std::env::var("VISUAL")
         .or_else(|_| std::env::var("EDITOR"))
         .unwrap_or_else(|_| "vi".into());
-    let status = std::process::Command::new(&editor).arg(&path).status()?;
+    let (program, args) = parse_editor(&editor);
+    let status = std::process::Command::new(&program).args(&args).arg(&path).status()?;
     if !status.success() {
-        anyhow::bail!("{editor} exited with {status}");
+        anyhow::bail!("{program} exited with {status}");
     }
     Ok(())
+}
+
+/// Split a `$VISUAL`/`$EDITOR` value into a program and its arguments so that
+/// argument-bearing settings like `code --wait` or `emacsclient -nw` work --
+/// `Command::new` execs the program verbatim with no word-splitting. Falls back
+/// to `vi` when the value is empty or whitespace-only.
+fn parse_editor(editor: &str) -> (String, Vec<String>) {
+    // Unbalanced quotes (`None`) fall back to the raw string as one token --
+    // no worse than the previous un-split behavior.
+    let mut parts = shlex::split(editor).unwrap_or_else(|| vec![editor.to_string()]);
+    parts.retain(|p| !p.is_empty());
+    if parts.is_empty() {
+        return ("vi".to_string(), Vec::new());
+    }
+    let program = parts.remove(0);
+    (program, parts)
 }
 
 pub(crate) async fn info(config: &gritty::config::ConfigFile) -> anyhow::Result<()> {
@@ -607,5 +624,30 @@ mod tests {
         assert!(parse_port_spec("abc").is_err());
         assert!(parse_port_spec("80:xyz").is_err());
         assert!(parse_port_spec("99999").is_err());
+    }
+
+    #[test]
+    fn parse_editor_plain() {
+        assert_eq!(parse_editor("vi"), ("vi".into(), Vec::new()));
+    }
+
+    #[test]
+    fn parse_editor_with_args() {
+        assert_eq!(parse_editor("code --wait"), ("code".into(), vec!["--wait".into()]));
+        assert_eq!(parse_editor("emacsclient -nw"), ("emacsclient".into(), vec!["-nw".into()]));
+    }
+
+    #[test]
+    fn parse_editor_quoted_path() {
+        assert_eq!(
+            parse_editor("'/path with spaces/ed' -f"),
+            ("/path with spaces/ed".into(), vec!["-f".into()])
+        );
+    }
+
+    #[test]
+    fn parse_editor_empty_falls_back_to_vi() {
+        assert_eq!(parse_editor(""), ("vi".into(), Vec::new()));
+        assert_eq!(parse_editor("   "), ("vi".into(), Vec::new()));
     }
 }
