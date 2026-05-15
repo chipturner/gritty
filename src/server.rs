@@ -322,8 +322,10 @@ enum OpenEvent {
 
 /// Events from clipboard svc connections to the main relay loop.
 enum ClipboardEvent {
-    /// Copy data to client clipboard.
-    Copy { data: Bytes },
+    /// Copy data to client clipboard. `reply` resolves `true` once the data
+    /// was forwarded to an attached, clipboard-capable client, `false` if it
+    /// was dropped (detached session / no `CAP_CLIPBOARD`).
+    Copy { data: Bytes, reply: tokio::sync::oneshot::Sender<bool> },
     /// Paste request: send ClipboardGet to client, return data via oneshot.
     Paste { reply: tokio::sync::oneshot::Sender<Option<Bytes>> },
 }
@@ -793,13 +795,9 @@ fn spawn_svc_acceptor(
                     }
                     Some(crate::protocol::SvcRequest::Clipboard) => {
                         use tokio::io::AsyncWriteExt;
-                        if caps.load(std::sync::atomic::Ordering::Relaxed)
+                        let has_cap = caps.load(std::sync::atomic::Ordering::Relaxed)
                             & crate::protocol::CAP_CLIPBOARD
-                            == 0
-                        {
-                            debug!("svc socket: clipboard request but client lacks CAP_CLIPBOARD");
-                            return;
-                        }
+                            != 0;
                         let mut op = [0u8; 1];
                         if stream.read_exact(&mut op).await.is_err() {
                             return;
@@ -811,6 +809,7 @@ fn spawn_svc_acceptor(
                                 let mut data = Vec::new();
                                 let mut limited = stream.take((CLIPBOARD_MAX + 1) as u64);
                                 let _ = limited.read_to_end(&mut data).await;
+                                let mut stream = limited.into_inner();
                                 if data.len() > CLIPBOARD_MAX {
                                     warn!(
                                         size = data.len(),
@@ -818,13 +817,34 @@ fn spawn_svc_acceptor(
                                     );
                                     data.truncate(CLIPBOARD_MAX);
                                 }
-                                if !data.is_empty() {
-                                    let _ =
-                                        ctx.send(ClipboardEvent::Copy { data: Bytes::from(data) });
-                                }
+                                // Reply 1 byte: 0x01 = delivered to an attached
+                                // clipboard-capable client, 0x00 = dropped. An
+                                // older client never reads it (harmless write to
+                                // a closed socket); a current client uses it so
+                                // `gritty copy` no longer exits 0 on a silent
+                                // drop.
+                                let delivered = if !has_cap || data.is_empty() {
+                                    if !has_cap {
+                                        debug!("svc socket: clipboard copy but no CAP_CLIPBOARD");
+                                    }
+                                    false
+                                } else {
+                                    let (tx, rx) = tokio::sync::oneshot::channel();
+                                    ctx.send(ClipboardEvent::Copy {
+                                        data: Bytes::from(data),
+                                        reply: tx,
+                                    })
+                                    .is_ok()
+                                        && rx.await.unwrap_or(false)
+                                };
+                                let _ = stream.write_all(&[u8::from(delivered)]).await;
                             }
                             0x02 => {
                                 // Paste: request clipboard from client
+                                if !has_cap {
+                                    debug!("svc socket: clipboard paste but no CAP_CLIPBOARD");
+                                    return;
+                                }
                                 let (tx, rx) = tokio::sync::oneshot::channel();
                                 let _ = ctx.send(ClipboardEvent::Paste { reply: tx });
                                 if let Ok(Some(data)) = rx.await {
@@ -2258,8 +2278,14 @@ pub async fn run(
                         continue;
                     }
                     event = clipboard_event_rx.recv() => {
-                        if let Some(ClipboardEvent::Paste { reply }) = event {
-                            let _ = reply.send(None);
+                        match event {
+                            Some(ClipboardEvent::Paste { reply }) => {
+                                let _ = reply.send(None);
+                            }
+                            Some(ClipboardEvent::Copy { reply, .. }) => {
+                                let _ = reply.send(false);
+                            }
+                            None => {}
                         }
                         debug!("discarding clipboard event while detached");
                         continue;
@@ -2514,14 +2540,20 @@ pub async fn run(
                                 & crate::protocol::CAP_CLIPBOARD == 0
                             {
                                 // Client doesn't support clipboard -- drop the event
-                                if let ClipboardEvent::Paste { reply } = event {
-                                    let _ = reply.send(None);
+                                match event {
+                                    ClipboardEvent::Paste { reply } => {
+                                        let _ = reply.send(None);
+                                    }
+                                    ClipboardEvent::Copy { reply, .. } => {
+                                        let _ = reply.send(false);
+                                    }
                                 }
                             } else {
                                 match event {
-                                    ClipboardEvent::Copy { data } => {
+                                    ClipboardEvent::Copy { data, reply } => {
                                         info!("clipboard operation forwarded");
                                         let _ = send_framed_timed(&mut framed, Frame::ClipboardSet { data }).await;
+                                        let _ = reply.send(true);
                                     }
                                     ClipboardEvent::Paste { reply } => {
                                         info!("clipboard operation forwarded");

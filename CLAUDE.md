@@ -106,7 +106,7 @@ Handshake: `0x01` Hello, `0x02` HelloAck. Relay: `0x10` Data, `0x11` Resize, `0x
 
 `SessionInfo`: `[count: u32][per entry: [entry_len: u32][id: u32][name: u16-len + bytes][pty_path: u16-len + bytes][shell_pid: u32][created_at: u64][attached: u8][last_heartbeat: u64][foreground_cmd: u16-len + bytes][cwd: u16-len + bytes][client_name: u16-len + bytes][agent_forwarding_active: u8][is_last_attached: u8]]`. Decoder skips unknown trailing bytes within each entry_len; new fields default gracefully when absent (older servers).
 
-`SvcRequest`: `OpenUrl=1`, `Send=2`, `Receive=3`, `Clipboard=5` (1-byte discriminator). Clipboard sub-protocol: `[0x01][data]` = copy, `[0x02]` = paste (server responds with clipboard content).
+`SvcRequest`: `OpenUrl=1`, `Send=2`, `Receive=3`, `Clipboard=5` (1-byte discriminator). Clipboard sub-protocol: `[0x01][data]` = copy (client half-closes its write side; server replies one byte -- `0x01` delivered to an attached clipboard-capable client, `0x00` dropped -- so `gritty copy` fails loudly instead of exiting 0 on a silent drop; an older server sends nothing and the client degrades to a soft warning), `[0x02]` = paste (server responds with clipboard content).
 
 `PortForwardRequest`: `[forward_id: u32][direction: u8][listen_port: u16][target_port: u16]`. Client sends to server. Direction `0` = local-forward (server listens), `1` = remote-forward (client listens).
 

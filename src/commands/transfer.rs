@@ -36,6 +36,23 @@ struct DiscoveredSession {
     ctl_path: PathBuf,
 }
 
+/// Error if any two send entries share a wire name: the receiver opens each
+/// file with `truncate(true)`, so a collision (e.g. `send a/x.txt b/x.txt`)
+/// silently overwrites an earlier file while still counting every entry as
+/// received.
+fn reject_duplicate_names<'a>(names: impl IntoIterator<Item = &'a str>) -> anyhow::Result<()> {
+    let mut seen = std::collections::HashSet::new();
+    for name in names {
+        if !seen.insert(name) {
+            anyhow::bail!(
+                "duplicate file name `{name}`: the receiver would overwrite it -- \
+                 rename a file or send them in separate transfers"
+            );
+        }
+    }
+    Ok(())
+}
+
 /// Result of probing one daemon -- distinguishes a protocol-version mismatch
 /// from a plain unreachable daemon so discovery can give an actionable hint.
 enum ProbeOutcome {
@@ -352,22 +369,33 @@ pub(crate) async fn send_command(
     if !use_stdin && entries.is_empty() {
         anyhow::bail!("no files to send");
     }
+    reject_duplicate_names(entries.iter().map(|(n, ..)| n.as_str()))?;
 
-    let mut tagged =
+    let tagged =
         connect_send_sockets(ctl_socket, session, gritty::protocol::SvcRequest::Send.to_byte())
             .await?;
 
-    // Write manifest on all streams
-    if let Some((_, size)) = &stdin_temp {
-        let stdin_entries = vec![("stdin".to_string(), *size, 0o644u32, PathBuf::new())];
-        for ts in &mut tagged {
-            write_send_manifest(&mut ts.stream, &stdin_entries).await?;
-        }
-    } else {
-        for ts in &mut tagged {
-            write_send_manifest(&mut ts.stream, &entries).await?;
+    // Write the manifest on every discovered stream, best-effort: a stale or
+    // broken session must not abort the whole transfer and discard healthy
+    // sessions that were ready to pair ("first receiver wins").
+    let manifest = match &stdin_temp {
+        Some((_, size)) => vec![("stdin".to_string(), *size, 0o644u32, PathBuf::new())],
+        None => entries.clone(),
+    };
+    let mut live = Vec::with_capacity(tagged.len());
+    for mut ts in tagged {
+        match write_send_manifest(&mut ts.stream, &manifest).await {
+            Ok(()) => live.push(ts),
+            Err(e) => eprintln!(
+                "\x1b[2;33m\u{25b8} skipping session {}: {e}\x1b[0m",
+                ts.label.as_deref().unwrap_or("?")
+            ),
         }
     }
+    if live.is_empty() {
+        anyhow::bail!("no reachable receiver sessions");
+    }
+    let tagged = live;
 
     // Wait for go signal -- first stream to get paired wins
     eprintln!("\x1b[2;33m\u{25b8} waiting for receiver...\x1b[0m");
@@ -447,16 +475,32 @@ pub(crate) async fn receive_command(
         anyhow::bail!("{}: not a directory", dest_dir.display());
     }
 
-    let mut tagged =
+    let tagged =
         connect_send_sockets(ctl_socket, session, gritty::protocol::SvcRequest::Receive.to_byte())
             .await?;
 
-    // Write dest dir on all streams
+    // Write the dest dir on every discovered stream, best-effort: one broken
+    // session must not abort the transfer ("first sender wins").
     let dest_str = dest_dir.to_string_lossy();
-    for ts in &mut tagged {
-        ts.stream.write_all(dest_str.as_bytes()).await?;
-        ts.stream.write_all(b"\n").await?;
+    let mut live = Vec::with_capacity(tagged.len());
+    for mut ts in tagged {
+        let wrote = async {
+            ts.stream.write_all(dest_str.as_bytes()).await?;
+            ts.stream.write_all(b"\n").await
+        }
+        .await;
+        match wrote {
+            Ok(()) => live.push(ts),
+            Err(e) => eprintln!(
+                "\x1b[2;33m\u{25b8} skipping session {}: {e}\x1b[0m",
+                ts.label.as_deref().unwrap_or("?")
+            ),
+        }
     }
+    if live.is_empty() {
+        anyhow::bail!("no reachable sender sessions");
+    }
+    let tagged = live;
 
     // Wait for file data -- first stream to get paired wins
     eprintln!("\x1b[2;33m\u{25b8} waiting for sender...\x1b[0m");
@@ -639,5 +683,17 @@ mod tests {
         walk_dir(&root, tmp.path(), &mut entries).unwrap();
         let names: Vec<_> = entries.iter().map(|(n, _, _, _)| n.clone()).collect();
         assert_eq!(names, vec!["d/real.txt"]);
+    }
+
+    #[test]
+    fn reject_duplicate_names_allows_distinct() {
+        assert!(reject_duplicate_names(["a.txt", "b.txt", "dir/a.txt"]).is_ok());
+    }
+
+    #[test]
+    fn reject_duplicate_names_rejects_collision() {
+        // `send a/README.md b/README.md` -- both reduce to README.md.
+        let err = reject_duplicate_names(["README.md", "README.md"]).unwrap_err();
+        assert!(err.to_string().contains("duplicate file name"), "{err}");
     }
 }

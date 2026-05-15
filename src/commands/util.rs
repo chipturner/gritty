@@ -386,9 +386,29 @@ pub(crate) fn clipboard_copy() {
         .write_all(&[gritty::protocol::SvcRequest::Clipboard.to_byte()])
         .and_then(|_| stream.write_all(&[0x01]))
         .and_then(|_| stream.write_all(&data))
+        // Half-close so the server's read_to_end sees EOF and can reply.
+        .and_then(|_| stream.shutdown(std::net::Shutdown::Write))
     {
         eprintln!("error: clipboard copy failed: {e}");
         std::process::exit(1);
+    }
+    // Read the 1-byte delivery confirmation: 0x01 = set, 0x00 = dropped (no
+    // attached client, or the client lacks clipboard support). An older server
+    // sends nothing and closes -- read_exact then errors and we degrade to a
+    // soft warning, matching `gritty open`.
+    let _ = stream.set_read_timeout(Some(std::time::Duration::from_secs(2)));
+    let mut resp = [0u8; 1];
+    match stream.read_exact(&mut resp) {
+        Ok(()) if resp[0] == 0x00 => {
+            eprintln!(
+                "error: clipboard not delivered -- no client is attached, or it lacks clipboard support"
+            );
+            std::process::exit(1);
+        }
+        Ok(()) => {}
+        Err(_) => {
+            eprintln!("warning: could not confirm clipboard was set (server may be older)");
+        }
     }
 }
 
