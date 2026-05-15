@@ -50,16 +50,33 @@ pub(crate) async fn connect_session(
     use gritty::protocol::{Frame, FrameCodec};
     use tokio_util::codec::Framed;
 
-    let (name, _picked, picker_force) = match session {
-        Some(name) => (name, false, false),
-        None if new_session => (auto_new_session_name(&ctl_path).await, false, false),
-        None => pick_session(pick, no_pick, &ctl_path).await,
+    // Resolve the session name. An explicit name or the interactive picker
+    // can be resolved up front; -n/--new must wait until connect_or_start has
+    // proven the socket reachable.
+    let (preliminary_name, picker_force) = match &session {
+        Some(name) => (Some(name.clone()), false),
+        None if new_session => (None, false),
+        None => {
+            let (n, _picked, pf) = pick_session(pick, no_pick, &ctl_path).await;
+            (Some(n), pf)
+        }
     };
     let force = force || picker_force;
     let session_command = command.unwrap_or_default();
 
     let (stream, _auto_started) =
         super::util::connect_or_start(&ctl_path, &auto_start_mode, wait).await?;
+
+    // -n/--new: resolve the auto-name only now. Resolving it before
+    // connect_or_start collapses to "default" whenever the local tunnel
+    // socket is down (e.g. after a laptop reboot), and the attach-first path
+    // would then silently attach to a pre-existing remote `default` instead
+    // of creating a fresh session-N -- violating the --new contract.
+    let name = match preliminary_name {
+        Some(n) => n,
+        None => auto_new_session_name(&ctl_path).await,
+    };
+
     let mut framed = Framed::new(stream, FrameCodec);
     let info = gritty::handshake(&mut framed, gritty::get_or_create_device_id()).await?;
     gritty::require_matched_version(&info)?;
@@ -1218,5 +1235,40 @@ pub(crate) async fn suggest_session(cmd: &str, host: &str, ctl_path: &Path) -> a
             anyhow::bail!("{msg}");
         }
         _ => anyhow::bail!("specify a session: gritty {cmd} {host}:<session>"),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn row(name: &str) -> Row {
+        Row {
+            name: name.to_string(),
+            attached: false,
+            age: String::new(),
+            cmd: String::new(),
+            cwd: String::new(),
+            client: String::new(),
+            hotkey: None,
+        }
+    }
+
+    #[test]
+    fn suggest_name_uses_default_when_free() {
+        assert_eq!(suggest_name(&[]), "default");
+        assert_eq!(suggest_name(&[row("work")]), "default");
+    }
+
+    #[test]
+    fn suggest_name_increments_past_default() {
+        assert_eq!(suggest_name(&[row("default")]), "session-2");
+        assert_eq!(suggest_name(&[row("default"), row("session-2")]), "session-3");
+    }
+
+    #[test]
+    fn suggest_name_fills_first_free_slot() {
+        // session-2 missing -- the first free slot, not the max+1.
+        assert_eq!(suggest_name(&[row("default"), row("session-3")]), "session-2");
     }
 }
