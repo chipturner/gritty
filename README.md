@@ -280,6 +280,7 @@ gritty completions fish > ~/.config/fish/completions/gritty.fish
 ```bash
 kill -USR1 $(cat $(gritty socket-path | xargs dirname)/daemon.pid)
 ```
+SIGUSR1 cycling is disabled when the daemon was started with `RUST_LOG` set -- that filter takes priority and is left untouched. `-v` passed to `connect`/`restart`/`refresh` is forwarded to any daemon or tunnel they auto-start.
 
 **Log rotation:** Send SIGUSR2 to reopen the log file, compatible with external logrotate:
 ```bash

@@ -34,6 +34,10 @@ static LOG_RELOAD: OnceLock<ReloadFn> = OnceLock::new();
 /// through these on SIGUSR1.
 static LOG_LEVEL_INDEX: AtomicU8 = AtomicU8::new(0);
 
+/// Set when `RUST_LOG` drove the filter -- SIGUSR1 cycling is then disabled
+/// (it would discard the user's filter) and the level name reports `RUST_LOG`.
+static RUST_LOG_ACTIVE: AtomicBool = AtomicBool::new(false);
+
 const LOG_LEVELS: [&str; 3] = ["gritty=info", "gritty=debug", "gritty=trace"];
 
 /// Cycle to the next log level. Called from the daemon's SIGUSR1 handler.
@@ -51,6 +55,9 @@ pub fn cycle_log_level() {
 
 /// Return the human-readable name of the current log level.
 pub fn current_log_level_name() -> &'static str {
+    if RUST_LOG_ACTIVE.load(Ordering::Relaxed) {
+        return "RUST_LOG";
+    }
     let idx = LOG_LEVEL_INDEX.load(Ordering::Relaxed) as usize;
     match LOG_LEVELS.get(idx) {
         Some(s) => s.strip_prefix("gritty=").unwrap_or(s),
@@ -119,7 +126,9 @@ pub fn init_tracing(verbose: bool, log_path: Option<&Path>) {
     use tracing_subscriber::layer::SubscriberExt;
     use tracing_subscriber::util::SubscriberInitExt;
 
-    let filter_spec = if std::env::var("RUST_LOG").is_ok() {
+    let rust_log_set = std::env::var("RUST_LOG").is_ok();
+    RUST_LOG_ACTIVE.store(rust_log_set, Ordering::Relaxed);
+    let filter_spec = if rust_log_set {
         None // RUST_LOG takes priority, no cycling
     } else if verbose {
         LOG_LEVEL_INDEX.store(1, Ordering::Relaxed);
@@ -142,9 +151,15 @@ pub fn init_tracing(verbose: bool, log_path: Option<&Path>) {
             let _ = LOG_WRITER.set(writer.clone());
 
             let (filter_layer, reload_handle) = tracing_subscriber::reload::Layer::new(filter);
-            let _ = LOG_RELOAD.set(Box::new(move |spec: &str| {
-                let _ = reload_handle.reload(EnvFilter::new(spec));
-            }));
+            // Only wire SIGUSR1 level-cycling when RUST_LOG is unset: otherwise
+            // the first `kill -USR1` would reload a plain `gritty=debug` filter
+            // and silently discard the user's RUST_LOG spec (often a verbosity
+            // downgrade from trace, plus loss of per-module filters).
+            if !rust_log_set {
+                let _ = LOG_RELOAD.set(Box::new(move |spec: &str| {
+                    let _ = reload_handle.reload(EnvFilter::new(spec));
+                }));
+            }
 
             tracing_subscriber::registry()
                 .with(filter_layer)

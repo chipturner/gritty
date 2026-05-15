@@ -527,6 +527,8 @@ fn main() {
 
     let cli = Cli::parse();
     let verbose = cli.verbose;
+    // Record verbosity so auto_start can forward --verbose to daemons it spawns.
+    set_verbose(verbose);
     let config = gritty::config::ConfigFile::load();
 
     match cli.command {

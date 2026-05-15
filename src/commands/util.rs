@@ -81,11 +81,29 @@ pub(crate) fn server_auto_start_args(ctl_socket: Option<&str>) -> Vec<&str> {
     }
 }
 
+/// Whether the CLI was invoked with `-v/--verbose`. Recorded once in `main` so
+/// `auto_start` can propagate verbosity to daemons it self-spawns.
+static VERBOSE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Record the `-v/--verbose` flag for later propagation by `auto_start`.
+pub(crate) fn set_verbose(verbose: bool) {
+    VERBOSE.store(verbose, std::sync::atomic::Ordering::Relaxed);
+}
+
 /// Run the current binary with the given args. Both `gritty server` and
 /// `gritty tunnel-create <host>` self-daemonize and return after the socket is ready.
+///
+/// `--verbose` is forwarded to the spawned daemon when the current process was
+/// started verbose, so `gritty -v connect/restart/refresh` produces debug logs
+/// in the daemon it launches -- the place those failures actually originate.
 pub(crate) fn auto_start(args: &[&str]) -> anyhow::Result<()> {
     let exe = std::env::current_exe().unwrap_or_else(|_| PathBuf::from("gritty"));
-    let status = std::process::Command::new(&exe).args(args).status()?;
+    let mut cmd = std::process::Command::new(&exe);
+    cmd.args(args);
+    if VERBOSE.load(std::sync::atomic::Ordering::Relaxed) {
+        cmd.arg("--verbose");
+    }
+    let status = cmd.status()?;
     if !status.success() {
         anyhow::bail!("failed to start `gritty {}` (exit {})", args.join(" "), status);
     }
