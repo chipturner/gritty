@@ -71,6 +71,16 @@ pub(crate) async fn server_request_any_version(
     server_request_inner(ctl_path, frame, false).await
 }
 
+/// Build the `auto_start` argument list for launching `gritty server`,
+/// threading a `--ctl-socket` override through so the respawn lands on the same
+/// socket the user asked for (not the default path).
+pub(crate) fn server_auto_start_args(ctl_socket: Option<&str>) -> Vec<&str> {
+    match ctl_socket {
+        Some(s) => vec!["--ctl-socket", s, "server"],
+        None => vec!["server"],
+    }
+}
+
 /// Run the current binary with the given args. Both `gritty server` and
 /// `gritty tunnel-create <host>` self-daemonize and return after the socket is ready.
 pub(crate) fn auto_start(args: &[&str]) -> anyhow::Result<()> {
@@ -440,7 +450,7 @@ fn parse_editor(editor: &str) -> (String, Vec<String>) {
     (program, parts)
 }
 
-pub(crate) async fn info() -> anyhow::Result<()> {
+pub(crate) async fn info(ctl_socket: Option<PathBuf>) -> anyhow::Result<()> {
     use gritty::protocol::Frame;
 
     println!("gritty {}", env!("CARGO_PKG_VERSION"));
@@ -461,8 +471,14 @@ pub(crate) async fn info() -> anyhow::Result<()> {
     };
     println!("config:         {} ({cfg_status})", cfg_path.display());
 
-    let socket_dir = canonicalize_or_raw(gritty::daemon::socket_dir());
-    let ctl_path = socket_dir.join("ctl.sock");
+    // A --ctl-socket override points `info` at a specific daemon; its log/pid
+    // are siblings of that socket.
+    let ctl_path = match &ctl_socket {
+        Some(p) => canonicalize_or_raw(p.clone()),
+        None => canonicalize_or_raw(gritty::daemon::socket_dir()).join("ctl.sock"),
+    };
+    let socket_dir =
+        ctl_path.parent().map(Path::to_path_buf).unwrap_or_else(gritty::daemon::socket_dir);
 
     println!("socket dir:     {}", socket_dir.display());
     println!("server socket:  {}", ctl_path.display());
@@ -658,6 +674,15 @@ mod tests {
         assert!(parse_port_spec("abc").is_err());
         assert!(parse_port_spec("80:xyz").is_err());
         assert!(parse_port_spec("99999").is_err());
+    }
+
+    #[test]
+    fn server_auto_start_args_threads_ctl_socket() {
+        assert_eq!(server_auto_start_args(None), vec!["server"]);
+        assert_eq!(
+            server_auto_start_args(Some("/tmp/x.sock")),
+            vec!["--ctl-socket", "/tmp/x.sock", "server"]
+        );
     }
 
     #[test]

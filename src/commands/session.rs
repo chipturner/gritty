@@ -993,6 +993,9 @@ pub(crate) async fn restart(
     use gritty::protocol::Frame;
 
     let host = host.unwrap_or_else(|| "local".to_string());
+    // Snapshot the override before resolve_ctl_path consumes it -- the local
+    // respawn below must land on the same socket, not the default path.
+    let ctl_socket_arg = ctl_socket.as_ref().map(|p| p.to_string_lossy().into_owned());
     let ctl_path = super::util::resolve_ctl_path(ctl_socket, Some(&host))?;
 
     // Step 1: kill-server, tolerant of both "nothing running" and
@@ -1019,7 +1022,7 @@ pub(crate) async fn restart(
     if host == "local" {
         // For local, kick off a fresh `gritty server`.
         eprintln!("\x1b[2;33m\u{25b8} starting server...\x1b[0m");
-        super::util::auto_start(&["server"])?;
+        super::util::auto_start(&super::util::server_auto_start_args(ctl_socket_arg.as_deref()))?;
         eprintln!("\x1b[32m\u{25b8} server restarted\x1b[0m");
     } else {
         // Remote: capture the original destination from the .dest sidecar

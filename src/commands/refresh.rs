@@ -85,6 +85,9 @@ fn pid_file_alive(pid_path: &Path) -> bool {
 /// daemon that wasn't already running -- refresh is about picking up a new
 /// binary, not about bringing services up.
 async fn refresh_local(ctl_socket: Option<PathBuf>) -> anyhow::Result<()> {
+    // Snapshot the override before resolve_ctl_path consumes it, so the
+    // respawn below lands on the same socket.
+    let ctl_socket_arg = ctl_socket.as_ref().map(|p| p.to_string_lossy().into_owned());
     let ctl_path = util::resolve_ctl_path(ctl_socket, Some("local"))?;
     let info_path = gritty::runinfo::daemon_info_path(&ctl_path);
     let pid_path = ctl_path.with_file_name("daemon.pid");
@@ -117,7 +120,7 @@ async fn refresh_local(ctl_socket: Option<PathBuf>) -> anyhow::Result<()> {
             }
         }
     }
-    util::auto_start(&["server"])?;
+    util::auto_start(&util::server_auto_start_args(ctl_socket_arg.as_deref()))?;
     eprintln!("\x1b[32m\u{25b8} local daemon restarted\x1b[0m");
     Ok(())
 }

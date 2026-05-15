@@ -908,9 +908,9 @@ async fn run(cli: Cli, config: gritty::config::ConfigFile) -> anyhow::Result<()>
             gritty::connect::list_tunnels();
             Ok(())
         }
-        Command::Info => info().await,
+        Command::Info => info(cli.ctl_socket).await,
         Command::Config => config_edit(),
-        Command::Doctor => doctor().await,
+        Command::Doctor => doctor(cli.ctl_socket).await,
         Command::ProtocolVersion => {
             println!("{}", gritty::protocol::PROTOCOL_VERSION);
             Ok(())

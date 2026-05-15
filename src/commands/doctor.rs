@@ -202,12 +202,12 @@ async fn probe_server(
     }
 }
 
-async fn check_local_server(
-    socket_dir: &Path,
-) -> (Vec<Check>, Vec<gritty::protocol::SessionEntry>) {
+async fn check_local_server(ctl_path: &Path) -> (Vec<Check>, Vec<gritty::protocol::SessionEntry>) {
     let mut checks = Vec::new();
-    let ctl_path = socket_dir.join("ctl.sock");
-    let pid_path = gritty::daemon::pid_file_path(&ctl_path);
+    // Per-session sockets and the daemon log/pid are siblings of the ctl
+    // socket (the daemon derives its dir from ctl_path.parent()).
+    let socket_dir = ctl_path.parent().unwrap_or(Path::new("."));
+    let pid_path = gritty::daemon::pid_file_path(ctl_path);
     let pid = read_pid_file(&pid_path);
 
     // Check daemon PID staleness
@@ -223,7 +223,7 @@ async fn check_local_server(
     }
 
     // Probe server via socket
-    match probe_server(&ctl_path).await {
+    match probe_server(ctl_path).await {
         Ok((version, sessions)) => {
             let n = sessions.len();
             let s = if n == 1 { "" } else { "s" };
@@ -240,7 +240,7 @@ async fn check_local_server(
                 )));
             }
             check_staleness(
-                &gritty::runinfo::daemon_info_path(&ctl_path),
+                &gritty::runinfo::daemon_info_path(ctl_path),
                 "server",
                 "gritty refresh local",
                 &mut checks,
@@ -291,7 +291,7 @@ async fn check_local_server(
             // sidecar can say which side is stale (running daemon vs on-disk
             // binary) -- often more actionable than the raw version numbers.
             check_staleness(
-                &gritty::runinfo::daemon_info_path(&ctl_path),
+                &gritty::runinfo::daemon_info_path(ctl_path),
                 "server",
                 "gritty refresh local",
                 &mut checks,
@@ -467,15 +467,23 @@ fn format_size(bytes: u64) -> String {
 
 // ---- Entry point ------------------------------------------------------------
 
-pub(crate) async fn doctor() -> anyhow::Result<()> {
-    let socket_dir = super::util::canonicalize_or_raw(gritty::daemon::socket_dir());
+pub(crate) async fn doctor(ctl_socket: Option<std::path::PathBuf>) -> anyhow::Result<()> {
+    let default_dir = super::util::canonicalize_or_raw(gritty::daemon::socket_dir());
+    // The server's ctl/svc/agent sockets and log follow a --ctl-socket
+    // override; tunnel connect-*.sock always live in the default dir.
+    let ctl_path = match &ctl_socket {
+        Some(p) => super::util::canonicalize_or_raw(p.clone()),
+        None => default_dir.join("ctl.sock"),
+    };
+    let server_dir =
+        ctl_path.parent().map(Path::to_path_buf).unwrap_or_else(|| default_dir.clone());
 
     let config_checks = check_config();
-    let (server_checks, sessions) = check_local_server(&socket_dir).await;
-    let tunnel_checks = check_tunnels(&socket_dir).await;
+    let (server_checks, sessions) = check_local_server(&ctl_path).await;
+    let tunnel_checks = check_tunnels(&default_dir).await;
 
     let live_ids: Vec<u32> = sessions.iter().map(|s| s.id).collect();
-    let socket_checks = check_sockets(&socket_dir, &live_ids);
+    let socket_checks = check_sockets(&server_dir, &live_ids);
 
     let groups: Vec<(&str, Vec<Check>)> = vec![
         ("Configuration", config_checks),
