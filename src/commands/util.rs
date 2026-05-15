@@ -23,7 +23,9 @@ pub(crate) fn resolve_ctl_path(
     match host {
         Some("local") => Ok(gritty::daemon::control_socket_path()),
         Some(h) => Ok(gritty::daemon::socket_dir().join(format!("connect-{h}.sock"))),
-        None => anyhow::bail!("specify a host or use --ctl-socket"),
+        None => anyhow::bail!(
+            "specify a host (e.g. `local`, or a tunnel name) or use --ctl-socket <path>"
+        ),
     }
 }
 
@@ -182,14 +184,23 @@ pub(crate) fn format_timestamp(epoch_secs: u64) -> String {
 }
 
 /// Parse a port spec: "PORT" or "LISTEN_PORT:TARGET_PORT".
+///
+/// Port 0 is rejected: gritty has no way to report the OS-assigned ephemeral
+/// port back to the user (unlike `ssh -L 0:` which prints it), so a `0` forward
+/// would be live on an undiscoverable port.
 pub(crate) fn parse_port_spec(spec: &str) -> anyhow::Result<(u16, u16)> {
+    fn port(field: &str, value: &str) -> anyhow::Result<u16> {
+        let p: u16 = value.parse().map_err(|_| anyhow::anyhow!("invalid {field}: {value}"))?;
+        if p == 0 {
+            anyhow::bail!("{field} must not be 0 (ephemeral ports are not supported)");
+        }
+        Ok(p)
+    }
     if let Some((a, b)) = spec.split_once(':') {
-        let listen: u16 = a.parse().map_err(|_| anyhow::anyhow!("invalid listen port: {a}"))?;
-        let target: u16 = b.parse().map_err(|_| anyhow::anyhow!("invalid target port: {b}"))?;
-        Ok((listen, target))
+        Ok((port("listen port", a)?, port("target port", b)?))
     } else {
-        let port: u16 = spec.parse().map_err(|_| anyhow::anyhow!("invalid port: {spec}"))?;
-        Ok((port, port))
+        let p = port("port", spec)?;
+        Ok((p, p))
     }
 }
 
@@ -647,6 +658,13 @@ mod tests {
         assert!(parse_port_spec("abc").is_err());
         assert!(parse_port_spec("80:xyz").is_err());
         assert!(parse_port_spec("99999").is_err());
+    }
+
+    #[test]
+    fn parse_port_spec_rejects_zero() {
+        assert!(parse_port_spec("0").is_err());
+        assert!(parse_port_spec("0:8080").is_err());
+        assert!(parse_port_spec("8080:0").is_err());
     }
 
     #[test]

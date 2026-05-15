@@ -123,6 +123,12 @@ pub(crate) async fn connect_session(
             std::process::exit(code);
         }
         Frame::Error { code: gritty::protocol::ErrorCode::NoSuchSession, .. } => {
+            if name == "-" {
+                // `-` means "last-attached session"; creating one named `-`
+                // is reserved and would fail with a misleading error.
+                let host = host_from_ctl_path(&ctl_path);
+                anyhow::bail!("no previously-attached session on {host}");
+            }
             if no_create {
                 anyhow::bail!("no such session: {name}");
             }

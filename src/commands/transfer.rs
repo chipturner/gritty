@@ -309,7 +309,7 @@ pub(crate) async fn send_command(
     use tokio::io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt};
 
     if use_stdin && !files.is_empty() {
-        anyhow::bail!("--stdin cannot be used with file arguments");
+        anyhow::bail!("cannot send stdin (`-`) together with file arguments");
     }
     if !use_stdin && files.is_empty() {
         anyhow::bail!("provide files to send (use - for stdin)");
