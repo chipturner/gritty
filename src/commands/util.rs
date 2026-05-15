@@ -413,23 +413,24 @@ fn parse_editor(editor: &str) -> (String, Vec<String>) {
     (program, parts)
 }
 
-pub(crate) async fn info(config: &gritty::config::ConfigFile) -> anyhow::Result<()> {
+pub(crate) async fn info() -> anyhow::Result<()> {
     use gritty::protocol::Frame;
 
     println!("gritty {}", env!("CARGO_PKG_VERSION"));
     println!();
 
     let cfg_path = gritty::config::config_path();
-    let cfg_status = if cfg_path.exists() {
-        if config.host.is_empty() {
-            "loaded".to_string()
-        } else {
-            let n = config.host.len();
+    // Re-parse strictly: a config rejected by deny_unknown_fields must not be
+    // reported as "loaded" -- `config` here is the default-fallback value.
+    let cfg_status = match gritty::config::config_status(&cfg_path) {
+        gritty::config::ConfigStatus::NotFound => "not found".to_string(),
+        gritty::config::ConfigStatus::Invalid(e) => format!("INVALID -- ignored: {e}"),
+        gritty::config::ConfigStatus::Valid(cfg) if cfg.host.is_empty() => "loaded".to_string(),
+        gritty::config::ConfigStatus::Valid(cfg) => {
+            let n = cfg.host.len();
             let s = if n == 1 { "" } else { "s" };
             format!("loaded, {n} host{s}")
         }
-    } else {
-        "not found".to_string()
     };
     println!("config:         {} ({cfg_status})", cfg_path.display());
 

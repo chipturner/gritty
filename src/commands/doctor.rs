@@ -112,26 +112,21 @@ fn check_config() -> Vec<Check> {
     let mut checks = Vec::new();
     let path = gritty::config::config_path();
 
-    match std::fs::read_to_string(&path) {
-        Ok(content) => match toml::from_str::<gritty::config::ConfigFile>(&content) {
-            Ok(cfg) => {
-                if cfg.host.is_empty() {
-                    checks.push(Check::ok("config valid"));
-                } else {
-                    let n = cfg.host.len();
-                    let s = if n == 1 { "" } else { "s" };
-                    checks.push(Check::ok(format!("config valid ({n} host{s})")));
-                }
-            }
-            Err(e) => {
-                checks.push(Check::fail(format!("config invalid: {e}")));
-            }
-        },
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+    match gritty::config::config_status(&path) {
+        gritty::config::ConfigStatus::NotFound => {
             checks.push(Check::ok("no config file (using defaults)"));
         }
-        Err(e) => {
-            checks.push(Check::fail(format!("cannot read config: {e}")));
+        gritty::config::ConfigStatus::Valid(cfg) => {
+            if cfg.host.is_empty() {
+                checks.push(Check::ok("config valid"));
+            } else {
+                let n = cfg.host.len();
+                let s = if n == 1 { "" } else { "s" };
+                checks.push(Check::ok(format!("config valid ({n} host{s})")));
+            }
+        }
+        gritty::config::ConfigStatus::Invalid(e) => {
+            checks.push(Check::fail(format!("config invalid: {e}")));
         }
     }
 

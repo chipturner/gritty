@@ -113,8 +113,12 @@ pub struct TunnelSettings {
 }
 
 /// Top-level config file structure.
+///
+/// `deny_unknown_fields` rejects a misspelled top-level section (`[default]`,
+/// `[hosts.x]`, `[Host.x]`) instead of silently dropping it. The `host` field
+/// is a map, so arbitrary `[host.<name>]` tables are still accepted.
 #[derive(Debug, Clone, Default, Deserialize)]
-#[serde(default)]
+#[serde(default, deny_unknown_fields)]
 pub struct ConfigFile {
     pub defaults: Defaults,
     pub host: HashMap<String, HostConfig>,
@@ -170,6 +174,29 @@ pub fn config_path() -> PathBuf {
         return proj.config_dir().join("config.toml");
     }
     PathBuf::from(".config").join("gritty").join("config.toml")
+}
+
+/// Outcome of strictly parsing the config file. Unlike `load`/`load_from`
+/// (which swallow any error and silently fall back to defaults), this reports
+/// a rejected file -- so `info` and `doctor` agree and never call a discarded
+/// config "loaded".
+pub enum ConfigStatus {
+    NotFound,
+    Valid(ConfigFile),
+    Invalid(String),
+}
+
+/// Strictly parse the config file for diagnostics.
+pub fn config_status(path: &std::path::Path) -> ConfigStatus {
+    let content = match std::fs::read_to_string(path) {
+        Ok(c) => c,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return ConfigStatus::NotFound,
+        Err(e) => return ConfigStatus::Invalid(format!("cannot read config: {e}")),
+    };
+    match toml::from_str(&content) {
+        Ok(cfg) => ConfigStatus::Valid(cfg),
+        Err(e) => ConfigStatus::Invalid(e.to_string()),
+    }
 }
 
 impl ConfigFile {
@@ -532,6 +559,53 @@ mod tests {
             "#,
         );
         assert!(result.is_err());
+    }
+
+    // A misspelled top-level section ([hosts.x], [default], [Host.x]) must be
+    // rejected, not silently dropped -- otherwise the override is lost and every
+    // diagnostic still reports the config as valid.
+    #[test]
+    fn unknown_top_level_section_rejected() {
+        let result: Result<ConfigFile, _> = toml::from_str(
+            r#"
+            [hosts.devbox]
+            forward-agent = true
+            "#,
+        );
+        assert!(result.is_err(), "misspelled [hosts.x] section must be rejected");
+    }
+
+    #[test]
+    fn config_status_reports_invalid_for_bad_key() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        std::fs::write(&path, "[defaults]\nforward_agent = true\n").unwrap();
+        assert!(
+            matches!(config_status(&path), ConfigStatus::Invalid(_)),
+            "underscore key must parse as Invalid, not Valid"
+        );
+    }
+
+    #[test]
+    fn config_status_reports_valid_and_not_found() {
+        let dir = tempfile::tempdir().unwrap();
+        let missing = dir.path().join("nope.toml");
+        assert!(matches!(config_status(&missing), ConfigStatus::NotFound));
+
+        let path = dir.path().join("config.toml");
+        std::fs::write(&path, "[host.devbox]\nforward-agent = true\n").unwrap();
+        match config_status(&path) {
+            ConfigStatus::Valid(cfg) => assert_eq!(cfg.host.len(), 1),
+            other => panic!("expected Valid, got {}", status_name(&other)),
+        }
+    }
+
+    fn status_name(s: &ConfigStatus) -> &'static str {
+        match s {
+            ConfigStatus::NotFound => "NotFound",
+            ConfigStatus::Valid(_) => "Valid",
+            ConfigStatus::Invalid(_) => "Invalid",
+        }
     }
 
     #[test]

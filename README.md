@@ -211,6 +211,8 @@ gritty works out of the box with no config file. Optionally, set persistent defa
 
 # Per-host overrides, keyed by connection name.
 # Connection name = hostname from destination, or -n override.
+# A connection name with dots (an FQDN) must be quoted, or TOML reads the
+# dots as table separators: [host."prod-db.example.com"].
 [host.devbox.tunnel]
 ssh-options = ["IdentityFile=~/.ssh/devbox_tunnel_key"]
 
@@ -225,7 +227,9 @@ no-server-start = true
 
 **Precedence:** CLI flag > `[host.<name>]` > `[defaults]` > built-in default. For `ssh-options`, values are appended (CLI first, then host, then defaults; SSH first-match gives earlier options priority).
 
-A missing or malformed config file is silently ignored. Use `gritty info` to check config status.
+`ring-buffer-size` and `oauth-tunnel-idle-timeout` are resolved by the daemon, which has no per-connection context -- they take effect only from `[defaults]`, not `[host.<name>]`.
+
+A missing config file uses built-in defaults. A malformed config file (a typo'd key or section -- keys are kebab-case) is rejected in full and the built-in defaults are used; `gritty info` and `gritty doctor` both report it as invalid.
 
 ## Escape Sequences
 
