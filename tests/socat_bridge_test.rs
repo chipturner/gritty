@@ -167,8 +167,16 @@ async fn create_session(proxy_path: &Path, name: &str) -> (u32, Framed<UnixStrea
     (id, framed)
 }
 
-/// Attach to a session through the proxy. Returns the framed connection.
-async fn attach_session(proxy_path: &Path, session: &str) -> Framed<UnixStream, FrameCodec> {
+/// Attach to a session through the proxy. `attach_token == 0` is an explicit
+/// fresh viewer (server replays scrollback context); non-zero is an
+/// auto-reconnect carrying `rendered_offset`, so the server resumes the output
+/// stream (Clean/Truncated replay of buffered `History` as `Data`).
+async fn send_attach(
+    proxy_path: &Path,
+    session: &str,
+    attach_token: u64,
+    rendered_offset: u64,
+) -> Framed<UnixStream, FrameCodec> {
     let mut framed = connect_and_handshake(proxy_path).await;
     framed
         .send(Frame::Attach {
@@ -178,8 +186,8 @@ async fn attach_session(proxy_path: &Path, session: &str) -> Framed<UnixStream, 
             no_replay: false,
             cols: 0,
             rows: 0,
-            attach_token: 0,
-            rendered_offset: 0,
+            attach_token,
+            rendered_offset,
             line_dirty: false,
         })
         .await
@@ -191,6 +199,18 @@ async fn attach_session(proxy_path: &Path, session: &str) -> Framed<UnixStream, 
         .expect("decode error");
     assert!(matches!(resp, Frame::AttachAck { .. }), "expected AttachAck for attach, got {resp:?}");
     framed
+}
+
+/// Explicit fresh attach (scrollback context, no ownership claim).
+async fn attach_session(proxy_path: &Path, session: &str) -> Framed<UnixStream, FrameCodec> {
+    send_attach(proxy_path, session, 0, 0).await
+}
+
+/// Auto-reconnect from offset 0: the server resumes the output stream and
+/// replays everything still buffered in `History` (as `Data`), mirroring the
+/// real client's reconnect rather than the fresh-viewer scrollback path.
+async fn resume_session(proxy_path: &Path, session: &str) -> Framed<UnixStream, FrameCodec> {
+    send_attach(proxy_path, session, 1, 0).await
 }
 
 /// Send Env + Resize and wait for first Data frame (shell prompt).
@@ -209,11 +229,18 @@ async fn wait_for_shell(framed: &mut Framed<UnixStream, FrameCodec>) {
     }
 }
 
-/// Drain all Data frames until timeout.
+/// Drain terminal-output frames until the stream is idle for `wait`. Collects
+/// both `Data` (the live PTY stream) and `Notice` (server reconnect chrome:
+/// dividers, truncation markers, replayed scrollback) since both render to the
+/// user's terminal. Non-output frames (`Resume`, `Pong`, ...) are skipped, not
+/// treated as end-of-stream -- every attach now begins with a `Resume` frame.
 async fn drain_data(framed: &mut Framed<UnixStream, FrameCodec>, wait: Duration) -> Vec<u8> {
     let mut out = Vec::new();
-    while let Ok(Some(Ok(Frame::Data(data)))) = timeout(wait, framed.next()).await {
-        out.extend_from_slice(&data);
+    while let Ok(Some(Ok(frame))) = timeout(wait, framed.next()).await {
+        match frame {
+            Frame::Data(data) | Frame::Notice(data) => out.extend_from_slice(&data),
+            _ => {}
+        }
     }
     out
 }
@@ -616,8 +643,9 @@ async fn tunnel_death_buffered_output_preserved() {
     // Restart socat
     env.restart_socat();
 
-    // Reattach -- buffered output should drain
-    let mut framed = attach_session(&env.proxy_path, &id.to_string()).await;
+    // Reattach as an auto-reconnect -- the server resumes the output stream and
+    // replays everything still buffered in History (< 1MB, so nothing evicted).
+    let mut framed = resume_session(&env.proxy_path, &id.to_string()).await;
     framed.send(Frame::Resize { cols: 80, rows: 24 }).await.unwrap();
 
     let output = drain_data(&mut framed, Duration::from_secs(3)).await;
@@ -656,13 +684,15 @@ async fn tunnel_death_ring_buffer_overflow_marker() {
     // Restart and reattach
     env.restart_socat();
 
-    let mut framed = attach_session(&env.proxy_path, &id.to_string()).await;
+    // Auto-reconnect from offset 0 against a ring that overflowed (>1MB) lands
+    // on the Truncated replay plan, which emits the truncation marker.
+    let mut framed = resume_session(&env.proxy_path, &id.to_string()).await;
     framed.send(Frame::Resize { cols: 80, rows: 24 }).await.unwrap();
 
     let output = drain_data(&mut framed, Duration::from_secs(3)).await;
     let output_str = String::from_utf8_lossy(&output);
     assert!(
-        output_str.contains("bytes of output dropped"),
+        output_str.contains("lost while disconnected"),
         "should see ring buffer overflow marker, got {} bytes of output: {}",
         output.len(),
         &output_str[..output_str.len().min(200)]

@@ -214,6 +214,38 @@ async fn read_available_data(
     out
 }
 
+/// Ask the server for its authoritative output-stream offset
+/// (`History::total()`), parsed out of the `DiagResponse` text. Deriving the
+/// rendered offset by counting bytes from time-boxed reads is racy: a loaded
+/// runner can emit PTY output (e.g. a post-command prompt redraw) after the
+/// read window closes, leaving the test's offset behind the server's so a
+/// "clean" resume legitimately -- but surprisingly -- replays the uncounted
+/// tail. The server's own offset makes the resume deterministic.
+async fn server_stream_offset(framed: &mut Framed<UnixStream, FrameCodec>) -> u64 {
+    framed.send(Frame::DiagRequest).await.unwrap();
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(3);
+    loop {
+        match timeout(Duration::from_secs(1), framed.next()).await {
+            Ok(Some(Ok(Frame::DiagResponse { text }))) => {
+                // "...history: N bytes in M chunks (offset K, cap C)..."
+                let after =
+                    text.split("(offset ").nth(1).expect("diag text should report an offset");
+                return after
+                    .split([',', ')'])
+                    .next()
+                    .unwrap()
+                    .trim()
+                    .parse()
+                    .expect("offset should be a number");
+            }
+            _ if tokio::time::Instant::now() >= deadline => {
+                panic!("no DiagResponse within 3s");
+            }
+            _ => continue,
+        }
+    }
+}
+
 /// Read frames until we see an Exit frame or timeout.
 async fn expect_exit_frame(
     framed: &mut Framed<UnixStream, FrameCodec>,
@@ -2617,18 +2649,24 @@ async fn fresh_connect_shows_divider_on_main_screen() {
 async fn reconnect_resumes_incrementally_from_offset() {
     let (client_tx, mut framed, server, _meta) = setup_session().await;
     wait_for_shell(&mut framed).await;
-    // Consume the shell banner / first prompt and count how far we've rendered.
-    let pre = read_available_data(&mut framed, Duration::from_secs(1)).await;
-    let mut rendered: u64 = pre.len() as u64;
+    // Consume the shell banner / first prompt.
+    read_available_data(&mut framed, Duration::from_secs(1)).await;
 
-    // Produce a line, render it, advance our offset past it.
+    // Produce and render a line.
     framed.send(Frame::Data(Bytes::from("echo BEFORE_DISCONNECT\n"))).await.unwrap();
     let seen = read_available_data(&mut framed, Duration::from_millis(800)).await;
-    rendered += seen.len() as u64;
     assert!(
         String::from_utf8_lossy(&seen).contains("BEFORE_DISCONNECT"),
         "should have rendered the pre-disconnect line"
     );
+
+    // Drain anything still trickling (a loaded runner can emit the
+    // post-command prompt redraw well after the line itself), then take the
+    // server's own authoritative stream offset as "what we have rendered".
+    // Counting bytes from time-boxed reads is racy; `History::total()` is
+    // exact, so resuming from it replays nothing regardless of redraw timing.
+    read_available_data(&mut framed, Duration::from_millis(300)).await;
+    let rendered = server_stream_offset(&mut framed).await;
 
     // Disconnect.
     drop(framed);
