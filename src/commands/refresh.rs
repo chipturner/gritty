@@ -204,9 +204,22 @@ pub(crate) async fn refresh(
         Some("local") => refresh_local(ctl_socket).await,
         Some(name) => refresh_remote(name, config).await,
         None => {
-            refresh_local(ctl_socket).await?;
+            // Best-effort: `refresh` is documented as idempotent, so one
+            // unreachable host must not abort the rest. Collect failures and
+            // report an aggregate at the end.
+            let mut failed = 0usize;
+            if let Err(e) = refresh_local(ctl_socket).await {
+                eprintln!("error: refresh local: {e}");
+                failed += 1;
+            }
             for name in gritty::connect::enumerate_tunnels() {
-                refresh_remote(&name, config).await?;
+                if let Err(e) = refresh_remote(&name, config).await {
+                    eprintln!("error: refresh {name}: {e}");
+                    failed += 1;
+                }
+            }
+            if failed > 0 {
+                anyhow::bail!("refresh failed for {failed} target(s) (see errors above)");
             }
             Ok(())
         }

@@ -838,13 +838,21 @@ async fn run(cli: Cli, config: gritty::config::ConfigFile) -> anyhow::Result<()>
         Command::KillServer { target } => {
             let host = target.as_deref().map(|t| parse_target(t).0);
             let ctl_path = resolve_ctl_path(cli.ctl_socket, host.as_deref())?;
-            kill_server(ctl_path).await?;
-            if let Some(h) = host.as_deref()
-                && h != "local"
-            {
-                gritty::connect::disconnect(h).await?;
+            let kill_result = kill_server(ctl_path).await;
+            match host.as_deref() {
+                Some(h) if h != "local" => {
+                    // Always tear down the tunnel supervisor: if the remote
+                    // daemon is already down it would otherwise reconnect
+                    // forever. A kill_server error here usually just means the
+                    // remote daemon was already gone -- downgrade it to a
+                    // warning and let the tunnel teardown decide the outcome.
+                    if let Err(e) = &kill_result {
+                        eprintln!("\x1b[2;33m\u{25b8} {h}: {e}\x1b[0m");
+                    }
+                    gritty::connect::disconnect(h).await
+                }
+                _ => kill_result,
             }
-            Ok(())
         }
         Command::Restart { target } => {
             let host = target.as_deref().map(|t| parse_target(t).0);
