@@ -367,6 +367,9 @@ async fn tui_pick_session(
     }
 
     let mut mode = Mode::Pick;
+    // Last server error from an in-picker rename/kill, shown until the next
+    // attempt. Without it a rejected rename/kill is a silent no-op.
+    let mut status: Option<String> = None;
     let mut prev_total_lines: usize = 0;
 
     struct PickerTermGuard;
@@ -400,13 +403,15 @@ async fn tui_pick_session(
                   rows: &[Row],
                   cursor: usize,
                   mode: &Mode,
+                  status: Option<&str>,
                   prev_total_lines: usize| {
         let name_w = rows.iter().map(|r| r.name.len()).max().unwrap_or(0).max(3);
         let tag_w = 10; // "(attached)" is 10 chars
         let age_w = rows.iter().map(|r| r.age.len()).max().unwrap_or(0);
         let cmd_w = rows.iter().map(|r| r.cmd.len()).max().unwrap_or(0);
         let client_w = rows.iter().map(|r| r.client.len()).max().unwrap_or(0);
-        let total_lines = rows.len() + 3; // header + rows + new-session + hint
+        // header + rows + new-session + hint, plus an optional status line.
+        let total_lines = rows.len() + 3 + usize::from(status.is_some());
 
         // If we drew before, erase old output first
         if prev_total_lines > 0 {
@@ -495,12 +500,16 @@ async fn tui_pick_session(
             Mode::ConfirmKill { name } => format!("kill {name}? y/n"),
         };
         let _ = write!(stderr, "\x1b[2m  {hints}\x1b[0m\r\n");
+        if let Some(msg) = status {
+            let _ = write!(stderr, "\x1b[31m  {msg}\x1b[0m\r\n");
+        }
         let _ = stderr.flush();
         total_lines
     };
 
     // Initial render
-    prev_total_lines = render(&mut stderr, &rows, cursor, &mode, prev_total_lines);
+    prev_total_lines =
+        render(&mut stderr, &rows, cursor, &mode, status.as_deref(), prev_total_lines);
 
     let result = loop {
         // Poll-based loop so we can yield to the async runtime
@@ -572,6 +581,7 @@ async fn tui_pick_session(
                     let name = suggest_name(&rows);
                     let len = name.len();
                     cursor = rows.len();
+                    status = None;
                     mode = Mode::Input { buf: name, cursor_pos: len, rename_of: None };
                 }
                 // 'x' or Delete -> kill selected session
@@ -581,6 +591,7 @@ async fn tui_pick_session(
                     ..
                 }) => {
                     if cursor < rows.len() {
+                        status = None;
                         mode = Mode::ConfirmKill { name: rows[cursor].name.clone() };
                     }
                 }
@@ -593,6 +604,7 @@ async fn tui_pick_session(
                     if cursor < rows.len() {
                         let name = rows[cursor].name.clone();
                         let len = name.len();
+                        status = None;
                         mode = Mode::Input {
                             buf: name.clone(),
                             cursor_pos: len,
@@ -630,11 +642,20 @@ async fn tui_pick_session(
                 Event::Key(KeyEvent { code: KeyCode::Char('y'), .. }) => {
                     let kill_name = name.clone();
                     let ctl = ctl_path.to_path_buf();
-                    let _ = server_request(
+                    match server_request(
                         &ctl,
                         gritty::protocol::Frame::KillSession { session: kill_name },
                     )
-                    .await;
+                    .await
+                    {
+                        Ok(gritty::protocol::Frame::Ok) => status = None,
+                        Ok(gritty::protocol::Frame::Error { message, .. }) => {
+                            status = Some(format!("kill failed: {message}"));
+                        }
+                        other => {
+                            status = Some(format!("kill failed: unexpected response {other:?}"));
+                        }
+                    }
                     // Refresh session list
                     if let Ok(gritty::protocol::Frame::SessionInfo { sessions: fresh }) =
                         server_request(&ctl, gritty::protocol::Frame::ListSessions).await
@@ -654,28 +675,48 @@ async fn tui_pick_session(
             Mode::Input { buf, cursor_pos, rename_of } => match ev {
                 Event::Key(KeyEvent { code: KeyCode::Enter, .. }) => {
                     let new_name = buf.trim().to_string();
-                    if let Some(old_name) = rename_of.take() {
+                    // clone, don't take: on a rejected rename we stay in Input
+                    // mode, and `rename_of` must still say this is a rename.
+                    if let Some(old_name) = rename_of.clone() {
                         // Rename mode
                         if new_name.is_empty() || new_name == old_name {
                             mode = Mode::Pick;
                         } else {
                             let ctl = ctl_path.to_path_buf();
-                            let _ = server_request(
+                            match server_request(
                                 &ctl,
                                 gritty::protocol::Frame::RenameSession {
                                     session: old_name,
                                     new_name,
                                 },
                             )
-                            .await;
-                            // Refresh
-                            if let Ok(gritty::protocol::Frame::SessionInfo { sessions: fresh }) =
-                                server_request(&ctl, gritty::protocol::Frame::ListSessions).await
+                            .await
                             {
-                                rows = build_rows(&fresh);
-                                cursor = cursor.min(rows.len().saturating_sub(1));
+                                Ok(gritty::protocol::Frame::Ok) => {
+                                    status = None;
+                                    // Refresh
+                                    if let Ok(gritty::protocol::Frame::SessionInfo {
+                                        sessions: fresh,
+                                    }) =
+                                        server_request(&ctl, gritty::protocol::Frame::ListSessions)
+                                            .await
+                                    {
+                                        rows = build_rows(&fresh);
+                                        cursor = cursor.min(rows.len().saturating_sub(1));
+                                    }
+                                    mode = Mode::Pick;
+                                }
+                                // Rejected (name collision, invalid name): keep
+                                // the user in rename mode with the message.
+                                Ok(gritty::protocol::Frame::Error { message, .. }) => {
+                                    status = Some(format!("rename failed: {message}"));
+                                }
+                                other => {
+                                    status = Some(format!(
+                                        "rename failed: unexpected response {other:?}"
+                                    ));
+                                }
                             }
-                            mode = Mode::Pick;
                         }
                     } else if new_name.is_empty() {
                         mode = Mode::Pick;
@@ -686,6 +727,7 @@ async fn tui_pick_session(
                 }
                 Event::Key(KeyEvent { code: KeyCode::Esc, .. }) => {
                     let back_to_new = rename_of.is_none();
+                    status = None;
                     mode = Mode::Pick;
                     if back_to_new {
                         cursor = rows.len();
@@ -697,6 +739,7 @@ async fn tui_pick_session(
                     ..
                 }) => {
                     let back_to_new = rename_of.is_none();
+                    status = None;
                     mode = Mode::Pick;
                     if back_to_new {
                         cursor = rows.len();
@@ -785,7 +828,8 @@ async fn tui_pick_session(
                 _ => continue,
             },
         }
-        prev_total_lines = render(&mut stderr, &rows, cursor, &mode, prev_total_lines);
+        prev_total_lines =
+            render(&mut stderr, &rows, cursor, &mode, status.as_deref(), prev_total_lines);
     };
 
     // Cleanup: erase picker lines (terminal restore handled by PickerTermGuard)
