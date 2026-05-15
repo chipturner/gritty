@@ -15,6 +15,57 @@ const fn idle_evict_ceiling_secs() -> u64 {
     IDLE_EVICT_TIMEOUT.as_secs() - IDLE_EVICT_SAFETY_MARGIN.as_secs()
 }
 
+/// Clamp the heartbeat interval/timeout to the three invariants the client and
+/// server both rely on -- `interval >= 1`, `timeout > interval`, and
+/// `interval + timeout <= ceiling` -- and return the clamped pair plus any
+/// human-readable warnings.
+///
+/// The interval is capped first at `(ceiling - 1) / 2`: without the cap a large
+/// interval drives the timeout clamp below the interval (or to 0), and the
+/// client's `link_is_stale()` check then trips on the first heartbeat tick --
+/// an endless reconnect loop.
+///
+/// Warnings name the config keys in kebab-case (`heartbeat-interval`, not
+/// `heartbeat_interval`) because `deny_unknown_fields` + `rename_all` make only
+/// the kebab spelling valid -- a user who copies an underscore name back into
+/// the config writes an unknown key and the whole file is discarded.
+fn clamp_heartbeat(raw_interval: u64, raw_timeout: u64) -> (u64, u64, Vec<String>) {
+    let mut warnings = Vec::new();
+
+    let max_interval = (idle_evict_ceiling_secs().saturating_sub(1) / 2).max(1);
+    let interval = raw_interval.clamp(1, max_interval);
+    if interval != raw_interval {
+        warnings.push(format!("heartbeat-interval clamped to {interval}s (was {raw_interval}s)"));
+    }
+
+    // timeout must exceed the (clamped) interval.
+    let timeout = if raw_timeout <= interval {
+        warnings.push(format!(
+            "heartbeat-timeout ({raw_timeout}s) must exceed heartbeat-interval ({interval}s); clamped to {}s",
+            interval + 1
+        ));
+        interval + 1
+    } else {
+        raw_timeout
+    };
+    // Keep interval + timeout under the server idle-evict ceiling so a healthy
+    // client always sends a Ping before the server gives up on it. The interval
+    // cap above guarantees max_timeout >= interval + 1, so this never undoes
+    // `timeout > interval`.
+    let max_timeout = idle_evict_ceiling_secs().saturating_sub(interval);
+    let timeout = if timeout > max_timeout {
+        let evict = IDLE_EVICT_TIMEOUT.as_secs();
+        warnings.push(format!(
+            "heartbeat-interval ({interval}s) + heartbeat-timeout ({timeout}s) exceeds server idle-evict ({evict}s); timeout clamped to {max_timeout}s"
+        ));
+        max_timeout
+    } else {
+        timeout
+    };
+
+    (interval, timeout, warnings)
+}
+
 /// Resolved session settings after merging all config layers.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SessionSettings {
@@ -146,57 +197,28 @@ impl ConfigFile {
         }
     }
 
-    /// Resolve session settings for a given host (or None for local).
+    /// Resolve session settings for a given host (or None for local),
+    /// printing any heartbeat-clamp warnings to stderr. Used by the connect
+    /// path and the daemon -- both want the user (or the daemon log) to see a
+    /// misconfiguration.
     pub fn resolve_session(&self, host: Option<&str>) -> SessionSettings {
+        self.resolve_session_inner(host, true)
+    }
+
+    fn resolve_session_inner(&self, host: Option<&str>, warn: bool) -> SessionSettings {
         let d = &self.defaults;
         let h = host.and_then(|name| self.host.get(name));
 
-        // Resolve heartbeat_interval first and cap it so the three invariants
-        // the client and server both rely on stay jointly satisfiable:
-        //   interval >= 1, timeout > interval, interval + timeout <= ceiling.
-        // That requires interval + (interval + 1) <= ceiling, i.e.
-        // interval <= (ceiling - 1) / 2. Without the cap a large interval
-        // drives the timeout clamp below the interval (or to 0), and the
-        // client's link_is_stale() check then trips on the first heartbeat
-        // tick -- an endless reconnect loop.
-        let heartbeat_interval = {
-            let raw = h.and_then(|h| h.heartbeat_interval).or(d.heartbeat_interval).unwrap_or(10);
-            let max_interval = (idle_evict_ceiling_secs().saturating_sub(1) / 2).max(1);
-            let clamped = raw.clamp(1, max_interval);
-            if clamped != raw {
-                eprintln!("warning: heartbeat_interval clamped to {clamped}s (was {raw}s)");
+        let raw_interval =
+            h.and_then(|h| h.heartbeat_interval).or(d.heartbeat_interval).unwrap_or(10);
+        let raw_timeout = h.and_then(|h| h.heartbeat_timeout).or(d.heartbeat_timeout).unwrap_or(60);
+        let (heartbeat_interval, heartbeat_timeout, warnings) =
+            clamp_heartbeat(raw_interval, raw_timeout);
+        if warn {
+            for w in &warnings {
+                eprintln!("warning: {w}");
             }
-            clamped
-        };
-
-        let heartbeat_timeout = {
-            let iv = heartbeat_interval;
-            let v = h.and_then(|h| h.heartbeat_timeout).or(d.heartbeat_timeout).unwrap_or(60);
-            let v = if v <= iv {
-                eprintln!(
-                    "warning: heartbeat_timeout ({v}s) must exceed heartbeat_interval ({iv}s); clamped to {}s",
-                    iv + 1
-                );
-                iv + 1
-            } else {
-                v
-            };
-            // The server's idle-evict fires after IDLE_EVICT_TIMEOUT of client
-            // silence. Keep interval + timeout under that (less a safety
-            // margin) so a healthy client always sends a Ping before the
-            // server gives up on it. The interval cap above guarantees
-            // max_timeout >= iv + 1, so this clamp can never undo `v > iv`.
-            let max_timeout = idle_evict_ceiling_secs().saturating_sub(iv);
-            if v > max_timeout {
-                let evict = IDLE_EVICT_TIMEOUT.as_secs();
-                eprintln!(
-                    "warning: heartbeat_interval ({iv}s) + heartbeat_timeout ({v}s) exceeds server idle-evict ({evict}s); timeout clamped to {max_timeout}s"
-                );
-                max_timeout
-            } else {
-                v
-            }
-        };
+        }
 
         SessionSettings {
             forward_agent: h.and_then(|h| h.forward_agent).or(d.forward_agent).unwrap_or(false),
@@ -238,7 +260,9 @@ impl ConfigFile {
         }
 
         TunnelSettings {
-            session: self.resolve_session(Some(host)),
+            // Quiet: tunnel-create / bootstrap / refresh never establish a
+            // heartbeat, so a heartbeat-clamp warning here is pure noise.
+            session: self.resolve_session_inner(Some(host), false),
             ssh_options,
             no_server_start: pick(
                 hc.and_then(|c| c.no_server_start),
@@ -583,6 +607,32 @@ mod tests {
                 "interval={interval}: {} + {} > ceiling {ceiling}",
                 s.heartbeat_interval,
                 s.heartbeat_timeout,
+            );
+        }
+    }
+
+    #[test]
+    fn clamp_heartbeat_in_range_is_silent() {
+        let (iv, to, warnings) = clamp_heartbeat(10, 60);
+        assert_eq!((iv, to), (10, 60));
+        assert!(warnings.is_empty(), "in-range values must not warn: {warnings:?}");
+    }
+
+    // The warning text must name the config keys in kebab-case: the structs use
+    // rename_all = "kebab-case" + deny_unknown_fields, so an underscore spelling
+    // copied back into the config is an unknown key that discards the whole file.
+    #[test]
+    fn clamp_heartbeat_warnings_use_kebab_case_keys() {
+        let (.., warnings) = clamp_heartbeat(10_000, 1);
+        assert!(!warnings.is_empty(), "out-of-range values must warn");
+        for w in &warnings {
+            assert!(
+                !w.contains("heartbeat_interval") && !w.contains("heartbeat_timeout"),
+                "warning must not use underscore key names: {w}"
+            );
+            assert!(
+                w.contains("heartbeat-interval") || w.contains("heartbeat-timeout"),
+                "warning must name a kebab-case config key: {w}"
             );
         }
     }
