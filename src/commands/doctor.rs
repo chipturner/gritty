@@ -45,7 +45,7 @@ impl Check {
 /// to catch a same-protocol rebuild -- the wire handshake can't see it, and
 /// for the tunnel supervisor (a pure byte proxy) no handshake ever touches
 /// its code at all.
-fn check_staleness(info_path: &Path, label: &str, restart_hint: &str, checks: &mut Vec<Check>) {
+fn check_staleness(info_path: &Path, label: &str, stale_hint: &str, checks: &mut Vec<Check>) {
     let Ok(info) = RunInfo::read(info_path) else {
         // No `.info` file -- process predates this feature or wrote it to a
         // different socket dir. Not an error, just no staleness signal.
@@ -54,10 +54,10 @@ fn check_staleness(info_path: &Path, label: &str, restart_hint: &str, checks: &m
     match info.staleness_vs_current() {
         None => {}
         Some(s @ Staleness::Protocol { .. }) => {
-            checks.push(Check::fail(format!("{label}: {s}")).with_hint(restart_hint));
+            checks.push(Check::fail(format!("{label}: {s}")).with_hint(stale_hint));
         }
         Some(s @ Staleness::Build { .. }) => {
-            checks.push(Check::warn(format!("{label}: {s}")).with_hint(restart_hint));
+            checks.push(Check::warn(format!("{label}: {s}")).with_hint(stale_hint));
         }
     }
 }
@@ -242,7 +242,7 @@ async fn check_local_server(
             check_staleness(
                 &gritty::runinfo::daemon_info_path(&ctl_path),
                 "server",
-                "gritty restart local",
+                "gritty refresh local",
                 &mut checks,
             );
 
@@ -285,7 +285,7 @@ async fn check_local_server(
                 None => String::new(),
             };
             checks.push(
-                Check::warn(format!("server{pid_str}: {msg}")).with_hint("gritty restart local"),
+                Check::warn(format!("server{pid_str}: {msg}")).with_hint("gritty refresh local"),
             );
             // The handshake detected the protocol mismatch; the `.info`
             // sidecar can say which side is stale (running daemon vs on-disk
@@ -293,7 +293,7 @@ async fn check_local_server(
             check_staleness(
                 &gritty::runinfo::daemon_info_path(&ctl_path),
                 "server",
-                "gritty restart local",
+                "gritty refresh local",
                 &mut checks,
             );
         }
@@ -387,7 +387,7 @@ async fn check_tunnels(socket_dir: &Path) -> Vec<Check> {
             check_staleness(
                 &gritty::runinfo::connect_info_path(name),
                 &format!("{name} supervisor"),
-                &format!("gritty restart {name}"),
+                &format!("gritty refresh {name}"),
                 &mut checks,
             );
         }

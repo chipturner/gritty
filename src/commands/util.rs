@@ -448,16 +448,22 @@ pub(crate) async fn info() -> anyhow::Result<()> {
     let pid_path = gritty::daemon::pid_file_path(&ctl_path);
     let pid = std::fs::read_to_string(&pid_path).ok().and_then(|s| s.trim().parse::<u32>().ok());
 
-    match server_request(&ctl_path, Frame::ListSessions).await {
+    // Probe with the version-tolerant request: a running-but-mismatched daemon
+    // must report as running (with the mismatch), not "not running".
+    match server_request_any_version(&ctl_path, Frame::ListSessions).await {
         Ok(Frame::SessionInfo { sessions }) => {
             let n = sessions.len();
+            let s = if n == 1 { "" } else { "s" };
             match pid {
-                Some(p) => {
-                    let s = if n == 1 { "" } else { "s" };
-                    println!("server status:  running (pid {p}, {n} session{s})");
-                }
-                None => println!("server status:  running"),
+                Some(p) => println!("server status:  running (pid {p}, {n} session{s})"),
+                None => println!("server status:  running ({n} session{s})"),
             }
+        }
+        Ok(Frame::Error { code: gritty::protocol::ErrorCode::VersionMismatch, .. }) => {
+            let pid_str = pid.map(|p| format!("pid {p}, ")).unwrap_or_default();
+            println!(
+                "server status:  running ({pid_str}protocol version mismatch -- run `gritty refresh`)"
+            );
         }
         _ => {
             println!("server status:  not running");

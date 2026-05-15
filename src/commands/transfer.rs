@@ -36,36 +36,49 @@ struct DiscoveredSession {
     ctl_path: PathBuf,
 }
 
+/// Result of probing one daemon -- distinguishes a protocol-version mismatch
+/// from a plain unreachable daemon so discovery can give an actionable hint.
+enum ProbeOutcome {
+    /// The daemon answered (the list may still be empty).
+    Sessions(Vec<DiscoveredSession>),
+    /// The daemon is up but speaks a different protocol version.
+    VersionMismatch,
+    /// The daemon could not be reached or did not answer.
+    Unavailable,
+}
+
 /// Probe a single daemon for its sessions.
-async fn probe_daemon_sessions(ctl_path: &Path) -> Vec<DiscoveredSession> {
+async fn probe_daemon_sessions(ctl_path: &Path) -> ProbeOutcome {
     use futures_util::{SinkExt, StreamExt};
     use gritty::protocol::{Frame, FrameCodec};
     use tokio_util::codec::Framed;
 
     let stream = match gritty::security::connect_verified(ctl_path).await {
         Ok(s) => s,
-        Err(_) => return vec![],
+        Err(_) => return ProbeOutcome::Unavailable,
     };
     let mut framed = Framed::new(stream, FrameCodec);
     let info = match gritty::handshake(&mut framed, gritty::get_or_create_device_id()).await {
         Ok(i) => i,
-        Err(_) => return vec![],
+        Err(_) => return ProbeOutcome::Unavailable,
     };
     if gritty::require_matched_version(&info).is_err() {
-        return vec![];
+        return ProbeOutcome::VersionMismatch;
     }
     if framed.send(Frame::ListSessions).await.is_err() {
-        return vec![];
+        return ProbeOutcome::Unavailable;
     }
     match Frame::expect_from(framed.next().await) {
-        Ok(Frame::SessionInfo { sessions }) => sessions
-            .into_iter()
-            .map(|s| DiscoveredSession {
-                session_id: if s.name.is_empty() { s.id.to_string() } else { s.name },
-                ctl_path: ctl_path.to_path_buf(),
-            })
-            .collect(),
-        _ => vec![],
+        Ok(Frame::SessionInfo { sessions }) => ProbeOutcome::Sessions(
+            sessions
+                .into_iter()
+                .map(|s| DiscoveredSession {
+                    session_id: if s.name.is_empty() { s.id.to_string() } else { s.name },
+                    ctl_path: ctl_path.to_path_buf(),
+                })
+                .collect(),
+        ),
+        _ => ProbeOutcome::Unavailable,
     }
 }
 
@@ -89,14 +102,26 @@ async fn discover_all_sessions(
         .map(|path| async move {
             tokio::time::timeout(std::time::Duration::from_secs(2), probe_daemon_sessions(&path))
                 .await
-                .unwrap_or_default()
+                .unwrap_or(ProbeOutcome::Unavailable)
         })
         .collect();
 
-    let results: Vec<DiscoveredSession> =
-        futures_util::future::join_all(futures).await.into_iter().flatten().collect();
+    let mut results: Vec<DiscoveredSession> = Vec::new();
+    let mut saw_version_mismatch = false;
+    for outcome in futures_util::future::join_all(futures).await {
+        match outcome {
+            ProbeOutcome::Sessions(s) => results.extend(s),
+            ProbeOutcome::VersionMismatch => saw_version_mismatch = true,
+            ProbeOutcome::Unavailable => {}
+        }
+    }
 
     if results.is_empty() {
+        if saw_version_mismatch {
+            anyhow::bail!(
+                "no active sessions (a daemon has a protocol version mismatch -- run `gritty refresh`)"
+            );
+        }
         anyhow::bail!("no active sessions");
     }
     Ok(results)

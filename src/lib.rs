@@ -76,7 +76,7 @@ pub async fn handshake(
 pub fn require_matched_version(info: &HandshakeInfo) -> anyhow::Result<()> {
     if info.version != protocol::PROTOCOL_VERSION {
         anyhow::bail!(
-            "protocol version mismatch: local={} remote={}; run `gritty restart <host>` to upgrade",
+            "protocol version mismatch: local={} remote={}; run `gritty refresh` to update",
             protocol::PROTOCOL_VERSION,
             info.version,
         );
@@ -217,6 +217,27 @@ pub fn spawn_channel_relay<R, W, F, G>(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn require_matched_version_accepts_same_version() {
+        let info =
+            HandshakeInfo { version: protocol::PROTOCOL_VERSION, capabilities: 0, server_id: 0 };
+        assert!(require_matched_version(&info).is_ok());
+    }
+
+    // The mismatch guidance must point at the idempotent `gritty refresh`
+    // (the documented recovery), not the scorched-earth `restart`.
+    #[test]
+    fn require_matched_version_points_at_refresh() {
+        let info = HandshakeInfo {
+            version: protocol::PROTOCOL_VERSION.wrapping_add(1),
+            capabilities: 0,
+            server_id: 0,
+        };
+        let err = require_matched_version(&info).unwrap_err().to_string();
+        assert!(err.contains("gritty refresh"), "got: {err}");
+        assert!(!err.contains("restart"), "must not steer users to restart: {err}");
+    }
 
     #[test]
     fn collect_env_vars_only_known_keys() {
