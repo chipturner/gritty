@@ -43,11 +43,32 @@ struct SessionState {
     name: Option<String>,
 }
 
+/// Validate a `GRITTY_SOCKET_DIR` override. It must be a non-empty absolute
+/// path: `daemonize()` does `chdir("/")` before the daemon binds its socket, so
+/// a relative value resolves against three different working directories
+/// (launcher, daemon, client) and produces an opaque three-way path mismatch.
+fn validated_socket_dir_override(dir: &str) -> Result<PathBuf, String> {
+    if dir.is_empty() {
+        return Err("GRITTY_SOCKET_DIR is set but empty".to_string());
+    }
+    let path = PathBuf::from(dir);
+    if !path.is_absolute() {
+        return Err(format!("GRITTY_SOCKET_DIR must be an absolute path (got {dir:?})"));
+    }
+    Ok(path)
+}
+
 /// Returns the base directory for gritty sockets.
 /// Prefers $GRITTY_SOCKET_DIR, then $XDG_RUNTIME_DIR/gritty, falls back to /tmp/gritty-$UID.
 pub fn socket_dir() -> PathBuf {
     if let Ok(dir) = std::env::var("GRITTY_SOCKET_DIR") {
-        return PathBuf::from(dir);
+        match validated_socket_dir_override(&dir) {
+            Ok(path) => return path,
+            Err(e) => {
+                eprintln!("error: {e}");
+                std::process::exit(1);
+            }
+        }
     }
     if let Some(proj) = directories::ProjectDirs::from("", "", "gritty")
         && let Some(runtime) = proj.runtime_dir()
@@ -1000,5 +1021,28 @@ async fn dispatch_control(
             .await;
             false
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::validated_socket_dir_override;
+
+    #[test]
+    fn socket_dir_override_accepts_absolute() {
+        let p = validated_socket_dir_override("/tmp/gritty-test").unwrap();
+        assert!(p.is_absolute());
+    }
+
+    #[test]
+    fn socket_dir_override_rejects_relative() {
+        assert!(validated_socket_dir_override("sockets").is_err());
+        assert!(validated_socket_dir_override("./sockets").is_err());
+        assert!(validated_socket_dir_override("../sockets").is_err());
+    }
+
+    #[test]
+    fn socket_dir_override_rejects_empty() {
+        assert!(validated_socket_dir_override("").is_err());
     }
 }
