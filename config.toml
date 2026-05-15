@@ -1,5 +1,7 @@
 # gritty configuration file
-# $XDG_CONFIG_HOME/gritty/config.toml (default: ~/.config/gritty/config.toml)
+# Linux: ~/.config/gritty/config.toml (honors $XDG_CONFIG_HOME)
+# macOS: ~/Library/Application Support/gritty/config.toml
+# `gritty config` opens it at the right path; `gritty info` prints it.
 #
 # All settings are optional. CLI flags always take priority.
 # Precedence: CLI flag > [host.<name>] > [defaults] > built-in default.
@@ -21,7 +23,7 @@
 [defaults.tunnel]
 # ssh-options = []
 # no-server-start = false
-# isolate-control-path = false  # force ControlPath=none on the tunnel ssh (disables ControlMaster sharing)
+# isolate-control-path = true   # default; forces ControlPath=none on the tunnel ssh. Set false to ride an existing ControlMaster mux.
 # connect-timeout = 30          # ssh -o ConnectTimeout (seconds); 0 = defer to ssh_config
 
 # Per-host overrides, keyed by connection name.

@@ -41,12 +41,12 @@ sequenceDiagram
     participant T as SSH tunnel
     participant S as Session + PTY
 
-    C->>S: Ping (every 5s)
+    C->>S: Ping (every 10s when idle)
     S->>C: Pong
 
     Note over C,T: Network interruption
     C--xS: Ping (no response)
-    Note over C: 15s with no Pong
+    Note over C: 60s with no server frame
 
     rect rgb(255, 245, 245)
     Note over C: [reconnecting...]
@@ -104,7 +104,7 @@ Forwarding multiplexes over the existing session connection -- no extra tunnels.
 
 **Port forwarding** is client-initiated only. The `lf`/`rf` commands communicate with the client process through a local forward socket (`fwd-{host}-{session}.sock`), and the client sends `PortForwardRequest` frames to the server. A compromised server cannot initiate port forwards. All forwarding binds to `127.0.0.1` only.
 
-**Clipboard forwarding** (requires `CAP_CLIPBOARD` negotiation): `gritty copy` and `gritty paste` inside a session relay clipboard data through the svc socket and session connection to the client. The client interacts with the local system clipboard. Clipboard is push-only -- the server can push `ClipboardSet` to the client (rate limited to 5 per 30s), but `ClipboardGet` always returns empty. This prevents a compromised server from reading the client clipboard.
+**Clipboard forwarding** (requires `CAP_CLIPBOARD` negotiation): `gritty copy` inside a session relays clipboard data through the svc socket and session connection to the client. The client interacts with the local system clipboard. Clipboard is push-only -- the server can push `ClipboardSet` to the client (rate limited to 5 per 30s), but `ClipboardGet` always returns empty. This prevents a compromised server from reading the client clipboard.
 
 ## Single-Socket Protocol
 
