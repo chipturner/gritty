@@ -34,6 +34,7 @@ A tunnel named `NAME` owns these files in `socket_dir()`:
 | `connect-NAME.pid`      | `run()` immediately after lock acquired  | Target for `disconnect`'s SIGTERM. |
 | `connect-NAME.sock`     | `ssh -L` bind target                     | Client connects here to reach remote `ctl.sock`. |
 | `connect-NAME.dest`     | `run()` after socket is up               | Original destination string, for `restart` / auto-start recovery. |
+| `connect-NAME.ssh-opts` | `run()` after socket is up               | Pre-merge CLI `-o` options (one per line), replayed on `restart` / auto-start via `tunnel_recreate_args`. Config `ssh-options` are re-resolved and not stored here. |
 | `connect-NAME.log`      | tracing subscriber                       | Supervisor's own structured logs. |
 | `connect-NAME.out`      | daemonize stderr redirection             | ssh child's stderr (forward-setup errors, etc.). |
 | `connect-NAME.remote-sock` | `run()` after post-bind probe succeeds | Cache of remote `ctl.sock` path. Survives teardown so subsequent connects can skip the Preflight `ensure_remote_ready` SSH-exec. |
@@ -55,7 +56,7 @@ Three guards keep that state from becoming destructive:
    `LockIdentity { dev, ino }` from its held flock fd. On drop it compares
    that against `stat(lock_path)`: if they differ (the path was replaced or
    removed), the supervisor is a ghost and removes **nothing** -- the real
-   owner's `.sock`/`.pid`/`.info`/`.dest`/`.lock` all survive. When the
+   owner's `.sock`/`.pid`/`.info`/`.dest`/`.ssh-opts`/`.lock` all survive. When the
    identities match, it unlinks the sidecar files *while still holding the
    flock* (a racing `O_CREAT` after the unlink gets a brand-new inode and
    flocks it independently) and releases the flock last.
@@ -210,8 +211,8 @@ backoff not trip the client's short socket-gone grace.
    startup surfaces as a fast, diagnosable error instead of forcing us to
    wait the full `socket_wait_deadline`.
 2. **Absent -> Starting** -- `try_acquire_lock` returned `Ok`. We own the
-   supervisor role. Clean any stale `.sock`/`.pid`/`.dest` (we don't remove
-   the lock we just acquired), then write the `.pid` file **immediately**
+   supervisor role. Clean any stale `.sock`/`.pid`/`.dest`/`.ssh-opts` (we
+   don't remove the lock we just acquired), then write the `.pid` file **immediately**
    so `disconnect` can find us during the startup window.
 3. **Starting.Preflight -> Starting.SpawnChild** -- if
    `connect-NAME.remote-sock` exists, use its contents as `remote_sock`
@@ -340,7 +341,7 @@ Two entry points into `Stopping`:
   or fell out of the main `select!` because the monitor returned (e.g.
   non-transient exit). `Drop` cancels the stop token, SIGTERMs the ssh
   child directly as a belt-and-braces (the monitor also kills on cancel),
-  then removes `.sock`, `.pid`, `.lock`, `.dest`. The flock is released
+  then removes `.sock`, `.pid`, `.lock`, `.dest`, `.ssh-opts`. The flock is released
   last when `_lock` drops.
 - **`disconnect(name)`** (external command) -- reads `.pid`, sends SIGTERM,
   polls `is_lock_held` for up to 2s. If still held, escalates to SIGKILL

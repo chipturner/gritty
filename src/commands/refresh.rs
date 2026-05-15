@@ -189,8 +189,12 @@ async fn refresh_remote(host: &str, config: &gritty::config::ConfigFile) -> anyh
     // (possibly freshly-refreshed) remote daemon and connects cleanly
     // instead of tripping over a half-restarted one.
     if supervisor_verdict.needs_restart() {
+        // Capture the recreate args (incl. persisted CLI -o options) before
+        // disconnect wipes the sidecars.
+        let recreate = gritty::connect::tunnel_recreate_args(host, &dest);
         gritty::connect::disconnect(host).await?;
-        util::auto_start(&["tunnel-create", "--name", host, &dest])?;
+        let recreate: Vec<&str> = recreate.iter().map(String::as_str).collect();
+        util::auto_start(&recreate)?;
         eprintln!("\x1b[32m\u{25b8} {host} supervisor restarted\x1b[0m");
     }
     Ok(())

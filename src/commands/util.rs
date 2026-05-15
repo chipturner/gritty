@@ -155,11 +155,15 @@ pub(crate) async fn connect_or_start(
                     })
                     .unwrap_or_else(|| host.clone());
                 eprintln!("\x1b[2;33m\u{25b8} starting tunnel {host}...\x1b[0m");
+                // Replay any persisted CLI -o options so a reboot/respawn
+                // doesn't silently lose a ProxyJump/IdentityFile/Port.
+                let recreate = gritty::connect::tunnel_recreate_args(host, &destination);
+                let recreate: Vec<&str> = recreate.iter().map(String::as_str).collect();
                 // Same rationale: `connect::run` returns Ok(0) when another
                 // instance already holds the lock, so a tunnel-create race
                 // is usually fine -- but if auto_start errors for any other
                 // reason, still try to connect before giving up.
-                if let Err(e) = auto_start(&["tunnel-create", "--name", host, &destination]) {
+                if let Err(e) = auto_start(&recreate) {
                     eprintln!(
                         "\x1b[2;33m\u{25b8} auto-start failed ({e}); retrying connect in case another process started one\x1b[0m"
                     );

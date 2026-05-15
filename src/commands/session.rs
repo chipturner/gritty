@@ -1036,12 +1036,16 @@ pub(crate) async fn restart(
                 if trimmed.is_empty() { None } else { Some(trimmed.to_string()) }
             })
             .unwrap_or_else(|| host.clone());
+        // Capture the recreate args (destination + persisted CLI -o options)
+        // *before* disconnect wipes the sidecar files.
+        let recreate = gritty::connect::tunnel_recreate_args(&host, &destination);
         // Tear down the tunnel (the supervisor may already be exiting
         // because the ctl socket vanished when the daemon died, but
         // `disconnect` is idempotent for the "already stopped" case).
         gritty::connect::disconnect(&host).await?;
         eprintln!("\x1b[2;33m\u{25b8} starting tunnel {host}...\x1b[0m");
-        super::util::auto_start(&["tunnel-create", "--name", &host, &destination])?;
+        let recreate: Vec<&str> = recreate.iter().map(String::as_str).collect();
+        super::util::auto_start(&recreate)?;
         eprintln!("\x1b[32m\u{25b8} {host} restarted\x1b[0m");
     }
     Ok(())

@@ -951,6 +951,47 @@ pub fn connect_dest_path(connection_name: &str) -> PathBuf {
     crate::daemon::socket_dir().join(format!("connect-{connection_name}.dest"))
 }
 
+/// Sidecar recording the CLI `-o` SSH options (one per line) so a restart /
+/// auto-start can replay them. Only the *pre-merge* CLI options are stored --
+/// config-file `ssh-options` are re-resolved by `tunnel-create`, so persisting
+/// the merged set would double them on replay.
+pub fn connect_ssh_opts_path(connection_name: &str) -> PathBuf {
+    crate::daemon::socket_dir().join(format!("connect-{connection_name}.ssh-opts"))
+}
+
+/// Read the persisted CLI `-o` SSH options for a tunnel (empty if none).
+pub fn read_persisted_ssh_options(connection_name: &str) -> Vec<String> {
+    std::fs::read_to_string(connect_ssh_opts_path(connection_name))
+        .map(|s| s.lines().filter(|l| !l.is_empty()).map(str::to_string).collect())
+        .unwrap_or_default()
+}
+
+/// Build the `tunnel-create` argument list to recreate a tunnel on restart /
+/// auto-start, replaying any persisted CLI `-o` options. Config `ssh-options`
+/// are intentionally omitted -- `tunnel-create` re-resolves them.
+pub fn tunnel_recreate_args(connection_name: &str, destination: &str) -> Vec<String> {
+    build_tunnel_recreate_args(
+        connection_name,
+        destination,
+        &read_persisted_ssh_options(connection_name),
+    )
+}
+
+fn build_tunnel_recreate_args(
+    connection_name: &str,
+    destination: &str,
+    ssh_options: &[String],
+) -> Vec<String> {
+    let mut args =
+        vec!["tunnel-create".to_string(), "--name".to_string(), connection_name.to_string()];
+    for opt in ssh_options {
+        args.push("-o".to_string());
+        args.push(opt.clone());
+    }
+    args.push(destination.to_string());
+    args
+}
+
 /// Cache of the remote daemon's ctl socket path. Lets a subsequent
 /// `tunnel-create` skip the ~2s `ensure_remote_ready` SSH-exec when the
 /// path is known (it only changes if the remote UID / `XDG_RUNTIME_DIR`
@@ -1256,7 +1297,8 @@ pub fn read_pid_hint(name: &str) -> Option<u32> {
     std::fs::read_to_string(connect_pid_path(name)).ok().and_then(|s| s.trim().parse().ok())
 }
 
-/// Remove the non-lock sidecar files (`.sock`, `.pid`, `.info`, `.dest`).
+/// Remove the non-lock sidecar files (`.sock`, `.pid`, `.info`, `.dest`,
+/// `.ssh-opts`).
 /// Callers must hold the tunnel flock -- either they just acquired it
 /// (`run()`, `cleanup_if_unheld()`) or they verified ownership via
 /// `LockIdentity::matches_path` (`ConnectGuard::drop`). The lock file itself
@@ -1267,6 +1309,7 @@ fn cleanup_stale_files(name: &str) {
     let _ = std::fs::remove_file(connect_pid_path(name));
     let _ = std::fs::remove_file(crate::runinfo::connect_info_path(name));
     let _ = std::fs::remove_file(connect_dest_path(name));
+    let _ = std::fs::remove_file(connect_ssh_opts_path(name));
 }
 
 /// Extract tunnel connection names by globbing lock files in the socket dir.
@@ -1299,6 +1342,7 @@ struct ConnectGuard {
     info_file: PathBuf,
     lock_file: PathBuf,
     dest_file: PathBuf,
+    ssh_opts_file: PathBuf,
     _lock: Option<nix::fcntl::Flock<std::fs::File>>,
     stop: tokio_util::sync::CancellationToken,
 }
@@ -1342,6 +1386,7 @@ impl Drop for ConnectGuard {
             let _ = std::fs::remove_file(&self.pid_file);
             let _ = std::fs::remove_file(&self.info_file);
             let _ = std::fs::remove_file(&self.dest_file);
+            let _ = std::fs::remove_file(&self.ssh_opts_file);
             let _ = std::fs::remove_file(&self.lock_file);
         } else {
             warn!(
@@ -1361,7 +1406,11 @@ impl Drop for ConnectGuard {
 pub struct ConnectOpts {
     pub destination: String,
     pub no_server_start: bool,
+    /// SSH options used to run ssh -- the merged CLI + config set.
     pub ssh_options: Vec<String>,
+    /// Just the CLI `-o` options (pre-merge), persisted so a restart /
+    /// auto-start can replay them without double-counting config options.
+    pub cli_ssh_options: Vec<String>,
     pub name: Option<String>,
     pub dry_run: bool,
     pub foreground: bool,
@@ -1587,6 +1636,7 @@ pub async fn run(opts: ConnectOpts, ready_fd: Option<OwnedFd>) -> anyhow::Result
         info_file: crate::runinfo::connect_info_path(&connection_name),
         lock_file: lock_path,
         dest_file: dest_file.clone(),
+        ssh_opts_file: connect_ssh_opts_path(&connection_name),
         _lock: Some(lock_fd),
         stop: stop.clone(),
     };
@@ -1655,8 +1705,15 @@ pub async fn run(opts: ConnectOpts, ready_fd: Option<OwnedFd>) -> anyhow::Result
     let _ = std::fs::write(&remote_sock_cache, &remote_sock);
 
     // PID is already written (right after we got the lock, above). Record
-    // the original destination so `restart` / auto-start can recover it.
+    // the original destination and the CLI -o options so `restart` /
+    // auto-start can recover them.
     let _ = std::fs::write(&dest_file, &opts.destination);
+    let ssh_opts_file = connect_ssh_opts_path(&connection_name);
+    if opts.cli_ssh_options.is_empty() {
+        let _ = std::fs::remove_file(&ssh_opts_file);
+    } else {
+        let _ = std::fs::write(&ssh_opts_file, opts.cli_ssh_options.join("\n"));
+    }
 
     // 7. Signal readiness to parent (or print if foreground)
     signal_ready(&ready_fd);
@@ -1851,6 +1908,32 @@ mod tests {
         assert_eq!(d.user.as_deref(), Some("user"));
         assert_eq!(d.host, "host");
         assert_eq!(d.port, None);
+    }
+
+    #[test]
+    fn build_tunnel_recreate_args_without_options() {
+        assert_eq!(
+            build_tunnel_recreate_args("dev", "user@dev.example.com", &[]),
+            vec!["tunnel-create", "--name", "dev", "user@dev.example.com"]
+        );
+    }
+
+    #[test]
+    fn build_tunnel_recreate_args_replays_each_option() {
+        let opts = vec!["ProxyJump=bastion".to_string(), "Port=2222".to_string()];
+        assert_eq!(
+            build_tunnel_recreate_args("dev", "dev", &opts),
+            vec![
+                "tunnel-create",
+                "--name",
+                "dev",
+                "-o",
+                "ProxyJump=bastion",
+                "-o",
+                "Port=2222",
+                "dev",
+            ]
+        );
     }
 
     #[test]

@@ -669,11 +669,11 @@ fn main() {
             let opts = gritty::connect::ConnectOpts {
                 destination,
                 no_server_start: no_server_start || resolved.no_server_start,
-                ssh_options: {
-                    let mut opts = ssh_options;
-                    opts.extend(resolved.ssh_options);
-                    opts
-                },
+                ssh_options: merged_ssh_options,
+                // Persist only the pre-merge CLI -o options: tunnel-create
+                // re-resolves config ssh-options on replay, so storing the
+                // merged set would double them.
+                cli_ssh_options: ssh_options,
                 name,
                 dry_run,
                 foreground,
@@ -901,9 +901,23 @@ async fn run(cli: Cli, config: gritty::config::ConfigFile) -> anyhow::Result<()>
         }
         Command::Bootstrap { destination, install_dir, ssh_options } => {
             let host = gritty::connect::parse_host(&destination)?;
-            let connect_timeout = config.resolve_tunnel(&host).connect_timeout;
-            gritty::connect::bootstrap(&destination, &ssh_options, &install_dir, connect_timeout)
-                .await
+            let resolved = config.resolve_tunnel(&host);
+            // Merge configured ssh-options with the CLI ones (CLI first, SSH
+            // first-match wins) -- every other SSH path does this, so a host
+            // reachable only via a configured ProxyJump/IdentityFile/Port
+            // must work for `bootstrap` too.
+            let merged_ssh_options = {
+                let mut opts = ssh_options;
+                opts.extend(resolved.ssh_options);
+                opts
+            };
+            gritty::connect::bootstrap(
+                &destination,
+                &merged_ssh_options,
+                &install_dir,
+                resolved.connect_timeout,
+            )
+            .await
         }
         Command::TunnelDestroy { name } => gritty::connect::disconnect(&name).await,
         Command::Tunnels => {
