@@ -353,7 +353,14 @@ pub(crate) fn clipboard_copy() {
     }
 }
 
-pub(crate) fn open_url(url: &str) {
+/// Forward a URL to the attached client to open locally.
+///
+/// `is_browser_shim` is true when invoked as the `gritty-open` `$BROWSER`
+/// helper. In that case a client that opted out of URL forwarding (or a
+/// detached session) must NOT hard-fail the calling tool (`gh`, `cargo doc
+/// --open`, ...): print the URL for manual opening and exit 0. The explicit
+/// `gritty open <url>` command still reports an error and exits non-zero.
+pub(crate) fn open_url(url: &str, is_browser_shim: bool) {
     use std::io::{Read, Write};
 
     let mut stream = connect_svc_socket(" with --forward-open");
@@ -366,8 +373,17 @@ pub(crate) fn open_url(url: &str) {
     let mut resp = [0u8; 1];
     match stream.read_exact(&mut resp) {
         Ok(()) if resp[0] == 0x00 => {
-            eprintln!("error: no client is connected with --forward-open");
-            std::process::exit(1);
+            if is_browser_shim {
+                eprintln!(
+                    "gritty: could not open URL in your browser (URL forwarding is off \
+                           or no client is attached); open it manually:"
+                );
+                eprintln!("  {url}");
+                // exit 0: do not break the tool that invoked $BROWSER.
+            } else {
+                eprintln!("error: no client is connected with --forward-open");
+                std::process::exit(1);
+            }
         }
         Ok(()) => {} // 0x01 or other = success
         Err(_) => {

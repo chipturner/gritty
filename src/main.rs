@@ -521,7 +521,7 @@ fn main() {
                 std::process::exit(1);
             }
         };
-        open_url(&url);
+        open_url(&url, true);
         return;
     }
 
@@ -882,7 +882,7 @@ async fn run(cli: Cli, config: gritty::config::ConfigFile) -> anyhow::Result<()>
             receive_command(cli.ctl_socket, session, use_stdout, timeout, dir).await
         }
         Command::Open { url } => {
-            open_url(&url);
+            open_url(&url, false);
             Ok(())
         }
         Command::Copy => {
