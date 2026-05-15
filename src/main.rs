@@ -28,6 +28,8 @@ Sessions:
   kill-session           Kill a session
   rename                 Rename a session
   kill-server            Kill the server and all sessions
+  restart                Kill + restart the server (upgrade recovery)
+  refresh                Restart only stale processes (idempotent)
 
 Tunnels:
   tunnels (tun)          List active SSH tunnels
@@ -35,11 +37,13 @@ Tunnels:
   tunnel-destroy         Tear down an SSH tunnel
   bootstrap              Install gritty on a remote host
 
-In-session (run inside a gritty session):
+Forwarding & transfer:
   local-forward (lf)     Forward a port: session to client
   remote-forward (rf)    Forward a port: client to session
   send                   Send files to a paired receiver
   receive                Receive files from a paired sender
+
+In-session (run inside a gritty session):
   open                   Open a URL on the local machine
   copy                   Copy stdin to the client clipboard
 
@@ -906,6 +910,32 @@ async fn run(cli: Cli, config: gritty::config::ConfigFile) -> anyhow::Result<()>
         Command::Completions { shell } => {
             clap_complete::generate(shell, &mut Cli::command(), "gritty", &mut std::io::stdout());
             Ok(())
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn clap_config_is_valid() {
+        Cli::command().debug_assert();
+    }
+
+    // The top-level `gritty --help` uses a hand-written help_template with no
+    // {subcommands} placeholder, so it can silently drift from the Command
+    // enum. Guard it: every subcommand must be named in the rendered help.
+    #[test]
+    fn help_template_lists_every_subcommand() {
+        let help = Cli::command().render_help().to_string();
+        for sub in Cli::command().get_subcommands() {
+            let name = sub.get_name();
+            assert!(
+                help.contains(name),
+                "top-level --help omits subcommand `{name}` -- help_template has \
+                 drifted from the Command enum"
+            );
         }
     }
 }
