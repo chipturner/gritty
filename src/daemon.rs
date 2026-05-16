@@ -143,6 +143,71 @@ fn resolve_session(
     None
 }
 
+/// Validate a proposed session name against the rules shared by `NewSession`
+/// and `RenameSession`, returning the error frame to send on rejection.
+///
+/// Empty names are intentionally not checked here: `NewSession` maps an empty
+/// name to "unnamed" before validating, while `RenameSession` rejects it with
+/// its own distinct `EmptyName` code. Everything else (control chars, purely
+/// numeric, reserved `-`, duplicate) is identical between the two and lives
+/// here so the rules and their exact messages cannot drift.
+fn validate_session_name(name: &str, sessions: &HashMap<u32, SessionState>) -> Result<(), Frame> {
+    if name.bytes().any(|b| b.is_ascii_control()) {
+        return Err(Frame::Error {
+            code: ErrorCode::InvalidName,
+            message: "session name must not contain control characters".to_string(),
+        });
+    }
+    if name.parse::<u32>().is_ok() {
+        return Err(Frame::Error {
+            code: ErrorCode::InvalidName,
+            message: "session name must not be purely numeric (ambiguous with session IDs)"
+                .to_string(),
+        });
+    }
+    if name == "-" {
+        return Err(Frame::Error {
+            code: ErrorCode::InvalidName,
+            message: "session name must not be '-' (reserved for last-attached)".to_string(),
+        });
+    }
+    if sessions.values().any(|s| s.name.as_deref() == Some(name)) {
+        return Err(Frame::Error {
+            code: ErrorCode::NameAlreadyExists,
+            message: format!("session name already exists: {name}"),
+        });
+    }
+    Ok(())
+}
+
+/// Reap finished sessions, then resolve `session` to a *live* session id.
+///
+/// Returns the `NoSuchSession` error frame when the name doesn't resolve, or
+/// when the resolved session's task has already ended (`client_tx` closed) --
+/// in which case the stale entry is removed. Centralizes the
+/// reap -> resolve -> dead-task-sweep skeleton that control arms repeat; the
+/// dead-task check used to be applied inconsistently (Attach/Tail/SendFile had
+/// it, KillSession/RenameSession did not).
+fn resolve_live_session(
+    sessions: &mut HashMap<u32, SessionState>,
+    session: &str,
+    last_attached: Option<u32>,
+) -> Result<u32, Frame> {
+    reap_sessions(sessions);
+    let not_found = || Frame::Error {
+        code: ErrorCode::NoSuchSession,
+        message: format!("no such session: {session}"),
+    };
+    let Some(id) = resolve_session(sessions, session, last_attached) else {
+        return Err(not_found());
+    };
+    if sessions[&id].client_tx.is_closed() {
+        sessions.remove(&id);
+        return Err(not_found());
+    }
+    Ok(id)
+}
+
 /// Read the foreground process command name for a shell pid.
 /// Returns "-" on any failure.
 #[cfg(target_os = "linux")]
@@ -596,57 +661,16 @@ async fn dispatch_control(
             // just exited still lives in `sessions` until the next reap,
             // and would otherwise trigger a spurious NameAlreadyExists.
             reap_sessions(sessions);
-            // Reject names containing control characters
             let name_opt = if name.is_empty() { None } else { Some(name) };
             let command_opt = if command.is_empty() { None } else { Some(command) };
             let cwd_opt = if cwd.is_empty() { None } else { Some(cwd) };
-            if let Some(ref n) = name_opt {
-                if n.bytes().any(|b| b.is_ascii_control()) {
-                    let _ = timed_send(
-                        &mut framed,
-                        Frame::Error {
-                            code: ErrorCode::InvalidName,
-                            message: "session name must not contain control characters".to_string(),
-                        },
-                    )
-                    .await;
-                    return false;
-                }
-                if n.parse::<u32>().is_ok() {
-                    let _ = timed_send(
-                        &mut framed,
-                        Frame::Error {
-                            code: ErrorCode::InvalidName,
-                            message: "session name must not be purely numeric (ambiguous with session IDs)".to_string(),
-                        },
-                    )
-                    .await;
-                    return false;
-                }
-                if n == "-" {
-                    let _ = timed_send(
-                        &mut framed,
-                        Frame::Error {
-                            code: ErrorCode::InvalidName,
-                            message: "session name must not be '-' (reserved for last-attached)"
-                                .to_string(),
-                        },
-                    )
-                    .await;
-                    return false;
-                }
-                let dup = sessions.values().any(|s| s.name.as_deref() == Some(n));
-                if dup {
-                    let _ = timed_send(
-                        &mut framed,
-                        Frame::Error {
-                            code: ErrorCode::NameAlreadyExists,
-                            message: format!("session name already exists: {n}"),
-                        },
-                    )
-                    .await;
-                    return false;
-                }
+            // An empty name means "unnamed" (None); only a provided name is
+            // validated. The rules are shared with RenameSession.
+            if let Some(ref n) = name_opt
+                && let Err(f) = validate_session_name(n, sessions)
+            {
+                let _ = timed_send(&mut framed, f).await;
+                return false;
             }
 
             let id = *next_id;
@@ -896,31 +920,16 @@ async fn dispatch_control(
             false
         }
         Frame::Tail { session } => {
-            reap_sessions(sessions);
-            if let Some(id) = resolve_session(sessions, &session, *last_attached) {
-                let state = &sessions[&id];
-                if state.client_tx.is_closed() {
-                    sessions.remove(&id);
-                    let _ = timed_send(
-                        &mut framed,
-                        Frame::Error {
-                            code: ErrorCode::NoSuchSession,
-                            message: format!("no such session: {session}"),
-                        },
-                    )
-                    .await;
-                } else if timed_send(&mut framed, Frame::Ok).await.is_ok() {
-                    let _ = state.client_tx.send(ClientConn::Tail(framed));
+            let id = match resolve_live_session(sessions, &session, *last_attached) {
+                Ok(id) => id,
+                Err(f) => {
+                    let _ = timed_send(&mut framed, f).await;
+                    return false;
                 }
-            } else {
-                let _ = timed_send(
-                    &mut framed,
-                    Frame::Error {
-                        code: ErrorCode::NoSuchSession,
-                        message: format!("no such session: {session}"),
-                    },
-                )
-                .await;
+            };
+            let state = &sessions[&id];
+            if timed_send(&mut framed, Frame::Ok).await.is_ok() {
+                let _ = state.client_tx.send(ClientConn::Tail(framed));
             }
             false
         }
@@ -931,118 +940,62 @@ async fn dispatch_control(
             false
         }
         Frame::KillSession { session } => {
-            reap_sessions(sessions);
-            if let Some(id) = resolve_session(sessions, &session, *last_attached) {
-                let state = sessions.remove(&id).unwrap();
-                state.handle.abort();
-                info!(id, "session killed");
-                let _ = timed_send(&mut framed, Frame::Ok).await;
-            } else {
-                let _ = timed_send(
-                    &mut framed,
-                    Frame::Error {
-                        code: ErrorCode::NoSuchSession,
-                        message: format!("no such session: {session}"),
-                    },
-                )
-                .await;
-            }
+            let id = match resolve_live_session(sessions, &session, *last_attached) {
+                Ok(id) => id,
+                Err(f) => {
+                    let _ = timed_send(&mut framed, f).await;
+                    return false;
+                }
+            };
+            let state = sessions.remove(&id).unwrap();
+            state.handle.abort();
+            info!(id, "session killed");
+            let _ = timed_send(&mut framed, Frame::Ok).await;
             false
         }
         Frame::SendFile { session } => {
-            reap_sessions(sessions);
-            if let Some(id) = resolve_session(sessions, &session, *last_attached) {
-                let state = &sessions[&id];
-                if state.client_tx.is_closed() {
-                    sessions.remove(&id);
-                    let _ = timed_send(
-                        &mut framed,
-                        Frame::Error {
-                            code: ErrorCode::NoSuchSession,
-                            message: format!("no such session: {session}"),
-                        },
-                    )
-                    .await;
-                } else if timed_send(&mut framed, Frame::Ok).await.is_ok() {
-                    let stream = framed.into_inner();
-                    let _ = state.client_tx.send(ClientConn::Send(stream));
+            let id = match resolve_live_session(sessions, &session, *last_attached) {
+                Ok(id) => id,
+                Err(f) => {
+                    let _ = timed_send(&mut framed, f).await;
+                    return false;
                 }
-            } else {
-                let _ = timed_send(
-                    &mut framed,
-                    Frame::Error {
-                        code: ErrorCode::NoSuchSession,
-                        message: format!("no such session: {session}"),
-                    },
-                )
-                .await;
+            };
+            let state = &sessions[&id];
+            if timed_send(&mut framed, Frame::Ok).await.is_ok() {
+                let stream = framed.into_inner();
+                let _ = state.client_tx.send(ClientConn::Send(stream));
             }
             false
         }
         Frame::RenameSession { session, new_name } => {
-            reap_sessions(sessions);
-            if let Some(id) = resolve_session(sessions, &session, *last_attached) {
-                if new_name.is_empty() {
-                    let _ = timed_send(
-                        &mut framed,
-                        Frame::Error {
-                            code: ErrorCode::EmptyName,
-                            message: "new name must not be empty".to_string(),
-                        },
-                    )
-                    .await;
-                } else if new_name.bytes().any(|b| b.is_ascii_control()) {
-                    let _ = timed_send(
-                        &mut framed,
-                        Frame::Error {
-                            code: ErrorCode::InvalidName,
-                            message: "session name must not contain control characters".to_string(),
-                        },
-                    )
-                    .await;
-                } else if new_name.parse::<u32>().is_ok() {
-                    let _ = timed_send(
-                        &mut framed,
-                        Frame::Error {
-                            code: ErrorCode::InvalidName,
-                            message: "session name must not be purely numeric (ambiguous with session IDs)".to_string(),
-                        },
-                    )
-                    .await;
-                } else if new_name == "-" {
-                    let _ = timed_send(
-                        &mut framed,
-                        Frame::Error {
-                            code: ErrorCode::InvalidName,
-                            message: "session name must not be '-' (reserved for last-attached)"
-                                .to_string(),
-                        },
-                    )
-                    .await;
-                } else if sessions.values().any(|s| s.name.as_deref() == Some(&new_name)) {
-                    let _ = timed_send(
-                        &mut framed,
-                        Frame::Error {
-                            code: ErrorCode::NameAlreadyExists,
-                            message: format!("session name already exists: {new_name}"),
-                        },
-                    )
-                    .await;
-                } else {
-                    sessions.get_mut(&id).unwrap().name = Some(new_name.clone());
-                    info!(id, new_name, "session renamed");
-                    let _ = timed_send(&mut framed, Frame::Ok).await;
+            let id = match resolve_live_session(sessions, &session, *last_attached) {
+                Ok(id) => id,
+                Err(f) => {
+                    let _ = timed_send(&mut framed, f).await;
+                    return false;
                 }
-            } else {
+            };
+            // Empty is rename-specific (distinct EmptyName code); the rest of
+            // the rules are shared with NewSession via validate_session_name.
+            if new_name.is_empty() {
                 let _ = timed_send(
                     &mut framed,
                     Frame::Error {
-                        code: ErrorCode::NoSuchSession,
-                        message: format!("no such session: {session}"),
+                        code: ErrorCode::EmptyName,
+                        message: "new name must not be empty".to_string(),
                     },
                 )
                 .await;
+                return false;
             }
+            if let Err(f) = validate_session_name(&new_name, sessions) {
+                let _ = timed_send(&mut framed, f).await;
+                return false;
+            }
+            sessions.get_mut(&id).unwrap().name = Some(new_name.clone());
+            info!(id, new_name, "session renamed");
+            let _ = timed_send(&mut framed, Frame::Ok).await;
             false
         }
         Frame::KillServer => {
