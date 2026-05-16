@@ -125,18 +125,6 @@ async fn refresh_local(ctl_socket: Option<PathBuf>) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// SSH destination for a tunnel, from the `.dest` sidecar the supervisor
-/// wrote at create time. Falls back to the connection name so a missing
-/// sidecar degrades to "try the name as a hostname" rather than failing.
-fn tunnel_destination(host: &str) -> String {
-    std::fs::read_to_string(gritty::connect::connect_dest_path(host))
-        .ok()
-        .and_then(|s| {
-            let t = s.trim();
-            (!t.is_empty()).then(|| t.to_string())
-        })
-        .unwrap_or_else(|| host.to_string())
-}
 
 /// Refresh a remote host: its tunnel supervisor and, via `gritty refresh
 /// local` over SSH, its remote daemon.
@@ -152,7 +140,7 @@ async fn refresh_remote(host: &str, config: &gritty::config::ConfigFile) -> anyh
         return Ok(());
     }
 
-    let dest = tunnel_destination(host);
+    let dest = gritty::connect::resolve_destination(host);
     let tun_cfg = config.resolve_tunnel(host);
     // resolve_tunnel only knows config `ssh-options`; the CLI `-o` options the
     // tunnel was created with live in the `.ssh-opts` sidecar. Merge them or a

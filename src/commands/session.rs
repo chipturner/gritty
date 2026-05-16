@@ -1029,13 +1029,7 @@ pub(crate) async fn restart(
         // before disconnect wipes it. Using just `host` here would collapse
         // `user@server.example.com:2222` down to the friendly connection
         // name and break SSH.
-        let destination = std::fs::read_to_string(gritty::connect::connect_dest_path(&host))
-            .ok()
-            .and_then(|s| {
-                let trimmed = s.trim();
-                if trimmed.is_empty() { None } else { Some(trimmed.to_string()) }
-            })
-            .unwrap_or_else(|| host.clone());
+        let destination = gritty::connect::resolve_destination(&host);
         // Capture the recreate args (destination + persisted CLI -o options)
         // *before* disconnect wipes the sidecar files.
         let recreate = gritty::connect::tunnel_recreate_args(&host, &destination);

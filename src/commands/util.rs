@@ -142,18 +142,9 @@ pub(crate) async fn connect_or_start(
             AutoStart::Tunnel(host) => {
                 // The connection name alone is not a valid SSH destination
                 // when the user originally passed `user@host`, `host:port`,
-                // or `--name <alias>`. Recover the original destination
-                // from the `.dest` sidecar written by connect::run; fall
-                // back to the connection name only if the sidecar is
-                // missing (first-ever connection to this alias).
-                let dest_path = gritty::connect::connect_dest_path(host);
-                let destination = std::fs::read_to_string(&dest_path)
-                    .ok()
-                    .and_then(|s| {
-                        let trimmed = s.trim();
-                        if trimmed.is_empty() { None } else { Some(trimmed.to_string()) }
-                    })
-                    .unwrap_or_else(|| host.clone());
+                // or `--name <alias>`. Recover the original destination from
+                // the `.dest` sidecar (falls back to the name if missing).
+                let destination = gritty::connect::resolve_destination(host);
                 eprintln!("\x1b[2;33m\u{25b8} starting tunnel {host}...\x1b[0m");
                 // Replay any persisted CLI -o options so a reboot/respawn
                 // doesn't silently lose a ProxyJump/IdentityFile/Port.

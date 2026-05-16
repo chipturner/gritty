@@ -939,25 +939,59 @@ async fn ensure_remote_ready(
 // Local socket path
 // ---------------------------------------------------------------------------
 
+/// Path of a per-tunnel sidecar file: `{socket_dir}/connect-{name}.{ext}`.
+///
+/// Single source of the sidecar naming convention -- all the typed accessors
+/// below delegate here so the `connect-` prefix and per-extension layout
+/// cannot drift.
+fn connect_sidecar_path(connection_name: &str, ext: &str) -> PathBuf {
+    crate::daemon::socket_dir().join(format!("connect-{connection_name}.{ext}"))
+}
+
 /// Compute a deterministic local socket path based on the destination.
 ///
 /// Using the raw destination string means re-running `gritty tunnel-create user@host`
 /// produces the same socket path, so sessions that used `--ctl-socket` can
 /// auto-reconnect after a tunnel restart.
 fn local_socket_path(destination: &str) -> PathBuf {
-    crate::daemon::socket_dir().join(format!("connect-{destination}.sock"))
+    connect_sidecar_path(destination, "sock")
 }
 
 fn connect_pid_path(connection_name: &str) -> PathBuf {
-    crate::daemon::socket_dir().join(format!("connect-{connection_name}.pid"))
+    connect_sidecar_path(connection_name, "pid")
 }
 
 fn connect_lock_path(connection_name: &str) -> PathBuf {
-    crate::daemon::socket_dir().join(format!("connect-{connection_name}.lock"))
+    connect_sidecar_path(connection_name, "lock")
 }
 
 pub fn connect_dest_path(connection_name: &str) -> PathBuf {
-    crate::daemon::socket_dir().join(format!("connect-{connection_name}.dest"))
+    connect_sidecar_path(connection_name, "dest")
+}
+
+/// Pure core of [`resolve_destination`]: a trimmed, non-empty sidecar value,
+/// else the connection name.
+fn destination_from_sidecar(contents: Option<String>, connection_name: &str) -> String {
+    contents
+        .and_then(|s| {
+            let t = s.trim();
+            (!t.is_empty()).then(|| t.to_string())
+        })
+        .unwrap_or_else(|| connection_name.to_string())
+}
+
+/// The SSH destination for a tunnel: the original `user@host:port` (or
+/// `--name` alias target) recorded in the `.dest` sidecar by `connect::run`.
+///
+/// Falls back to the connection name only when the sidecar is missing or empty
+/// (first-ever connection). Using the connection name unconditionally would
+/// collapse `user@server.example.com:2222` to the friendly alias and break
+/// SSH, so this must stay the single source for that recovery.
+pub fn resolve_destination(connection_name: &str) -> String {
+    destination_from_sidecar(
+        std::fs::read_to_string(connect_dest_path(connection_name)).ok(),
+        connection_name,
+    )
 }
 
 /// Sidecar recording the CLI `-o` SSH options (one per line) so a restart /
@@ -965,7 +999,7 @@ pub fn connect_dest_path(connection_name: &str) -> PathBuf {
 /// config-file `ssh-options` are re-resolved by `tunnel-create`, so persisting
 /// the merged set would double them on replay.
 pub fn connect_ssh_opts_path(connection_name: &str) -> PathBuf {
-    crate::daemon::socket_dir().join(format!("connect-{connection_name}.ssh-opts"))
+    connect_sidecar_path(connection_name, "ssh-opts")
 }
 
 /// Read the persisted CLI `-o` SSH options for a tunnel (empty if none).
@@ -1021,15 +1055,15 @@ fn build_tunnel_recreate_args(
 /// changes). Deliberately NOT removed on tunnel teardown -- it is a
 /// persistence cache, not live state.
 pub fn connect_remote_sock_path(connection_name: &str) -> PathBuf {
-    crate::daemon::socket_dir().join(format!("connect-{connection_name}.remote-sock"))
+    connect_sidecar_path(connection_name, "remote-sock")
 }
 
 pub fn connect_log_path(connection_name: &str) -> PathBuf {
-    crate::daemon::socket_dir().join(format!("connect-{connection_name}.log"))
+    connect_sidecar_path(connection_name, "log")
 }
 
 pub fn connect_out_path(connection_name: &str) -> PathBuf {
-    crate::daemon::socket_dir().join(format!("connect-{connection_name}.out"))
+    connect_sidecar_path(connection_name, "out")
 }
 
 /// Compute the local socket path for a given connection name.
@@ -2827,5 +2861,19 @@ mod tests {
         assert_eq!(merge_ssh_options(&[], &[]), Vec::<String>::new());
         assert_eq!(merge_ssh_options(&["A=1".to_string()], &[]), vec!["A=1".to_string()]);
         assert_eq!(merge_ssh_options(&[], &["B=2".to_string()]), vec!["B=2".to_string()]);
+    }
+
+    #[test]
+    fn destination_from_sidecar_prefers_trimmed_contents() {
+        assert_eq!(
+            destination_from_sidecar(Some("user@host:2222\n".to_string()), "alias"),
+            "user@host:2222"
+        );
+    }
+
+    #[test]
+    fn destination_from_sidecar_falls_back_on_missing_or_empty() {
+        assert_eq!(destination_from_sidecar(None, "alias"), "alias");
+        assert_eq!(destination_from_sidecar(Some("   \n".to_string()), "alias"), "alias");
     }
 }
