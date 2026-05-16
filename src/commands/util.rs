@@ -44,13 +44,21 @@ pub(crate) fn resolve_ctl_path(
     }
 }
 
-async fn server_request_inner(
+/// A control connection whose version handshake is complete, kept open so the
+/// caller can keep streaming on it (unlike the one-shot [`server_request`]).
+pub(crate) type HandshakedConn =
+    tokio_util::codec::Framed<tokio::net::UnixStream, gritty::protocol::FrameCodec>;
+
+/// Connect to a daemon control socket and complete the version handshake,
+/// returning the live `Framed` plus the [`gritty::HandshakeInfo`] (callers
+/// such as `tail` need `server_id` for reconnect detection). A failed connect
+/// maps to the standard "no server running" error. `check_version` mirrors the
+/// [`server_request`] / [`server_request_any_version`] split.
+pub(crate) async fn connect_handshaked(
     ctl_path: &Path,
-    frame: gritty::protocol::Frame,
     check_version: bool,
-) -> anyhow::Result<gritty::protocol::Frame> {
-    use futures_util::{SinkExt, StreamExt};
-    use gritty::protocol::{Frame, FrameCodec};
+) -> anyhow::Result<(HandshakedConn, gritty::HandshakeInfo)> {
+    use gritty::protocol::FrameCodec;
     use tokio_util::codec::Framed;
 
     let stream = gritty::security::connect_verified(ctl_path).await.map_err(|_| {
@@ -61,6 +69,18 @@ async fn server_request_inner(
     if check_version {
         gritty::require_matched_version(&info)?;
     }
+    Ok((framed, info))
+}
+
+async fn server_request_inner(
+    ctl_path: &Path,
+    frame: gritty::protocol::Frame,
+    check_version: bool,
+) -> anyhow::Result<gritty::protocol::Frame> {
+    use futures_util::{SinkExt, StreamExt};
+    use gritty::protocol::Frame;
+
+    let (mut framed, _info) = connect_handshaked(ctl_path, check_version).await?;
     framed.send(frame).await?;
     Frame::expect_from(framed.next().await)
 }

@@ -153,16 +153,10 @@ async fn send_file_handshake(
     role: u8,
 ) -> anyhow::Result<tokio::net::UnixStream> {
     use futures_util::{SinkExt, StreamExt};
-    use gritty::protocol::{Frame, FrameCodec};
+    use gritty::protocol::Frame;
     use tokio::io::AsyncWriteExt;
-    use tokio_util::codec::Framed;
 
-    let stream = gritty::security::connect_verified(ctl_path).await.map_err(|_| {
-        anyhow::anyhow!("no server running (could not connect to {})", ctl_path.display())
-    })?;
-    let mut framed = Framed::new(stream, FrameCodec);
-    let info = gritty::handshake(&mut framed, gritty::get_or_create_device_id()).await?;
-    gritty::require_matched_version(&info)?;
+    let (mut framed, _info) = super::util::connect_handshaked(ctl_path, true).await?;
     framed.send(Frame::SendFile { session: session.to_string() }).await?;
 
     match Frame::expect_from(framed.next().await)? {

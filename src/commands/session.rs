@@ -904,20 +904,14 @@ async fn alert_detached_sessions(current_name: &str, ctl_path: &Path) {
 
 pub(crate) async fn tail_session(target: String, ctl_path: PathBuf) -> anyhow::Result<i32> {
     use futures_util::{SinkExt, StreamExt};
-    use gritty::protocol::{Frame, FrameCodec};
-    use tokio_util::codec::Framed;
+    use gritty::protocol::Frame;
 
     // Resolve the target to a numeric id before opening the tail stream so
     // reconnect can reuse that id (the original target string may be `-`
     // or a name that can shift while we're tailing).
     let session_id = resolve_session_id(&ctl_path, &target).await?;
 
-    let stream = gritty::security::connect_verified(&ctl_path).await.map_err(|_| {
-        anyhow::anyhow!("no server running (could not connect to {})", ctl_path.display())
-    })?;
-    let mut framed = Framed::new(stream, FrameCodec);
-    let info = gritty::handshake(&mut framed, gritty::get_or_create_device_id()).await?;
-    gritty::require_matched_version(&info)?;
+    let (mut framed, info) = super::util::connect_handshaked(&ctl_path, true).await?;
     let server_id = info.server_id;
     framed.send(Frame::Tail { session: session_id.to_string() }).await?;
 
