@@ -461,6 +461,56 @@ pub(crate) async fn send_command(
     Ok(())
 }
 
+/// Stream the received file protocol from `reader`, writing every payload to
+/// `out`, and flush `out` before returning (returning the file count).
+///
+/// The flush is load-bearing: `receive -` writes to `tokio::io::stdout()`,
+/// whose blocking `LineWriter` is not flushed at process exit, so without an
+/// explicit flush the tail of a non-newline-terminated payload (the canonical
+/// `gritty receive - | tar xzf -` case) is silently truncated.
+async fn receive_to_writer<R, W>(reader: &mut R, out: &mut W) -> anyhow::Result<u32>
+where
+    R: tokio::io::AsyncRead + Unpin,
+    W: tokio::io::AsyncWrite + Unpin,
+{
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    let mut received = 0u32;
+    let mut buf = vec![0u8; 64 * 1024];
+    loop {
+        let mut buf2 = [0u8; 2];
+        reader.read_exact(&mut buf2).await?;
+        let name_len = u16::from_be_bytes(buf2) as usize;
+        if name_len == 0 {
+            break; // sentinel
+        }
+        let mut name_buf = vec![0u8; name_len];
+        reader.read_exact(&mut name_buf).await?;
+        let name = String::from_utf8(name_buf)?;
+        // Validate even though stdout mode ignores the name, to keep the
+        // accepted/rejected inputs identical to the receive-to-dir path.
+        sanitize_path(&name)?;
+
+        let mut buf8 = [0u8; 8];
+        reader.read_exact(&mut buf8).await?;
+        let file_size = u64::from_be_bytes(buf8);
+        let mut buf4 = [0u8; 4];
+        reader.read_exact(&mut buf4).await?;
+        let _mode = u32::from_be_bytes(buf4);
+
+        let mut remaining = file_size;
+        while remaining > 0 {
+            let to_read = (remaining as usize).min(buf.len());
+            reader.read_exact(&mut buf[..to_read]).await?;
+            out.write_all(&buf[..to_read]).await?;
+            remaining -= to_read as u64;
+        }
+        received += 1;
+    }
+    out.flush().await?;
+    Ok(received)
+}
+
 pub(crate) async fn receive_command(
     ctl_socket: Option<PathBuf>,
     session: Option<String>,
@@ -529,10 +579,17 @@ pub(crate) async fn receive_command(
         wait_for_pair.await?
     };
 
-    // Read per-file metadata and data
+    // Pipe mode: stream every payload straight to stdout and flush (see
+    // receive_to_writer -- the flush prevents silent tail truncation).
+    if use_stdout {
+        let mut out = tokio::io::stdout();
+        receive_to_writer(&mut stream, &mut out).await?;
+        return Ok(());
+    }
+
+    // Read per-file metadata and data into the destination directory.
     let mut received = 0u32;
     let mut buf = vec![0u8; 64 * 1024];
-    let mut stdout = if use_stdout { Some(tokio::io::stdout()) } else { None };
     loop {
         // Read filename_len (u16 BE)
         let mut buf2 = [0u8; 2];
@@ -556,57 +613,44 @@ pub(crate) async fn receive_command(
         stream.read_exact(&mut buf4).await?;
         let mode = u32::from_be_bytes(buf4);
 
-        if let Some(ref mut out) = stdout {
-            // Write data to stdout
-            let mut remaining = file_size;
-            while remaining > 0 {
-                let to_read = (remaining as usize).min(buf.len());
-                stream.read_exact(&mut buf[..to_read]).await?;
-                out.write_all(&buf[..to_read]).await?;
-                remaining -= to_read as u64;
-            }
-        } else {
-            let s = if file_count == 1 { "" } else { "s" };
-            if received == 0 {
-                eprintln!("\x1b[2;33m\u{25b8} receiving {file_count} file{s}\x1b[0m");
-            }
-
-            // Write file data (create parent dirs for nested paths)
-            let file_path = dest_dir.join(&name);
-            if let Some(parent) = file_path.parent() {
-                tokio::fs::create_dir_all(parent).await?;
-            }
-            let recv_mode = if mode == 0 { 0o644 } else { mode & 0o7777 };
-            let mut file = tokio::fs::OpenOptions::new()
-                .write(true)
-                .create(true)
-                .truncate(true)
-                .mode(recv_mode)
-                .open(&file_path)
-                .await?;
-            let mut remaining = file_size;
-            let mut transferred = 0u64;
-            let mut last_render = std::time::Instant::now();
-            while remaining > 0 {
-                let to_read = (remaining as usize).min(buf.len());
-                stream.read_exact(&mut buf[..to_read]).await?;
-                file.write_all(&buf[..to_read]).await?;
-                remaining -= to_read as u64;
-                transferred += to_read as u64;
-                print_progress(&name, transferred, file_size, &mut last_render);
-            }
-            eprintln!();
+        let s = if file_count == 1 { "" } else { "s" };
+        if received == 0 {
+            eprintln!("\x1b[2;33m\u{25b8} receiving {file_count} file{s}\x1b[0m");
         }
+
+        // Write file data (create parent dirs for nested paths)
+        let file_path = dest_dir.join(&name);
+        if let Some(parent) = file_path.parent() {
+            tokio::fs::create_dir_all(parent).await?;
+        }
+        let recv_mode = if mode == 0 { 0o644 } else { mode & 0o7777 };
+        let mut file = tokio::fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .mode(recv_mode)
+            .open(&file_path)
+            .await?;
+        let mut remaining = file_size;
+        let mut transferred = 0u64;
+        let mut last_render = std::time::Instant::now();
+        while remaining > 0 {
+            let to_read = (remaining as usize).min(buf.len());
+            stream.read_exact(&mut buf[..to_read]).await?;
+            file.write_all(&buf[..to_read]).await?;
+            remaining -= to_read as u64;
+            transferred += to_read as u64;
+            print_progress(&name, transferred, file_size, &mut last_render);
+        }
+        eprintln!();
         received += 1;
     }
 
-    if !use_stdout {
-        if received == 0 {
-            eprintln!("\x1b[2;33m\u{25b8} no files received\x1b[0m");
-        } else {
-            let s = if received == 1 { "" } else { "s" };
-            eprintln!("\x1b[32m\u{25b8} received {received} file{s}\x1b[0m");
-        }
+    if received == 0 {
+        eprintln!("\x1b[2;33m\u{25b8} no files received\x1b[0m");
+    } else {
+        let s = if received == 1 { "" } else { "s" };
+        eprintln!("\x1b[32m\u{25b8} received {received} file{s}\x1b[0m");
     }
     Ok(())
 }
@@ -695,5 +739,89 @@ mod tests {
         // `send a/README.md b/README.md` -- both reduce to README.md.
         let err = reject_duplicate_names(["README.md", "README.md"]).unwrap_err();
         assert!(err.to_string().contains("duplicate file name"), "{err}");
+    }
+
+    /// Writer that models `tokio::io::Stdout`'s hazard: bytes sit in an
+    /// unflushed buffer and only reach the "output" on an explicit
+    /// flush/shutdown. A receiver that forgets to flush loses the tail.
+    #[derive(Default)]
+    struct BufferedSink {
+        pending: Vec<u8>,
+        flushed: Vec<u8>,
+    }
+
+    impl tokio::io::AsyncWrite for BufferedSink {
+        fn poll_write(
+            mut self: std::pin::Pin<&mut Self>,
+            _: &mut std::task::Context<'_>,
+            buf: &[u8],
+        ) -> std::task::Poll<std::io::Result<usize>> {
+            self.pending.extend_from_slice(buf);
+            std::task::Poll::Ready(Ok(buf.len()))
+        }
+
+        fn poll_flush(
+            mut self: std::pin::Pin<&mut Self>,
+            _: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<std::io::Result<()>> {
+            let p = std::mem::take(&mut self.pending);
+            self.flushed.extend_from_slice(&p);
+            std::task::Poll::Ready(Ok(()))
+        }
+
+        fn poll_shutdown(
+            self: std::pin::Pin<&mut Self>,
+            cx: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<std::io::Result<()>> {
+            self.poll_flush(cx)
+        }
+    }
+
+    fn encode_one_file(name: &str, payload: &[u8]) -> Vec<u8> {
+        let mut v = Vec::new();
+        v.extend_from_slice(&(name.len() as u16).to_be_bytes());
+        v.extend_from_slice(name.as_bytes());
+        v.extend_from_slice(&(payload.len() as u64).to_be_bytes());
+        v.extend_from_slice(&0u32.to_be_bytes()); // mode
+        v.extend_from_slice(payload);
+        v.extend_from_slice(&0u16.to_be_bytes()); // end sentinel
+        v
+    }
+
+    // Regression for bug_022: the stdout receive path must flush at end of
+    // transfer, or the tail of a non-newline-terminated payload (a tar/gzip
+    // stream) is silently dropped.
+    #[tokio::test]
+    async fn receive_to_writer_flushes_tail() {
+        let payload = [0xDEu8, 0xAD, 0xBE, 0xEF]; // no trailing newline
+        let input = encode_one_file("a.bin", &payload);
+        let mut reader: &[u8] = &input;
+        let mut sink = BufferedSink::default();
+
+        let n = receive_to_writer(&mut reader, &mut sink).await.unwrap();
+
+        assert_eq!(n, 1);
+        assert!(sink.pending.is_empty(), "bytes left unflushed -- tail would be lost");
+        assert_eq!(sink.flushed, payload, "flushed output must be the full payload");
+    }
+
+    #[tokio::test]
+    async fn receive_to_writer_concats_multiple_files() {
+        let mut input = encode_one_file("a", b"hello");
+        // Second file: reuse encoder but strip its leading-in-nothing; just
+        // build a two-file stream manually to exercise the loop.
+        input.truncate(input.len() - 2); // drop first sentinel
+        input.extend_from_slice(&(1u16).to_be_bytes());
+        input.extend_from_slice(b"b");
+        input.extend_from_slice(&(5u64).to_be_bytes());
+        input.extend_from_slice(&0u32.to_be_bytes());
+        input.extend_from_slice(b"world");
+        input.extend_from_slice(&0u16.to_be_bytes());
+
+        let mut reader: &[u8] = &input;
+        let mut sink = BufferedSink::default();
+        let n = receive_to_writer(&mut reader, &mut sink).await.unwrap();
+        assert_eq!(n, 2);
+        assert_eq!(sink.flushed, b"helloworld");
     }
 }
