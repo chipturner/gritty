@@ -471,20 +471,27 @@ fn classify_exit(status: std::process::ExitStatus) -> ExitClass {
     }
 }
 
-/// Given the previous backoff and the just-exited child's uptime,
-/// returns `(sleep_duration, next_backoff)`:
-/// - `sleep_duration`: how long to wait before the next respawn.
-/// - `next_backoff`: the value to carry forward (doubled, capped
-///   at `MAX_RESPAWN_BACKOFF`).
+/// How long to wait before the next respawn, given the previous backoff and
+/// the just-exited child's uptime.
 ///
-/// If the prior child lived at least `HEALTHY_CHILD_THRESHOLD`, the
-/// cycle is considered healthy and the sleep resets to
-/// `MIN_RESPAWN_BACKOFF` before doubling -- so a tunnel that stabilized
-/// for 30s+ gets an aggressive 1s retry on its first death.
-fn next_backoff(prev: Duration, prior_uptime: Duration) -> (Duration, Duration) {
-    let sleep = if prior_uptime >= HEALTHY_CHILD_THRESHOLD { MIN_RESPAWN_BACKOFF } else { prev };
-    let next = (sleep * 2).min(MAX_RESPAWN_BACKOFF);
-    (sleep, next)
+/// If the prior child lived at least `HEALTHY_CHILD_THRESHOLD` the cycle is
+/// considered healthy and the sleep resets to `MIN_RESPAWN_BACKOFF` -- so a
+/// tunnel that stabilized for 30s+ gets an aggressive 1s retry on its first
+/// death. Otherwise the already-climbing previous backoff is reused. The
+/// progression is advanced separately via [`double_backoff`] after the wait
+/// (the wait can shorten `sleep`, e.g. on a network-recovery wake).
+fn respawn_sleep(prev: Duration, prior_uptime: Duration) -> Duration {
+    if prior_uptime >= HEALTHY_CHILD_THRESHOLD { MIN_RESPAWN_BACKOFF } else { prev }
+}
+
+/// Advance the respawn backoff: double it, clamped to
+/// `[MIN_RESPAWN_BACKOFF, MAX_RESPAWN_BACKOFF]`.
+///
+/// The lower clamp is load-bearing, not cosmetic: the `we_killed` path sleeps
+/// for `Duration::ZERO`, so a plain `* 2` would pin the backoff at zero and
+/// defeat the climb. This is the single source of the doubling rule.
+fn double_backoff(cur: Duration) -> Duration {
+    (cur.max(MIN_RESPAWN_BACKOFF) * 2).min(MAX_RESPAWN_BACKOFF)
 }
 
 /// Per-child supervised state. Grouping child handle, spawn time, and
@@ -719,8 +726,7 @@ async fn tunnel_monitor(
                     we_killed = false;
                     Duration::ZERO
                 } else {
-                    let (s, _) = next_backoff(backoff, died_uptime);
-                    s
+                    respawn_sleep(backoff, died_uptime)
                 };
                 let mut backoff_saw_unsatisfied = false;
 
@@ -794,7 +800,7 @@ async fn tunnel_monitor(
                             _ = stop.cancelled() => return,
                         }
                     }
-                    backoff = (sleep.max(MIN_RESPAWN_BACKOFF) * 2).min(MAX_RESPAWN_BACKOFF);
+                    backoff = double_backoff(sleep);
 
                     // Re-run ensure_remote_ready so a remote that rebooted,
                     // crashed, or was upgraded gets its gritty server
@@ -2616,7 +2622,7 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // classify_exit / next_backoff (pure helpers)
+    // classify_exit / respawn_sleep / double_backoff (pure helpers)
     // -----------------------------------------------------------------------
 
     /// Build an `ExitStatus` with a given exit code (Unix wait status
@@ -2670,34 +2676,25 @@ mod tests {
     }
 
     #[test]
-    fn next_backoff_resets_after_healthy_child() {
+    fn respawn_sleep_resets_after_healthy_child() {
         // Child lived 45s > HEALTHY_CHILD_THRESHOLD (30s): sleep resets to MIN
-        let (sleep, next) = next_backoff(Duration::from_secs(16), Duration::from_secs(45));
+        let sleep = respawn_sleep(Duration::from_secs(16), Duration::from_secs(45));
         assert_eq!(sleep, MIN_RESPAWN_BACKOFF);
-        assert_eq!(next, Duration::from_secs(2));
     }
 
     #[test]
-    fn next_backoff_keeps_growing_after_unhealthy_child() {
-        let (sleep, next) = next_backoff(Duration::from_secs(8), Duration::from_secs(5));
+    fn respawn_sleep_keeps_growing_after_unhealthy_child() {
+        let sleep = respawn_sleep(Duration::from_secs(8), Duration::from_secs(5));
         assert_eq!(sleep, Duration::from_secs(8));
-        assert_eq!(next, Duration::from_secs(16));
     }
 
     #[test]
-    fn next_backoff_caps_at_max() {
-        let (sleep, next) = next_backoff(MAX_RESPAWN_BACKOFF, Duration::from_secs(5));
-        assert_eq!(sleep, MAX_RESPAWN_BACKOFF);
-        assert_eq!(next, MAX_RESPAWN_BACKOFF);
-    }
-
-    #[test]
-    fn next_backoff_threshold_is_inclusive() {
+    fn respawn_sleep_threshold_is_inclusive() {
         // exactly HEALTHY_CHILD_THRESHOLD: counts as healthy
-        let (sleep, _) = next_backoff(Duration::from_secs(16), HEALTHY_CHILD_THRESHOLD);
+        let sleep = respawn_sleep(Duration::from_secs(16), HEALTHY_CHILD_THRESHOLD);
         assert_eq!(sleep, MIN_RESPAWN_BACKOFF);
         // just under threshold: unhealthy, keeps current backoff
-        let (sleep, _) = next_backoff(
+        let sleep = respawn_sleep(
             Duration::from_secs(16),
             HEALTHY_CHILD_THRESHOLD - Duration::from_millis(1),
         );
@@ -2705,11 +2702,18 @@ mod tests {
     }
 
     #[test]
-    fn next_backoff_initial_value_doubles_to_two_seconds() {
-        // First failure of a short-lived child: sleep=1s, next=2s
-        let (sleep, next) = next_backoff(MIN_RESPAWN_BACKOFF, Duration::from_secs(2));
-        assert_eq!(sleep, MIN_RESPAWN_BACKOFF);
-        assert_eq!(next, Duration::from_secs(2));
+    fn double_backoff_doubles_and_caps() {
+        assert_eq!(double_backoff(MIN_RESPAWN_BACKOFF), Duration::from_secs(2));
+        assert_eq!(double_backoff(Duration::from_secs(8)), Duration::from_secs(16));
+        assert_eq!(double_backoff(MAX_RESPAWN_BACKOFF), MAX_RESPAWN_BACKOFF);
+    }
+
+    #[test]
+    fn double_backoff_climbs_from_zero() {
+        // The we_killed path sleeps for ZERO; the backoff must still advance
+        // to a full MIN step, not collapse to zero (the divergence that the
+        // discarded next_backoff second return would have reintroduced).
+        assert_eq!(double_backoff(Duration::ZERO), Duration::from_secs(2));
     }
 
     // --- ensure_remote_ready output parsing -------------------------------
