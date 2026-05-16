@@ -104,11 +104,32 @@ pub fn device_id_path() -> std::path::PathBuf {
 ///
 /// Stored in `$XDG_STATE_HOME/gritty/device_id` (typically `~/.local/state/gritty/device_id`).
 /// The value is a random non-zero `u64` generated via `getrandom`.
+///
+/// The result is memoized for the life of the process. This is load-bearing,
+/// not an optimization: the daemon records the Hello's `device_id` as the
+/// session owner, and the client must auto-reconnect with the *same* value or
+/// the server rejects it with a spurious `OwnerChanged`. The id is requested
+/// from several independent call sites (the Hello handshake and the client
+/// config, per connect). If the backing file cannot be persisted (read-only
+/// or full `$HOME`, container, sandbox) each un-memoized call would generate a
+/// fresh random id, so the owner recorded at handshake and the value used for
+/// the first auto-reconnect would differ -- silently breaking reconnect
+/// exactly where it is needed most. Caching once per process closes that gap.
 pub fn get_or_create_device_id() -> u64 {
-    let path = device_id_path();
+    static CACHED: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    *CACHED.get_or_init(|| load_or_create_device_id(&device_id_path()))
+}
 
+/// Read an existing device id from `path`, or generate a new non-zero random
+/// one and persist it best-effort.
+///
+/// Not memoized: a failed persist makes successive calls return *different*
+/// ids, which is why [`get_or_create_device_id`] wraps this in a process-wide
+/// cache. Kept separate so the read/persist contract is unit-testable without
+/// touching the real state directory.
+fn load_or_create_device_id(path: &std::path::Path) -> u64 {
     // Try reading an existing ID first.
-    if let Ok(contents) = std::fs::read_to_string(&path)
+    if let Ok(contents) = std::fs::read_to_string(path)
         && let Ok(id) = contents.trim().parse::<u64>()
         && id != 0
     {
@@ -120,15 +141,16 @@ pub fn get_or_create_device_id() -> u64 {
     getrandom::fill(&mut buf).expect("getrandom failed");
     let id = u64::from_ne_bytes(buf) | 1;
 
-    // Persist -- best-effort; failure is non-fatal (we'll regenerate next time).
+    // Persist -- best-effort; failure is non-fatal (the process-wide cache in
+    // get_or_create_device_id keeps us consistent until the next run).
     if let Some(dir) = path.parent() {
         let _ = security::secure_create_dir_all(dir);
     }
-    if std::fs::write(&path, format!("{id}\n")).is_ok() {
+    if std::fs::write(path, format!("{id}\n")).is_ok() {
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
-            let _ = std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600));
+            let _ = std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600));
         }
     }
 
@@ -300,6 +322,49 @@ mod tests {
         if std::env::var("TERM").is_ok() {
             let vars = collect_env_vars();
             assert!(vars.iter().any(|(k, _)| k == "TERM"));
+        }
+    }
+
+    #[test]
+    fn device_id_round_trips_through_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("device_id");
+        let first = load_or_create_device_id(&path);
+        assert_ne!(first, 0, "generated id must be non-zero");
+        assert!(path.exists(), "id must be persisted on first call");
+        // A second call must read the persisted id back, not regenerate.
+        assert_eq!(load_or_create_device_id(&path), first);
+    }
+
+    #[test]
+    fn device_id_prefers_existing_valid_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("device_id");
+        std::fs::write(&path, "424242\n").unwrap();
+        assert_eq!(load_or_create_device_id(&path), 424242);
+    }
+
+    #[test]
+    fn device_id_regenerates_on_invalid_or_zero_file() {
+        let dir = tempfile::tempdir().unwrap();
+        for bad in ["0", "0\n", "not-a-number", ""] {
+            let path = dir.path().join("device_id");
+            std::fs::write(&path, bad).unwrap();
+            let id = load_or_create_device_id(&path);
+            assert_ne!(id, 0, "invalid/zero file {bad:?} must regenerate a non-zero id");
+        }
+    }
+
+    // Regression for the split-brain device id: the Hello handshake and the
+    // client config each asked for the device id independently, so a failed
+    // persist made the two ids diverge and the first auto-reconnect hit a
+    // spurious OwnerChanged. The public entry point must be process-stable.
+    #[test]
+    fn get_or_create_device_id_is_memoized() {
+        let first = get_or_create_device_id();
+        assert_ne!(first, 0);
+        for _ in 0..5 {
+            assert_eq!(get_or_create_device_id(), first);
         }
     }
 
