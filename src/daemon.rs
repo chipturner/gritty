@@ -548,6 +548,32 @@ pub async fn run(ctl_path: &Path, ready_fd: Option<OwnedFd>) -> anyhow::Result<(
     Ok(())
 }
 
+/// Wait briefly for the session task to publish its metadata, then mark the
+/// session attached.
+///
+/// The session task publishes `metadata` early (before the shell spawn and
+/// Env wait) but sets `attached` only much later, after its Env wait. Because
+/// control-frame dispatch is serialized, marking the session attached here --
+/// before the NewSession handler returns -- guarantees a racing follow-up
+/// non-forced Attach observes it and is rejected with AlreadyAttached instead
+/// of silently stealing the brand-new session from its creator.
+///
+/// Best-effort: the session task also sets this flag, so a timeout here (the
+/// task never published metadata) is harmless.
+async fn mark_attached_when_ready(metadata: &Arc<OnceLock<SessionMetadata>>) {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
+    loop {
+        if let Some(m) = metadata.get() {
+            m.attached.store(true, Ordering::Relaxed);
+            return;
+        }
+        if std::time::Instant::now() >= deadline {
+            return;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+    }
+}
+
 /// Dispatch a single control frame. Takes ownership of the framed connection
 /// so it can be handed off to session tasks when needed. Returns `true` for
 /// KillServer (daemon should exit).
@@ -629,6 +655,7 @@ async fn dispatch_control(
             let (client_tx, client_rx) = mpsc::unbounded_channel();
             let metadata = Arc::new(OnceLock::new());
             let meta_clone = Arc::clone(&metadata);
+            let meta_for_mark = Arc::clone(&metadata);
             let sock_dir = ctl_path.parent().expect("ctl_path must have a parent");
             let agent_socket_path = sock_dir.join(format!("agent-{id}.sock"));
             let svc_socket_path = sock_dir.join(format!("svc-{id}.sock"));
@@ -688,6 +715,13 @@ async fn dispatch_control(
                 info!(id, "NewSession creator gone before hand-off; rolled back");
                 return false;
             }
+
+            // Mark the session attached before returning. Control dispatch is
+            // serialized, so a follow-up non-forced `gritty connect` must see
+            // the creator's session as attached and get AlreadyAttached,
+            // rather than stealing it during the birth window before the
+            // session task (after its Env wait) would set this itself.
+            mark_attached_when_ready(&meta_for_mark).await;
 
             // Hand off connection to session for auto-attach. The session was
             // just created with the requested cols/rows, so no Attach-side
@@ -824,6 +858,14 @@ async fn dispatch_control(
                         .is_ok()
                         {
                             meta.owner_device_id.store(device_id, Ordering::Relaxed);
+                            // Mark attached here, at hand-off, not later in the
+                            // session task. Control dispatch is serialized, so
+                            // a subsequent non-forced Attach is guaranteed to
+                            // observe this before the session task would have
+                            // set it (after its Env wait) -- without it a racing
+                            // second `connect` steals the session instead of
+                            // getting AlreadyAttached.
+                            meta.attached.store(true, Ordering::Relaxed);
                             *last_attached = Some(id);
                             let _ = state.client_tx.send(ClientConn::Active {
                                 framed,

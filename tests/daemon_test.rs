@@ -898,6 +898,96 @@ async fn attach_nonexistent_returns_error() {
     );
 }
 
+/// Regression: a non-forced Attach that races into the session-birth window
+/// -- after the creator was handed off but before the session task marks the
+/// session attached -- must be rejected with AlreadyAttached, not silently
+/// take the session over from the creator. The admission guard used to read
+/// an `attached` flag that only the session task set (after its Env wait), so
+/// the guard was a no-op during creation and a second `gritty connect` could
+/// steal a brand-new session.
+#[tokio::test]
+async fn second_attach_during_birth_window_is_rejected() {
+    let (_tmp, ctl_path) = test_ctl();
+
+    let ctl = ctl_path.clone();
+    let _daemon = tokio::spawn(async move { gritty::daemon::run(&ctl, None).await });
+    wait_for_daemon(&ctl_path).await;
+
+    // Creator A: NewSession, consume SessionCreated + AttachAck, then hold the
+    // connection open WITHOUT sending Env. The session task is now parked in
+    // its Env wait and has not marked the session attached itself -- this is
+    // exactly the birth window the bug exploited.
+    let stream_a = UnixStream::connect(&ctl_path).await.unwrap();
+    let mut a = Framed::new(stream_a, FrameCodec);
+    do_handshake(&mut a).await;
+    a.send(Frame::NewSession {
+        name: "birthrace".to_string(),
+        command: String::new(),
+        cwd: String::new(),
+        cols: 0,
+        rows: 0,
+        client_name: String::new(),
+    })
+    .await
+    .unwrap();
+    let created = timeout(Duration::from_secs(3), a.next())
+        .await
+        .expect("timed out")
+        .expect("stream ended")
+        .expect("decode error");
+    let id = match created {
+        Frame::SessionCreated { id } => id,
+        other => panic!("expected SessionCreated, got {other:?}"),
+    };
+    let ack = timeout(Duration::from_secs(3), a.next())
+        .await
+        .expect("timed out")
+        .expect("stream ended")
+        .expect("decode error");
+    assert!(matches!(ack, Frame::AttachAck { .. }), "expected AttachAck, got {ack:?}");
+
+    // Second client B: non-forced explicit connect (force = false,
+    // attach_token = 0). It must be told the session is already attached.
+    let stream_b = UnixStream::connect(&ctl_path).await.unwrap();
+    let mut b = Framed::new(stream_b, FrameCodec);
+    do_handshake(&mut b).await;
+    b.send(Frame::Attach {
+        session: id.to_string(),
+        client_name: String::new(),
+        force: false,
+        no_replay: false,
+        cols: 0,
+        rows: 0,
+        attach_token: 0,
+        rendered_offset: 0,
+        line_dirty: false,
+    })
+    .await
+    .unwrap();
+    let resp = timeout(Duration::from_secs(5), b.next())
+        .await
+        .expect("timed out")
+        .expect("stream ended")
+        .expect("decode error");
+    match resp {
+        Frame::Error { code, .. } => {
+            assert_eq!(code, ErrorCode::AlreadyAttached, "expected AlreadyAttached, got {code:?}");
+        }
+        other => {
+            panic!("a non-forced attach during the birth window must be rejected, got {other:?}")
+        }
+    }
+
+    // The creator must not have been detached by the rejected attach.
+    let a_frame = timeout(Duration::from_millis(300), a.next()).await;
+    assert!(
+        !matches!(a_frame, Ok(Some(Ok(Frame::Detached)))),
+        "creator was wrongly detached by a rejected non-forced attach"
+    );
+
+    kill_cleanup(&ctl_path, &id.to_string()).await;
+}
+
 /// Regression: attaching to a session whose shell has exited should return Error,
 /// not Ok followed by a silent disconnect.
 #[tokio::test]
