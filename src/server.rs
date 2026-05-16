@@ -2136,7 +2136,7 @@ pub async fn run(
     let mut managed = ManagedChild::new(unsafe {
         cmd.pre_exec(move || {
             nix::unistd::setsid().map_err(io::Error::other)?;
-            libc::ioctl(raw_stdin, libc::TIOCSCTTY as libc::c_ulong, 0);
+            libc::ioctl(raw_stdin, libc::TIOCSCTTY as libc::Ioctl, 0);
             Ok(())
         })
         .stdin(Stdio::from(stdin_fd))
