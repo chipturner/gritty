@@ -172,7 +172,8 @@ File transfer manifest (svc socket, not Frame protocol): sender writes `[file_co
 - Run `just fmt` after making code changes.
 - Run `just check` (clippy + full test suite) before finishing work.
 - When changing code, update docs **in the same commit**. Files to check:
-  - **README.md** -- command table, flags, session env vars, config defaults, escape sequences
+  - **README.md** -- overview, install, quick start, features, comparison, short config pointer, common troubleshooting, security model
+  - **USAGE.md** -- full command table, all flags, `host:session` addressing, session env vars, full config reference, escape sequences, shell completions, debugging
   - **CLAUDE.md** -- module descriptions, wire format codes, `server::run()` signature, key patterns
   - **ARCHITECTURE.md** -- high-level feature descriptions, diagrams
   - **docs/tunnel-state-machine.md** -- any change to `connect.rs` supervisor behavior (states, transitions, timing constants, exit-code classification, `TunnelStatus` projection, flock/client-observer contract)

@@ -1,5 +1,5 @@
 use std::os::unix::fs::{MetadataExt, PermissionsExt};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use gritty::connect::{TunnelStatus, enumerate_tunnels, probe_tunnel_status, read_pid_hint};
 use gritty::protocol::{Frame, PROTOCOL_VERSION};
@@ -103,6 +103,40 @@ fn render(groups: &[(&str, Vec<Check>)]) {
             if f == 1 { "" } else { "s" },
             if w == 1 { "" } else { "s" },
         ),
+    }
+}
+
+// ---- Paths ------------------------------------------------------------------
+
+/// The key filesystem locations worth surfacing up front: where config,
+/// sockets, logs, and the device id live. Pure so it can be unit tested;
+/// existence is resolved at render time. Log/socket paths are derived from
+/// `server_dir` so a `--ctl-socket` override is reflected.
+fn path_report(
+    config_path: PathBuf,
+    device_id_path: PathBuf,
+    ctl_path: &Path,
+    server_dir: &Path,
+) -> Vec<(&'static str, PathBuf)> {
+    vec![
+        ("config file", config_path),
+        ("socket dir", server_dir.to_path_buf()),
+        ("server socket", ctl_path.to_path_buf()),
+        ("device id", device_id_path),
+        ("server log", server_dir.join("daemon.log")),
+        ("server output", server_dir.join("daemon.out")),
+    ]
+}
+
+fn render_paths(paths: &[(&str, PathBuf)]) {
+    println!("Paths");
+    let width = paths.iter().map(|(label, _)| label.len()).max().unwrap_or(0);
+    for (label, path) in paths {
+        if path.exists() {
+            println!("  {label:<width$}  {}", path.display());
+        } else {
+            println!("  {label:<width$}  {} \x1b[2m(not found)\x1b[0m", path.display());
+        }
     }
 }
 
@@ -492,6 +526,14 @@ pub(crate) async fn doctor(ctl_socket: Option<std::path::PathBuf>) -> anyhow::Re
         ("Sockets", socket_checks),
     ];
 
+    let paths = path_report(
+        gritty::config::config_path(),
+        gritty::device_id_path(),
+        &ctl_path,
+        &server_dir,
+    );
+    render_paths(&paths);
+    println!();
     render(&groups);
 
     let has_failures = groups.iter().flat_map(|(_, cs)| cs).any(|c| c.status == Status::Fail);
@@ -533,6 +575,42 @@ mod tests {
         // We test the function indirectly -- the important thing is it doesn't panic.
         let checks = check_config();
         assert!(!checks.is_empty());
+    }
+
+    #[test]
+    fn path_report_labels_and_derivation() {
+        let cfg = PathBuf::from("/cfg/config.toml");
+        let dev = PathBuf::from("/state/device_id");
+        let server_dir = PathBuf::from("/sock");
+        let ctl = server_dir.join("ctl.sock");
+
+        let report = path_report(cfg.clone(), dev.clone(), &ctl, &server_dir);
+
+        assert_eq!(
+            report,
+            vec![
+                ("config file", cfg),
+                ("socket dir", server_dir.clone()),
+                ("server socket", ctl),
+                ("device id", dev),
+                ("server log", PathBuf::from("/sock/daemon.log")),
+                ("server output", PathBuf::from("/sock/daemon.out")),
+            ]
+        );
+    }
+
+    #[test]
+    fn path_report_follows_ctl_socket_override() {
+        // A --ctl-socket override points logs/sockets at the override's dir.
+        let server_dir = PathBuf::from("/custom/dir");
+        let ctl = PathBuf::from("/custom/dir/my.sock");
+        let report =
+            path_report(PathBuf::from("/cfg.toml"), PathBuf::from("/dev"), &ctl, &server_dir);
+
+        let log = report.iter().find(|(l, _)| *l == "server log").unwrap();
+        assert_eq!(log.1, PathBuf::from("/custom/dir/daemon.log"));
+        let sock = report.iter().find(|(l, _)| *l == "server socket").unwrap();
+        assert_eq!(sock.1, ctl);
     }
 
     #[test]
