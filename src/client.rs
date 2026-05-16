@@ -148,6 +148,16 @@ struct EscapeProcessor {
     state: EscapeState,
 }
 
+/// Flush any buffered input bytes as a `Data` action before emitting a control
+/// action. Every control transition must do this first (so buffered keystrokes
+/// reach the server in order), so the ordering invariant is named once here
+/// instead of open-coded at each `AfterTilde` arm.
+fn flush_pending(actions: &mut Vec<EscapeAction>, data_buf: &mut Vec<u8>) {
+    if !data_buf.is_empty() {
+        actions.push(EscapeAction::Data(std::mem::take(data_buf)));
+    }
+}
+
 impl EscapeProcessor {
     fn new() -> Self {
         Self { state: EscapeState::AfterNewline }
@@ -168,10 +178,8 @@ impl EscapeProcessor {
                 EscapeState::AfterNewline => {
                     if b == b'~' {
                         self.state = EscapeState::AfterTilde;
-                        // Buffer the tilde — don't send yet
-                        if !data_buf.is_empty() {
-                            actions.push(EscapeAction::Data(std::mem::take(&mut data_buf)));
-                        }
+                        // Buffer the tilde -- don't send yet
+                        flush_pending(&mut actions, &mut data_buf);
                     } else if b == b'\n' || b == b'\r' {
                         // Stay in AfterNewline
                         data_buf.push(b);
@@ -183,39 +191,29 @@ impl EscapeProcessor {
                 EscapeState::AfterTilde => {
                     match b {
                         b'.' => {
-                            if !data_buf.is_empty() {
-                                actions.push(EscapeAction::Data(std::mem::take(&mut data_buf)));
-                            }
+                            flush_pending(&mut actions, &mut data_buf);
                             actions.push(EscapeAction::Detach);
                             return actions; // Stop processing
                         }
                         b'R' => {
-                            if !data_buf.is_empty() {
-                                actions.push(EscapeAction::Data(std::mem::take(&mut data_buf)));
-                            }
+                            flush_pending(&mut actions, &mut data_buf);
                             actions.push(EscapeAction::Reconnect);
                             self.state = EscapeState::Normal;
                             return actions; // Stop processing
                         }
                         0x1a => {
                             // Ctrl-Z
-                            if !data_buf.is_empty() {
-                                actions.push(EscapeAction::Data(std::mem::take(&mut data_buf)));
-                            }
+                            flush_pending(&mut actions, &mut data_buf);
                             actions.push(EscapeAction::Suspend);
                             self.state = EscapeState::Normal;
                         }
                         b'#' => {
-                            if !data_buf.is_empty() {
-                                actions.push(EscapeAction::Data(std::mem::take(&mut data_buf)));
-                            }
+                            flush_pending(&mut actions, &mut data_buf);
                             actions.push(EscapeAction::Status);
                             self.state = EscapeState::Normal;
                         }
                         b'?' => {
-                            if !data_buf.is_empty() {
-                                actions.push(EscapeAction::Data(std::mem::take(&mut data_buf)));
-                            }
+                            flush_pending(&mut actions, &mut data_buf);
                             actions.push(EscapeAction::Help);
                             self.state = EscapeState::Normal;
                         }
@@ -241,9 +239,7 @@ impl EscapeProcessor {
             }
         }
 
-        if !data_buf.is_empty() {
-            actions.push(EscapeAction::Data(data_buf));
-        }
+        flush_pending(&mut actions, &mut data_buf);
         actions
     }
 }
@@ -741,6 +737,20 @@ struct ClientRelay<'a> {
 }
 
 impl ClientRelay<'_> {
+    /// Send a frame whose delivery is required for progress. Returns `false`
+    /// if the link is down (caller bails to the reconnect loop). Threads
+    /// `last_outbound_at` so the heartbeat keys off our own sends.
+    async fn send(&mut self, framed: &mut Framed<UnixStream, FrameCodec>, frame: Frame) -> bool {
+        timed_send(framed, frame, self.last_outbound_at).await
+    }
+
+    /// Best-effort send: a failed delivery just means the link is down, which
+    /// the next required send or the heartbeat will surface. Use for frames
+    /// whose loss is not independently fatal (channel teardown, acks, etc.).
+    async fn notify(&mut self, framed: &mut Framed<UnixStream, FrameCodec>, frame: Frame) {
+        let _ = timed_send(framed, frame, self.last_outbound_at).await;
+    }
+
     async fn handle_server_frame(
         &mut self,
         framed: &mut Framed<UnixStream, FrameCodec>,
@@ -855,18 +865,11 @@ impl ClientRelay<'_> {
                         }
                         Err(e) => {
                             debug!("failed to connect to local agent: {e}");
-                            let _ = timed_send(
-                                framed,
-                                Frame::AgentClose { channel_id },
-                                self.last_outbound_at,
-                            )
-                            .await;
+                            self.notify(framed, Frame::AgentClose { channel_id }).await;
                         }
                     }
                 } else {
-                    let _ =
-                        timed_send(framed, Frame::AgentClose { channel_id }, self.last_outbound_at)
-                            .await;
+                    self.notify(framed, Frame::AgentClose { channel_id }).await;
                 }
             }
             Some(Ok(Frame::AgentData { channel_id, data })) => {
@@ -875,9 +878,7 @@ impl ClientRelay<'_> {
                     warn!(channel_id, "agent channel backpressured, closing");
                     self.agent.channels.remove(&channel_id);
                     // Notify the server so its half tears down too.
-                    let _ =
-                        timed_send(framed, Frame::AgentClose { channel_id }, self.last_outbound_at)
-                            .await;
+                    self.notify(framed, Frame::AgentClose { channel_id }).await;
                 }
             }
             Some(Ok(Frame::AgentClose { channel_id })) => {
@@ -909,30 +910,17 @@ impl ClientRelay<'_> {
             }
             Some(Ok(Frame::ClipboardGet)) => {
                 warn!("rejected clipboard read from remote");
-                let _ = timed_send(
-                    framed,
-                    Frame::ClipboardData { data: Bytes::new() },
-                    self.last_outbound_at,
-                )
-                .await;
+                self.notify(framed, Frame::ClipboardData { data: Bytes::new() }).await;
             }
             Some(Ok(Frame::TunnelListen { port })) => {
                 if !self.oauth_redirect {
                     debug!(port, "tunnel: oauth-redirect disabled, declining");
-                    let _ = timed_send(
-                        framed,
-                        Frame::TunnelClose { channel_id: TUNNEL_DECLINE_CHANNEL },
-                        self.last_outbound_at,
-                    )
-                    .await;
+                    self.notify(framed, Frame::TunnelClose { channel_id: TUNNEL_DECLINE_CHANNEL })
+                        .await;
                 } else if !self.tunnel_listen_limiter.check() {
                     warn!(port, "rate limited TunnelListen");
-                    let _ = timed_send(
-                        framed,
-                        Frame::TunnelClose { channel_id: TUNNEL_DECLINE_CHANNEL },
-                        self.last_outbound_at,
-                    )
-                    .await;
+                    self.notify(framed, Frame::TunnelClose { channel_id: TUNNEL_DECLINE_CHANNEL })
+                        .await;
                 } else {
                     // A prior TunnelListen within the rate window may have left
                     // an accept loop running. Dropping a JoinHandle detaches
@@ -1027,10 +1015,9 @@ impl ClientRelay<'_> {
                         }
                         Err(e) => {
                             debug!(port, "tunnel: bind failed: {e}");
-                            let _ = timed_send(
+                            self.notify(
                                 framed,
                                 Frame::TunnelClose { channel_id: TUNNEL_DECLINE_CHANNEL },
-                                self.last_outbound_at,
                             )
                             .await;
                         }
@@ -1067,12 +1054,7 @@ impl ClientRelay<'_> {
                     warn!(channel_id, "tunnel channel backpressured, closing");
                     self.tunnel.channels.remove(&channel_id);
                     // Notify the server so its half tears down too.
-                    let _ = timed_send(
-                        framed,
-                        Frame::TunnelClose { channel_id },
-                        self.last_outbound_at,
-                    )
-                    .await;
+                    self.notify(framed, Frame::TunnelClose { channel_id }).await;
                 }
             }
             Some(Ok(Frame::TunnelClose { channel_id })) => {
@@ -1081,23 +1063,13 @@ impl ClientRelay<'_> {
             // Port forward: server asks client to bind a port -- rejected (client-initiated only)
             Some(Ok(Frame::PortForwardListen { forward_id, listen_port, .. })) => {
                 warn!(forward_id, listen_port, "rejected server-initiated port bind");
-                let _ = timed_send(
-                    framed,
-                    Frame::PortForwardStop { forward_id },
-                    self.last_outbound_at,
-                )
-                .await;
+                self.notify(framed, Frame::PortForwardStop { forward_id }).await;
             }
             // Port forward: new TCP connection from server side (only accept client-initiated)
             Some(Ok(Frame::PortForwardOpen { forward_id, channel_id, target_port })) => {
                 let Some(&expected_port) = self.client_initiated_forwards.get(&forward_id) else {
                     warn!(forward_id, target_port, "rejected unsolicited port forward open");
-                    let _ = timed_send(
-                        framed,
-                        Frame::PortForwardClose { channel_id },
-                        self.last_outbound_at,
-                    )
-                    .await;
+                    self.notify(framed, Frame::PortForwardClose { channel_id }).await;
                     return Ok(ControlFlow::Continue(()));
                 };
                 if target_port != expected_port {
@@ -1132,12 +1104,7 @@ impl ClientRelay<'_> {
                     }
                     Err(e) => {
                         debug!(channel_id, expected_port, "pf connect failed: {e}");
-                        let _ = timed_send(
-                            framed,
-                            Frame::PortForwardClose { channel_id },
-                            self.last_outbound_at,
-                        )
-                        .await;
+                        self.notify(framed, Frame::PortForwardClose { channel_id }).await;
                     }
                 }
             }
@@ -1152,12 +1119,7 @@ impl ClientRelay<'_> {
                     warn!(channel_id, "pf channel backpressured, closing");
                     self.pf.channels.remove(&channel_id);
                     // Notify the server so its half tears down too.
-                    let _ = timed_send(
-                        framed,
-                        Frame::PortForwardClose { channel_id },
-                        self.last_outbound_at,
-                    )
-                    .await;
+                    self.notify(framed, Frame::PortForwardClose { channel_id }).await;
                 }
             }
             // Port forward: channel closed by server
@@ -1227,20 +1189,14 @@ impl ClientRelay<'_> {
         match event {
             Some(AgentEvent::Data { channel_id, data }) => {
                 if self.agent.channels.contains_key(&channel_id)
-                    && !timed_send(
-                        framed,
-                        Frame::AgentData { channel_id, data },
-                        self.last_outbound_at,
-                    )
-                    .await
+                    && !self.send(framed, Frame::AgentData { channel_id, data }).await
                 {
                     return false;
                 }
             }
             Some(AgentEvent::Closed { channel_id }) => {
                 if self.agent.channels.remove(&channel_id).is_some()
-                    && !timed_send(framed, Frame::AgentClose { channel_id }, self.last_outbound_at)
-                        .await
+                    && !self.send(framed, Frame::AgentClose { channel_id }).await
                 {
                     return false;
                 }
@@ -1259,28 +1215,18 @@ impl ClientRelay<'_> {
         match event {
             Some(ClientTunnelEvent::Accepted { channel_id, writer_tx }) => {
                 self.tunnel.channels.insert(channel_id, writer_tx);
-                if !timed_send(framed, Frame::TunnelOpen { channel_id }, self.last_outbound_at)
-                    .await
-                {
+                if !self.send(framed, Frame::TunnelOpen { channel_id }).await {
                     return false;
                 }
             }
             Some(ClientTunnelEvent::Data { channel_id, data }) => {
-                if !timed_send(
-                    framed,
-                    Frame::TunnelData { channel_id, data },
-                    self.last_outbound_at,
-                )
-                .await
-                {
+                if !self.send(framed, Frame::TunnelData { channel_id, data }).await {
                     return false;
                 }
             }
             Some(ClientTunnelEvent::Closed { channel_id }) => {
                 self.tunnel.channels.remove(&channel_id);
-                if !timed_send(framed, Frame::TunnelClose { channel_id }, self.last_outbound_at)
-                    .await
-                {
+                if !self.send(framed, Frame::TunnelClose { channel_id }).await {
                     return false;
                 }
             }
@@ -1300,12 +1246,12 @@ impl ClientRelay<'_> {
                 if let Some(fwd) = self.pf.forwards.get(&forward_id) {
                     let target_port = fwd.target_port;
                     self.pf.channels.insert(channel_id, (forward_id, writer_tx));
-                    if !timed_send(
-                        framed,
-                        Frame::PortForwardOpen { forward_id, channel_id, target_port },
-                        self.last_outbound_at,
-                    )
-                    .await
+                    if !self
+                        .send(
+                            framed,
+                            Frame::PortForwardOpen { forward_id, channel_id, target_port },
+                        )
+                        .await
                     {
                         return false;
                     }
@@ -1313,24 +1259,14 @@ impl ClientRelay<'_> {
             }
             Some(ClientPortForwardEvent::Data { channel_id, data }) => {
                 if self.pf.channels.contains_key(&channel_id)
-                    && !timed_send(
-                        framed,
-                        Frame::PortForwardData { channel_id, data },
-                        self.last_outbound_at,
-                    )
-                    .await
+                    && !self.send(framed, Frame::PortForwardData { channel_id, data }).await
                 {
                     return false;
                 }
             }
             Some(ClientPortForwardEvent::Closed { channel_id }) => {
                 if self.pf.channels.remove(&channel_id).is_some()
-                    && !timed_send(
-                        framed,
-                        Frame::PortForwardClose { channel_id },
-                        self.last_outbound_at,
-                    )
-                    .await
+                    && !self.send(framed, Frame::PortForwardClose { channel_id }).await
                 {
                     return false;
                 }
@@ -1343,9 +1279,7 @@ impl ClientRelay<'_> {
                 }
                 self.pf.channels.retain(|_, (fid, _)| *fid != forward_id);
                 self.client_initiated_forwards.remove(&forward_id);
-                if !timed_send(framed, Frame::PortForwardStop { forward_id }, self.last_outbound_at)
-                    .await
-                {
+                if !self.send(framed, Frame::PortForwardStop { forward_id }).await {
                     return false;
                 }
             }
@@ -1457,12 +1391,12 @@ impl ClientRelay<'_> {
             self.client_initiated_forwards.insert(forward_id, target_port);
         }
         // Send PortForwardRequest to server
-        if !timed_send(
-            framed,
-            Frame::PortForwardRequest { forward_id, direction, listen_port, target_port },
-            self.last_outbound_at,
-        )
-        .await
+        if !self
+            .send(
+                framed,
+                Frame::PortForwardRequest { forward_id, direction, listen_port, target_port },
+            )
+            .await
         {
             let _ = fwd_stream.write_all(&[0x02]).await;
             let _ = fwd_stream.write_all(b"server connection lost").await;
