@@ -18,7 +18,7 @@ gritty works by forwarding Unix domain sockets over SSH -- no custom protocol, n
 
 ### Install
 
-**Prebuilt binaries** (Linux x86_64/ARM64, macOS x86_64/ARM64):
+**Prebuilt binaries** (Linux x86_64/ARM64, macOS x86_64/ARM64). Linux builds are statically linked (musl), so they run on any Linux host regardless of glibc version:
 
 ```
 # Download the install script, review it, then run:
