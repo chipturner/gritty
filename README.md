@@ -6,7 +6,7 @@
 
 Persistent remote shells that just work.
 
-Close your laptop, change wifi, reboot -- `gritty connect devbox:work` picks up exactly where you left off. Your SSH agent, browser opens, port forwards, and in-progress work all survive. No stale sockets, no `tmux attach`, no re-auth.
+Connect once with gritty. Close your laptop, change wifi, lose the network -- it reconnects itself and you're exactly where you left off, with your SSH agent, port forwards, and in-progress work all intact. No stale sockets, no `tmux attach`, no re-auth. And even if your laptop reboots, your sessions are still there to resume.
 
 ```
 laptop$ gritty connect devbox:work          # creates or reattaches -- one command, always
