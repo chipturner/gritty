@@ -616,7 +616,10 @@ async fn tunnel_monitor(
                     "debounced network probe"
                 );
                 match probe_tunnel_alive(&local_sock).await {
-                    Ok(()) => {
+                    // Version is irrelevant to tunnel liveness -- the
+                    // supervisor is a byte proxy and must not kill ssh over a
+                    // protocol mismatch; that is the client handshake's job.
+                    Ok(_) => {
                         state.probe_failures = 0;
                         last_healthy = Some(std::time::SystemTime::now());
                         saw_unsatisfied = false;
@@ -646,7 +649,7 @@ async fn tunnel_monitor(
                     return;
                 }
                 match probe_tunnel_alive(&local_sock).await {
-                    Ok(()) => {
+                    Ok(_) => {
                         if state.probe_failures > 0 {
                             info!("tunnel probe recovered");
                         }
@@ -1266,7 +1269,35 @@ pub enum TunnelStatus {
 /// Uses tight timeouts (3s total, 1s handshake) because this runs in the
 /// hot path -- a slow probe that blocks the select loop is worse than a
 /// false positive that triggers an unnecessary respawn.
-async fn probe_tunnel_alive(local_sock: &std::path::Path) -> Result<(), &'static str> {
+/// Gate the connect on remote/local protocol compatibility.
+///
+/// A mismatch bails with an actionable message unless `ignore` is set, in
+/// which case it only warns. Shared by the slow path (the version
+/// `ensure_remote_ready` reports) and the cached fast path (the version
+/// `probe_tunnel_alive` observes): without this being applied on *both*, a
+/// cached connect to a freshly-upgraded remote would silently succeed and
+/// defeat the fail-fast diagnostic this check exists to provide.
+fn check_remote_protocol_version(remote: u16, ignore: bool) -> anyhow::Result<()> {
+    if remote == crate::protocol::PROTOCOL_VERSION {
+        return Ok(());
+    }
+    let msg = format!(
+        "remote protocol version ({remote}) differs from local ({}); \
+         use --ignore-version-mismatch to connect anyway",
+        crate::protocol::PROTOCOL_VERSION
+    );
+    if ignore {
+        warn!("{msg}");
+        Ok(())
+    } else {
+        bail!("{msg}");
+    }
+}
+
+/// Probe the tunnel for a live remote daemon, returning the remote's protocol
+/// version from its `HelloAck`. The caller uses it to apply the version gate
+/// on the cached fast path (where `ensure_remote_ready` was skipped).
+async fn probe_tunnel_alive(local_sock: &std::path::Path) -> Result<u16, &'static str> {
     use crate::protocol::{Frame, PROTOCOL_VERSION};
     use futures_util::{SinkExt, StreamExt};
 
@@ -1279,18 +1310,19 @@ async fn probe_tunnel_alive(local_sock: &std::path::Path) -> Result<(), &'static
             .send(Frame::Hello { version: PROTOCOL_VERSION, capabilities: 0, device_id: 0 })
             .await
             .map_err(|_| "Hello send failed")?;
-        match tokio::time::timeout(Duration::from_secs(1), framed.next()).await {
-            Ok(Some(Ok(Frame::HelloAck { .. }))) => {}
+        let remote_version = match tokio::time::timeout(Duration::from_secs(1), framed.next()).await
+        {
+            Ok(Some(Ok(Frame::HelloAck { version, .. }))) => version,
             Ok(Some(Ok(_))) => return Err("unexpected frame"),
             Ok(Some(Err(_))) => return Err("decode error"),
             Ok(None) => return Err("EOF before HelloAck"),
             Err(_) => return Err("HelloAck timeout"),
-        }
+        };
         // Send a control frame so the daemon doesn't wait 5s for one and
         // log a spurious "control connection timed out" warning on every probe.
         framed.send(Frame::ListSessions).await.map_err(|_| "ListSessions send failed")?;
         let _ = tokio::time::timeout(Duration::from_secs(1), framed.next()).await;
-        Ok(())
+        Ok(remote_version)
     };
     tokio::time::timeout(Duration::from_secs(3), probe).await.unwrap_or(Err("probe timeout"))
 }
@@ -1615,20 +1647,12 @@ pub async fn run(opts: ConnectOpts, ready_fd: Option<OwnedFd>) -> anyhow::Result
     };
     info!(remote_sock, ?remote_version, "remote socket path");
 
-    // Check protocol version compatibility
-    if let Some(rv) = remote_version
-        && rv != crate::protocol::PROTOCOL_VERSION
-    {
-        let msg = format!(
-            "remote protocol version ({rv}) differs from local ({}); \
-             use --ignore-version-mismatch to connect anyway",
-            crate::protocol::PROTOCOL_VERSION
-        );
-        if opts.ignore_version_mismatch {
-            warn!("{msg}");
-        } else {
-            bail!("{msg}");
-        }
+    // Check protocol version compatibility. Only the slow path
+    // (ensure_remote_ready) reports a version here; the cached fast path has
+    // `remote_version == None` and is gated later against the version
+    // observed by probe_tunnel_alive.
+    if let Some(rv) = remote_version {
+        check_remote_protocol_version(rv, opts.ignore_version_mismatch)?;
     }
 
     // Snapshot the inode we flock'd so the monitor can detect the lock file
@@ -1689,37 +1713,52 @@ pub async fn run(opts: ConnectOpts, ready_fd: Option<OwnedFd>) -> anyhow::Result
     }
     info!("tunnel socket ready");
 
-    // Verify the forward actually reaches a live remote daemon. On the
-    // cached-path fast path we skipped ensure_remote_ready, so the remote
-    // server may not be running yet (first connect after remote reboot) or
-    // the cached path may be stale. On the slow path this is a cheap
-    // belt-and-suspenders check.
-    if let Err(why) = probe_tunnel_alive(&local_sock).await {
-        if used_cache {
-            info!(why, "cached remote socket unreachable; running ensure_remote_ready");
-            let (fresh_sock, _) = ensure_remote_ready(
-                &dest,
-                opts.no_server_start,
-                &opts.ssh_options,
-                opts.foreground,
-                opts.connect_timeout,
-            )
-            .await?;
-            if fresh_sock != remote_sock {
-                // Stale cache (remote UID / runtime dir changed). Our -L is
-                // aimed at the wrong path; invalidate and error -- a retry
-                // will take the slow path with the fresh value.
-                let _ = std::fs::remove_file(&remote_sock_cache);
-                bail!("cached remote socket path is stale ({remote_sock} -> {fresh_sock}); retry");
+    // Verify the forward actually reaches a live remote daemon, and learn the
+    // remote's protocol version from the probe handshake. On the cached-path
+    // fast path we skipped ensure_remote_ready, so the remote server may not
+    // be running yet (first connect after remote reboot) or the cached path
+    // may be stale. On the slow path this is a cheap belt-and-suspenders check.
+    let probed_version = match probe_tunnel_alive(&local_sock).await {
+        Ok(v) => v,
+        Err(why) => {
+            if used_cache {
+                info!(why, "cached remote socket unreachable; running ensure_remote_ready");
+                let (fresh_sock, _) = ensure_remote_ready(
+                    &dest,
+                    opts.no_server_start,
+                    &opts.ssh_options,
+                    opts.foreground,
+                    opts.connect_timeout,
+                )
+                .await?;
+                if fresh_sock != remote_sock {
+                    // Stale cache (remote UID / runtime dir changed). Our -L is
+                    // aimed at the wrong path; invalidate and error -- a retry
+                    // will take the slow path with the fresh value.
+                    let _ = std::fs::remove_file(&remote_sock_cache);
+                    bail!(
+                        "cached remote socket path is stale ({remote_sock} -> {fresh_sock}); retry"
+                    );
+                }
+                // Server was down; ensure_remote_ready started it. The existing
+                // -L connects on-demand, so no respawn needed -- just re-probe.
+                match probe_tunnel_alive(&local_sock).await {
+                    Ok(v) => v,
+                    Err(why) => bail!("remote daemon unreachable after start: {why}"),
+                }
+            } else {
+                bail!("tunnel forward bound but remote daemon is not responding: {why}");
             }
-            // Server was down; ensure_remote_ready started it. The existing
-            // -L connects on-demand, so no respawn needed -- just re-probe.
-            if let Err(why) = probe_tunnel_alive(&local_sock).await {
-                bail!("remote daemon unreachable after start: {why}");
-            }
-        } else {
-            bail!("tunnel forward bound but remote daemon is not responding: {why}");
         }
+    };
+
+    // The cached fast path skipped the version gate above (remote_version was
+    // None). The probe just completed a real handshake with the remote daemon
+    // through the tunnel, so apply the same gate to what it reported --
+    // otherwise a cached connect to a freshly-upgraded remote would succeed
+    // silently, defeating the fail-fast diagnostic the slow path provides.
+    if used_cache {
+        check_remote_protocol_version(probed_version, opts.ignore_version_mismatch)?;
     }
     let _ = std::fs::write(&remote_sock_cache, &remote_sock);
 
@@ -2729,5 +2768,29 @@ mod tests {
         let (sock, ver) = parse_ensure_remote_output("/tmp/ctl.sock\n20\nsome noise").unwrap();
         assert_eq!(sock, "/tmp/ctl.sock");
         assert_eq!(ver, Some(20));
+    }
+
+    #[test]
+    fn version_gate_accepts_matching_version() {
+        assert!(check_remote_protocol_version(crate::protocol::PROTOCOL_VERSION, false).is_ok());
+    }
+
+    #[test]
+    fn version_gate_rejects_mismatch() {
+        let rv = crate::protocol::PROTOCOL_VERSION.wrapping_add(1);
+        let err = check_remote_protocol_version(rv, false).unwrap_err().to_string();
+        assert!(err.contains(&rv.to_string()), "message names remote version: {err}");
+        assert!(
+            err.contains(&crate::protocol::PROTOCOL_VERSION.to_string()),
+            "message names local version: {err}"
+        );
+        assert!(err.contains("--ignore-version-mismatch"), "message is actionable: {err}");
+    }
+
+    #[test]
+    fn version_gate_ignore_flag_downgrades_to_warn() {
+        let rv = crate::protocol::PROTOCOL_VERSION.wrapping_add(1);
+        // With the escape hatch set, a mismatch must not bail.
+        assert!(check_remote_protocol_version(rv, true).is_ok());
     }
 }

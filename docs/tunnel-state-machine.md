@@ -221,7 +221,10 @@ backoff not trip the client's short socket-gone grace.
    returns `(remote_sock, remote_version)`; version mismatch bails unless
    `--ignore-version-mismatch` (predates the in-band v15 mismatch
    recovery, still used as a pre-flight for `tunnel-create` since we
-   can't talk to the remote daemon without ssh).
+   can't talk to the remote daemon without ssh). On the cached fast path
+   no version is known here, so the same version gate
+   (`check_remote_protocol_version`) is deferred to the post-bind probe
+   in step 5 -- the cached path must not silently skip it.
 4. **Starting.SpawnChild -> Starting.WaitForSocket** -- ssh spawned. With
    `isolate_control_path` (the default) it uses `-N`: no remote process,
    so a half-open drop (local ssh exits on `ServerAliveInterval`; remote
@@ -248,14 +251,17 @@ backoff not trip the client's short socket-gone grace.
 
    On socket-ready first, run one `probe_tunnel_alive` against the local
    socket to confirm the forward actually reaches a live remote daemon.
+   The probe returns the remote's protocol version from its `HelloAck`.
    On the cached-`remote_sock` fast path this is the only liveness
    check (we skipped `ensure_remote_ready`): probe failure re-runs
    `ensure_remote_ready`; if it returns a different path the cache was
    stale -- invalidate `.remote-sock` and bail so a retry takes the slow
-   path. On the slow path the probe is belt-and-suspenders. Then write
-   `.dest` + `.remote-sock`, call `signal_ready` so the parent
-   `tunnel-create` process exits, and hand the ssh child to
-   `tunnel_monitor`.
+   path. On the slow path the probe is belt-and-suspenders. On the cached
+   path the probed version is then run through the step-3 version gate
+   (`check_remote_protocol_version`) -- without this a cached connect to a
+   freshly-upgraded remote would succeed silently. Then write `.dest` +
+   `.remote-sock`, call `signal_ready` so the parent `tunnel-create`
+   process exits, and hand the ssh child to `tunnel_monitor`.
 
 ### Supervisor loop (`tunnel_monitor`)
 
