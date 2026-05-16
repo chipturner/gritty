@@ -111,7 +111,10 @@ jobs:
         run: |
           bin="target/${{ matrix.target }}/release/gritty"
           file "$bin"
-          file "$bin" | grep -q 'statically linked' || {
+          # Accept both 'statically linked' and 'static-pie linked' -- recent
+          # musl toolchains produce static-pie binaries by default, which are
+          # still fully self-contained (no dynamic loader required).
+          file "$bin" | grep -qE 'statically linked|static-pie linked' || {
             echo "error: $bin is not statically linked" >&2
             exit 1
           }

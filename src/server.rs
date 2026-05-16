@@ -2133,10 +2133,21 @@ pub async fn run(
     if let Some(ref name) = session_name {
         cmd.env("GRITTY_SESSION_NAME", name);
     }
+    // `libc::ioctl`'s request type is `c_ulong` on glibc and macOS but `c_int`
+    // on musl. `libc::Ioctl` is a Linux-only alias that smooths the
+    // glibc/musl difference; on macOS we cast to `c_ulong` directly.
+    #[cfg(target_os = "linux")]
+    const fn tiocsctty_req() -> libc::Ioctl {
+        libc::TIOCSCTTY as libc::Ioctl
+    }
+    #[cfg(not(target_os = "linux"))]
+    const fn tiocsctty_req() -> libc::c_ulong {
+        libc::TIOCSCTTY as libc::c_ulong
+    }
     let mut managed = ManagedChild::new(unsafe {
         cmd.pre_exec(move || {
             nix::unistd::setsid().map_err(io::Error::other)?;
-            libc::ioctl(raw_stdin, libc::TIOCSCTTY as libc::Ioctl, 0);
+            libc::ioctl(raw_stdin, tiocsctty_req(), 0);
             Ok(())
         })
         .stdin(Stdio::from(stdin_fd))
