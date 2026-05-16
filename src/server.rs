@@ -2001,12 +2001,29 @@ pub async fn run(
             ))
         });
 
-    // Wait for first active client + its Env frame before spawning the
-    // shell. If the first client disconnects before sending Env we'd
-    // otherwise spawn the shell with empty env permanently; loop back
-    // and wait for the next active client instead. A genuine timeout
-    // (client connected but hasn't sent Env in 2s) falls through with
-    // empty env -- rare in practice.
+    // Wait for the first active client, then read its Env frame before
+    // spawning the shell.
+    //
+    // NOTE: the Env read below is *not* inside this loop. Once the first
+    // Active client arrives we commit to it: if it fails to deliver Env
+    // (disconnect, unexpected frame, or 2s timeout) the shell is spawned
+    // with empty env for the whole life of the session -- there is no
+    // loop-back and no recovery (reconnect ignores Env at server.rs, and
+    // the client clears its env on disconnect, so reattaching does not
+    // restore it; the shell process is already spawned regardless).
+    //
+    // This is intentional for control-only callers (tests/tooling that
+    // create a session and drop the stream without ever attaching -- see
+    // tests/daemon_test.rs), which rely on the shell spawning so the
+    // session exists. It is also a latent hazard for a real `gritty
+    // connect`: its connection blipping in the sub-second window between
+    // AttachAck and the Env frame permanently poisons TERM/LANG/PATH for
+    // that session. The two cases are indistinguishable here (both surface
+    // as an immediate Ok(None)), so they cannot simply be told apart by
+    // looping on disconnect. A proper fix needs Env delivered as part of
+    // attach (not a separate post-handoff frame) so it is not subject to
+    // this race; tracked as a design follow-up, deliberately not patched
+    // with the unsafe "loop on Ok(None)" heuristic.
     let (mut framed, initial_client_name) = loop {
         tokio::select! {
             client = client_rx.recv() => match client {
@@ -2056,8 +2073,9 @@ pub async fn run(
             // Control-only callers (tests, tooling that creates but
             // doesn't attach) drop the stream immediately after
             // SessionCreated; spawning with empty env lets those cases
-            // proceed. A real attached user who disconnected before
-            // sending Env can force the richer env by reattaching.
+            // proceed. A real attached user who disconnected here does
+            // NOT recover env by reattaching (reconnect ignores Env and
+            // the client clears it on disconnect) -- see the NOTE above.
             warn!("first client disconnected before sending Env frame; spawning with empty env");
             Vec::new()
         }
