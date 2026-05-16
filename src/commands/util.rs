@@ -13,6 +13,21 @@ pub(crate) fn parse_target(s: &str) -> (String, Option<String>) {
     }
 }
 
+/// Parse an optional `host[:session]` target into `(host, session)`.
+///
+/// `None` (no target given) yields `(None, None)`; a present target is split
+/// via [`parse_target`]. Shared by the commands that take an optional target
+/// (connect / tail / kill-session) so the mapping is written once.
+pub(crate) fn split_optional_target(target: Option<&str>) -> (Option<String>, Option<String>) {
+    match target {
+        Some(t) => {
+            let (host, session) = parse_target(t);
+            (Some(host), session)
+        }
+        None => (None, None),
+    }
+}
+
 pub(crate) fn resolve_ctl_path(
     ctl_socket: Option<PathBuf>,
     host: Option<&str>,
@@ -598,6 +613,20 @@ mod tests {
         let (host, session) = parse_target("local:work");
         assert_eq!(host, "local");
         assert_eq!(session, Some("work".to_string()));
+    }
+
+    #[test]
+    fn split_optional_target_none_is_all_none() {
+        assert_eq!(split_optional_target(None), (None, None));
+    }
+
+    #[test]
+    fn split_optional_target_splits_present_target() {
+        assert_eq!(
+            split_optional_target(Some("local:work")),
+            (Some("local".to_string()), Some("work".to_string()))
+        );
+        assert_eq!(split_optional_target(Some("local")), (Some("local".to_string()), None));
     }
 
     #[test]

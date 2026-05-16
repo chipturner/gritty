@@ -724,13 +724,7 @@ async fn run(cli: Cli, config: gritty::config::ConfigFile) -> anyhow::Result<()>
             no_pick,
             new_session,
         } => {
-            let (host, session) = match &target {
-                Some(t) => {
-                    let (h, s) = parse_target(t);
-                    (Some(h), s)
-                }
-                None => (None, None),
-            };
+            let (host, session) = split_optional_target(target.as_deref());
             let auto_start_mode = match (&cli.ctl_socket, host.as_deref()) {
                 (Some(_), _) => AutoStart::None,
                 (None, Some("local")) => AutoStart::Server,
@@ -762,27 +756,15 @@ async fn run(cli: Cli, config: gritty::config::ConfigFile) -> anyhow::Result<()>
             connect_session(
                 session,
                 command,
-                detach,
-                no_create,
-                force,
-                pick,
-                no_pick,
-                new_session,
+                ConnectFlags { detach, no_create, force, pick, no_pick, new_session, wait },
                 settings,
                 ctl_path,
                 auto_start_mode,
-                wait,
             )
             .await
         }
         Command::Tail { target } => {
-            let (host, session) = match &target {
-                Some(t) => {
-                    let (h, s) = parse_target(t);
-                    (Some(h), s)
-                }
-                None => (None, None),
-            };
+            let (host, session) = split_optional_target(target.as_deref());
             let ctl_path = resolve_ctl_path(cli.ctl_socket, host.as_deref())?;
             let session = match session {
                 Some(s) => s,
@@ -804,13 +786,7 @@ async fn run(cli: Cli, config: gritty::config::ConfigFile) -> anyhow::Result<()>
             }
         }
         Command::KillSession { target } => {
-            let (host, session) = match &target {
-                Some(t) => {
-                    let (h, s) = parse_target(t);
-                    (Some(h), s)
-                }
-                None => (None, None),
-            };
+            let (host, session) = split_optional_target(target.as_deref());
             let ctl_path = resolve_ctl_path(cli.ctl_socket, host.as_deref())?;
             let session = match session {
                 Some(s) => s,

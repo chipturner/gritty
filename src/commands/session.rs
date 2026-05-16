@@ -31,24 +31,32 @@ fn client_config(
     }
 }
 
-#[allow(clippy::too_many_arguments)]
+/// Boolean options for [`connect_session`], grouped into one struct because
+/// seven adjacent bare `bool` parameters are silently transposable at the call
+/// site (mirrors the existing `SessionSettings` grouping pattern).
+pub(crate) struct ConnectFlags {
+    pub(crate) detach: bool,
+    pub(crate) no_create: bool,
+    pub(crate) force: bool,
+    pub(crate) pick: bool,
+    pub(crate) no_pick: bool,
+    pub(crate) new_session: bool,
+    pub(crate) wait: bool,
+}
+
 pub(crate) async fn connect_session(
     session: Option<String>,
     command: Option<String>,
-    detach: bool,
-    no_create: bool,
-    force: bool,
-    pick: bool,
-    no_pick: bool,
-    new_session: bool,
+    flags: ConnectFlags,
     settings: gritty::config::SessionSettings,
     ctl_path: PathBuf,
     auto_start_mode: AutoStart,
-    wait: bool,
 ) -> anyhow::Result<()> {
     use futures_util::{SinkExt, StreamExt};
     use gritty::protocol::{Frame, FrameCodec};
     use tokio_util::codec::Framed;
+
+    let ConnectFlags { detach, no_create, force, pick, no_pick, new_session, wait } = flags;
 
     // Resolve the session name. An explicit name or the interactive picker
     // can be resolved up front; -n/--new must wait until connect_or_start has
@@ -1045,6 +1053,40 @@ pub(crate) async fn restart(
     Ok(())
 }
 
+/// The nine shared session-table columns (ID..Status) for one row. Identical
+/// between `list_sessions` and `list_all_sessions`; the latter just prepends a
+/// Host column. Single-sourced so the "starting"/attached/heartbeat/detached
+/// status logic and column order cannot drift between the two listings.
+fn session_status_cols(s: &gritty::protocol::SessionEntry, now: u64) -> Vec<String> {
+    let name = if s.name.is_empty() { "-".to_string() } else { s.name.clone() };
+    let (pty, pid, created, status) = if s.shell_pid == 0 {
+        ("-".to_string(), "-".to_string(), "-".to_string(), "starting".to_string())
+    } else {
+        let status = if s.attached {
+            if s.last_heartbeat > 0 {
+                let ago = now.saturating_sub(s.last_heartbeat);
+                format!("attached (heartbeat {ago}s ago)")
+            } else {
+                "attached".to_string()
+            }
+        } else {
+            "detached".to_string()
+        };
+        (s.pty_path.clone(), s.shell_pid.to_string(), format_timestamp(s.created_at), status)
+    };
+    vec![
+        s.id.to_string(),
+        name,
+        s.foreground_cmd.clone(),
+        s.cwd.clone(),
+        s.client_name.clone(),
+        pty,
+        pid,
+        created,
+        status,
+    ]
+}
+
 pub(crate) async fn list_sessions(ctl_path: PathBuf) -> anyhow::Result<()> {
     use gritty::protocol::Frame;
 
@@ -1060,48 +1102,8 @@ pub(crate) async fn list_sessions(ctl_path: PathBuf) -> anyhow::Result<()> {
                     .as_secs();
 
                 // Build row data
-                let rows: Vec<Vec<String>> = sessions
-                    .iter()
-                    .map(|s| {
-                        let name = if s.name.is_empty() { "-".to_string() } else { s.name.clone() };
-                        let (pty, pid, created, status) = if s.shell_pid == 0 {
-                            (
-                                "-".to_string(),
-                                "-".to_string(),
-                                "-".to_string(),
-                                "starting".to_string(),
-                            )
-                        } else {
-                            let status = if s.attached {
-                                if s.last_heartbeat > 0 {
-                                    let ago = now.saturating_sub(s.last_heartbeat);
-                                    format!("attached (heartbeat {ago}s ago)")
-                                } else {
-                                    "attached".to_string()
-                                }
-                            } else {
-                                "detached".to_string()
-                            };
-                            (
-                                s.pty_path.clone(),
-                                s.shell_pid.to_string(),
-                                format_timestamp(s.created_at),
-                                status,
-                            )
-                        };
-                        vec![
-                            s.id.to_string(),
-                            name,
-                            s.foreground_cmd.clone(),
-                            s.cwd.clone(),
-                            s.client_name.clone(),
-                            pty,
-                            pid,
-                            created,
-                            status,
-                        ]
-                    })
-                    .collect();
+                let rows: Vec<Vec<String>> =
+                    sessions.iter().map(|s| session_status_cols(s, now)).collect();
 
                 gritty::table::print_table(
                     &["ID", "Name", "Cmd", "CWD", "Client", "PTY", "PID", "Created", "Status"],
@@ -1190,44 +1192,15 @@ pub(crate) async fn list_all_sessions() -> anyhow::Result<()> {
         .collect();
     let multi_host = ok_hosts.len() > 1;
 
-    // Build row data: [host, id, name, pty, pid, created, status]
+    // Build row data: [host, id, name, cmd, cwd, client, pty, pid, created, status]
     let rows: Vec<Vec<String>> = ok_hosts
         .iter()
         .flat_map(|(host, sessions)| {
             sessions.iter().map(move |s| {
-                let name = if s.name.is_empty() { "-".to_string() } else { s.name.clone() };
-                let (pty, pid, created, status) = if s.shell_pid == 0 {
-                    ("-".to_string(), "-".to_string(), "-".to_string(), "starting".to_string())
-                } else {
-                    let status = if s.attached {
-                        if s.last_heartbeat > 0 {
-                            let ago = now.saturating_sub(s.last_heartbeat);
-                            format!("attached (heartbeat {ago}s ago)")
-                        } else {
-                            "attached".to_string()
-                        }
-                    } else {
-                        "detached".to_string()
-                    };
-                    (
-                        s.pty_path.clone(),
-                        s.shell_pid.to_string(),
-                        format_timestamp(s.created_at),
-                        status,
-                    )
-                };
-                vec![
-                    (*host).clone(),
-                    s.id.to_string(),
-                    name,
-                    s.foreground_cmd.clone(),
-                    s.cwd.clone(),
-                    s.client_name.clone(),
-                    pty,
-                    pid,
-                    created,
-                    status,
-                ]
+                let mut row = Vec::with_capacity(10);
+                row.push((*host).clone());
+                row.extend(session_status_cols(s, now));
+                row
             })
         })
         .collect();
@@ -1321,5 +1294,54 @@ mod tests {
     fn suggest_name_fills_first_free_slot() {
         // session-2 missing -- the first free slot, not the max+1.
         assert_eq!(suggest_name(&[row("default"), row("session-3")]), "session-2");
+    }
+
+    fn entry() -> gritty::protocol::SessionEntry {
+        gritty::protocol::SessionEntry {
+            id: 3,
+            name: String::new(),
+            pty_path: "/dev/pts/7".to_string(),
+            shell_pid: 1234,
+            created_at: 0,
+            attached: false,
+            last_heartbeat: 0,
+            foreground_cmd: "vim".to_string(),
+            cwd: "/home/x".to_string(),
+            client_name: "laptop".to_string(),
+            agent_forwarding_active: false,
+            is_last_attached: false,
+        }
+    }
+
+    #[test]
+    fn session_status_cols_starting_when_no_shell() {
+        let mut s = entry();
+        s.shell_pid = 0;
+        let cols = session_status_cols(&s, 100);
+        // id, name(-), cmd, cwd, client, pty(-), pid(-), created(-), status
+        assert_eq!(cols[0], "3");
+        assert_eq!(cols[1], "-"); // empty name renders as "-"
+        assert_eq!(cols[5], "-"); // pty
+        assert_eq!(cols[6], "-"); // pid
+        assert_eq!(cols[8], "starting");
+    }
+
+    #[test]
+    fn session_status_cols_attached_reports_heartbeat_age() {
+        let mut s = entry();
+        s.attached = true;
+        s.last_heartbeat = 90;
+        let cols = session_status_cols(&s, 100);
+        assert_eq!(cols[8], "attached (heartbeat 10s ago)");
+        assert_eq!(cols[6], "1234"); // pid
+    }
+
+    #[test]
+    fn session_status_cols_detached_and_attached_no_heartbeat() {
+        let s = entry();
+        assert_eq!(session_status_cols(&s, 100)[8], "detached");
+        let mut s2 = entry();
+        s2.attached = true;
+        assert_eq!(session_status_cols(&s2, 100)[8], "attached");
     }
 }

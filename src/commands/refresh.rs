@@ -125,7 +125,6 @@ async fn refresh_local(ctl_socket: Option<PathBuf>) -> anyhow::Result<()> {
     Ok(())
 }
 
-
 /// Refresh a remote host: its tunnel supervisor and, via `gritty refresh
 /// local` over SSH, its remote daemon.
 async fn refresh_remote(host: &str, config: &gritty::config::ConfigFile) -> anyhow::Result<()> {
