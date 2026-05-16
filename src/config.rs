@@ -124,7 +124,10 @@ pub struct ConfigFile {
     pub host: HashMap<String, HostConfig>,
 }
 
-/// Global defaults section.
+/// Session/connection overrides. Used both for the global `[defaults]` section
+/// and for each `[host.<name>]` section (see [`HostConfig`]) -- a per-host
+/// entry can override exactly the same keys as the defaults, so both share one
+/// schema to keep them from drifting.
 #[derive(Debug, Clone, Default, Deserialize)]
 #[serde(default, deny_unknown_fields, rename_all = "kebab-case")]
 pub struct Defaults {
@@ -151,22 +154,10 @@ pub struct TunnelDefaults {
     pub connect_timeout: Option<u64>,
 }
 
-/// Per-host override section.
-#[derive(Debug, Clone, Default, Deserialize)]
-#[serde(default, deny_unknown_fields, rename_all = "kebab-case")]
-pub struct HostConfig {
-    pub forward_agent: Option<bool>,
-    pub forward_open: Option<bool>,
-    pub no_escape: Option<bool>,
-    pub oauth_redirect: Option<bool>,
-    pub oauth_timeout: Option<u64>,
-    pub heartbeat_interval: Option<u64>,
-    pub heartbeat_timeout: Option<u64>,
-    pub ring_buffer_size: Option<u64>,
-    pub oauth_tunnel_idle_timeout: Option<u64>,
-    pub client_name: Option<String>,
-    pub tunnel: Option<TunnelDefaults>,
-}
+/// Per-host override section (`[host.<name>]`). A host entry overrides the same
+/// keys as `[defaults]`, so it is exactly the [`Defaults`] schema -- aliased
+/// rather than duplicated so the two cannot drift.
+pub type HostConfig = Defaults;
 
 /// Return the config file path: $XDG_CONFIG_HOME/gritty/config.toml
 pub fn config_path() -> PathBuf {

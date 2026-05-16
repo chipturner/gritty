@@ -975,6 +975,20 @@ pub fn read_persisted_ssh_options(connection_name: &str) -> Vec<String> {
         .unwrap_or_default()
 }
 
+/// Merge CLI `-o` options ahead of configured `ssh-options`.
+///
+/// CLI first, configured next: OpenSSH honors the *first* value it sees for a
+/// given keyword, so a CLI `-o` wins while configured options still apply. This
+/// is the single source of the SSH-option precedence rule -- every SSH entry
+/// point (tunnel-create, bootstrap, remote refresh) merges the same way, so it
+/// must not be re-inlined.
+pub fn merge_ssh_options(cli: &[String], configured: &[String]) -> Vec<String> {
+    let mut merged = Vec::with_capacity(cli.len() + configured.len());
+    merged.extend_from_slice(cli);
+    merged.extend_from_slice(configured);
+    merged
+}
+
 /// Build the `tunnel-create` argument list to recreate a tunnel on restart /
 /// auto-start, replaying any persisted CLI `-o` options. Config `ssh-options`
 /// are intentionally omitted -- `tunnel-create` re-resolves them.
@@ -2796,5 +2810,22 @@ mod tests {
         let rv = crate::protocol::PROTOCOL_VERSION.wrapping_add(1);
         // With the escape hatch set, a mismatch must not bail.
         assert!(check_remote_protocol_version(rv, true).is_ok());
+    }
+
+    #[test]
+    fn merge_ssh_options_cli_precedes_configured() {
+        let cli = vec!["ProxyJump=bastion".to_string()];
+        let configured = vec!["IdentityFile=~/.ssh/id_ed25519".to_string()];
+        assert_eq!(
+            merge_ssh_options(&cli, &configured),
+            vec!["ProxyJump=bastion".to_string(), "IdentityFile=~/.ssh/id_ed25519".to_string(),]
+        );
+    }
+
+    #[test]
+    fn merge_ssh_options_handles_empty_sides() {
+        assert_eq!(merge_ssh_options(&[], &[]), Vec::<String>::new());
+        assert_eq!(merge_ssh_options(&["A=1".to_string()], &[]), vec!["A=1".to_string()]);
+        assert_eq!(merge_ssh_options(&[], &["B=2".to_string()]), vec!["B=2".to_string()]);
     }
 }

@@ -615,11 +615,8 @@ fn main() {
             // Running preflight against only the CLI options produced
             // false-negative "cannot connect non-interactively" when the
             // config supplied IdentityFile / ProxyJump / etc.
-            let merged_ssh_options = {
-                let mut opts = ssh_options.clone();
-                opts.extend(resolved.ssh_options.clone());
-                opts
-            };
+            let merged_ssh_options =
+                gritty::connect::merge_ssh_options(&ssh_options, &resolved.ssh_options);
 
             if !foreground
                 && !dry_run
@@ -906,11 +903,8 @@ async fn run(cli: Cli, config: gritty::config::ConfigFile) -> anyhow::Result<()>
             // first-match wins) -- every other SSH path does this, so a host
             // reachable only via a configured ProxyJump/IdentityFile/Port
             // must work for `bootstrap` too.
-            let merged_ssh_options = {
-                let mut opts = ssh_options;
-                opts.extend(resolved.ssh_options);
-                opts
-            };
+            let merged_ssh_options =
+                gritty::connect::merge_ssh_options(&ssh_options, &resolved.ssh_options);
             gritty::connect::bootstrap(
                 &destination,
                 &merged_ssh_options,
