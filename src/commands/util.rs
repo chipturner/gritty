@@ -296,6 +296,7 @@ pub(crate) async fn resolve_session_id(ctl_path: &Path, target: &str) -> anyhow:
 pub(crate) async fn port_forward_client_command(
     ctl_socket: Option<PathBuf>,
     target: &str,
+    client_name: &str,
     direction: u8,
     listen_port: u16,
     target_port: u16,
@@ -303,7 +304,8 @@ pub(crate) async fn port_forward_client_command(
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
     let (host, session) = parse_target(target);
-    let session = session.unwrap_or_else(|| "default".to_string());
+    let session =
+        gritty::naming::resolve_session_name(session.as_deref().unwrap_or("default"), client_name);
     let ctl_path = resolve_ctl_path(ctl_socket, Some(&host))?;
     let session_id = resolve_session_id(&ctl_path, &session).await?;
 

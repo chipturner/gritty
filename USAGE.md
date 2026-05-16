@@ -57,6 +57,8 @@ laptop$ gritty connect devbox:work          # now "devbox" routes to user@10.0.0
 - `-`: refers to the last-attached session, e.g. `gritty connect devbox:-`.
 - Numeric-only names are rejected (they would collide with auto-assigned session IDs).
 
+**Client namespacing.** Every short name (no `/`) you type is silently scoped to your client's namespace. With `client-name = "mylaptop"` (the default is your hostname), `gritty connect devbox:work` resolves to the wire name `mylaptop/work`. Two laptops typing the same short name no longer collide -- each lands in its own session. To address a session in another client's namespace (or a deliberately-shared session), type the full slash-bearing form: `gritty connect devbox:laptop2/work` is taken literally with no prefix added. `gritty ls` strips your own prefix for readability and shows foreign prefixes intact.
+
 `connect` auto-starts the server and tunnel as needed. `send`/`receive` auto-detect the session across all active servers; use `--session host:session` to target a specific one.
 
 ## Options
@@ -144,7 +146,13 @@ gritty works out of the box with no config file. Optionally, set persistent defa
 # heartbeat-timeout = 60
 # ring-buffer-size = 1048576
 # oauth-tunnel-idle-timeout = 5
-# client-name = "my-laptop"      # label shown in session lists; default: hostname
+# client-name = "my-laptop"      # prefix applied to session names; default: hostname.
+                                  # Sessions you create are named <client-name>/<short>
+                                  # on the wire so multi-laptop clients don't collide.
+                                  # Must be non-empty and contain no `/`, whitespace,
+                                  # or control characters (invalid -> falls back to
+                                  # "unknown"). Use `gritty connect host:foo/bar` to
+                                  # bypass prefixing (foreign or shared sessions).
 
 # Tunnel-specific global defaults (for tunnel-create).
 [defaults.tunnel]

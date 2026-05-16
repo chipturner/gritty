@@ -81,8 +81,13 @@ pub struct SessionSettings {
     pub client_name: String,
 }
 
+/// Resolve a default `client_name` from the system hostname, sanitized through
+/// [`crate::naming::sanitize_client_name`] so an empty hostname or one with a
+/// `/` in it falls back to `"unknown"` instead of producing a broken prefix.
 fn default_client_name() -> String {
-    nix::unistd::gethostname().ok().and_then(|s| s.into_string().ok()).unwrap_or_default()
+    let raw =
+        nix::unistd::gethostname().ok().and_then(|s| s.into_string().ok()).unwrap_or_default();
+    crate::naming::sanitize_client_name(raw)
 }
 
 impl Default for SessionSettings {
@@ -257,6 +262,7 @@ impl ConfigFile {
             client_name: h
                 .and_then(|h| h.client_name.clone())
                 .or_else(|| d.client_name.clone())
+                .map(crate::naming::sanitize_client_name)
                 .unwrap_or_else(default_client_name),
         }
     }

@@ -73,6 +73,8 @@ laptop$ gritty receive - | tar xzf -
 
 In `devbox:work`, the part before the colon is **the host's name** and the part after is a **session name** you choose (so you can keep several going). By default the host name is just the SSH hostname -- `gritty connect devbox:work` targets the machine you reach as `devbox`. You can remap it (`gritty tunnel-create user@10.0.0.5 -n devbox`) when the SSH destination and the name you'd rather type differ. The reserved host `local` runs a server on this machine -- handy for testing, but remote sessions are the point.
 
+Session names are scoped to your client: `gritty connect devbox:work` from your laptop lands in a session named `mylaptop/work` on the wire, so when you log in from another machine you don't silently land in (and clobber) each other's sessions. A name containing `/` is taken literally -- use that form to reach another client's session (`devbox:laptop2/work`) or to create a deliberately-shared one. The client prefix defaults to your hostname; set `client-name` in `~/.config/gritty/config.toml` to override.
+
 See **[USAGE.md](USAGE.md)** for every command and flag, configuration, escape sequences, completions, and debugging.
 
 ## Features

@@ -4,6 +4,7 @@ pub mod config;
 pub mod connect;
 pub mod daemon;
 pub mod logging;
+pub mod naming;
 pub mod net_watch;
 pub mod protocol;
 pub mod runinfo;

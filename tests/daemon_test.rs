@@ -1704,6 +1704,68 @@ async fn already_attached_error_names_current_client() {
 }
 
 #[tokio::test]
+async fn client_prefixed_names_do_not_collide_across_clients() {
+    // Two simulated clients with different `client_name` values both
+    // resolve `gritty c host:default` -- under the client-prefix rule
+    // they send `laptop-a/default` and `laptop-b/default` respectively,
+    // which must coexist as two distinct sessions on the same daemon.
+    // Pre-prefix: both would have collided on the bare name `default`.
+    let (_tmp, ctl_path) = test_ctl();
+    let ctl = ctl_path.clone();
+    let _daemon = tokio::spawn(async move { gritty::daemon::run(&ctl, None).await });
+    wait_for_daemon(&ctl_path).await;
+
+    let _framed_a = new_session_for_test(&ctl_path, "laptop-a/default", "laptop-a", 100).await;
+    let _framed_b = new_session_for_test(&ctl_path, "laptop-b/default", "laptop-b", 200).await;
+
+    let resp = control_request(&ctl_path, Frame::ListSessions).await;
+    let sessions = match resp {
+        Frame::SessionInfo { sessions } => sessions,
+        other => panic!("expected SessionInfo, got {other:?}"),
+    };
+    assert_eq!(sessions.len(), 2, "expected two distinct sessions, got {sessions:#?}");
+    let mut names: Vec<_> = sessions.iter().map(|s| s.name.clone()).collect();
+    names.sort();
+    assert_eq!(names, vec!["laptop-a/default".to_string(), "laptop-b/default".to_string()]);
+}
+
+#[tokio::test]
+async fn slash_bearing_name_enables_cross_client_access() {
+    // Client A creates `laptop-a/work`. Client B types `gritty c host:laptop-a/work`
+    // -- the slash in the user-supplied name causes the client to skip its own
+    // prefixing rule and pass the literal foreign name through. The daemon
+    // accepts it as a valid attach (force-takeover, since A holds it). This
+    // is the documented foreign-access form.
+    let (_tmp, ctl_path) = test_ctl();
+    let ctl = ctl_path.clone();
+    let _daemon = tokio::spawn(async move { gritty::daemon::run(&ctl, None).await });
+    wait_for_daemon(&ctl_path).await;
+
+    let _framed_a = new_session_for_test(&ctl_path, "laptop-a/work", "laptop-a", 100).await;
+
+    let resp = control_request_as(
+        &ctl_path,
+        Frame::Attach {
+            session: "laptop-a/work".to_string(),
+            client_name: "laptop-b".to_string(),
+            force: true,
+            no_replay: false,
+            cols: 0,
+            rows: 0,
+            attach_token: 0,
+            rendered_offset: 0,
+            line_dirty: false,
+        },
+        200,
+    )
+    .await;
+    assert!(
+        matches!(resp, Frame::AttachAck { .. }),
+        "expected cross-client foreign attach to succeed, got {resp:?}"
+    );
+}
+
+#[tokio::test]
 async fn attach_dash_no_previous_session() {
     let (_tmp, ctl_path) = test_ctl();
 

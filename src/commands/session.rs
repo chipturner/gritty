@@ -65,7 +65,8 @@ pub(crate) async fn connect_session(
         Some(name) => (Some(name.clone()), false),
         None if new_session => (None, false),
         None => {
-            let (n, _picked, pf) = pick_session(pick, no_pick, &ctl_path).await;
+            let (n, _picked, pf) =
+                pick_session(pick, no_pick, &ctl_path, &settings.client_name).await;
             (Some(n), pf)
         }
     };
@@ -82,7 +83,7 @@ pub(crate) async fn connect_session(
     // of creating a fresh session-N -- violating the --new contract.
     let name = match preliminary_name {
         Some(n) => n,
-        None => auto_new_session_name(&ctl_path).await,
+        None => auto_new_session_name(&ctl_path, &settings.client_name).await,
     };
 
     let mut framed = Framed::new(stream, FrameCodec);
@@ -194,7 +195,7 @@ pub(crate) async fn connect_session(
             }
 
             // Alert about other detached sessions
-            alert_detached_sessions(&name, &ctl_path).await;
+            alert_detached_sessions(&name, &ctl_path, &settings.client_name).await;
 
             let client_span = tracing::info_span!("client", session = %name, session_id = id);
             let code = gritty::client::run(
@@ -210,71 +211,82 @@ pub(crate) async fn connect_session(
     }
 }
 
-/// Resolve session name when none was explicitly given.
-/// Returns `(name, picked)` where `picked` is true if the user chose interactively.
 /// Resolve `-n`/`--new` to the next auto-named session slot. Uses the same
-/// rule the picker applies: `default` if unused, otherwise the first free
-/// `session-N`. Falls back to `default` if the server can't be reached --
-/// the connect flow auto-starts the daemon and will re-attempt anyway.
-async fn auto_new_session_name(ctl_path: &Path) -> String {
+/// rule the picker applies: `<client>/default` if unused, otherwise the first
+/// free `<client>/session-N`. Falls back to `<client>/default` if the server
+/// can't be reached -- the connect flow auto-starts the daemon and will
+/// re-attempt anyway.
+async fn auto_new_session_name(ctl_path: &Path, client_name: &str) -> String {
     use gritty::protocol::Frame;
 
     let sessions = match server_request(ctl_path, Frame::ListSessions).await {
         Ok(Frame::SessionInfo { sessions }) => sessions,
-        _ => return "default".to_string(),
+        _ => return gritty::naming::resolve_session_name("default", client_name),
     };
-    suggest_name(&build_rows(&sessions))
+    suggest_name(&build_rows(&sessions), client_name)
 }
 
-async fn pick_session(pick: bool, no_pick: bool, ctl_path: &Path) -> (String, bool, bool) {
+async fn pick_session(
+    pick: bool,
+    no_pick: bool,
+    ctl_path: &Path,
+    client_name: &str,
+) -> (String, bool, bool) {
     use gritty::protocol::Frame;
 
+    let default_wire = gritty::naming::resolve_session_name("default", client_name);
+
     if no_pick {
-        return ("default".to_string(), false, false);
+        return (default_wire, false, false);
     }
 
     let sessions = match server_request(ctl_path, Frame::ListSessions).await {
         Ok(Frame::SessionInfo { sessions }) => sessions,
-        _ => return ("default".to_string(), false, false),
+        _ => return (default_wire, false, false),
     };
 
     if sessions.is_empty() {
-        return ("default".to_string(), false, false);
+        return (default_wire, false, false);
     }
 
     let host = host_from_ctl_path(ctl_path);
 
     if pick {
-        return pick_or_list(&host, &sessions, ctl_path).await;
+        return pick_or_list(&host, &sessions, ctl_path, client_name).await;
     }
 
     let detached: Vec<_> = sessions.iter().filter(|s| !s.attached).collect();
 
     // One session, detached: attach directly
     if sessions.len() == 1 && detached.len() == 1 {
-        return (session_display_name(&sessions[0]), false, false);
+        return (session_wire_name(&sessions[0]), false, false);
     }
 
     // Multiple sessions, exactly one detached: attach to the detached one
     if detached.len() == 1 {
-        return (session_display_name(detached[0]), false, false);
+        return (session_wire_name(detached[0]), false, false);
     }
 
     // Ambiguous (multiple detached) or all attached: show picker
-    pick_or_list(&host, &sessions, ctl_path).await
+    pick_or_list(&host, &sessions, ctl_path, client_name).await
 }
 
-fn session_display_name(s: &gritty::protocol::SessionEntry) -> String {
+/// The wire name of a session: its `name` field, or the numeric id as a string
+/// for an unnamed session. Always passed back to the server verbatim, never
+/// elided.
+fn session_wire_name(s: &gritty::protocol::SessionEntry) -> String {
     if s.name.is_empty() { s.id.to_string() } else { s.name.clone() }
 }
 
-/// Suggest a name for a new session. Returns "default" if unused, otherwise "session-N".
-fn suggest_name(rows: &[Row]) -> String {
-    if !rows.iter().any(|r| r.name == "default") {
-        return "default".to_string();
+/// Suggest a wire name for a new session in this client's namespace. Returns
+/// `<client>/default` if unused, otherwise the first free `<client>/session-N`.
+fn suggest_name(rows: &[Row], client_name: &str) -> String {
+    let default = gritty::naming::resolve_session_name("default", client_name);
+    if !rows.iter().any(|r| r.name == default) {
+        return default;
     }
     for n in 2.. {
-        let candidate = format!("session-{n}");
+        let candidate = gritty::naming::resolve_session_name(&format!("session-{n}"), client_name);
         if !rows.iter().any(|r| r.name == candidate) {
             return candidate;
         }
@@ -282,16 +294,17 @@ fn suggest_name(rows: &[Row]) -> String {
     unreachable!()
 }
 
-fn print_session_list(host: &str, sessions: &[gritty::protocol::SessionEntry]) {
+fn print_session_list(host: &str, sessions: &[gritty::protocol::SessionEntry], client_name: &str) {
     if sessions.len() == 1 {
         eprintln!("error: session on {host} is already attached:");
     } else {
         eprintln!("error: multiple sessions on {host} -- specify one:");
     }
     for s in sessions {
-        let name = session_display_name(s);
+        let wire = session_wire_name(s);
+        let shown = gritty::naming::display_session_name(&wire, client_name);
         let suffix = if s.attached { "     (attached)" } else { "" };
-        eprintln!("  gritty connect {host}:{name}{suffix}");
+        eprintln!("  gritty connect {host}:{shown}{suffix}");
     }
 }
 
@@ -301,14 +314,15 @@ async fn pick_or_list(
     host: &str,
     sessions: &[gritty::protocol::SessionEntry],
     ctl_path: &Path,
+    client_name: &str,
 ) -> (String, bool, bool) {
     if std::io::IsTerminal::is_terminal(&std::io::stderr()) {
-        match tui_pick_session(host, sessions, ctl_path).await {
+        match tui_pick_session(host, sessions, ctl_path, client_name).await {
             Some((name, force)) => (name, true, force),
             None => std::process::exit(1),
         }
     } else {
-        print_session_list(host, sessions);
+        print_session_list(host, sessions, client_name);
         std::process::exit(1);
     }
 }
@@ -333,7 +347,7 @@ fn build_rows(sessions: &[gritty::protocol::SessionEntry]) -> Vec<Row> {
         .iter()
         .enumerate()
         .map(|(i, s)| Row {
-            name: session_display_name(s),
+            name: session_wire_name(s),
             attached: s.attached,
             age: format_age(now, s.created_at),
             cmd: s.foreground_cmd.clone(),
@@ -354,11 +368,14 @@ fn shorten_home(path: &str, home: &str) -> String {
     path.to_string()
 }
 
-/// Interactive session picker. Returns selected session name, or None on abort.
+/// Interactive session picker. Returns selected session name (wire form), or
+/// None on abort. `client_name` is the ambient prefix used to elide own-namespace
+/// names in display and to namespace newly-suggested names.
 async fn tui_pick_session(
     host: &str,
     sessions: &[gritty::protocol::SessionEntry],
     ctl_path: &Path,
+    client_name: &str,
 ) -> Option<(String, bool)> {
     use crossterm::{
         event::{self, Event, KeyCode, KeyEvent, KeyModifiers},
@@ -419,7 +436,14 @@ async fn tui_pick_session(
                   mode: &Mode,
                   status: Option<&str>,
                   prev_total_lines: usize| {
-        let name_w = rows.iter().map(|r| r.name.len()).max().unwrap_or(0).max(3);
+        // Elide own-client prefix from the displayed NAME column. Width
+        // computations and the cell content both use the elided form so
+        // foreign sessions still align correctly.
+        let displayed: Vec<&str> = rows
+            .iter()
+            .map(|r| gritty::naming::display_session_name(&r.name, client_name))
+            .collect();
+        let name_w = displayed.iter().map(|s| s.len()).max().unwrap_or(0).max(3);
         let tag_w = 10; // "(attached)" is 10 chars
         let age_w = rows.iter().map(|r| r.age.len()).max().unwrap_or(0);
         let cmd_w = rows.iter().map(|r| r.cmd.len()).max().unwrap_or(0);
@@ -455,30 +479,32 @@ async fn tui_pick_session(
                 " "
             };
             let hk = row.hotkey.map_or(String::from("  "), |c| format!("{c})"));
+            let shown = displayed[i];
 
             if i == cursor && matches!(mode, Mode::Pick | Mode::ConfirmKill { .. }) {
                 let tag = if row.attached { "(attached)" } else { "" };
                 let _ = write!(
                     stderr,
                     "{marker} \x1b[2m{hk}\x1b[0m \x1b[32;1m{:<name_w$}\x1b[0m  {:<tag_w$}  \x1b[32m{:<age_w$}\x1b[0m  \x1b[32m{:<cmd_w$}\x1b[0m  \x1b[32m{:<client_w$}\x1b[0m  \x1b[32m{}\x1b[0m\r\n",
-                    row.name, tag, row.age, row.cmd, row.client, row.cwd,
+                    shown, tag, row.age, row.cmd, row.client, row.cwd,
                 );
             } else if row.attached {
                 let _ = write!(
                     stderr,
                     "{marker} \x1b[2m{hk} {:<name_w$}  {:<tag_w$}  {:<age_w$}  {:<cmd_w$}  {:<client_w$}  {}\x1b[0m\r\n",
-                    row.name, "(attached)", row.age, row.cmd, row.client, row.cwd,
+                    shown, "(attached)", row.age, row.cmd, row.client, row.cwd,
                 );
             } else {
                 let _ = write!(
                     stderr,
                     "{marker} \x1b[2m{hk}\x1b[0m {:<name_w$}  {:<tag_w$}  {:<age_w$}  {:<cmd_w$}  {:<client_w$}  {}\r\n",
-                    row.name, "", row.age, row.cmd, row.client, row.cwd,
+                    shown, "", row.age, row.cmd, row.client, row.cwd,
                 );
             }
         }
         // "New session" row / input line
-        let suggested = suggest_name(rows);
+        let suggested_wire = suggest_name(rows, client_name);
+        let suggested = gritty::naming::display_session_name(&suggested_wire, client_name);
         match mode {
             Mode::Pick | Mode::ConfirmKill { .. } => {
                 let marker = if cursor == rows.len() { "\x1b[32;1m\u{25b8}\x1b[0m" } else { " " };
@@ -557,7 +583,7 @@ async fn tui_pick_session(
                         break Some((rows[cursor].name.clone(), false));
                     }
                     // On the "new session" row: create immediately with suggested name
-                    break Some((suggest_name(&rows), false));
+                    break Some((suggest_name(&rows, client_name), false));
                 }
                 // Hotkeys 1-9
                 Event::Key(KeyEvent {
@@ -570,13 +596,17 @@ async fn tui_pick_session(
                         break Some((rows[idx].name.clone(), false));
                     }
                 }
-                // 'd' -> select or create "default"
+                // 'd' -> select or create "default" (resolved into this
+                // client's namespace, e.g. `mylaptop/default`).
                 Event::Key(KeyEvent {
                     code: KeyCode::Char('d'),
                     modifiers: KeyModifiers::NONE,
                     ..
                 }) => {
-                    break Some(("default".to_string(), false));
+                    break Some((
+                        gritty::naming::resolve_session_name("default", client_name),
+                        false,
+                    ));
                 }
                 // 'n' -> create new session immediately with the suggested name
                 Event::Key(KeyEvent {
@@ -584,7 +614,7 @@ async fn tui_pick_session(
                     modifiers: KeyModifiers::NONE,
                     ..
                 }) => {
-                    break Some((suggest_name(&rows), false));
+                    break Some((suggest_name(&rows, client_name), false));
                 }
                 // 'c' or '+' -> new session input, prompting to edit the name
                 Event::Key(KeyEvent {
@@ -592,7 +622,13 @@ async fn tui_pick_session(
                     modifiers: KeyModifiers::NONE,
                     ..
                 }) => {
-                    let name = suggest_name(&rows);
+                    // Pre-fill the input with the suggested name in display
+                    // form (e.g. `default` instead of `mylaptop/default`) so
+                    // the user edits the part they care about; the prefix is
+                    // re-applied via resolve_session_name on submit.
+                    let suggested = suggest_name(&rows, client_name);
+                    let name =
+                        gritty::naming::display_session_name(&suggested, client_name).to_string();
                     let len = name.len();
                     cursor = rows.len();
                     status = None;
@@ -675,7 +711,10 @@ async fn tui_pick_session(
                         server_request(&ctl, gritty::protocol::Frame::ListSessions).await
                     {
                         if fresh.is_empty() {
-                            break Some(("default".to_string(), false));
+                            break Some((
+                                gritty::naming::resolve_session_name("default", client_name),
+                                false,
+                            ));
                         }
                         rows = build_rows(&fresh);
                         cursor = cursor.min(rows.len().saturating_sub(1));
@@ -688,12 +727,15 @@ async fn tui_pick_session(
             },
             Mode::Input { buf, cursor_pos, rename_of } => match ev {
                 Event::Key(KeyEvent { code: KeyCode::Enter, .. }) => {
-                    let new_name = buf.trim().to_string();
+                    let user_input = buf.trim().to_string();
+                    // Re-prefix the user's input with our namespace -- the
+                    // input was pre-filled with the elided display form.
+                    let new_wire = gritty::naming::resolve_session_name(&user_input, client_name);
                     // clone, don't take: on a rejected rename we stay in Input
                     // mode, and `rename_of` must still say this is a rename.
                     if let Some(old_name) = rename_of.clone() {
                         // Rename mode
-                        if new_name.is_empty() || new_name == old_name {
+                        if user_input.is_empty() || new_wire == old_name {
                             mode = Mode::Pick;
                         } else {
                             let ctl = ctl_path.to_path_buf();
@@ -701,7 +743,7 @@ async fn tui_pick_session(
                                 &ctl,
                                 gritty::protocol::Frame::RenameSession {
                                     session: old_name,
-                                    new_name,
+                                    new_name: new_wire,
                                 },
                             )
                             .await
@@ -732,11 +774,11 @@ async fn tui_pick_session(
                                 }
                             }
                         }
-                    } else if new_name.is_empty() {
+                    } else if user_input.is_empty() {
                         mode = Mode::Pick;
                         cursor = rows.len();
                     } else {
-                        break Some((new_name, false));
+                        break Some((new_wire, false));
                     }
                 }
                 Event::Key(KeyEvent { code: KeyCode::Esc, .. }) => {
@@ -872,8 +914,9 @@ fn host_from_ctl_path(ctl_path: &Path) -> String {
 }
 
 /// After creating a new session, show a hint if there are other detached
-/// sessions the user might have forgotten about.
-async fn alert_detached_sessions(current_name: &str, ctl_path: &Path) {
+/// sessions the user might have forgotten about. Names are shown with our
+/// own client prefix elided.
+async fn alert_detached_sessions(current_name: &str, ctl_path: &Path, client_name: &str) {
     use gritty::protocol::Frame;
 
     let ctl_path_buf = ctl_path.to_path_buf();
@@ -883,21 +926,17 @@ async fn alert_detached_sessions(current_name: &str, ctl_path: &Path) {
     let Frame::SessionInfo { sessions } = resp else {
         return;
     };
-    let detached: Vec<_> = sessions
-        .iter()
-        .filter(|s| {
-            !s.attached && {
-                let display = if s.name.is_empty() { s.id.to_string() } else { s.name.clone() };
-                display != current_name
-            }
-        })
-        .collect();
+    let detached: Vec<_> =
+        sessions.iter().filter(|s| !s.attached && session_wire_name(s) != current_name).collect();
     if detached.is_empty() {
         return;
     }
     let names: Vec<_> = detached
         .iter()
-        .map(|s| if s.name.is_empty() { s.id.to_string() } else { s.name.clone() })
+        .map(|s| {
+            let wire = session_wire_name(s);
+            gritty::naming::display_session_name(&wire, client_name).to_string()
+        })
         .collect();
     eprintln!("\x1b[2;33m\u{25b8} detached sessions: {}\x1b[0m", names.join(", "));
 }
@@ -1051,8 +1090,20 @@ pub(crate) async fn restart(
 /// between `list_sessions` and `list_all_sessions`; the latter just prepends a
 /// Host column. Single-sourced so the "starting"/attached/heartbeat/detached
 /// status logic and column order cannot drift between the two listings.
-fn session_status_cols(s: &gritty::protocol::SessionEntry, now: u64) -> Vec<String> {
-    let name = if s.name.is_empty() { "-".to_string() } else { s.name.clone() };
+///
+/// `ambient_client_name` elides that prefix from the displayed NAME column so
+/// your own sessions read as `work` rather than `mylaptop/work`; pass an empty
+/// string to skip elision (e.g. `--full`).
+fn session_status_cols(
+    s: &gritty::protocol::SessionEntry,
+    now: u64,
+    ambient_client_name: &str,
+) -> Vec<String> {
+    let name = if s.name.is_empty() {
+        "-".to_string()
+    } else {
+        gritty::naming::display_session_name(&s.name, ambient_client_name).to_string()
+    };
     let (pty, pid, created, status) = if s.shell_pid == 0 {
         ("-".to_string(), "-".to_string(), "-".to_string(), "starting".to_string())
     } else {
@@ -1081,7 +1132,7 @@ fn session_status_cols(s: &gritty::protocol::SessionEntry, now: u64) -> Vec<Stri
     ]
 }
 
-pub(crate) async fn list_sessions(ctl_path: PathBuf) -> anyhow::Result<()> {
+pub(crate) async fn list_sessions(ctl_path: PathBuf, client_name: &str) -> anyhow::Result<()> {
     use gritty::protocol::Frame;
 
     let resp = server_request(&ctl_path, Frame::ListSessions).await?;
@@ -1097,7 +1148,7 @@ pub(crate) async fn list_sessions(ctl_path: PathBuf) -> anyhow::Result<()> {
 
                 // Build row data
                 let rows: Vec<Vec<String>> =
-                    sessions.iter().map(|s| session_status_cols(s, now)).collect();
+                    sessions.iter().map(|s| session_status_cols(s, now, client_name)).collect();
 
                 gritty::table::print_table(
                     &["ID", "Name", "Cmd", "CWD", "Client", "PTY", "PID", "Created", "Status"],
@@ -1112,7 +1163,7 @@ pub(crate) async fn list_sessions(ctl_path: PathBuf) -> anyhow::Result<()> {
     }
 }
 
-pub(crate) async fn list_all_sessions() -> anyhow::Result<()> {
+pub(crate) async fn list_all_sessions(config: &gritty::config::ConfigFile) -> anyhow::Result<()> {
     use gritty::protocol::{Frame, FrameCodec, SessionEntry};
 
     let probes = discover_daemon_probes();
@@ -1186,14 +1237,20 @@ pub(crate) async fn list_all_sessions() -> anyhow::Result<()> {
         .collect();
     let multi_host = ok_hosts.len() > 1;
 
-    // Build row data: [host, id, name, cmd, cwd, client, pty, pid, created, status]
+    // Build row data: [host, id, name, cmd, cwd, client, pty, pid, created, status].
+    // Per-host: the client_name elision applied to the NAME column uses the
+    // *resolved* client_name for that host -- a host with a per-host
+    // `client_name` override (different from `[defaults].client-name`) gets
+    // its own elision rather than the default one.
     let rows: Vec<Vec<String>> = ok_hosts
         .iter()
         .flat_map(|(host, sessions)| {
+            let host_str = (*host).clone();
+            let client_name = config.resolve_session(Some(&host_str)).client_name;
             sessions.iter().map(move |s| {
                 let mut row = Vec::with_capacity(10);
-                row.push((*host).clone());
-                row.extend(session_status_cols(s, now));
+                row.push(host_str.clone());
+                row.extend(session_status_cols(s, now, &client_name));
                 row
             })
         })
@@ -1222,7 +1279,12 @@ pub(crate) async fn list_all_sessions() -> anyhow::Result<()> {
 /// Print available sessions and exit with an error when a session-requiring
 /// command is invoked without the session part (e.g. `gritty tail local`
 /// instead of `gritty tail local:session`).
-pub(crate) async fn suggest_session(cmd: &str, host: &str, ctl_path: &Path) -> anyhow::Result<()> {
+pub(crate) async fn suggest_session(
+    cmd: &str,
+    host: &str,
+    ctl_path: &Path,
+    client_name: &str,
+) -> anyhow::Result<()> {
     use gritty::protocol::Frame;
 
     let ctl_path_buf = ctl_path.to_path_buf();
@@ -1246,7 +1308,11 @@ pub(crate) async fn suggest_session(cmd: &str, host: &str, ctl_path: &Path) -> a
             let mut msg = format!("specify a session: gritty {cmd} {host}:<session>\n\n");
             msg.push_str("  ID  Name     Age\n");
             for s in &sessions {
-                let name = if s.name.is_empty() { "-".to_string() } else { s.name.clone() };
+                let name = if s.name.is_empty() {
+                    "-".to_string()
+                } else {
+                    gritty::naming::display_session_name(&s.name, client_name).to_string()
+                };
                 let age = format_age(now, s.created_at);
                 msg.push_str(&format!("  {}   {:<8} {}\n", s.id, name, age));
             }
@@ -1274,20 +1340,27 @@ mod tests {
 
     #[test]
     fn suggest_name_uses_default_when_free() {
-        assert_eq!(suggest_name(&[]), "default");
-        assert_eq!(suggest_name(&[row("work")]), "default");
+        assert_eq!(suggest_name(&[], "mylaptop"), "mylaptop/default");
+        // A foreign session also named `default` doesn't occupy our slot.
+        assert_eq!(suggest_name(&[row("laptop2/default")], "mylaptop"), "mylaptop/default");
     }
 
     #[test]
     fn suggest_name_increments_past_default() {
-        assert_eq!(suggest_name(&[row("default")]), "session-2");
-        assert_eq!(suggest_name(&[row("default"), row("session-2")]), "session-3");
+        assert_eq!(suggest_name(&[row("mylaptop/default")], "mylaptop"), "mylaptop/session-2");
+        assert_eq!(
+            suggest_name(&[row("mylaptop/default"), row("mylaptop/session-2")], "mylaptop"),
+            "mylaptop/session-3"
+        );
     }
 
     #[test]
     fn suggest_name_fills_first_free_slot() {
-        // session-2 missing -- the first free slot, not the max+1.
-        assert_eq!(suggest_name(&[row("default"), row("session-3")]), "session-2");
+        // session-2 missing in our namespace -- the first free slot, not max+1.
+        assert_eq!(
+            suggest_name(&[row("mylaptop/default"), row("mylaptop/session-3")], "mylaptop"),
+            "mylaptop/session-2"
+        );
     }
 
     fn entry() -> gritty::protocol::SessionEntry {
@@ -1311,7 +1384,7 @@ mod tests {
     fn session_status_cols_starting_when_no_shell() {
         let mut s = entry();
         s.shell_pid = 0;
-        let cols = session_status_cols(&s, 100);
+        let cols = session_status_cols(&s, 100, "");
         // id, name(-), cmd, cwd, client, pty(-), pid(-), created(-), status
         assert_eq!(cols[0], "3");
         assert_eq!(cols[1], "-"); // empty name renders as "-"
@@ -1325,7 +1398,7 @@ mod tests {
         let mut s = entry();
         s.attached = true;
         s.last_heartbeat = 90;
-        let cols = session_status_cols(&s, 100);
+        let cols = session_status_cols(&s, 100, "");
         assert_eq!(cols[8], "attached (heartbeat 10s ago)");
         assert_eq!(cols[6], "1234"); // pid
     }
@@ -1333,9 +1406,25 @@ mod tests {
     #[test]
     fn session_status_cols_detached_and_attached_no_heartbeat() {
         let s = entry();
-        assert_eq!(session_status_cols(&s, 100)[8], "detached");
+        assert_eq!(session_status_cols(&s, 100, "")[8], "detached");
         let mut s2 = entry();
         s2.attached = true;
-        assert_eq!(session_status_cols(&s2, 100)[8], "attached");
+        assert_eq!(session_status_cols(&s2, 100, "")[8], "attached");
+    }
+
+    #[test]
+    fn session_status_cols_elides_ambient_client_prefix() {
+        let mut s = entry();
+        s.name = "mylaptop/work".to_string();
+        let cols = session_status_cols(&s, 100, "mylaptop");
+        assert_eq!(cols[1], "work"); // own prefix elided
+    }
+
+    #[test]
+    fn session_status_cols_keeps_foreign_prefix() {
+        let mut s = entry();
+        s.name = "laptop2/work".to_string();
+        let cols = session_status_cols(&s, 100, "mylaptop");
+        assert_eq!(cols[1], "laptop2/work"); // foreign prefix kept
     }
 }

@@ -381,6 +381,22 @@ fn client_log_path(cmd: &Command, ctl_socket_override: bool) -> Option<PathBuf> 
     Some(gritty::connect::connect_log_path(&host))
 }
 
+/// Apply the client-name prefix rule to the session part of a `host:session`
+/// target string, leaving the host part untouched. Used by `send` / `receive`
+/// which take an opaque `--session host:session` string and pass it down to
+/// the transfer helpers (which don't know about config).
+fn resolve_target_session(
+    config: &gritty::config::ConfigFile,
+    target: Option<String>,
+) -> Option<String> {
+    let target = target?;
+    let (host, session) = parse_target(&target);
+    let session = session?;
+    let client_name = config.resolve_session(Some(&host)).client_name;
+    let wire = gritty::naming::resolve_session_name(&session, &client_name);
+    Some(format!("{host}:{wire}"))
+}
+
 /// Fork into background, returning the write end of the readiness pipe.
 ///
 /// Double-fork daemonize: parent -> session leader -> grandchild (daemon).
@@ -753,6 +769,11 @@ async fn run(cli: Cli, config: gritty::config::ConfigFile) -> anyhow::Result<()>
                 oauth_tunnel_idle_timeout: resolved.oauth_tunnel_idle_timeout,
                 client_name: resolved.client_name,
             };
+            // Prefix the user-supplied session into this client's namespace
+            // (e.g. `work` -> `mylaptop/work`). Names containing `/` pass
+            // through literally -- the foreign-access / shared-session form.
+            let session =
+                session.map(|s| gritty::naming::resolve_session_name(&s, &settings.client_name));
             connect_session(
                 session,
                 command,
@@ -766,10 +787,17 @@ async fn run(cli: Cli, config: gritty::config::ConfigFile) -> anyhow::Result<()>
         Command::Tail { target } => {
             let (host, session) = split_optional_target(target.as_deref());
             let ctl_path = resolve_ctl_path(cli.ctl_socket, host.as_deref())?;
+            let client_name = config.resolve_session(host.as_deref()).client_name;
             let session = match session {
-                Some(s) => s,
+                Some(s) => gritty::naming::resolve_session_name(&s, &client_name),
                 None => {
-                    suggest_session("tail", host.as_deref().unwrap_or("host"), &ctl_path).await?;
+                    suggest_session(
+                        "tail",
+                        host.as_deref().unwrap_or("host"),
+                        &ctl_path,
+                        &client_name,
+                    )
+                    .await?;
                     unreachable!()
                 }
             };
@@ -778,21 +806,28 @@ async fn run(cli: Cli, config: gritty::config::ConfigFile) -> anyhow::Result<()>
         }
         Command::ListSessions { target } => {
             if target.is_none() && cli.ctl_socket.is_none() {
-                list_all_sessions().await
+                list_all_sessions(&config).await
             } else {
                 let host = target.as_deref().map(|t| parse_target(t).0);
                 let ctl_path = resolve_ctl_path(cli.ctl_socket, host.as_deref())?;
-                list_sessions(ctl_path).await
+                let client_name = config.resolve_session(host.as_deref()).client_name;
+                list_sessions(ctl_path, &client_name).await
             }
         }
         Command::KillSession { target } => {
             let (host, session) = split_optional_target(target.as_deref());
             let ctl_path = resolve_ctl_path(cli.ctl_socket, host.as_deref())?;
+            let client_name = config.resolve_session(host.as_deref()).client_name;
             let session = match session {
-                Some(s) => s,
+                Some(s) => gritty::naming::resolve_session_name(&s, &client_name),
                 None => {
-                    suggest_session("kill-session", host.as_deref().unwrap_or("host"), &ctl_path)
-                        .await?;
+                    suggest_session(
+                        "kill-session",
+                        host.as_deref().unwrap_or("host"),
+                        &ctl_path,
+                        &client_name,
+                    )
+                    .await?;
                     unreachable!()
                 }
             };
@@ -801,13 +836,15 @@ async fn run(cli: Cli, config: gritty::config::ConfigFile) -> anyhow::Result<()>
         Command::Rename { target, new_name } => {
             let (host, session) = parse_target(&target);
             let ctl_path = resolve_ctl_path(cli.ctl_socket, Some(&host))?;
+            let client_name = config.resolve_session(Some(&host)).client_name;
             let session = match session {
-                Some(s) => s,
+                Some(s) => gritty::naming::resolve_session_name(&s, &client_name),
                 None => {
                     eprintln!("error: specify session as host:session (e.g. local:mysession)");
                     std::process::exit(1);
                 }
             };
+            let new_name = gritty::naming::resolve_session_name(&new_name, &client_name);
             rename_session(session, new_name, ctl_path).await
         }
         Command::KillServer { target } => {
@@ -848,12 +885,14 @@ async fn run(cli: Cli, config: gritty::config::ConfigFile) -> anyhow::Result<()>
                 files.retain(|f| f.as_os_str() != "-");
             }
             let timeout = if no_timeout { None } else { Some(timeout) };
+            let session = resolve_target_session(&config, session);
             send_command(cli.ctl_socket, session, use_stdin, timeout, recursive, files).await
         }
         Command::Receive { session, stdout, timeout, no_timeout, dir } => {
             let use_stdout = stdout || dir.as_deref().is_some_and(|d| d.as_os_str() == "-");
             let dir = if use_stdout { None } else { dir };
             let timeout = if no_timeout { None } else { Some(timeout) };
+            let session = resolve_target_session(&config, session);
             receive_command(cli.ctl_socket, session, use_stdout, timeout, dir).await
         }
         Command::Open { url } => {
@@ -866,11 +905,31 @@ async fn run(cli: Cli, config: gritty::config::ConfigFile) -> anyhow::Result<()>
         }
         Command::LocalForward { target, port } => {
             let (listen_port, target_port) = parse_port_spec(&port)?;
-            port_forward_client_command(cli.ctl_socket, &target, 0, listen_port, target_port).await
+            let host = parse_target(&target).0;
+            let client_name = config.resolve_session(Some(&host)).client_name;
+            port_forward_client_command(
+                cli.ctl_socket,
+                &target,
+                &client_name,
+                0,
+                listen_port,
+                target_port,
+            )
+            .await
         }
         Command::RemoteForward { target, port } => {
             let (listen_port, target_port) = parse_port_spec(&port)?;
-            port_forward_client_command(cli.ctl_socket, &target, 1, listen_port, target_port).await
+            let host = parse_target(&target).0;
+            let client_name = config.resolve_session(Some(&host)).client_name;
+            port_forward_client_command(
+                cli.ctl_socket,
+                &target,
+                &client_name,
+                1,
+                listen_port,
+                target_port,
+            )
+            .await
         }
         Command::Bootstrap { destination, install_dir, ssh_options } => {
             let host = gritty::connect::parse_host(&destination)?;
