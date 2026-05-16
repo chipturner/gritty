@@ -338,6 +338,26 @@ enum ReconnectPhase {
     WaitingForNetwork,
 }
 
+/// Outcome of a single reconnect attempt (connect + handshake + Attach).
+enum Attempt {
+    /// Connected and re-attached; resume the relay on this stream.
+    Connected(Framed<UnixStream, FrameCodec>),
+    /// The session no longer exists on the server.
+    SessionGone(String),
+    /// The daemon's `server_id` changed -- it restarted, the session is gone.
+    ServerRestarted,
+    /// Another device took ownership of the session.
+    OwnerChanged,
+    /// Peer protocol version differs from ours.
+    VersionMismatch { server_version: u16 },
+    /// Handshake failed for some other reason.
+    HandshakeErr(String),
+    /// The daemon/socket is gone (stale socket, tunnel torn down).
+    DaemonGone,
+    /// Transient failure; back off and try again.
+    Retry,
+}
+
 /// Render the in-place reconnect status line. `spin` indexes the spinner
 /// frames (any monotonically increasing counter); `elapsed_s` is seconds since
 /// the loop started (or since the network came back).
@@ -354,6 +374,46 @@ fn reconnect_status_line(spin: usize, elapsed_s: u64, phase: ReconnectPhase) -> 
 /// responsible for leaving alt-screen first if needed.
 fn reconnect_err_line(text: &str) -> String {
     format!("\r\x1b[31m\u{25b8} {text}\x1b[0m\x1b[K\r\n")
+}
+
+/// Paint (or first-time open) the reconnect status line, but only once the
+/// reconnect has dragged past the chrome-delay grace period -- a fast
+/// reconnect leaves the terminal untouched. A no-op in alt-screen (caller
+/// passes `show_chrome = false`) or inside the grace window.
+///
+/// `first_paint_ok` gates the *first* paint -- the `\r\n` that opens the status
+/// line's row and moves the cursor. It must be false while a reconnect attempt
+/// is in flight: that attempt's Attach frame already carried
+/// `line_dirty = chrome_shown`, and first-painting mid-attempt would move the
+/// cursor without the server knowing to repaint the line on resume. Deferred
+/// first paints land in the next backoff wait, before the following attempt
+/// snapshots `line_dirty`. Extracted from a function-local macro; `?` now
+/// propagates identically through the caller.
+async fn paint_reconnect_status(
+    async_stdout: &AsyncFd<std::os::fd::OwnedFd>,
+    show_chrome: bool,
+    reconnect_started: Instant,
+    chrome_shown: &mut bool,
+    spin: usize,
+    phase: ReconnectPhase,
+    first_paint_ok: bool,
+) -> anyhow::Result<()> {
+    if show_chrome && reconnect_started.elapsed() >= RECONNECT_CHROME_DELAY {
+        if !*chrome_shown && first_paint_ok {
+            // Open a fresh line below the user's content; repaint in place.
+            write_stdout_async(async_stdout, b"\r\n").await?;
+            *chrome_shown = true;
+        }
+        if *chrome_shown {
+            let elapsed = reconnect_started.elapsed().as_secs();
+            write_stdout_async(
+                async_stdout,
+                reconnect_status_line(spin, elapsed, phase).as_bytes(),
+            )
+            .await?;
+        }
+    }
+    Ok(())
 }
 
 struct NonBlockGuard {
@@ -1978,43 +2038,6 @@ pub async fn run(
                 let is_remote = crate::connect::ctl_socket_lock_path(ctl_path).is_some();
                 info!(is_remote, path_status = ?net.status(), "entering reconnect loop");
 
-                // Paint (or first-time open) the reconnect status line, but
-                // only once the reconnect has dragged past the chrome-delay
-                // grace period -- a fast reconnect leaves the terminal
-                // untouched. A no-op in alt-screen or inside the grace window.
-                //
-                // `$first_paint_ok` gates the *first* paint -- the `\r\n` that
-                // opens the status line's row and moves the cursor. It must be
-                // false while a reconnect attempt is in flight: that attempt's
-                // Attach frame already carried `line_dirty = chrome_shown`, and
-                // first-painting mid-attempt would move the cursor without the
-                // server knowing to repaint the line on resume. Deferred first
-                // paints land in the next backoff wait, before the following
-                // attempt snapshots `line_dirty`.
-                macro_rules! paint_reconnect_status {
-                    ($phase:expr) => {
-                        paint_reconnect_status!($phase, true)
-                    };
-                    ($phase:expr, $first_paint_ok:expr) => {{
-                        if show_chrome && reconnect_started.elapsed() >= RECONNECT_CHROME_DELAY {
-                            if !chrome_shown && $first_paint_ok {
-                                // Open a fresh line below the user's content;
-                                // we repaint it in place from here on.
-                                write_stdout_async(&async_stdout, b"\r\n").await?;
-                                chrome_shown = true;
-                            }
-                            if chrome_shown {
-                                let elapsed = reconnect_started.elapsed().as_secs();
-                                write_stdout_async(
-                                    &async_stdout,
-                                    reconnect_status_line(spin, elapsed, $phase).as_bytes(),
-                                )
-                                .await?;
-                            }
-                        }
-                    }};
-                }
-
                 loop {
                     // Only advance the backoff when we actually slept+tried
                     // (or the backoff was interrupted by something other
@@ -2038,7 +2061,16 @@ pub async fn run(
                                 } else {
                                     ReconnectPhase::Retrying
                                 };
-                                paint_reconnect_status!(phase);
+                                paint_reconnect_status(
+                                    &async_stdout,
+                                    show_chrome,
+                                    reconnect_started,
+                                    &mut chrome_shown,
+                                    spin,
+                                    phase,
+                                    true,
+                                )
+                                .await?;
                             }
                             _ = net.changed() => {
                                 // Network path changed while backing off --
@@ -2152,17 +2184,6 @@ pub async fn run(
                         socket_missing_since = None;
                     }
 
-                    enum Attempt {
-                        Connected(Framed<UnixStream, FrameCodec>),
-                        SessionGone(String),
-                        ServerRestarted,
-                        OwnerChanged,
-                        VersionMismatch { server_version: u16 },
-                        HandshakeErr(String),
-                        DaemonGone,
-                        Retry,
-                    }
-
                     attempt_n += 1;
                     let attempt_started = Instant::now();
                     debug!(
@@ -2260,10 +2281,19 @@ pub async fn run(
                             r = &mut attempt_fut => break r,
                             _ = tick.tick() => {
                                 spin = spin.wrapping_add(1);
-                                // first_paint_ok = false: see the macro -- the
-                                // Attach is already on the wire with a fixed
-                                // `line_dirty`, so the cursor must not move now.
-                                paint_reconnect_status!(ReconnectPhase::Retrying, false);
+                                // first_paint_ok = false: the Attach is already
+                                // on the wire with a fixed `line_dirty`, so the
+                                // cursor must not move now.
+                                paint_reconnect_status(
+                                    &async_stdout,
+                                    show_chrome,
+                                    reconnect_started,
+                                    &mut chrome_shown,
+                                    spin,
+                                    ReconnectPhase::Retrying,
+                                    false,
+                                )
+                                .await?;
                             }
                         }
                     };
