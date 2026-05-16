@@ -522,6 +522,188 @@ impl ChildState {
     }
 }
 
+/// Immutable configuration for the tunnel supervisor. Grouped so the respawn
+/// path is a single-argument call rather than a 10-argument one.
+struct MonitorConfig {
+    dest: Destination,
+    local_sock: PathBuf,
+    extra_ssh_opts: Vec<String>,
+    foreground: bool,
+    no_server_start: bool,
+    isolate_control_path: bool,
+    connect_timeout: u64,
+    lock_path: PathBuf,
+    lock_identity: Option<LockIdentity>,
+}
+
+/// Mutable supervisor state, previously a handful of scattered `let mut`
+/// locals. Grouping them keeps each flag's reset invariant in one place.
+struct MonitorState {
+    /// Remote ctl socket path; re-derived via `ensure_remote_ready` when the
+    /// tunnel has been down long enough that a reboot / daemon upgrade /
+    /// remote relocation is plausible.
+    remote_sock: String,
+    /// Current respawn backoff, advanced by `double_backoff`.
+    backoff: Duration,
+    /// Most recent time the remote daemon was confirmed alive. `SystemTime`
+    /// (not `Instant`) so a laptop suspend counts toward
+    /// `SKIP_ENSURE_REMOTE_THRESHOLD`.
+    last_healthy: Option<std::time::SystemTime>,
+    /// Armed debounced net-change probe deadline (see `NET_PROBE_DEBOUNCE`).
+    net_probe_at: Option<Instant>,
+    /// Set when the supervisor itself killed the child (probe failure), so the
+    /// next respawn skips the backoff sleep.
+    we_killed: bool,
+    /// Whether the OS has reported `Unsatisfied` since the last successful
+    /// probe. A burst that stays `Satisfied` throughout is interface noise.
+    saw_unsatisfied: bool,
+}
+
+/// Outcome of [`respawn_tunnel`].
+enum RespawnResult {
+    /// A replacement ssh child was spawned; install it and keep supervising.
+    NewChild(Child),
+    /// The supervisor must exit (cancelled, or lock ownership lost).
+    Exit,
+}
+
+/// Back off, then respawn the ssh child, re-running `ensure_remote_ready`
+/// unless the tunnel was recently healthy.
+///
+/// The backoff wait is interruptible: a suspend/wake jump or a network-recovery
+/// edge cuts it short, while pure network noise does not. Returns
+/// [`RespawnResult::Exit`] if cancelled or the tunnel lock was taken over
+/// mid-wait (the caller then returns without killing -- there is no live child
+/// during the wait).
+async fn respawn_tunnel(
+    cfg: &MonitorConfig,
+    stop: &tokio_util::sync::CancellationToken,
+    net: &crate::net_watch::NetWatcher,
+    ms: &mut MonitorState,
+    died_uptime: Duration,
+) -> RespawnResult {
+    // Apply the healthy-reset ONCE, based on how long the child that just died
+    // actually ran -- re-deriving it every retry let a long-dead child's
+    // ever-growing uptime pin backoff at MIN and hammer the remote at ~1s.
+    let mut sleep = if ms.we_killed {
+        ms.we_killed = false;
+        Duration::ZERO
+    } else {
+        respawn_sleep(ms.backoff, died_uptime)
+    };
+    let mut backoff_saw_unsatisfied = false;
+
+    loop {
+        // Re-check lock ownership every iteration: the probe_ticker arm that
+        // otherwise does this never runs while we're inside respawn, so a
+        // ghost whose lock was replaced must bail here or it would eventually
+        // spawn_tunnel -> remove the real owner's socket.
+        if !lock_still_owned(cfg.lock_identity, &cfg.lock_path) {
+            warn!(
+                lock_path = %cfg.lock_path.display(),
+                "lock ownership lost during respawn; another supervisor \
+                 owns this tunnel -- exiting"
+            );
+            return RespawnResult::Exit;
+        }
+        info!("respawn: sleeping {}s (backoff)", sleep.as_secs());
+        // Fixed deadline so net.changed() noise doesn't restart the sleep.
+        let deadline = tokio::time::Instant::now() + sleep;
+        // Anchors for suspend detection: wall-clock advances across suspend,
+        // the monotonic clock does not.
+        let wall_anchor = std::time::SystemTime::now();
+        let mono_anchor = Instant::now();
+        'wait: loop {
+            tokio::select! {
+                _ = tokio::time::sleep_until(deadline) => break 'wait,
+                _ = tokio::time::sleep(SUSPEND_POLL) => {
+                    let wall = std::time::SystemTime::now()
+                        .duration_since(wall_anchor)
+                        .unwrap_or_default();
+                    let mono = mono_anchor.elapsed();
+                    if wall > mono + SUSPEND_JUMP_THRESHOLD {
+                        // Cut this sleep short for one attempt; do NOT reset
+                        // the climb -- a dark wake with a locked Keychain
+                        // should cost exactly one failed auth.
+                        info!(
+                            jump_s = wall.saturating_sub(mono).as_secs(),
+                            "detected wake from suspend during backoff; retrying now"
+                        );
+                        break 'wait;
+                    }
+                }
+                _ = net.changed() => {
+                    let status = net.status();
+                    if status == crate::net_watch::PathStatus::Unsatisfied {
+                        backoff_saw_unsatisfied = true;
+                        debug!(?status, "network path changed during backoff (no route); continuing to wait");
+                    } else if backoff_saw_unsatisfied {
+                        info!(?status, "network path recovered during backoff; retrying now");
+                        backoff_saw_unsatisfied = false;
+                        sleep = MIN_RESPAWN_BACKOFF;
+                        break 'wait;
+                    } else {
+                        debug!(?status, "network path changed during backoff (noise); ignoring");
+                    }
+                }
+                _ = stop.cancelled() => return RespawnResult::Exit,
+            }
+        }
+        ms.backoff = double_backoff(sleep);
+
+        // Re-run ensure_remote_ready so a remote that rebooted/upgraded gets
+        // its server started before we point SSH at its ctl socket. Skipped
+        // when the tunnel was just proven healthy (a sub-minute blip can't
+        // have rebooted the remote).
+        let healthy_ago = ms.last_healthy.map(|t| t.elapsed().unwrap_or(Duration::ZERO));
+        let recently_healthy = healthy_ago.is_some_and(|d| d < SKIP_ENSURE_REMOTE_THRESHOLD);
+        if recently_healthy && !ms.remote_sock.is_empty() {
+            info!(
+                ago_s = healthy_ago.map(|d| d.as_secs()),
+                "skipping ensure_remote_ready (tunnel recently healthy)"
+            );
+        } else {
+            match ensure_remote_ready(
+                &cfg.dest,
+                cfg.no_server_start,
+                &cfg.extra_ssh_opts,
+                cfg.foreground,
+                cfg.connect_timeout,
+            )
+            .await
+            {
+                Ok((sock, _ver)) => {
+                    ms.remote_sock = sock;
+                }
+                Err(e) => {
+                    warn!("ensure_remote_ready failed on respawn: {e}");
+                    sleep = ms.backoff;
+                    continue;
+                }
+            }
+        }
+
+        match spawn_tunnel(
+            &cfg.dest,
+            &cfg.local_sock,
+            &ms.remote_sock,
+            &cfg.extra_ssh_opts,
+            cfg.foreground,
+            cfg.isolate_control_path,
+            cfg.connect_timeout,
+        )
+        .await
+        {
+            Ok(c) => return RespawnResult::NewChild(c),
+            Err(e) => {
+                warn!("failed to respawn ssh tunnel: {e}");
+                sleep = ms.backoff;
+                continue;
+            }
+        }
+    }
+}
+
 /// Background task: monitor SSH child, respawn on transient failure.
 /// Uses exponential backoff (1s..60s) and never gives up on transient errors.
 ///
@@ -546,40 +728,39 @@ async fn tunnel_monitor(
     lock_identity: Option<LockIdentity>,
     stop: tokio_util::sync::CancellationToken,
 ) {
-    // Seeded from the caller's initial ensure_remote_ready so a fast
-    // respawn can reuse it; re-derived via ensure_remote_ready whenever
-    // the tunnel has been down long enough that a reboot / daemon upgrade
-    // / remote relocation is plausible.
-    let mut remote_sock = initial_remote_sock;
-    let mut backoff = MIN_RESPAWN_BACKOFF;
-    // Most recent time the remote daemon was confirmed alive (by an
-    // app-layer probe here, or by the caller's ensure_remote_ready that
-    // produced initial_remote_sock). Gates whether respawn re-runs
-    // ensure_remote_ready. Seeded now because the caller just verified it.
-    // SystemTime (not Instant) so a laptop suspend counts toward the
-    // SKIP_ENSURE_REMOTE_THRESHOLD -- Instant pauses across suspend, which
-    // made a 4-minute lid-close read as "recently healthy".
-    let mut last_healthy =
-        if remote_sock.is_empty() { None } else { Some(std::time::SystemTime::now()) };
+    let cfg = MonitorConfig {
+        dest,
+        local_sock,
+        extra_ssh_opts,
+        foreground,
+        no_server_start,
+        isolate_control_path,
+        connect_timeout,
+        lock_path,
+        lock_identity,
+    };
+    // `last_healthy` is seeded now because the caller's ensure_remote_ready
+    // just verified the remote; SystemTime so suspend counts toward
+    // SKIP_ENSURE_REMOTE_THRESHOLD. `backoff` starts at MIN and climbs via
+    // double_backoff; `remote_sock` is reused on a fast respawn and re-derived
+    // when the tunnel has been down long enough.
+    let mut ms = MonitorState {
+        last_healthy: if initial_remote_sock.is_empty() {
+            None
+        } else {
+            Some(std::time::SystemTime::now())
+        },
+        remote_sock: initial_remote_sock,
+        backoff: MIN_RESPAWN_BACKOFF,
+        net_probe_at: None,
+        we_killed: false,
+        saw_unsatisfied: false,
+    };
     let net = crate::net_watch::NetWatcher::spawn();
     let mut probe_ticker = tokio::time::interval(PROBE_INTERVAL);
     probe_ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     probe_ticker.tick().await; // consume the immediate first tick
     let mut state = ChildState::new(child);
-    // Debounced net-change probe: set on each net.changed(), cleared when
-    // the deadline elapses and the probe runs (or when the child is
-    // replaced). See NET_PROBE_DEBOUNCE.
-    let mut net_probe_at: Option<Instant> = None;
-    // Set when the supervisor itself killed the child (probe failure).
-    // Suppresses the respawn backoff: we already rate-limited via the
-    // debounce + probe timeout, and there's no flap to guard against.
-    let mut we_killed = false;
-    // Whether the OS has reported Unsatisfied since the last successful
-    // probe. A burst that stays Satisfied throughout is interface-property
-    // noise (not an outage) -- probing on it risks a transient HelloAck
-    // timeout killing a working SSH. ServerAliveInterval still covers a
-    // genuine seamless route switch in ~6-9s.
-    let mut saw_unsatisfied = false;
 
     loop {
         tokio::select! {
@@ -594,14 +775,14 @@ async fn tunnel_monitor(
                 // debounced probe; each further event pushes it out.
                 let status = net.status();
                 if status == crate::net_watch::PathStatus::Unsatisfied {
-                    saw_unsatisfied = true;
+                    ms.saw_unsatisfied = true;
                 }
-                info!(?status, saw_unsatisfied, "network path changed; arming debounced probe");
-                net_probe_at = Some(Instant::now() + NET_PROBE_DEBOUNCE);
+                info!(?status, saw_unsatisfied = ms.saw_unsatisfied, "network path changed; arming debounced probe");
+                ms.net_probe_at = Some(Instant::now() + NET_PROBE_DEBOUNCE);
                 continue;
             }
             _ = async {
-                match net_probe_at {
+                match ms.net_probe_at {
                     Some(at) => tokio::time::sleep_until(at.into()).await,
                     None => std::future::pending().await,
                 }
@@ -612,8 +793,8 @@ async fn tunnel_monitor(
                 // respawn in ~1.5s instead. Single-strike, but only once
                 // this child is past SPAWN_GRACE (so a fresh ssh whose -L
                 // hasn't bound yet isn't killed by its own startup race).
-                net_probe_at = None;
-                if !saw_unsatisfied {
+                ms.net_probe_at = None;
+                if !ms.saw_unsatisfied {
                     info!("debounced network probe: path never went unsatisfied; skipping");
                     continue;
                 }
@@ -622,18 +803,18 @@ async fn tunnel_monitor(
                     uptime_s = state.uptime().as_secs(),
                     "debounced network probe"
                 );
-                match probe_tunnel_alive(&local_sock).await {
+                match probe_tunnel_alive(&cfg.local_sock).await {
                     // Version is irrelevant to tunnel liveness -- the
                     // supervisor is a byte proxy and must not kill ssh over a
                     // protocol mismatch; that is the client handshake's job.
                     Ok(_) => {
                         state.probe_failures = 0;
-                        last_healthy = Some(std::time::SystemTime::now());
-                        saw_unsatisfied = false;
+                        ms.last_healthy = Some(std::time::SystemTime::now());
+                        ms.saw_unsatisfied = false;
                     }
                     Err(why) if state.past_spawn_grace() => {
                         info!("tunnel probe failed after path change ({why}); killing ssh to respawn");
-                        we_killed = true;
+                        ms.we_killed = true;
                         let _ = state.child.kill().await;
                     }
                     Err(why) => {
@@ -646,23 +827,23 @@ async fn tunnel_monitor(
                 continue;
             }
             _ = probe_ticker.tick() => {
-                if !lock_still_owned(lock_identity, &lock_path) {
+                if !lock_still_owned(cfg.lock_identity, &cfg.lock_path) {
                     warn!(
-                        lock_path = %lock_path.display(),
+                        lock_path = %cfg.lock_path.display(),
                         "lock file replaced or removed; another supervisor owns this \
                          tunnel -- exiting"
                     );
                     let _ = state.child.kill().await;
                     return;
                 }
-                match probe_tunnel_alive(&local_sock).await {
+                match probe_tunnel_alive(&cfg.local_sock).await {
                     Ok(_) => {
                         if state.probe_failures > 0 {
                             info!("tunnel probe recovered");
                         }
                         state.probe_failures = 0;
-                        last_healthy = Some(std::time::SystemTime::now());
-                        saw_unsatisfied = false;
+                        ms.last_healthy = Some(std::time::SystemTime::now());
+                        ms.saw_unsatisfied = false;
                     }
                     Err(why) => {
                         state.probe_failures += 1;
@@ -675,7 +856,7 @@ async fn tunnel_monitor(
                                 "tunnel probe failed {}x; remote daemon looks dead, killing ssh to respawn",
                                 state.probe_failures
                             );
-                            we_killed = true;
+                            ms.we_killed = true;
                             let _ = state.child.kill().await;
                             // The failure counter is zeroed when the
                             // replacement ChildState is installed below;
@@ -698,11 +879,10 @@ async fn tunnel_monitor(
                     return;
                 }
 
-                // Drop any pending debounced net-probe and the Unsatisfied
-                // latch -- both were aimed at the dead child. probe_failures
-                // is reset by ChildState::new() when the replacement is
-                // installed below.
-                saw_unsatisfied = false;
+                // Drop the Unsatisfied latch -- it was aimed at the dead
+                // child. probe_failures is reset by ChildState::new() when the
+                // replacement is installed below.
+                ms.saw_unsatisfied = false;
 
                 let code = status.code();
                 info!("ssh tunnel exited: {:?}", code);
@@ -712,154 +892,15 @@ async fn tunnel_monitor(
                     return;
                 }
 
-                // Apply the healthy-reset ONCE, based on how long the child
-                // that just died actually ran. Previously `state.uptime()`
-                // was re-evaluated on every retry (via `continue` to the
-                // outer select and `child.wait()` re-resolving the cached
-                // status), which meant a long-dead child's ever-growing
-                // uptime kept resetting backoff to MIN -- so
-                // ensure_remote_ready failures hammered the remote at ~1s
-                // with no climb, tripping its auth rate-limit during macOS
-                // dark wakes when the Keychain SSH agent refuses to sign.
                 let died_uptime = state.uptime();
-                let mut sleep = if we_killed {
-                    we_killed = false;
-                    Duration::ZERO
-                } else {
-                    respawn_sleep(backoff, died_uptime)
-                };
-                let mut backoff_saw_unsatisfied = false;
-
-                let new_child = loop {
-                    // Re-check lock ownership every iteration. The outer
-                    // select's probe_ticker arm -- the only other place this
-                    // is checked -- never runs while control is inside this
-                    // respawn loop, so during a prolonged outage a ghost
-                    // supervisor whose lock file was replaced externally would
-                    // otherwise spin here for hours and eventually spawn_tunnel
-                    // -> remove_file() the legitimate supervisor's socket out
-                    // from under it. ConnectGuard::drop gates its own cleanup
-                    // on the same identity, so a plain return is safe here.
-                    if !lock_still_owned(lock_identity, &lock_path) {
-                        warn!(
-                            lock_path = %lock_path.display(),
-                            "lock ownership lost during respawn; another supervisor \
-                             owns this tunnel -- exiting"
-                        );
-                        return;
+                match respawn_tunnel(&cfg, &stop, &net, &mut ms, died_uptime).await {
+                    RespawnResult::NewChild(new_child) => {
+                        info!("ssh tunnel respawned");
+                        state = ChildState::new(new_child);
+                        ms.net_probe_at = None;
                     }
-                    info!("respawn: sleeping {}s (backoff)", sleep.as_secs());
-                    // Fixed deadline so net.changed() noise re-entering the
-                    // select doesn't restart the sleep from scratch -- a
-                    // lid-open Satisfied burst after backoff has climbed to
-                    // 60s must neither reset the climb nor extend the wait.
-                    let deadline = tokio::time::Instant::now() + sleep;
-                    // Anchors for suspend detection: if wall-clock advanced
-                    // far more than monotonic across the wait, the process
-                    // was frozen. Instant pauses during suspend on both
-                    // Linux (CLOCK_MONOTONIC) and macOS (CLOCK_UPTIME_RAW);
-                    // SystemTime (CLOCK_REALTIME) does not. Same assumption
-                    // client.rs::wall_elapsed() already relies on.
-                    let wall_anchor = std::time::SystemTime::now();
-                    let mono_anchor = Instant::now();
-                    'wait: loop {
-                        tokio::select! {
-                            _ = tokio::time::sleep_until(deadline) => break 'wait,
-                            _ = tokio::time::sleep(SUSPEND_POLL) => {
-                                let wall = std::time::SystemTime::now()
-                                    .duration_since(wall_anchor)
-                                    .unwrap_or_default();
-                                let mono = mono_anchor.elapsed();
-                                if wall > mono + SUSPEND_JUMP_THRESHOLD {
-                                    // Cut this sleep short for one attempt;
-                                    // do NOT reset the climb -- a dark wake
-                                    // with a locked Keychain should cost
-                                    // exactly one failed auth and then
-                                    // resume the climbed backoff.
-                                    info!(
-                                        jump_s = wall.saturating_sub(mono).as_secs(),
-                                        "detected wake from suspend during backoff; retrying now"
-                                    );
-                                    break 'wait;
-                                }
-                            }
-                            _ = net.changed() => {
-                                let status = net.status();
-                                if status == crate::net_watch::PathStatus::Unsatisfied {
-                                    backoff_saw_unsatisfied = true;
-                                    debug!(?status, "network path changed during backoff (no route); continuing to wait");
-                                } else if backoff_saw_unsatisfied {
-                                    info!(?status, "network path recovered during backoff; retrying now");
-                                    backoff_saw_unsatisfied = false;
-                                    sleep = MIN_RESPAWN_BACKOFF;
-                                    break 'wait;
-                                } else {
-                                    debug!(?status, "network path changed during backoff (noise); ignoring");
-                                }
-                            }
-                            _ = stop.cancelled() => return,
-                        }
-                    }
-                    backoff = double_backoff(sleep);
-
-                    // Re-run ensure_remote_ready so a remote that rebooted,
-                    // crashed, or was upgraded gets its gritty server
-                    // started again before we point SSH at its ctl socket.
-                    // Skipped when the tunnel was just proven healthy -- a
-                    // sub-minute network blip can't have rebooted the
-                    // remote, and the ~2s SSH-exec is pure latency.
-                    let healthy_ago =
-                        last_healthy.map(|t| t.elapsed().unwrap_or(Duration::ZERO));
-                    let recently_healthy =
-                        healthy_ago.is_some_and(|d| d < SKIP_ENSURE_REMOTE_THRESHOLD);
-                    if recently_healthy && !remote_sock.is_empty() {
-                        info!(
-                            ago_s = healthy_ago.map(|d| d.as_secs()),
-                            "skipping ensure_remote_ready (tunnel recently healthy)"
-                        );
-                    } else {
-                        match ensure_remote_ready(
-                            &dest,
-                            no_server_start,
-                            &extra_ssh_opts,
-                            foreground,
-                            connect_timeout,
-                        )
-                        .await
-                        {
-                            Ok((sock, _ver)) => {
-                                remote_sock = sock;
-                            }
-                            Err(e) => {
-                                warn!("ensure_remote_ready failed on respawn: {e}");
-                                sleep = backoff;
-                                continue;
-                            }
-                        }
-                    }
-
-                    match spawn_tunnel(
-                        &dest,
-                        &local_sock,
-                        &remote_sock,
-                        &extra_ssh_opts,
-                        foreground,
-                        isolate_control_path,
-                        connect_timeout,
-                    )
-                    .await
-                    {
-                        Ok(c) => break c,
-                        Err(e) => {
-                            warn!("failed to respawn ssh tunnel: {e}");
-                            sleep = backoff;
-                            continue;
-                        }
-                    }
-                };
-                info!("ssh tunnel respawned");
-                state = ChildState::new(new_child);
-                net_probe_at = None;
+                    RespawnResult::Exit => return,
+                }
             }
         }
     }
