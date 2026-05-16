@@ -236,22 +236,34 @@ async fn connect_send_sockets(
     Ok(streams)
 }
 
-/// Wait for the first stream to become readable, return it (drop the rest).
-async fn select_first_ready(streams: Vec<TaggedStream>) -> anyhow::Result<TaggedStream> {
+/// Race `probe` across all `items`; return the first that yields `Some(Ok)`.
+///
+/// An item whose probe yields `None` is a dead/EOF candidate: it is discarded
+/// and the race continues over the *remaining* items rather than aborting.
+/// This is the correctness contract for transfer pairing -- a Unix socket
+/// whose peer closed is reported readable and its probe fails instantly, so a
+/// naive `select_all` would let a dead sibling session beat a live-but-waiting
+/// one and abort the whole transfer (violating the best-effort invariant). A
+/// probe yielding `Some(Err)` is a hard protocol error and aborts. `Ok(None)`
+/// means every candidate died.
+#[allow(clippy::type_complexity)]
+async fn race_first_ready<S, T>(
+    items: Vec<S>,
+    probe: impl Fn(S) -> std::pin::Pin<Box<dyn std::future::Future<Output = Option<anyhow::Result<T>>>>>,
+) -> anyhow::Result<Option<T>> {
     use futures_util::future::select_all;
 
-    let futs: Vec<_> = streams
-        .into_iter()
-        .map(|ts| {
-            Box::pin(async move {
-                ts.stream.readable().await?;
-                Ok::<_, std::io::Error>(ts)
-            })
-        })
-        .collect();
-
-    let (result, _, _) = select_all(futs).await;
-    Ok(result?)
+    let mut futs: Vec<_> = items.into_iter().map(&probe).collect();
+    while !futs.is_empty() {
+        let (result, _idx, rest) = select_all(futs).await;
+        futs = rest;
+        match result {
+            Some(Ok(v)) => return Ok(Some(v)),
+            Some(Err(e)) => return Err(e),
+            None => {} // dead candidate: keep racing the survivors
+        }
+    }
+    Ok(None)
 }
 
 async fn write_send_manifest(
@@ -397,33 +409,34 @@ pub(crate) async fn send_command(
     }
     let tagged = live;
 
-    // Wait for go signal -- first stream to get paired wins
+    // Wait for go signal -- first stream to get paired wins. A sibling session
+    // that closes before pairing is skipped (its socket reads EOF), not
+    // treated as a failure of the whole transfer.
     eprintln!("\x1b[2;33m\u{25b8} waiting for receiver...\x1b[0m");
-    let wait_for_pair = async {
-        let ts = if tagged.len() == 1 {
-            tagged.into_iter().next().unwrap()
-        } else {
-            select_first_ready(tagged).await?
-        };
-        if let Some(ref label) = ts.label {
-            eprintln!("\x1b[32m\u{25b8} paired with session {label}\x1b[0m");
-        }
-        let mut stream = ts.stream;
-
-        let mut go = [0u8; 1];
-        stream.read_exact(&mut go).await.map_err(|_| anyhow::anyhow!("no receiver connected"))?;
-        if go[0] != 0x01 {
-            anyhow::bail!("unexpected signal from server: 0x{:02x}", go[0]);
-        }
-        Ok::<_, anyhow::Error>(stream)
-    };
-    let mut stream = if let Some(secs) = timeout {
-        tokio::time::timeout(std::time::Duration::from_secs(secs), wait_for_pair)
+    let select = race_first_ready(tagged, |mut ts| {
+        Box::pin(async move {
+            let mut go = [0u8; 1];
+            match ts.stream.read_exact(&mut go).await {
+                Ok(_) if go[0] == 0x01 => Some(Ok(ts)),
+                Ok(_) => {
+                    Some(Err(anyhow::anyhow!("unexpected signal from server: 0x{:02x}", go[0])))
+                }
+                Err(_) => None, // this session closed before pairing -- skip it
+            }
+        })
+    });
+    let ts = if let Some(secs) = timeout {
+        tokio::time::timeout(std::time::Duration::from_secs(secs), select)
             .await
             .map_err(|_| anyhow::anyhow!("timed out waiting for receiver"))??
     } else {
-        wait_for_pair.await?
-    };
+        select.await?
+    }
+    .ok_or_else(|| anyhow::anyhow!("no receiver connected"))?;
+    if let Some(ref label) = ts.label {
+        eprintln!("\x1b[32m\u{25b8} paired with session {label}\x1b[0m");
+    }
+    let mut stream = ts.stream;
 
     // Stream data
     if let Some((mut temp, size)) = stdin_temp {
@@ -552,32 +565,33 @@ pub(crate) async fn receive_command(
     }
     let tagged = live;
 
-    // Wait for file data -- first stream to get paired wins
+    // Wait for file data -- first stream to get paired wins. A sibling session
+    // that closes before pairing is skipped (its socket reads EOF), not
+    // treated as a failure of the whole transfer.
     eprintln!("\x1b[2;33m\u{25b8} waiting for sender...\x1b[0m");
-    let wait_for_pair = async {
-        let ts = if tagged.len() == 1 {
-            tagged.into_iter().next().unwrap()
-        } else {
-            select_first_ready(tagged).await?
-        };
-        if let Some(ref label) = ts.label {
-            eprintln!("\x1b[32m\u{25b8} paired with session {label}\x1b[0m");
-        }
-        let mut stream = ts.stream;
-
-        // Read: file_count (u32 BE)
-        let mut buf4 = [0u8; 4];
-        stream.read_exact(&mut buf4).await.map_err(|_| anyhow::anyhow!("no sender connected"))?;
-        let file_count = u32::from_be_bytes(buf4);
-        Ok::<_, anyhow::Error>((stream, file_count))
-    };
-    let (mut stream, file_count) = if let Some(secs) = timeout {
-        tokio::time::timeout(std::time::Duration::from_secs(secs), wait_for_pair)
+    let select = race_first_ready(tagged, |mut ts| {
+        Box::pin(async move {
+            // Read: file_count (u32 BE). EOF here means this session never
+            // paired -- drop it and keep racing the rest.
+            let mut buf4 = [0u8; 4];
+            match ts.stream.read_exact(&mut buf4).await {
+                Ok(_) => Some(Ok((ts, u32::from_be_bytes(buf4)))),
+                Err(_) => None,
+            }
+        })
+    });
+    let (ts, file_count) = if let Some(secs) = timeout {
+        tokio::time::timeout(std::time::Duration::from_secs(secs), select)
             .await
             .map_err(|_| anyhow::anyhow!("timed out waiting for sender"))??
     } else {
-        wait_for_pair.await?
-    };
+        select.await?
+    }
+    .ok_or_else(|| anyhow::anyhow!("no sender connected"))?;
+    if let Some(ref label) = ts.label {
+        eprintln!("\x1b[32m\u{25b8} paired with session {label}\x1b[0m");
+    }
+    let mut stream = ts.stream;
 
     // Pipe mode: stream every payload straight to stdout and flush (see
     // receive_to_writer -- the flush prevents silent tail truncation).
@@ -786,6 +800,47 @@ mod tests {
         v.extend_from_slice(payload);
         v.extend_from_slice(&0u16.to_be_bytes()); // end sentinel
         v
+    }
+
+    // Regression for bug_020: a dead sibling (probe resolves None immediately)
+    // must not beat a slower live stream, and must not abort the race.
+    #[tokio::test]
+    async fn race_first_ready_skips_dead_and_picks_live() {
+        let items = vec![0u8, 1u8];
+        let res = race_first_ready(items, |i| {
+            Box::pin(async move {
+                if i == 0 {
+                    None // dead sibling: closed before pairing
+                } else {
+                    tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+                    Some(Ok::<u32, anyhow::Error>(42))
+                }
+            })
+        })
+        .await
+        .unwrap();
+        assert_eq!(res, Some(42));
+    }
+
+    #[tokio::test]
+    async fn race_first_ready_all_dead_returns_none() {
+        let items = vec![0u8, 0u8, 0u8];
+        let res: Option<u32> =
+            race_first_ready(items, |_| Box::pin(async move { None })).await.unwrap();
+        assert_eq!(res, None);
+    }
+
+    #[tokio::test]
+    async fn race_first_ready_propagates_hard_error() {
+        let items = vec![7u8];
+        let err = race_first_ready(items, |_| {
+            Box::pin(async move {
+                Some(Err::<u32, anyhow::Error>(anyhow::anyhow!("unexpected signal")))
+            })
+        })
+        .await
+        .unwrap_err();
+        assert!(err.to_string().contains("unexpected signal"));
     }
 
     // Regression for bug_022: the stdout receive path must flush at end of
