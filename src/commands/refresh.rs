@@ -138,6 +138,15 @@ fn tunnel_destination(host: &str) -> String {
         .unwrap_or_else(|| host.to_string())
 }
 
+/// Merge the persisted CLI `-o` options ahead of the configured `ssh-options`.
+/// CLI-first, SSH first-match wins -- the same precedence every other SSH path
+/// uses (see `tunnel-create`/`bootstrap` in `main.rs`). Kept pure and separate
+/// from the sidecar read so the ordering contract is unit-testable.
+fn merge_remote_ssh_options(mut persisted_cli: Vec<String>, configured: &[String]) -> Vec<String> {
+    persisted_cli.extend_from_slice(configured);
+    persisted_cli
+}
+
 /// Refresh a remote host: its tunnel supervisor and, via `gritty refresh
 /// local` over SSH, its remote daemon.
 async fn refresh_remote(host: &str, config: &gritty::config::ConfigFile) -> anyhow::Result<()> {
@@ -154,6 +163,15 @@ async fn refresh_remote(host: &str, config: &gritty::config::ConfigFile) -> anyh
 
     let dest = tunnel_destination(host);
     let tun_cfg = config.resolve_tunnel(host);
+    // resolve_tunnel only knows config `ssh-options`; the CLI `-o` options the
+    // tunnel was created with live in the `.ssh-opts` sidecar. Merge them or a
+    // host reachable only via a CLI -o ProxyJump/IdentityFile/Port can't be
+    // reached here and its daemon is silently never refreshed. The sidecar is
+    // still present -- `disconnect` (below) is what wipes it.
+    let ssh_options = merge_remote_ssh_options(
+        gritty::connect::read_persisted_ssh_options(host),
+        &tun_cfg.ssh_options,
+    );
 
     // Delegate the remote daemon check to the remote binary. This keeps the
     // remote the source of truth about its own staleness (its daemon may be
@@ -163,7 +181,7 @@ async fn refresh_remote(host: &str, config: &gritty::config::ConfigFile) -> anyh
     match gritty::connect::run_remote_gritty(
         &dest,
         &["refresh", "local"],
-        &tun_cfg.ssh_options,
+        &ssh_options,
         tun_cfg.connect_timeout,
     )
     .await
@@ -305,5 +323,30 @@ mod tests {
         assert_eq!(Verdict::NotRunning.to_string(), "not running");
         assert_eq!(Verdict::Current.to_string(), "up to date");
         assert!(Verdict::Unknown.to_string().contains("predates"));
+    }
+
+    // Regression: the remote `gritty refresh local` check must carry the
+    // persisted CLI -o options, not just configured ssh-options. Without them
+    // a host reachable only via a CLI -o ProxyJump/IdentityFile/Port is
+    // unreachable here and the remote daemon is silently never refreshed while
+    // we still report success. CLI options must come first (SSH first-match
+    // wins), matching every other SSH path.
+    #[test]
+    fn remote_refresh_merges_cli_options_first() {
+        let persisted_cli = vec!["ProxyJump=bastion".to_string()];
+        let configured = vec!["IdentityFile=~/.ssh/id_ed25519".to_string()];
+        let merged = merge_remote_ssh_options(persisted_cli.clone(), &configured);
+        assert_eq!(
+            merged,
+            vec!["ProxyJump=bastion".to_string(), "IdentityFile=~/.ssh/id_ed25519".to_string(),],
+            "persisted CLI options must precede configured ones"
+        );
+    }
+
+    #[test]
+    fn remote_refresh_merge_handles_empty_sides() {
+        assert_eq!(merge_remote_ssh_options(vec![], &[]), Vec::<String>::new());
+        assert_eq!(merge_remote_ssh_options(vec!["A=1".to_string()], &[]), vec!["A=1".to_string()]);
+        assert_eq!(merge_remote_ssh_options(vec![], &["B=2".to_string()]), vec!["B=2".to_string()]);
     }
 }
