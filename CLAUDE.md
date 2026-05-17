@@ -72,7 +72,7 @@ just quicktest                        # manual 3-pane tmux test
 
 Single-socket: all communication (control + session relay) through one Unix domain socket per server. Hello/HelloAck version handshake, then control frame declares intent, server routes accordingly.
 
-Ten modules behind a lib crate (`src/lib.rs` hosts `collect_env_vars()`, `relay_writer_channel()` + `spawn_channel_relay()`, `handshake()`, `get_or_create_device_id()`) with thin binary entry (`src/main.rs`):
+Fourteen modules behind a lib crate (`src/lib.rs` hosts `collect_env_vars()`, `relay_writer_channel()` + `spawn_channel_relay()`, `handshake()`, `get_or_create_device_id()`) with thin binary entry (`src/main.rs`):
 
 - **`security`** -- Socket/dir creation with 0700/0600 perms, ownership validation, symlink rejection, `SO_PEERCRED`. **All socket binding and dir creation MUST go through this module.**
 - **`config`** -- TOML config (`$XDG_CONFIG_HOME/gritty/config.toml`). `[defaults]` + `[host.<name>]`. Precedence: CLI > host > defaults > built-in.
