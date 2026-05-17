@@ -72,9 +72,10 @@ jobs:
         run: cargo build
 
       - name: Container tests
+        timeout-minutes: 10
         run: |
           docker build -t gritty-container-test -f tests/container/Dockerfile .
-          docker run --rm gritty-container-test
+          timeout 480 docker run --rm gritty-container-test
 
   msrv:
     name: MSRV (1.94)

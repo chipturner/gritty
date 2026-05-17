@@ -1,14 +1,24 @@
 #!/bin/bash
-set -euo pipefail
+set -eou pipefail
 
 failed=0
 
-for script in /tests/lifecycle.sh /tests/features.sh /tests/ssh-tunnel.sh; do
+for script in \
+        /tests/lifecycle.sh \
+        /tests/features.sh \
+        /tests/send-receive.sh \
+        /tests/ssh-tunnel.sh \
+        /tests/session-over-tunnel.sh; do
     echo ""
-    if ! "$script"; then
+    echo "### running ${script} ###"
+    if ! "${script}"; then
         failed=1
     fi
+    # Best-effort teardown between suites so leftover state from one suite
+    # doesn't poison the next.
+    gritty kill-server local 2>/dev/null || true
+    tmux kill-server 2>/dev/null || true
     echo ""
 done
 
-exit "$failed"
+exit "${failed}"
