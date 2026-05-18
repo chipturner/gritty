@@ -28,6 +28,9 @@ laptop$ sh install.sh
 
 # Or via cargo-binstall:
 laptop$ cargo binstall gritty-cli
+
+# Or via Homebrew:
+laptop$ brew install chipturner/tap/gritty
 ```
 
 **From source:**
