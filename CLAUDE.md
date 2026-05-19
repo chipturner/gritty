@@ -11,7 +11,7 @@ Persistent TTY sessions over Unix domain sockets. Single binary, tmux-like CLI. 
 | Command | Alias | Description |
 |---------|-------|-------------|
 | `connect [host[:name]]` | `c` | Smart session: attach if exists, create if not |
-| `list-sessions [host]` | `ls`, `list` | List sessions (all servers if no host) |
+| `list-sessions [host]` | `ls`, `list` | List sessions on `host` (default: `local`); `--include-remote` fans out across known tunnels |
 | `tail [host:session]` | `t` | Read-only stream of session output |
 | `kill-session [host:session]` | | Kill a session |
 | `rename <host:session> <name>` | | Rename a session |

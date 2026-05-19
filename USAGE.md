@@ -7,7 +7,7 @@ Complete command and flag reference. For an overview and quick start, see [READM
 | Command | Aliases | Description |
 |---------|---------|-------------|
 | `gritty connect [host[:name]]` | `c` | Smart session: attach if exists, create if not |
-| `gritty list-sessions [host]` | `ls`, `list` | List sessions (no args = all servers; foreground process shown on Linux only) |
+| `gritty list-sessions [host]` | `ls`, `list` | List sessions on `host` (default: `local`); pass `--include-remote` to fan out across known tunnels (foreground process shown on Linux only) |
 | `gritty tail [host:session]` | `t` | Read-only stream of session output |
 | `gritty kill-session [host:session]` | | Kill a session |
 | `gritty rename <host:session> <name>` | | Rename a session |
