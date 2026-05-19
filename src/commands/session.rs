@@ -77,10 +77,10 @@ pub(crate) async fn connect_session(
         super::util::connect_or_start(&ctl_path, &auto_start_mode, wait).await?;
 
     // -n/--new: resolve the auto-name only now. Resolving it before
-    // connect_or_start collapses to "default" whenever the local tunnel
+    // connect_or_start collapses to `<client>/0` whenever the local tunnel
     // socket is down (e.g. after a laptop reboot), and the attach-first path
-    // would then silently attach to a pre-existing remote `default` instead
-    // of creating a fresh session-N -- violating the --new contract.
+    // would then silently attach to a pre-existing remote `0` instead
+    // of creating a fresh integer-slot session -- violating the --new contract.
     let name = match preliminary_name {
         Some(n) => n,
         None => auto_new_session_name(&ctl_path, &settings.client_name).await,
@@ -211,17 +211,16 @@ pub(crate) async fn connect_session(
     }
 }
 
-/// Resolve `-n`/`--new` to the next auto-named session slot. Uses the same
-/// rule the picker applies: `<client>/default` if unused, otherwise the first
-/// free `<client>/session-N`. Falls back to `<client>/default` if the server
-/// can't be reached -- the connect flow auto-starts the daemon and will
-/// re-attempt anyway.
+/// Resolve `-n`/`--new` to the next auto-named session slot: the first free
+/// integer slot in this client's namespace (`<client>/0`, `<client>/1`, ...).
+/// Falls back to `<client>/0` if the server can't be reached -- the connect
+/// flow auto-starts the daemon and will re-attempt anyway.
 async fn auto_new_session_name(ctl_path: &Path, client_name: &str) -> String {
     use gritty::protocol::Frame;
 
     let sessions = match server_request(ctl_path, Frame::ListSessions).await {
         Ok(Frame::SessionInfo { sessions }) => sessions,
-        _ => return gritty::naming::resolve_session_name("default", client_name),
+        _ => return gritty::naming::resolve_session_name("0", client_name),
     };
     suggest_name(&build_rows(&sessions), client_name)
 }
@@ -234,7 +233,7 @@ async fn pick_session(
 ) -> (String, bool, bool) {
     use gritty::protocol::Frame;
 
-    let default_wire = gritty::naming::resolve_session_name("default", client_name);
+    let default_wire = gritty::naming::resolve_session_name("0", client_name);
 
     if no_pick {
         return (default_wire, false, false);
@@ -264,8 +263,8 @@ async fn pick_session(
 /// Only sessions in `<client_name>/*` count -- foreign-namespace sessions
 /// (other clients' or legacy unprefixed names) are ignored entirely. That
 /// means a stale `default` left by an older gritty doesn't block creating
-/// `<client>/default`, and a teammate's `pat/work` doesn't get silently
-/// adopted. Reach those explicitly with the literal slash-bearing form
+/// `<client>/0`, and a teammate's `pat/work` doesn't get silently adopted.
+/// Reach those explicitly with the literal slash-bearing form
 /// (`gritty c host:other/name`).
 fn auto_attach_target(
     sessions: &[gritty::protocol::SessionEntry],
@@ -276,7 +275,7 @@ fn auto_attach_target(
         sessions.iter().filter(|s| s.name.starts_with(&prefix)).collect();
 
     if mine.is_empty() {
-        return Some(gritty::naming::resolve_session_name("default", client_name));
+        return Some(gritty::naming::resolve_session_name("0", client_name));
     }
 
     let detached: Vec<&gritty::protocol::SessionEntry> =
@@ -297,14 +296,12 @@ fn session_wire_name(s: &gritty::protocol::SessionEntry) -> String {
 }
 
 /// Suggest a wire name for a new session in this client's namespace. Returns
-/// `<client>/default` if unused, otherwise the first free `<client>/session-N`.
+/// the lowest-numbered free slot `<client>/N` starting at 0. Non-integer
+/// names (e.g. user-given labels, legacy `default` / `session-N`) do not
+/// occupy integer slots, so they are ignored by the scan.
 fn suggest_name(rows: &[Row], client_name: &str) -> String {
-    let default = gritty::naming::resolve_session_name("default", client_name);
-    if !rows.iter().any(|r| r.name == default) {
-        return default;
-    }
-    for n in 2.. {
-        let candidate = gritty::naming::resolve_session_name(&format!("session-{n}"), client_name);
+    for n in 0u32.. {
+        let candidate = gritty::naming::resolve_session_name(&n.to_string(), client_name);
         if !rows.iter().any(|r| r.name == candidate) {
             return candidate;
         }
@@ -312,7 +309,7 @@ fn suggest_name(rows: &[Row], client_name: &str) -> String {
     unreachable!()
 }
 
-fn print_session_list(host: &str, sessions: &[gritty::protocol::SessionEntry], client_name: &str) {
+fn print_session_list(host: &str, sessions: &[gritty::protocol::SessionEntry]) {
     if sessions.len() == 1 {
         eprintln!("error: session on {host} is already attached:");
     } else {
@@ -320,9 +317,8 @@ fn print_session_list(host: &str, sessions: &[gritty::protocol::SessionEntry], c
     }
     for s in sessions {
         let wire = session_wire_name(s);
-        let shown = gritty::naming::display_session_name(&wire, client_name);
         let suffix = if s.attached { "     (attached)" } else { "" };
-        eprintln!("  gritty connect {host}:{shown}{suffix}");
+        eprintln!("  gritty connect {host}:{wire}{suffix}");
     }
 }
 
@@ -340,7 +336,7 @@ async fn pick_or_list(
             None => std::process::exit(1),
         }
     } else {
-        print_session_list(host, sessions, client_name);
+        print_session_list(host, sessions);
         std::process::exit(1);
     }
 }
@@ -454,13 +450,12 @@ async fn tui_pick_session(
                   mode: &Mode,
                   status: Option<&str>,
                   prev_total_lines: usize| {
-        // Elide own-client prefix from the displayed NAME column. Width
-        // computations and the cell content both use the elided form so
-        // foreign sessions still align correctly.
-        let displayed: Vec<&str> = rows
-            .iter()
-            .map(|r| gritty::naming::display_session_name(&r.name, client_name))
-            .collect();
+        // Show the full wire name (`<client>/<suffix>`) in the picker so
+        // the namespace is visible at a glance, distinguishing your own
+        // sessions from foreign ones without scanning the CLIENT column.
+        // `gritty ls` still elides the ambient prefix (it has a separate
+        // CLIENT column doing the same job).
+        let displayed: Vec<&str> = rows.iter().map(|r| r.name.as_str()).collect();
         let name_w = displayed.iter().map(|s| s.len()).max().unwrap_or(0).max(3);
         let tag_w = 10; // "(attached)" is 10 chars
         let age_w = rows.iter().map(|r| r.age.len()).max().unwrap_or(0);
@@ -522,7 +517,7 @@ async fn tui_pick_session(
         }
         // "New session" row / input line
         let suggested_wire = suggest_name(rows, client_name);
-        let suggested = gritty::naming::display_session_name(&suggested_wire, client_name);
+        let suggested = suggested_wire.as_str();
         match mode {
             Mode::Pick | Mode::ConfirmKill { .. } => {
                 let marker = if cursor == rows.len() { "\x1b[32;1m\u{25b8}\x1b[0m" } else { " " };
@@ -550,7 +545,7 @@ async fn tui_pick_session(
         // Hint line
         let hints = match mode {
             Mode::Pick => {
-                "1-9 jump  enter select  f force  n new  c/+ new (named)  d default  r rename  x kill  esc quit"
+                "1-9 jump  enter select  f force  n new  c/+ new (named)  r rename  x kill  esc quit"
                     .to_string()
             }
             Mode::Input { rename_of: Some(_), .. } => "enter rename  esc back".to_string(),
@@ -614,18 +609,6 @@ async fn tui_pick_session(
                         break Some((rows[idx].name.clone(), false));
                     }
                 }
-                // 'd' -> select or create "default" (resolved into this
-                // client's namespace, e.g. `mylaptop/default`).
-                Event::Key(KeyEvent {
-                    code: KeyCode::Char('d'),
-                    modifiers: KeyModifiers::NONE,
-                    ..
-                }) => {
-                    break Some((
-                        gritty::naming::resolve_session_name("default", client_name),
-                        false,
-                    ));
-                }
                 // 'n' -> create new session immediately with the suggested name
                 Event::Key(KeyEvent {
                     code: KeyCode::Char('n'),
@@ -641,8 +624,8 @@ async fn tui_pick_session(
                     ..
                 }) => {
                     // Pre-fill the input with the suggested name in display
-                    // form (e.g. `default` instead of `mylaptop/default`) so
-                    // the user edits the part they care about; the prefix is
+                    // form (e.g. `0` instead of `mylaptop/0`) so the user
+                    // edits the part they care about; the prefix is
                     // re-applied via resolve_session_name on submit.
                     let suggested = suggest_name(&rows, client_name);
                     let name =
@@ -730,7 +713,7 @@ async fn tui_pick_session(
                     {
                         if fresh.is_empty() {
                             break Some((
-                                gritty::naming::resolve_session_name("default", client_name),
+                                gritty::naming::resolve_session_name("0", client_name),
                                 false,
                             ));
                         }
@@ -1357,28 +1340,33 @@ mod tests {
     }
 
     #[test]
-    fn suggest_name_uses_default_when_free() {
-        assert_eq!(suggest_name(&[], "mylaptop"), "mylaptop/default");
-        // A foreign session also named `default` doesn't occupy our slot.
-        assert_eq!(suggest_name(&[row("laptop2/default")], "mylaptop"), "mylaptop/default");
+    fn suggest_name_first_call_returns_zero() {
+        assert_eq!(suggest_name(&[], "mylaptop"), "mylaptop/0");
+        // A foreign session in another namespace doesn't occupy our slot 0.
+        assert_eq!(suggest_name(&[row("laptop2/0")], "mylaptop"), "mylaptop/0");
+        // A legacy `default` in our namespace doesn't occupy slot 0 either --
+        // the integer scan ignores non-integer names.
+        assert_eq!(suggest_name(&[row("mylaptop/default")], "mylaptop"), "mylaptop/0");
     }
 
     #[test]
-    fn suggest_name_increments_past_default() {
-        assert_eq!(suggest_name(&[row("mylaptop/default")], "mylaptop"), "mylaptop/session-2");
-        assert_eq!(
-            suggest_name(&[row("mylaptop/default"), row("mylaptop/session-2")], "mylaptop"),
-            "mylaptop/session-3"
-        );
+    fn suggest_name_increments_past_existing_integers() {
+        assert_eq!(suggest_name(&[row("mylaptop/0")], "mylaptop"), "mylaptop/1");
+        assert_eq!(suggest_name(&[row("mylaptop/0"), row("mylaptop/1")], "mylaptop"), "mylaptop/2");
     }
 
     #[test]
     fn suggest_name_fills_first_free_slot() {
-        // session-2 missing in our namespace -- the first free slot, not max+1.
-        assert_eq!(
-            suggest_name(&[row("mylaptop/default"), row("mylaptop/session-3")], "mylaptop"),
-            "mylaptop/session-2"
-        );
+        // 1 is missing in our namespace -- pick it first, not max+1.
+        assert_eq!(suggest_name(&[row("mylaptop/0"), row("mylaptop/2")], "mylaptop"), "mylaptop/1");
+    }
+
+    #[test]
+    fn suggest_name_ignores_non_integer_legacy_names() {
+        // `default` and `session-2` from before the change shouldn't shift
+        // our scan -- we always start at 0.
+        let rows = vec![row("mylaptop/default"), row("mylaptop/session-2")];
+        assert_eq!(suggest_name(&rows, "mylaptop"), "mylaptop/0");
     }
 
     fn entry() -> gritty::protocol::SessionEntry {
@@ -1406,22 +1394,22 @@ mod tests {
     }
 
     #[test]
-    fn auto_attach_no_sessions_creates_default() {
-        assert_eq!(auto_attach_target(&[], "defiant"), Some("defiant/default".to_string()));
+    fn auto_attach_no_sessions_creates_zero() {
+        assert_eq!(auto_attach_target(&[], "defiant"), Some("defiant/0".to_string()));
     }
 
     #[test]
     fn auto_attach_ignores_legacy_unprefixed_name() {
         // A `default` from a pre-namespace gritty must not block us from
-        // creating `defiant/default`.
+        // creating `defiant/0`.
         let s = vec![auto_entry("default", false)];
-        assert_eq!(auto_attach_target(&s, "defiant"), Some("defiant/default".to_string()));
+        assert_eq!(auto_attach_target(&s, "defiant"), Some("defiant/0".to_string()));
     }
 
     #[test]
     fn auto_attach_ignores_foreign_namespace() {
         let s = vec![auto_entry("laptop2/work", false)];
-        assert_eq!(auto_attach_target(&s, "defiant"), Some("defiant/default".to_string()));
+        assert_eq!(auto_attach_target(&s, "defiant"), Some("defiant/0".to_string()));
     }
 
     #[test]

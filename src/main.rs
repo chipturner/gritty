@@ -137,12 +137,13 @@ enum Command {
         #[arg(long, conflicts_with = "no_pick")]
         pick: bool,
 
-        /// Never show session picker; always target "default"
+        /// Never show session picker; always target session `0`
         #[arg(long, conflicts_with = "pick")]
         no_pick: bool,
 
-        /// Skip the picker and create a new session with the next auto-named
-        /// slot (`default` if unused, else `session-N`).
+        /// Skip the picker and create a new session in the next free
+        /// integer slot in your namespace (`0` if unused, else the lowest
+        /// free `N`).
         #[arg(short = 'n', long = "new", conflicts_with_all = ["pick", "no_pick"])]
         new_session: bool,
     },

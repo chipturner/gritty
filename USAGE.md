@@ -53,9 +53,9 @@ laptop$ gritty connect devbox:work          # now "devbox" routes to user@10.0.0
 
 **`session`** is a name you choose so you can run several sessions per host. Rules:
 
-- Omitted: `connect` looks only at sessions in your own namespace (`<client>/*`). It attaches the sole detached one, shows a picker when the choice is ambiguous, and falls back to `<client>/default` when your namespace is empty. Foreign-namespace and legacy unprefixed sessions are ignored -- reach those with the explicit slash-bearing form (`gritty connect host:other/name`).
+- Omitted: `connect` looks only at sessions in your own namespace (`<client>/*`). It attaches the sole detached one, shows a picker when the choice is ambiguous, and falls back to `<client>/0` when your namespace is empty. Auto-created sessions get the next free integer slot in your namespace (`0`, `1`, `2`, ...). Foreign-namespace and legacy unprefixed sessions are ignored -- reach those with the explicit slash-bearing form (`gritty connect host:other/name`).
 - `-`: refers to the last-attached session, e.g. `gritty connect devbox:-`.
-- Numeric-only names are rejected (they would collide with auto-assigned session IDs).
+- Purely numeric *wire* names are rejected by the server (they would collide with auto-assigned session IDs). Typing `0` as a short name still works -- the client prefix turns it into `<client>/0`, which contains a slash and so is not purely numeric.
 
 **Client namespacing.** Every short name (no `/`) you type is silently scoped to your client's namespace. With `client-name = "mylaptop"` (the default is your hostname), `gritty connect devbox:work` resolves to the wire name `mylaptop/work`. Two laptops typing the same short name no longer collide -- each lands in its own session. To address a session in another client's namespace (or a deliberately-shared session), type the full slash-bearing form: `gritty connect devbox:laptop2/work` is taken literally with no prefix added. `gritty ls` strips your own prefix for readability and shows foreign prefixes intact.
 
@@ -77,8 +77,8 @@ laptop$ gritty connect devbox:work          # now "devbox" routes to user@10.0.0
 - `-d` / `--detach`: create session without attaching (background jobs)
 - `--force`: take over an already-attached session without prompting
 - `--pick`: always show session picker (interactive when in a terminal)
-- `--no-pick`: never show session list; always target `default`
-- `-n` / `--new`: skip the picker and create the next auto-named session (`default` or `session-N`)
+- `--no-pick`: never show session list; always target session `0`
+- `-n` / `--new`: skip the picker and create the next free integer-slot session in your namespace (`0`, `1`, `2`, ...)
 - `--no-create`: attach only, error if session doesn't exist
 - `--no-escape`: disable escape sequence processing
 - `--no-oauth-redirect`: disable OAuth callback tunneling (part of `-O`)

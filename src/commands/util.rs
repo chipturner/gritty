@@ -305,7 +305,7 @@ pub(crate) async fn port_forward_client_command(
 
     let (host, session) = parse_target(target);
     let session =
-        gritty::naming::resolve_session_name(session.as_deref().unwrap_or("default"), client_name);
+        gritty::naming::resolve_session_name(session.as_deref().unwrap_or("0"), client_name);
     let ctl_path = resolve_ctl_path(ctl_socket, Some(&host))?;
     let session_id = resolve_session_id(&ctl_path, &session).await?;
 

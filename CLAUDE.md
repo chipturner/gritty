@@ -36,9 +36,9 @@ Persistent TTY sessions over Unix domain sockets. Single binary, tmux-like CLI. 
 | `socket-path` | `socket` | Print the default socket path |
 | `protocol-version` | | Print the protocol version number |
 
-Sessions have auto-incrementing IDs with optional names (`host:name`). Numeric names rejected. `-` = last-attached session. `<host>` is `local` or a connection name from `tunnel-create`. Session name defaults to `default` if omitted. Global: `--ctl-socket <path>`, `-v`. See `--help` for per-command flags.
+Sessions have auto-incrementing IDs with optional names (`host:name`). Purely numeric wire names rejected by the server (ambiguous with session IDs) -- harmless in practice because the client prefix always adds `<client>/`, so typing `0` resolves to the valid wire name `<client>/0`. `-` = last-attached session. `<host>` is `local` or a connection name from `tunnel-create`. Session name defaults to the next free integer slot in your namespace (`0`, `1`, ...) when omitted. Global: `--ctl-socket <path>`, `-v`. See `--help` for per-command flags.
 
-**Client-prefixed session names** (`naming` module): every short session name (no `/`) the user types is silently rewritten to `<client_name>/<name>` on the wire so two laptops typing `default` end up in distinct sessions. A name containing `/` is taken literally -- that's the foreign-access form (`gritty c host:laptop2/work`) and also how shared sessions work (`gritty rename host:work team/shared`). `-` (last-attached) is still special-cased. `gritty ls` elides the ambient client's own prefix in the NAME column for readability; foreign prefixes stay. The daemon is oblivious -- names are opaque strings to it, so the protocol version did not bump. `client_name` is validated (non-empty, no `/`, no whitespace/control); invalid falls back to `"unknown"` with a warning.
+**Client-prefixed session names** (`naming` module): every short session name (no `/`) the user types is silently rewritten to `<client_name>/<name>` on the wire so two laptops typing `0` end up in distinct sessions. A name containing `/` is taken literally -- that's the foreign-access form (`gritty c host:laptop2/work`) and also how shared sessions work (`gritty rename host:work team/shared`). `-` (last-attached) is still special-cased. `gritty ls` elides the ambient client's own prefix in the NAME column for readability; foreign prefixes stay. The daemon is oblivious -- names are opaque strings to it, so the protocol version did not bump. `client_name` is validated (non-empty, no `/`, no whitespace/control); invalid falls back to `"unknown"` with a warning.
 
 ## Build & Test
 
@@ -62,7 +62,7 @@ just coverage-html                   # HTML coverage report
 ```bash
 cargo run -- server                   # start server (self-backgrounds, prints PID)
 cargo run -- connect local:myproject  # create or attach to named session
-cargo run -- connect local            # create or attach to "default" session
+cargo run -- connect local            # create or attach to session `0`
 cargo run -- ls local                 # list active sessions
 RUST_LOG=debug cargo run -- server -f # debug mode (foreground)
 just quicktest                        # manual 3-pane tmux test
