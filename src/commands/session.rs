@@ -222,7 +222,7 @@ async fn auto_new_session_name(ctl_path: &Path, client_name: &str) -> String {
         Ok(Frame::SessionInfo { sessions }) => sessions,
         _ => return gritty::naming::resolve_session_name("0", client_name),
     };
-    suggest_name(&build_rows(&sessions), client_name)
+    suggest_name(&build_rows(&sessions, client_name), client_name)
 }
 
 async fn pick_session(
@@ -351,13 +351,19 @@ struct Row {
     hotkey: Option<char>, // '1'-'9' for first 9 rows
 }
 
-fn build_rows(sessions: &[gritty::protocol::SessionEntry]) -> Vec<Row> {
+fn build_rows(sessions: &[gritty::protocol::SessionEntry], client_name: &str) -> Vec<Row> {
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default()
         .as_secs();
     let home = std::env::var("HOME").unwrap_or_default();
-    sessions
+    // Sort own-namespace sessions first so the picker (and its `1`-`9` hotkeys)
+    // surface your own sessions ahead of foreign/legacy ones. Stable so the
+    // server's id-order survives within each group.
+    let prefix = format!("{client_name}/");
+    let mut ordered: Vec<&gritty::protocol::SessionEntry> = sessions.iter().collect();
+    ordered.sort_by_key(|s| !s.name.starts_with(&prefix));
+    ordered
         .iter()
         .enumerate()
         .map(|(i, s)| Row {
@@ -403,7 +409,7 @@ async fn tui_pick_session(
     let initial = sessions.iter().position(|s| !s.attached).unwrap_or(0);
     let mut cursor = initial;
 
-    let mut rows = build_rows(sessions);
+    let mut rows = build_rows(sessions, client_name);
 
     enum Mode {
         Pick,
@@ -717,7 +723,7 @@ async fn tui_pick_session(
                                 false,
                             ));
                         }
-                        rows = build_rows(&fresh);
+                        rows = build_rows(&fresh, client_name);
                         cursor = cursor.min(rows.len().saturating_sub(1));
                     }
                     mode = Mode::Pick;
@@ -758,7 +764,7 @@ async fn tui_pick_session(
                                         server_request(&ctl, gritty::protocol::Frame::ListSessions)
                                             .await
                                     {
-                                        rows = build_rows(&fresh);
+                                        rows = build_rows(&fresh, client_name);
                                         cursor = cursor.min(rows.len().saturating_sub(1));
                                     }
                                     mode = Mode::Pick;
@@ -1396,6 +1402,40 @@ mod tests {
     #[test]
     fn auto_attach_no_sessions_creates_zero() {
         assert_eq!(auto_attach_target(&[], "defiant"), Some("defiant/0".to_string()));
+    }
+
+    #[test]
+    fn build_rows_puts_own_namespace_first() {
+        // Server returns sessions sorted by id, mixing foreign and own
+        // namespaces. The picker should surface our own first so the `1`-`9`
+        // hotkeys land on them.
+        let sessions = vec![
+            auto_entry("laptop2/work", false),
+            auto_entry("defiant/a", false),
+            auto_entry("default", false),
+            auto_entry("defiant/b", false),
+        ];
+        let rows = build_rows(&sessions, "defiant");
+        let names: Vec<&str> = rows.iter().map(|r| r.name.as_str()).collect();
+        assert_eq!(names, vec!["defiant/a", "defiant/b", "laptop2/work", "default"]);
+        // Hotkeys follow the displayed order.
+        assert_eq!(rows[0].hotkey, Some('1'));
+        assert_eq!(rows[1].hotkey, Some('2'));
+        assert_eq!(rows[2].hotkey, Some('3'));
+    }
+
+    #[test]
+    fn build_rows_preserves_server_order_within_groups() {
+        // Within each group (own / foreign), the server's id-order survives.
+        let sessions = vec![
+            auto_entry("defiant/b", false),
+            auto_entry("laptop2/x", false),
+            auto_entry("defiant/a", false),
+            auto_entry("laptop2/y", false),
+        ];
+        let rows = build_rows(&sessions, "defiant");
+        let names: Vec<&str> = rows.iter().map(|r| r.name.as_str()).collect();
+        assert_eq!(names, vec!["defiant/b", "defiant/a", "laptop2/x", "laptop2/y"]);
     }
 
     #[test]
