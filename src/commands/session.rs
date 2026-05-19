@@ -245,30 +245,48 @@ async fn pick_session(
         _ => return (default_wire, false, false),
     };
 
-    if sessions.is_empty() {
-        return (default_wire, false, false);
-    }
-
     let host = host_from_ctl_path(ctl_path);
 
     if pick {
         return pick_or_list(&host, &sessions, ctl_path, client_name).await;
     }
 
-    let detached: Vec<_> = sessions.iter().filter(|s| !s.attached).collect();
+    match auto_attach_target(&sessions, client_name) {
+        Some(name) => (name, false, false),
+        None => pick_or_list(&host, &sessions, ctl_path, client_name).await,
+    }
+}
 
-    // One session, detached: attach directly
-    if sessions.len() == 1 && detached.len() == 1 {
-        return (session_wire_name(&sessions[0]), false, false);
+/// Decide the auto-attach target for `gritty connect host` (no session name).
+/// Returns `Some(wire_name)` when the choice is unambiguous, `None` when the
+/// caller should fall through to the picker.
+///
+/// Only sessions in `<client_name>/*` count -- foreign-namespace sessions
+/// (other clients' or legacy unprefixed names) are ignored entirely. That
+/// means a stale `default` left by an older gritty doesn't block creating
+/// `<client>/default`, and a teammate's `pat/work` doesn't get silently
+/// adopted. Reach those explicitly with the literal slash-bearing form
+/// (`gritty c host:other/name`).
+fn auto_attach_target(
+    sessions: &[gritty::protocol::SessionEntry],
+    client_name: &str,
+) -> Option<String> {
+    let prefix = format!("{client_name}/");
+    let mine: Vec<&gritty::protocol::SessionEntry> =
+        sessions.iter().filter(|s| s.name.starts_with(&prefix)).collect();
+
+    if mine.is_empty() {
+        return Some(gritty::naming::resolve_session_name("default", client_name));
     }
 
-    // Multiple sessions, exactly one detached: attach to the detached one
+    let detached: Vec<&gritty::protocol::SessionEntry> =
+        mine.iter().filter(|s| !s.attached).copied().collect();
+
     if detached.len() == 1 {
-        return (session_wire_name(detached[0]), false, false);
+        return Some(session_wire_name(detached[0]));
     }
 
-    // Ambiguous (multiple detached) or all attached: show picker
-    pick_or_list(&host, &sessions, ctl_path, client_name).await
+    None
 }
 
 /// The wire name of a session: its `name` field, or the numeric id as a string
@@ -1378,6 +1396,66 @@ mod tests {
             agent_forwarding_active: false,
             is_last_attached: false,
         }
+    }
+
+    fn auto_entry(name: &str, attached: bool) -> gritty::protocol::SessionEntry {
+        let mut e = entry();
+        e.name = name.to_string();
+        e.attached = attached;
+        e
+    }
+
+    #[test]
+    fn auto_attach_no_sessions_creates_default() {
+        assert_eq!(auto_attach_target(&[], "defiant"), Some("defiant/default".to_string()));
+    }
+
+    #[test]
+    fn auto_attach_ignores_legacy_unprefixed_name() {
+        // A `default` from a pre-namespace gritty must not block us from
+        // creating `defiant/default`.
+        let s = vec![auto_entry("default", false)];
+        assert_eq!(auto_attach_target(&s, "defiant"), Some("defiant/default".to_string()));
+    }
+
+    #[test]
+    fn auto_attach_ignores_foreign_namespace() {
+        let s = vec![auto_entry("laptop2/work", false)];
+        assert_eq!(auto_attach_target(&s, "defiant"), Some("defiant/default".to_string()));
+    }
+
+    #[test]
+    fn auto_attach_picks_lone_in_namespace_detached() {
+        let s = vec![auto_entry("defiant/work", false)];
+        assert_eq!(auto_attach_target(&s, "defiant"), Some("defiant/work".to_string()));
+    }
+
+    #[test]
+    fn auto_attach_shows_picker_when_lone_in_namespace_attached() {
+        let s = vec![auto_entry("defiant/work", true)];
+        assert_eq!(auto_attach_target(&s, "defiant"), None);
+    }
+
+    #[test]
+    fn auto_attach_picks_single_detached_among_in_namespace() {
+        let s = vec![auto_entry("defiant/work", true), auto_entry("defiant/play", false)];
+        assert_eq!(auto_attach_target(&s, "defiant"), Some("defiant/play".to_string()));
+    }
+
+    #[test]
+    fn auto_attach_shows_picker_for_multiple_detached_in_namespace() {
+        let s = vec![auto_entry("defiant/work", false), auto_entry("defiant/play", false)];
+        assert_eq!(auto_attach_target(&s, "defiant"), None);
+    }
+
+    #[test]
+    fn auto_attach_in_namespace_wins_over_foreign_detached() {
+        let s = vec![
+            auto_entry("defiant/work", false),
+            auto_entry("laptop2/foo", false),
+            auto_entry("default", false),
+        ];
+        assert_eq!(auto_attach_target(&s, "defiant"), Some("defiant/work".to_string()));
     }
 
     #[test]

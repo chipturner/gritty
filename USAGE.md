@@ -53,7 +53,7 @@ laptop$ gritty connect devbox:work          # now "devbox" routes to user@10.0.0
 
 **`session`** is a name you choose so you can run several sessions per host. Rules:
 
-- Omitted: `connect` attaches the sole detached session, shows a picker when the choice is ambiguous, and falls back to a session named `default` only when the server has no sessions.
+- Omitted: `connect` looks only at sessions in your own namespace (`<client>/*`). It attaches the sole detached one, shows a picker when the choice is ambiguous, and falls back to `<client>/default` when your namespace is empty. Foreign-namespace and legacy unprefixed sessions are ignored -- reach those with the explicit slash-bearing form (`gritty connect host:other/name`).
 - `-`: refers to the last-attached session, e.g. `gritty connect devbox:-`.
 - Numeric-only names are rejected (they would collide with auto-assigned session IDs).
 
