@@ -306,6 +306,78 @@ fn next_reconnect_delay(prev: Duration) -> Duration {
     }
 }
 
+/// Grace before a missing ctl socket with no supervisor is treated as a
+/// torn-down tunnel/server (e.g. `gritty tunnel-destroy` removed the file).
+const SOCKET_GONE_GRACE: Duration = Duration::from_secs(3);
+
+/// Grace before a *stale* ctl socket -- present on disk but refusing
+/// connections (`ECONNREFUSED`) with no supervisor holding the lock -- is
+/// treated as a crashed daemon.
+///
+/// Wake-from-suspend is the case this exists for: the `-L` forward socket is
+/// briefly stale *and* the tunnel lock can momentarily read free (a "ghost
+/// lock" window) before the supervisor respawns. Without a grace window a
+/// single unlucky probe at wake -- the client's heartbeat tick routinely lands
+/// a second before the supervisor's suspend poll -- permanently kills every
+/// session whose remote daemon is in fact still alive. Slightly longer than
+/// `SOCKET_GONE_GRACE` because a supervisor reclaiming the lock after wake can
+/// involve an SSH round-trip.
+const DAEMON_GONE_GRACE: Duration = Duration::from_secs(5);
+
+/// Tracks how long a terminal-looking reconnect condition (socket gone, stale
+/// socket + no supervisor) has persisted across attempts, so a transient
+/// wake-from-suspend blip doesn't trip a one-shot terminal verdict. Replaces
+/// the old inline `Option<Instant>` + `elapsed()` juggling and makes the grace
+/// semantics unit-testable -- the zero-grace regression this guards against was
+/// a live incident, not a hypothetical.
+struct PersistenceGate {
+    grace: Duration,
+    since: Option<Instant>,
+}
+
+impl PersistenceGate {
+    fn new(grace: Duration) -> Self {
+        Self { grace, since: None }
+    }
+
+    /// Feed the current observation. `present == false` clears the streak.
+    /// Returns true once the condition has held continuously for `grace`.
+    fn exceeded(&mut self, present: bool, now: Instant) -> bool {
+        if !present {
+            self.since = None;
+            return false;
+        }
+        let since = *self.since.get_or_insert(now);
+        now.saturating_duration_since(since) >= self.grace
+    }
+
+    /// Clear the streak. Used when a later stage of the same attempt proved the
+    /// condition transient (a retryable outcome rather than the terminal one).
+    fn reset(&mut self) {
+        self.since = None;
+    }
+
+    /// How long the current streak has lasted, for diagnostics. `None` when not
+    /// currently streaking.
+    fn streak(&self, now: Instant) -> Option<Duration> {
+        self.since.map(|s| now.saturating_duration_since(s))
+    }
+}
+
+/// Terminal message when the ctl socket refuses connections and no supervisor
+/// is managing it. For a tunnel the *remote* daemon is very likely still alive
+/// -- only the local forward is down -- so we must not claim the session is
+/// gone or suggest `gritty restart`, which would kill the remote daemon and its
+/// live sessions. For a local session `ECONNREFUSED` genuinely means the daemon
+/// died.
+fn daemon_gone_message(is_remote: bool) -> &'static str {
+    if is_remote {
+        "lost the tunnel and its supervisor is gone -- run `gritty connect <host>` to re-establish it"
+    } else {
+        "daemon appears to have crashed -- session is gone; run `gritty server` to restart it"
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Reconnect status-line chrome
 //
@@ -2016,13 +2088,15 @@ pub async fn run(
                 // cursor's line.
                 let mut chrome_shown = false;
                 let mut reconnect_started = Instant::now();
-                // Timestamp of the most recent observation that ctl_path did
-                // NOT exist. Cleared whenever the socket reappears or a probe
-                // succeeds. If it persists past SOCKET_GONE_GRACE we treat
-                // the tunnel/server as torn down (e.g. `gritty tunnel-destroy`
-                // removed the socket file) and exit instead of looping.
-                let mut socket_missing_since: Option<Instant> = None;
-                const SOCKET_GONE_GRACE: Duration = Duration::from_secs(3);
+                // Persistence gates for the two terminal-looking conditions.
+                // Each exits the loop only after the condition holds past its
+                // grace window, so a transient wake-from-suspend blip doesn't
+                // permanently kill a session. `socket_gone`: ctl_path missing +
+                // no supervisor (torn-down tunnel/server). `daemon_gone`:
+                // ctl_path present but refusing connections + no supervisor
+                // (crashed daemon, or a ghost-lock window at wake).
+                let mut socket_gone = PersistenceGate::new(SOCKET_GONE_GRACE);
+                let mut daemon_gone = PersistenceGate::new(DAEMON_GONE_GRACE);
                 let mut backoff = Duration::ZERO;
                 let mut was_offline = false;
                 let mut attempt_n = 0u32;
@@ -2154,34 +2228,33 @@ pub async fn run(
                     let tunnel_supervisor_alive = crate::connect::ctl_socket_lock_path(ctl_path)
                         .as_deref()
                         .is_some_and(crate::connect::is_lock_held);
-                    if !ctl_path.exists() && !tunnel_supervisor_alive {
-                        let first_seen = *socket_missing_since.get_or_insert_with(Instant::now);
-                        if first_seen.elapsed() >= SOCKET_GONE_GRACE {
-                            info!(
-                                gone_s = first_seen.elapsed().as_secs_f64(),
-                                "reconnect: exiting -- ctl socket gone and no supervisor"
-                            );
-                            // `\x1b[?1049l` leaves alt-screen first so the
-                            // error is visible on main screen -- otherwise
-                            // RawModeGuard's Drop emits it after the fact
-                            // and clobbers the message. No-op on main
-                            // screen.
-                            write_stdout_async(
-                                &async_stdout,
-                                format!(
-                                    "\x1b[?1049l{}",
-                                    reconnect_err_line(
-                                        "server socket gone -- session is unreachable; reconnect manually"
-                                    )
+                    let now = Instant::now();
+                    let socket_gone_now = !ctl_path.exists() && !tunnel_supervisor_alive;
+                    if socket_gone.exceeded(socket_gone_now, now) {
+                        info!(
+                            gone_s = socket_gone.streak(now).unwrap_or_default().as_secs_f64(),
+                            "reconnect: exiting -- ctl socket gone and no supervisor past grace"
+                        );
+                        // `\x1b[?1049l` leaves alt-screen first so the
+                        // error is visible on main screen -- otherwise
+                        // RawModeGuard's Drop emits it after the fact
+                        // and clobbers the message. No-op on main
+                        // screen.
+                        write_stdout_async(
+                            &async_stdout,
+                            format!(
+                                "\x1b[?1049l{}",
+                                reconnect_err_line(
+                                    "server socket gone -- session is unreachable; reconnect manually"
                                 )
-                                .as_bytes(),
                             )
-                            .await?;
-                            return Ok(1);
-                        }
+                            .as_bytes(),
+                        )
+                        .await?;
+                        return Ok(1);
+                    }
+                    if socket_gone_now {
                         continue;
-                    } else {
-                        socket_missing_since = None;
                     }
 
                     attempt_n += 1;
@@ -2392,19 +2465,35 @@ pub async fn run(
                                 attempt_ms,
                                 "reconnect: transient handshake err ({msg}), will retry"
                             );
+                            daemon_gone.reset();
                             if tunnel_supervisor_alive {
                                 backoff = Duration::ZERO;
                             }
                             continue;
                         }
                         Ok(Attempt::DaemonGone) => {
-                            info!(
+                            let now = Instant::now();
+                            if daemon_gone.exceeded(true, now) {
+                                info!(
+                                    attempt = attempt_n,
+                                    gone_s =
+                                        daemon_gone.streak(now).unwrap_or_default().as_secs_f64(),
+                                    socket_exists = ctl_path.exists(),
+                                    is_remote,
+                                    "reconnect: exiting -- ECONNREFUSED on stale socket, no supervisor past grace"
+                                );
+                                bail_reconnect!(daemon_gone_message(is_remote));
+                            }
+                            // Within the grace window: a wake-from-suspend
+                            // ghost-lock blip looks exactly like this until the
+                            // supervisor respawns. Keep retrying.
+                            debug!(
                                 attempt = attempt_n,
-                                "reconnect: exiting -- ECONNREFUSED on stale socket, no supervisor"
+                                gone_s = daemon_gone.streak(now).unwrap_or_default().as_secs_f64(),
+                                grace_s = DAEMON_GONE_GRACE.as_secs_f64(),
+                                "reconnect: stale socket + no supervisor, within grace -- will retry"
                             );
-                            bail_reconnect!(
-                                "daemon appears to have crashed -- session is gone; run `gritty server` or `gritty restart`"
-                            );
+                            continue;
                         }
                         Ok(Attempt::Retry) => {
                             debug!(
@@ -2417,6 +2506,7 @@ pub async fn run(
                             // local Unix socket and costs nothing; layering
                             // our own backoff on top just delays noticing
                             // the forward came back. Poll at 1s instead.
+                            daemon_gone.reset();
                             if tunnel_supervisor_alive {
                                 backoff = Duration::ZERO;
                             }
@@ -2428,6 +2518,7 @@ pub async fn run(
                                 timeout_s = RECONNECT_ATTEMPT_TIMEOUT.as_secs(),
                                 "reconnect: attempt timed out"
                             );
+                            daemon_gone.reset();
                             if tunnel_supervisor_alive {
                                 backoff = Duration::ZERO;
                             }
@@ -2561,13 +2652,14 @@ pub async fn tail(
                 // past `RECONNECT_CHROME_DELAY`.
                 let mut chrome_shown = false;
                 let mut reconnect_started = Instant::now();
-                let mut socket_missing_since: Option<Instant> = None;
+                // Same persistence gates as the interactive loop -- see there.
+                let mut socket_gone = PersistenceGate::new(SOCKET_GONE_GRACE);
+                let mut daemon_gone = PersistenceGate::new(DAEMON_GONE_GRACE);
                 let mut was_offline = false;
                 let mut spin: usize = 0;
                 let mut tick = tokio::time::interval(RECONNECT_SPIN_INTERVAL);
                 tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
                 let is_remote = crate::connect::ctl_socket_lock_path(ctl_path).is_some();
-                const SOCKET_GONE_GRACE: Duration = Duration::from_secs(3);
 
                 // Paint (or first-time open) the tail reconnect status line
                 // once the reconnect has dragged past the grace period.
@@ -2616,21 +2708,21 @@ pub async fn tail(
                     let tunnel_supervisor_alive = crate::connect::ctl_socket_lock_path(ctl_path)
                         .as_deref()
                         .is_some_and(crate::connect::is_lock_held);
-                    if !ctl_path.exists() && !tunnel_supervisor_alive {
-                        let first_seen = *socket_missing_since.get_or_insert_with(Instant::now);
-                        if first_seen.elapsed() >= SOCKET_GONE_GRACE {
-                            info!("tail reconnect: exiting -- ctl socket gone and no supervisor");
-                            eprint!(
-                                "{}",
-                                reconnect_err_line(
-                                    "server socket gone -- session is unreachable; reconnect manually"
-                                )
-                            );
-                            break 'outer 1;
-                        }
+                    let socket_gone_now = !ctl_path.exists() && !tunnel_supervisor_alive;
+                    if socket_gone.exceeded(socket_gone_now, Instant::now()) {
+                        info!(
+                            "tail reconnect: exiting -- ctl socket gone and no supervisor past grace"
+                        );
+                        eprint!(
+                            "{}",
+                            reconnect_err_line(
+                                "server socket gone -- session is unreachable; reconnect manually"
+                            )
+                        );
+                        break 'outer 1;
+                    }
+                    if socket_gone_now {
                         continue;
-                    } else {
-                        socket_missing_since = None;
                     }
 
                     // Bound a single attempt (connect + handshake + Tail
@@ -2749,14 +2841,22 @@ pub async fn tail(
                             bail_tail!(&format!("session gone: {message}"));
                         }
                         Ok(Outcome::DaemonGone) => {
-                            info!(
-                                "tail reconnect: exiting -- ECONNREFUSED on stale socket, no supervisor"
-                            );
-                            bail_tail!(
-                                "daemon appears to have crashed -- session is gone; run `gritty server` or `gritty restart`"
-                            );
+                            let now = Instant::now();
+                            if daemon_gone.exceeded(true, now) {
+                                info!(
+                                    gone_s =
+                                        daemon_gone.streak(now).unwrap_or_default().as_secs_f64(),
+                                    is_remote,
+                                    "tail reconnect: exiting -- ECONNREFUSED on stale socket, no supervisor past grace"
+                                );
+                                bail_tail!(daemon_gone_message(is_remote));
+                            }
+                            continue;
                         }
-                        Ok(Outcome::Retry) | Err(_) => continue,
+                        Ok(Outcome::Retry) | Err(_) => {
+                            daemon_gone.reset();
+                            continue;
+                        }
                     }
                 }
             }
@@ -2967,6 +3067,67 @@ mod tests {
         assert_eq!(next_reconnect_delay(Duration::from_secs(8)), RECONNECT_BACKOFF_MAX);
         assert_eq!(next_reconnect_delay(RECONNECT_BACKOFF_MAX), RECONNECT_BACKOFF_MAX);
         assert_eq!(next_reconnect_delay(Duration::from_secs(300)), RECONNECT_BACKOFF_MAX);
+    }
+
+    // The live incident this guards against: a single probe at wake-from-suspend
+    // (ECONNREFUSED on a stale socket + a ghost lock reading free) must NOT be a
+    // terminal verdict. The condition has to persist past the grace window.
+    #[test]
+    fn persistence_gate_not_terminal_on_first_observation() {
+        let grace = Duration::from_secs(5);
+        let mut gate = PersistenceGate::new(grace);
+        let t0 = Instant::now();
+        assert!(!gate.exceeded(true, t0), "first observation must never be terminal");
+    }
+
+    #[test]
+    fn persistence_gate_terminal_only_after_grace() {
+        let grace = Duration::from_secs(5);
+        let mut gate = PersistenceGate::new(grace);
+        let t0 = Instant::now();
+        assert!(!gate.exceeded(true, t0));
+        assert!(!gate.exceeded(true, t0 + Duration::from_secs(3)), "within grace: keep retrying");
+        assert!(!gate.exceeded(true, t0 + Duration::from_secs(4)));
+        assert!(gate.exceeded(true, t0 + grace), "at grace boundary: terminal");
+    }
+
+    #[test]
+    fn persistence_gate_resets_on_transient() {
+        let grace = Duration::from_secs(5);
+        let mut gate = PersistenceGate::new(grace);
+        let t0 = Instant::now();
+        assert!(!gate.exceeded(true, t0));
+        // A non-present observation (e.g. a retryable outcome) clears the streak.
+        assert!(!gate.exceeded(false, t0 + Duration::from_secs(4)));
+        // Streak restarts from here, so the old near-grace progress is gone.
+        assert!(!gate.exceeded(true, t0 + Duration::from_secs(6)));
+        assert!(!gate.exceeded(true, t0 + Duration::from_secs(10)), "still within the new window");
+        assert!(gate.exceeded(true, t0 + Duration::from_secs(11)));
+    }
+
+    #[test]
+    fn persistence_gate_reset_method_clears_streak() {
+        let grace = Duration::from_secs(5);
+        let mut gate = PersistenceGate::new(grace);
+        let t0 = Instant::now();
+        assert!(!gate.exceeded(true, t0));
+        gate.reset();
+        assert_eq!(gate.streak(t0 + Duration::from_secs(1)), None);
+        assert!(!gate.exceeded(true, t0 + Duration::from_secs(6)), "reset restarts the window");
+    }
+
+    #[test]
+    fn daemon_gone_message_is_tunnel_aware() {
+        // A tunnel's remote daemon is usually alive; never advise `gritty
+        // restart` (it would kill the remote daemon + its live sessions) and
+        // don't claim the session is gone.
+        let remote = daemon_gone_message(true);
+        assert!(!remote.contains("restart"), "{remote:?}");
+        assert!(!remote.contains("session is gone"), "{remote:?}");
+        assert!(remote.contains("gritty connect"), "{remote:?}");
+        // A local daemon that refuses really did crash.
+        let local = daemon_gone_message(false);
+        assert!(local.contains("session is gone"), "{local:?}");
     }
 
     #[test]

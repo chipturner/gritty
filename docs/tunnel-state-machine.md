@@ -194,8 +194,21 @@ state machine deliberately makes these indistinguishable from outside.
 The client's reconnect loop (`src/client.rs`) uses `is_lock_held` directly,
 not `TunnelStatus`: a held lock means "supervisor is alive and may be
 respawning" -- keep retrying past `SOCKET_GONE_GRACE` -- while a free lock
-means "tunnel is gone, give up". This distinction is what lets a 1..60s ssh
+means "tunnel is gone". This distinction is what lets a 1..60s ssh
 backoff not trip the client's short socket-gone grace.
+
+A free lock is **not** an instant terminal verdict, though. The client
+requires the "stale socket (`ECONNREFUSED`) + free lock" signature to persist
+past `DAEMON_GONE_GRACE` (5s, tracked via `PersistenceGate`) before it gives up
+with `daemon_gone_message`. Wake-from-suspend is why: the client's heartbeat
+tick routinely fires a second before the supervisor's suspend poll, and a
+transient *ghost lock* (an orphaned `.lock` file no live supervisor holds) can
+make `is_lock_held` read false for a tunnel whose remote daemon is still alive.
+Without the grace window a single unlucky probe at wake permanently killed every
+session (observed in the field). The terminal message is also tunnel-aware: for
+a remote session it points at `gritty connect` (the remote daemon is likely
+fine; only the forward is down) and never suggests `gritty restart`, which would
+kill the remote daemon and its live sessions.
 
 ## Transition details
 
@@ -213,7 +226,16 @@ backoff not trip the client's short socket-gone grace.
 2. **Absent -> Starting** -- `try_acquire_lock` returned `Ok`. We own the
    supervisor role. Clean any stale `.sock`/`.pid`/`.dest`/`.ssh-opts` (we
    don't remove the lock we just acquired), then write the `.pid` file **immediately**
-   so `disconnect` can find us during the startup window.
+   so `disconnect` can find us during the startup window. A `LockFileBailGuard`
+   is armed here too: if the fallible setup that follows (`ensure_remote_ready`,
+   version gate, `spawn_tunnel`, `wait_for_socket`) returns early, dropping
+   `lock_fd` releases the advisory lock but would leave the `.lock` *file* on
+   disk -- an orphaned ghost lock. The guard removes that file on early bail
+   (only while we still own the inode, via `lock_still_owned`) and is disarmed
+   once `ConnectGuard` takes over cleanup. This matters at wake-from-suspend:
+   an auto-start `tunnel-create` can grab the lock and then fail in
+   `ensure_remote_ready` because the SSH agent (e.g. a Secure-Enclave signer)
+   is still locked -- exactly the window that used to strand a ghost lock.
 3. **Starting.Preflight -> Starting.SpawnChild** -- if
    `connect-NAME.remote-sock` exists, use its contents as `remote_sock`
    and skip `ensure_remote_ready` entirely (saves one ~2s SSH-exec on
@@ -406,7 +428,9 @@ contract explicitly:
 > While the supervisor's flock is held, the client MUST assume the tunnel
 > is alive-but-possibly-respawning, and keep retrying past its normal
 > `SOCKET_GONE_GRACE` window. Only a free flock (== `TunnelStatus::Stale`)
-> authorizes the client to give up.
+> authorizes the client to give up -- and even then only after it has
+> persisted past `DAEMON_GONE_GRACE`, so a transient ghost-lock window at
+> wake-from-suspend can't be mistaken for a destroyed tunnel.
 
 Changing supervisor behavior in a way that holds the flock without being
 respawn-capable (for example, holding it in `Failed`) will break this

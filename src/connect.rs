@@ -601,6 +601,8 @@ async fn respawn_tunnel(
         if !lock_still_owned(cfg.lock_identity, &cfg.lock_path) {
             warn!(
                 lock_path = %cfg.lock_path.display(),
+                held = ?cfg.lock_identity,
+                on_disk = ?LockIdentity::of_path(&cfg.lock_path),
                 "lock ownership lost during respawn; another supervisor \
                  owns this tunnel -- exiting"
             );
@@ -830,6 +832,8 @@ async fn tunnel_monitor(
                 if !lock_still_owned(cfg.lock_identity, &cfg.lock_path) {
                     warn!(
                         lock_path = %cfg.lock_path.display(),
+                        held = ?cfg.lock_identity,
+                        on_disk = ?LockIdentity::of_path(&cfg.lock_path),
                         "lock file replaced or removed; another supervisor owns this \
                          tunnel -- exiting"
                     );
@@ -1537,11 +1541,58 @@ impl Drop for ConnectGuard {
         } else {
             warn!(
                 lock_path = %self.lock_file.display(),
+                held = ?self._lock.as_ref().and_then(LockIdentity::of_held),
+                on_disk = ?LockIdentity::of_path(&self.lock_file),
                 "lock file was replaced or removed out from under us; \
                  leaving sidecar files for the current owner"
             );
         }
         let _ = self._lock.take();
+    }
+}
+
+/// Removes a just-created tunnel lock file if setup fails *before* the
+/// long-lived [`ConnectGuard`] assumes ownership of cleanup.
+///
+/// Between `try_acquire_lock` and `ConnectGuard` construction we run fallible
+/// setup (`ensure_remote_ready`, the version gate, `spawn_tunnel`). An early
+/// `?` return there drops the `Flock` -- releasing the advisory lock -- but
+/// leaves the lock *file* on disk. That orphan is a "ghost lock": every other
+/// live supervisor sits on a different inode, so `is_lock_held(path)` reads
+/// false for all of them, and the client's reconnect loop reads that as a
+/// crashed daemon and kills the session. (Wake-from-suspend is the trigger in
+/// practice: an auto-start `tunnel-create` grabs the lock, then `ssh` can't
+/// sign because the Secure-Enclave agent is still locked, so setup bails right
+/// in this window.)
+///
+/// Only removes the file while it is still the inode we flock'd
+/// ([`lock_still_owned`]), so it can never yank a racing supervisor's fresh
+/// lock. Disarmed once `ConnectGuard` owns cleanup.
+struct LockFileBailGuard {
+    lock_path: PathBuf,
+    identity: Option<LockIdentity>,
+    armed: bool,
+}
+
+impl LockFileBailGuard {
+    fn disarm(&mut self) {
+        self.armed = false;
+    }
+}
+
+impl Drop for LockFileBailGuard {
+    fn drop(&mut self) {
+        if !self.armed {
+            return;
+        }
+        if lock_still_owned(self.identity, &self.lock_path) {
+            warn!(
+                lock_path = %self.lock_path.display(),
+                "tunnel setup failed before the supervisor started; removing \
+                 lock file to avoid a ghost lock"
+            );
+            let _ = std::fs::remove_file(&self.lock_path);
+        }
     }
 }
 
@@ -1704,6 +1755,19 @@ pub async fn run(opts: ConnectOpts, ready_fd: Option<OwnedFd>) -> anyhow::Result
         }
     };
 
+    // Snapshot the inode we flock'd: the monitor uses it to detect the lock
+    // file being replaced/removed out from under us (see `LockIdentity`), and
+    // the bail guard below uses it to clean up only our own lock file.
+    let lock_identity = LockIdentity::of_held(&lock_fd);
+
+    // Arm ghost-lock cleanup for the fallible setup that follows. An early `?`
+    // return from ensure_remote_ready / the version gate / spawn_tunnel /
+    // wait_for_socket would drop `lock_fd` (releasing the advisory lock) but
+    // leave the lock *file* behind -- a ghost lock that trips the client's
+    // reconnect loop. Disarmed once `ConnectGuard` takes over cleanup.
+    let mut lock_file_bail =
+        LockFileBailGuard { lock_path: lock_path.clone(), identity: lock_identity, armed: true };
+
     // 3. Install SIGTERM/SIGINT handlers *before* any slow step so a signal
     //    during ensure_remote_ready / spawn_tunnel / wait_for_socket no
     //    longer terminates us via the default handler -- which would skip
@@ -1750,10 +1814,6 @@ pub async fn run(opts: ConnectOpts, ready_fd: Option<OwnedFd>) -> anyhow::Result
         check_remote_protocol_version(rv, opts.ignore_version_mismatch)?;
     }
 
-    // Snapshot the inode we flock'd so the monitor can detect the lock file
-    // being replaced or removed out from under us. See `LockIdentity`.
-    let lock_identity = LockIdentity::of_held(&lock_fd);
-
     // 5. Spawn SSH tunnel
     let child = spawn_tunnel(
         &dest,
@@ -1778,6 +1838,9 @@ pub async fn run(opts: ConnectOpts, ready_fd: Option<OwnedFd>) -> anyhow::Result
         _lock: Some(lock_fd),
         stop: stop.clone(),
     };
+    // ConnectGuard now owns lock-file cleanup (it unlinks only while it still
+    // owns the inode), so the early-bail guard is no longer needed.
+    lock_file_bail.disarm();
 
     // 6. Wait for local socket to become connectable (race against child exit).
     // SSH stderr is already draining to our own stderr (-> .out in daemonized
@@ -2534,6 +2597,65 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let missing = dir.path().join("never-created.lock");
         assert!(lock_still_owned(None, &missing));
+    }
+
+    #[test]
+    fn bail_guard_removes_leaked_lock_file() {
+        // A tunnel-create that bails before ConnectGuard exists must not leave
+        // its lock file behind as a ghost lock.
+        let dir = tempfile::tempdir().unwrap();
+        let lock_path = dir.path().join("connect-leak.lock");
+        let fd = try_acquire_lock(&lock_path).unwrap();
+        let identity = LockIdentity::of_held(&fd);
+        {
+            let _bail = LockFileBailGuard { lock_path: lock_path.clone(), identity, armed: true };
+            // Simulate the early `?` return: the bail guard drops first (while
+            // the flock is still held), then the Flock.
+        }
+        assert!(!lock_path.exists(), "armed bail guard must remove the leaked lock file");
+        drop(fd);
+    }
+
+    #[test]
+    fn bail_guard_disarmed_leaves_lock_file() {
+        // Once ConnectGuard takes over, the bail guard must be inert.
+        let dir = tempfile::tempdir().unwrap();
+        let lock_path = dir.path().join("connect-ok.lock");
+        let fd = try_acquire_lock(&lock_path).unwrap();
+        let identity = LockIdentity::of_held(&fd);
+        {
+            let mut bail =
+                LockFileBailGuard { lock_path: lock_path.clone(), identity, armed: true };
+            bail.disarm();
+        }
+        assert!(lock_path.exists(), "disarmed bail guard must leave the lock file alone");
+        drop(fd);
+    }
+
+    #[test]
+    fn bail_guard_spares_a_racers_fresh_lock() {
+        // If the lock file was replaced by another supervisor's inode before we
+        // bail, the bail guard must not yank the racer's fresh lock.
+        let dir = tempfile::tempdir().unwrap();
+        let lock_path = dir.path().join("connect-race.lock");
+
+        let ours = try_acquire_lock(&lock_path).unwrap();
+        let our_id = LockIdentity::of_held(&ours);
+
+        // A racer replaces the path with a brand-new inode.
+        std::fs::remove_file(&lock_path).unwrap();
+        let theirs = try_acquire_lock(&lock_path).unwrap();
+
+        {
+            let _bail =
+                LockFileBailGuard { lock_path: lock_path.clone(), identity: our_id, armed: true };
+        }
+        assert!(
+            is_lock_held(&lock_path),
+            "bail guard must not remove a lock file it no longer owns"
+        );
+        drop(theirs);
+        drop(ours);
     }
 
     #[test]
