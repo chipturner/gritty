@@ -366,34 +366,56 @@ struct AgentForwardState {
     acceptor: Option<tokio::task::JoinHandle<()>>,
     next_channel_id: Arc<AtomicU32>,
     socket_path: PathBuf,
+    event_tx: mpsc::UnboundedSender<AgentEvent>,
 }
 
 impl AgentForwardState {
-    fn new(socket_path: PathBuf) -> Self {
+    fn new(socket_path: PathBuf, event_tx: mpsc::UnboundedSender<AgentEvent>) -> Self {
         Self {
             enabled: Arc::new(AtomicBool::new(false)),
             channels: HashMap::new(),
             acceptor: None,
             next_channel_id: Arc::new(AtomicU32::new(0)),
             socket_path,
+            event_tx,
         }
     }
 
-    /// Client detach/takeover: stop forwarding but keep the listener and socket
-    /// file alive so `SSH_AUTH_SOCK` remains a valid path for a future `-A`
-    /// reattach.
+    /// Client enabled `-A`: bind the listener and spawn the acceptor if not
+    /// already running, so `SSH_AUTH_SOCK` becomes connectable. Idempotent.
+    fn enable(&mut self) {
+        self.enabled.store(true, Ordering::Relaxed);
+        if self.acceptor.is_none()
+            && let Some(listener) = bind_agent_listener(&self.socket_path)
+        {
+            self.acceptor = Some(spawn_agent_acceptor(
+                listener,
+                self.event_tx.clone(),
+                self.next_channel_id.clone(),
+                self.enabled.clone(),
+            ));
+        }
+    }
+
+    /// Client detach/takeover (and session end): stop forwarding, abort the
+    /// acceptor, and remove the socket file. With no listener on the path a
+    /// process using `SSH_AUTH_SOCK` gets ECONNREFUSED/ENOENT -- `ssh-add`
+    /// reports "cannot connect to agent" (exit 2) instead of reaching a socket
+    /// that accepts and immediately closes (exit 1, which fools presence-based
+    /// login scripts into skipping their own agent). A future `-A` reattach
+    /// rebinds the same path via `enable`.
     fn disable(&mut self) {
         self.enabled.store(false, Ordering::Relaxed);
         self.channels.clear();
-    }
-
-    /// Session end: disable, abort the acceptor, and remove the socket file.
-    fn teardown(&mut self) {
-        self.disable();
         if let Some(handle) = self.acceptor.take() {
             handle.abort();
         }
         cleanup_socket(&self.socket_path);
+    }
+
+    /// Session end: same as `disable` -- listener down, socket removed.
+    fn teardown(&mut self) {
+        self.disable();
     }
 }
 
@@ -1128,7 +1150,7 @@ impl ServerRelay<'_> {
             }
             Some(Ok(Frame::AgentForward)) => {
                 debug!("agent forwarding enabled by client");
-                self.agent.enabled.store(true, Ordering::Relaxed);
+                self.agent.enable();
                 if let Some(meta) = self.metadata_slot.get() {
                     meta.wants_agent.store(true, Ordering::Relaxed);
                 }
@@ -1946,19 +1968,13 @@ pub async fn run(
     // reconnecting client can resume the stream by absolute offset.
     let mut history = History::new(ring_buffer_cap);
 
-    // Agent forwarding state. The listener is bound unconditionally so the
-    // shell's SSH_AUTH_SOCK always resolves; connections are refused at accept
-    // time when no `-A` client is attached.
-    let mut agent = AgentForwardState::new(agent_socket_path);
+    // Agent forwarding state. The listener is bound lazily -- only while an
+    // `-A` client is attached (see `AgentForwardState::enable`/`disable`).
+    // While forwarding is off the socket path has no listener, so a process
+    // using SSH_AUTH_SOCK gets ECONNREFUSED/ENOENT ("no agent", ssh-add exit 2)
+    // instead of a socket that accepts and immediately closes.
     let (agent_event_tx, mut agent_event_rx) = mpsc::unbounded_channel::<AgentEvent>();
-    if let Some(listener) = bind_agent_listener(&agent.socket_path) {
-        agent.acceptor = Some(spawn_agent_acceptor(
-            listener,
-            agent_event_tx.clone(),
-            agent.next_channel_id.clone(),
-            agent.enabled.clone(),
-        ));
-    }
+    let mut agent = AgentForwardState::new(agent_socket_path, agent_event_tx);
 
     // Open forwarding state (no acceptor -- svc_acceptor handles the socket)
     let mut open_forward_enabled = false;
@@ -2121,11 +2137,13 @@ pub async fn run(
     let _ = std::fs::remove_file(&open_link);
     let _ = std::os::unix::fs::symlink(&exe, &open_link);
     cmd.env("BROWSER", &open_link);
-    // Set SSH_AUTH_SOCK only when the agent listener bound successfully, so the
-    // path always resolves. Otherwise leave any inherited ambient agent intact.
-    if agent.acceptor.is_some() {
-        cmd.env("SSH_AUTH_SOCK", &agent.socket_path);
-    }
+    // Always export SSH_AUTH_SOCK with a stable path for the shell's whole
+    // life. The listener is bound only while an `-A` client is attached (lazy
+    // bind in `AgentForwardState::enable`), so while forwarding is off the path
+    // has no listener and a process using it gets "no agent" (ssh-add exit 2)
+    // rather than a dead accept-then-close socket. A later `-A` reattach
+    // rebinds the same path, activating this env var.
+    cmd.env("SSH_AUTH_SOCK", &agent.socket_path);
     // Set GRITTY_SOCK so `gritty open`/`gritty send`/`gritty receive` find the service socket
     cmd.env("GRITTY_SOCK", &svc_socket_path);
     // Session context env vars

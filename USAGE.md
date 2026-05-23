@@ -112,7 +112,9 @@ laptop$ gritty receive - | tar xzf -
 
 ## Session environment
 
-**Set inside sessions:** `GRITTY_SOCK` (svc socket for `gritty open`/`send`/`receive`/port forwarding), `GRITTY_SESSION` (session ID), and `GRITTY_SESSION_NAME` (if named) are set in the shell environment. Useful for prompt customization or scripts that need to know which session they're in.
+**Set inside sessions:** `GRITTY_SOCK` (svc socket for `gritty open`/`send`/`receive`/port forwarding), `GRITTY_SESSION` (session ID), and `GRITTY_SESSION_NAME` (if named) are set in the shell environment. Useful for prompt customization or scripts that need to know which session they're in. `BROWSER` points at the `gritty-open` helper (URL forwarding), and `SSH_AUTH_SOCK` points at the session's agent socket.
+
+**Agent socket without `-A`:** `SSH_AUTH_SOCK` is always exported, but the underlying socket only has a listener while an `-A` client is attached. Without agent forwarding, a tool connecting to it (e.g. `ssh-add -l`) gets "cannot connect to agent" (exit 2) -- so a login script that checks whether an agent is reachable will correctly conclude there is none and can start its own. Probe reachability (`ssh-add -l`; exit 2 means no agent) rather than mere presence of `SSH_AUTH_SOCK`.
 
 **Forwarded to sessions:** `TERM`, `COLORTERM`, `LANG`, and the `LC_*` locale categories are carried from the client to the session's login shell (mirroring SSH's default `SendEnv LANG LC_*`), so a remote session renders UTF-8 correctly even when the remote daemon's own environment lacks your locale.
 

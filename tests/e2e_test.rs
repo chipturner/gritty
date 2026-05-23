@@ -35,6 +35,18 @@ fn unique_svc_socket_path() -> PathBuf {
     TEST_DIR.path().join(format!("svc-{pid}-{id}.sock"))
 }
 
+/// Poll `cond` until it returns true or `limit` elapses. Returns the final value.
+async fn wait_until(mut cond: impl FnMut() -> bool, limit: Duration) -> bool {
+    let deadline = tokio::time::Instant::now() + limit;
+    while tokio::time::Instant::now() < deadline {
+        if cond() {
+            return true;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    cond()
+}
+
 /// Spawn a server task connected via socketpair + channel.
 /// Returns (client_tx for takeover, client-side framed, server join handle).
 async fn setup_session() -> (
@@ -1225,26 +1237,74 @@ async fn agent_close_on_remote_disconnect() {
     let _ = timeout(Duration::from_secs(3), server).await;
 }
 
+fn connect_err_is_no_agent(err: &std::io::Error) -> bool {
+    matches!(err.kind(), std::io::ErrorKind::ConnectionRefused | std::io::ErrorKind::NotFound)
+}
+
 #[tokio::test]
-async fn agent_not_forwarded_without_flag() {
+async fn agent_socket_absent_without_forwarding() {
     let (_tx, mut framed, server, _meta, agent_path) = setup_session_with_agent_path().await;
     wait_for_shell(&mut framed).await;
     read_available_data(&mut framed, Duration::from_secs(1)).await;
 
-    // Do NOT send AgentForward. The agent socket is bound unconditionally so
-    // SSH_AUTH_SOCK always resolves, but connections are refused (immediately
-    // closed) when no -A client is attached.
-    assert!(agent_path.exists(), "agent socket should be bound unconditionally");
-
-    let mut conn = UnixStream::connect(&agent_path).await.expect("agent socket should accept");
-    let mut buf = [0u8; 1];
-    let n = timeout(Duration::from_secs(2), conn.read(&mut buf))
-        .await
-        .expect("agent connection should close promptly")
-        .expect("read on closed connection");
-    assert_eq!(n, 0, "agent connection should be closed immediately without AgentForward");
+    // Without AgentForward the listener is never bound, so SSH_AUTH_SOCK (which
+    // is still exported) points at a path with no socket. A process connecting
+    // to it -- e.g. `ssh-add -l` -- gets ECONNREFUSED/ENOENT and reports
+    // "cannot connect to agent" (exit 2), rather than reaching a socket that
+    // accepts and immediately closes (exit 1, which masquerades as a live
+    // agent to presence-based login scripts).
+    assert!(!agent_path.exists(), "agent socket must not be bound without -A");
+    let err = UnixStream::connect(&agent_path).await.expect_err("connect must fail without -A");
+    assert!(connect_err_is_no_agent(&err), "expected ECONNREFUSED/ENOENT, got {err:?}");
 
     let _ = framed.send(Frame::Data(Bytes::from("exit\n"))).await;
+    let _ = timeout(Duration::from_secs(3), server).await;
+}
+
+#[tokio::test]
+async fn agent_socket_toggles_with_forwarding() {
+    let (client_tx, mut framed, server, _meta, agent_path) = setup_session_with_agent_path().await;
+    wait_for_shell(&mut framed).await;
+    read_available_data(&mut framed, Duration::from_secs(1)).await;
+
+    // Off by default: no listener.
+    assert!(!agent_path.exists(), "agent socket absent before -A");
+
+    // Enable -A -> the listener binds and the socket becomes connectable.
+    framed.send(Frame::AgentForward).await.unwrap();
+    assert!(
+        wait_until(|| agent_path.exists(), Duration::from_secs(2)).await,
+        "agent socket should bind once -A is enabled"
+    );
+    UnixStream::connect(&agent_path).await.expect("connectable once -A is enabled");
+
+    // Takeover by a client that does NOT enable -A -> listener torn down again,
+    // so the detached window honestly reports "no agent".
+    let (server_stream, client_stream) = UnixStream::pair().unwrap();
+    client_tx
+        .send(ClientConn::Active {
+            framed: Framed::new(server_stream, FrameCodec),
+            client_name: String::new(),
+            capabilities: 0,
+            cols: 0,
+            rows: 0,
+            rendered_offset: 0,
+            line_dirty: false,
+            is_fresh: false,
+        })
+        .unwrap();
+    let mut framed2 = Framed::new(client_stream, FrameCodec);
+    framed2.send(Frame::Env { vars: vec![] }).await.unwrap();
+
+    assert!(
+        wait_until(|| !agent_path.exists(), Duration::from_secs(2)).await,
+        "agent socket should be torn down on takeover without -A"
+    );
+    let err =
+        UnixStream::connect(&agent_path).await.expect_err("not connectable after -A-less takeover");
+    assert!(connect_err_is_no_agent(&err), "expected ECONNREFUSED/ENOENT, got {err:?}");
+
+    let _ = framed2.send(Frame::Data(Bytes::from("exit\n"))).await;
     let _ = timeout(Duration::from_secs(3), server).await;
 }
 
