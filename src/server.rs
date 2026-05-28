@@ -528,6 +528,13 @@ fn sanitize_filename(name: &str) -> Option<String> {
     has_normal.then(|| name.to_string())
 }
 
+/// Strip the literal " (deleted)" suffix Linux appends to `/proc/self/exe`
+/// when the running binary has been unlinked (e.g. after a rebuild). The
+/// caller is responsible for verifying that the cleaned path still exists.
+fn strip_deleted_suffix(path: &str) -> &str {
+    path.strip_suffix(" (deleted)").unwrap_or(path)
+}
+
 /// Extract redirect port from a URL's redirect_uri/redirect_url query parameter.
 /// Returns Some(port) if the redirect target is localhost or 127.0.0.1 with a port.
 fn extract_redirect_port(url_str: &str) -> Option<u16> {
@@ -2128,10 +2135,17 @@ pub async fn run(
         }
     }
     cmd.env("GRITTY_CLIENT", &client_name);
-    // Create gritty-open symlink and set BROWSER unconditionally
+    // Create gritty-open symlink and set BROWSER unconditionally.
+    // Linux's /proc/self/exe (what current_exe() reads) appends a literal
+    // " (deleted)" when the binary has been unlinked -- typical after a
+    // `cargo build` that replaces the file in place. Strip that and verify
+    // the cleaned path still resolves; otherwise fall back to bare "gritty"
+    // and trust $PATH.
     let exe = std::env::current_exe()
         .ok()
         .and_then(|p| p.to_str().map(String::from))
+        .map(|s| strip_deleted_suffix(&s).to_string())
+        .filter(|p| Path::new(p).exists())
         .unwrap_or_else(|| "gritty".into());
     let open_link = svc_socket_path.parent().unwrap_or(Path::new(".")).join("gritty-open");
     let _ = std::fs::remove_file(&open_link);
@@ -2893,6 +2907,21 @@ mod tests {
             .trim_end_matches("\x1b[0m")
             .chars()
             .count()
+    }
+
+    #[test]
+    fn strip_deleted_suffix_removes_kernel_marker() {
+        assert_eq!(
+            strip_deleted_suffix("/usr/local/bin/gritty (deleted)"),
+            "/usr/local/bin/gritty"
+        );
+    }
+
+    #[test]
+    fn strip_deleted_suffix_passes_clean_paths_through() {
+        assert_eq!(strip_deleted_suffix("/usr/local/bin/gritty"), "/usr/local/bin/gritty");
+        // Only the exact trailing token is stripped; embedded text is preserved.
+        assert_eq!(strip_deleted_suffix("/tmp/weird (deleted) name"), "/tmp/weird (deleted) name");
     }
 
     #[test]
