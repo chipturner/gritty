@@ -125,9 +125,7 @@ pub fn remove_bind_lock_if_unheld(socket_path: &Path) {
     let Ok(file) = std::fs::OpenOptions::new().write(true).open(&lock_path) else {
         return;
     };
-    if let Ok(_flock) =
-        nix::fcntl::Flock::lock(file, nix::fcntl::FlockArg::LockExclusiveNonblock)
-    {
+    if let Ok(_flock) = nix::fcntl::Flock::lock(file, nix::fcntl::FlockArg::LockExclusiveNonblock) {
         // Unlink while holding the lock: a racer that opens the path after
         // this unlink creates a brand-new inode and locks it independently,
         // so there is never a window where the path points at an inode we

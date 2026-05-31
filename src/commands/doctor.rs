@@ -528,9 +528,8 @@ fn check_stale_bindlocks(socket_dir: &Path) -> Vec<Check> {
     let n = stale.len();
     let s = if n == 1 { "" } else { "s" };
     vec![
-        Check::warn(format!("{n} stale bind-lock file{s} (socket already gone)")).with_hint(
-            format!("safe to remove: rm '{}'/*.bindlock", socket_dir.display()),
-        ),
+        Check::warn(format!("{n} stale bind-lock file{s} (socket already gone)"))
+            .with_hint(format!("safe to remove: rm '{}'/*.bindlock", socket_dir.display())),
     ]
 }
 
