@@ -107,6 +107,35 @@ struct BindLockGuard {
     _flock: nix::fcntl::Flock<std::fs::File>,
 }
 
+/// Remove the companion `.bindlock` of a socket that is being cleaned up.
+///
+/// Every `bind_unix_listener` call creates a `<path>.bindlock`; without this,
+/// they accumulate one per socket ever bound. Callers that remove a socket
+/// (client fwd cleanup, server session-socket cleanup, daemon shutdown) call
+/// this right after removing the socket itself.
+///
+/// The file is only removed when no concurrent binder holds its flock -- a
+/// held lock means someone is mid-probe/bind on this path, and unlinking the
+/// file under them would let a third racer create a fresh lock file and bind
+/// unserialized (the race the bindlock exists to prevent). Best-effort: any
+/// error leaves the file in place, which is always safe.
+pub fn remove_bind_lock_if_unheld(socket_path: &Path) {
+    let lock_path = bind_lock_path(socket_path);
+    // No create: if there is no bindlock there is nothing to clean.
+    let Ok(file) = std::fs::OpenOptions::new().write(true).open(&lock_path) else {
+        return;
+    };
+    if let Ok(_flock) =
+        nix::fcntl::Flock::lock(file, nix::fcntl::FlockArg::LockExclusiveNonblock)
+    {
+        // Unlink while holding the lock: a racer that opens the path after
+        // this unlink creates a brand-new inode and locks it independently,
+        // so there is never a window where the path points at an inode we
+        // are about to delete (same ordering rationale as the tunnel lock).
+        let _ = std::fs::remove_file(&lock_path);
+    }
+}
+
 /// Connect to a Unix socket and verify the peer's UID matches ours.
 /// All client-side connects to daemon/session sockets MUST go through this.
 pub async fn connect_verified(path: &Path) -> io::Result<tokio::net::UnixStream> {
@@ -350,6 +379,56 @@ mod tests {
     async fn bind_unix_listener_nonexistent_dir() {
         let err = bind_unix_listener(Path::new("/no/such/dir/test.sock")).unwrap_err();
         assert!(err.kind() == io::ErrorKind::NotFound || err.kind() == io::ErrorKind::Other);
+    }
+
+    // --- remove_bind_lock_if_unheld ---
+
+    #[tokio::test]
+    async fn bind_then_cleanup_removes_bindlock() {
+        let tmp = tempfile::tempdir().unwrap();
+        let sock = tmp.path().join("test.sock");
+        let lock = tmp.path().join("test.sock.bindlock");
+        // bind creates the companion lock file
+        let listener = bind_unix_listener(&sock).unwrap();
+        assert!(lock.exists());
+        // cleanup removes it once the listener is gone
+        drop(listener);
+        let _ = std::fs::remove_file(&sock);
+        remove_bind_lock_if_unheld(&sock);
+        assert!(!lock.exists());
+    }
+
+    #[test]
+    fn remove_bind_lock_noop_when_missing() {
+        let tmp = tempfile::tempdir().unwrap();
+        // Must not create the file or panic when there is nothing to remove.
+        let sock = tmp.path().join("never-bound.sock");
+        remove_bind_lock_if_unheld(&sock);
+        assert!(!tmp.path().join("never-bound.sock.bindlock").exists());
+    }
+
+    #[test]
+    fn remove_bind_lock_skips_held_lock() {
+        let tmp = tempfile::tempdir().unwrap();
+        let sock = tmp.path().join("busy.sock");
+        let lock_path = bind_lock_path(&sock);
+        // Simulate a concurrent binder holding the flock. BSD flock conflicts
+        // are per open-file-description, so a second open in the same process
+        // genuinely contends.
+        let file = std::fs::OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .write(true)
+            .open(&lock_path)
+            .unwrap();
+        let held =
+            nix::fcntl::Flock::lock(file, nix::fcntl::FlockArg::LockExclusiveNonblock).unwrap();
+        remove_bind_lock_if_unheld(&sock);
+        assert!(lock_path.exists(), "must not yank a lock file a binder holds");
+        // Once released, cleanup succeeds.
+        drop(held);
+        remove_bind_lock_if_unheld(&sock);
+        assert!(!lock_path.exists());
     }
 
     // --- verify_peer_uid ---

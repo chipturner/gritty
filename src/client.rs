@@ -1991,6 +1991,9 @@ pub async fn run(
     impl Drop for FwdCleanup {
         fn drop(&mut self) {
             let _ = std::fs::remove_file(&self.0);
+            // The companion `.bindlock` goes with the socket, else one
+            // accumulates per session ever attached.
+            crate::security::remove_bind_lock_if_unheld(&self.0);
         }
     }
     // On same-host force-takeover the old client's fwd socket may still

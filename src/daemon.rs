@@ -360,6 +360,8 @@ async fn shutdown(sessions: &mut HashMap<u32, SessionState>, ctl_path: &Path) {
         }
     }
     let _ = std::fs::remove_file(ctl_path);
+    // The companion `.bindlock` goes with the socket (flock-guarded).
+    crate::security::remove_bind_lock_if_unheld(ctl_path);
     let _ = std::fs::remove_file(pid_file_path(ctl_path));
     let _ = std::fs::remove_file(crate::runinfo::daemon_info_path(ctl_path));
 }

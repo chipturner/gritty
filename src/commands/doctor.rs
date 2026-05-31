@@ -430,6 +430,110 @@ async fn check_tunnels(socket_dir: &Path) -> Vec<Check> {
     checks
 }
 
+/// Sidecar files of tunnels that have no `.lock` file at all.
+///
+/// These are invisible to [`check_tunnels`] (which enumerates lock files) and
+/// were historically skipped by [`check_sockets`], so a tunnel that died
+/// without running cleanup (SIGKILL, power loss, crash before `ConnectGuard`
+/// existed) leaves residue no diagnostic could see. `.log`/`.out` (kept for
+/// post-mortem debugging) and `.remote-sock` (a cache that deliberately
+/// survives teardown) are not residue.
+fn check_tunnel_residue(socket_dir: &Path) -> Vec<Check> {
+    const RESIDUE_EXTS: [&str; 5] = ["sock", "pid", "dest", "info", "ssh-opts"];
+    let Ok(entries) = std::fs::read_dir(socket_dir) else {
+        return Vec::new();
+    };
+
+    // name -> leftover files, BTreeMap for deterministic report order.
+    let mut residue: std::collections::BTreeMap<String, Vec<String>> = Default::default();
+    for entry in entries.filter_map(|e| e.ok()) {
+        let fname = entry.file_name().to_string_lossy().to_string();
+        let Some(rest) = fname.strip_prefix("connect-") else {
+            continue;
+        };
+        let Some((name, ext)) = rest.rsplit_once('.') else {
+            continue;
+        };
+        if !RESIDUE_EXTS.contains(&ext) {
+            continue;
+        }
+        // A `.lock` file means check_tunnels owns this name (live or stale).
+        if socket_dir.join(format!("connect-{name}.lock")).exists() {
+            continue;
+        }
+        residue.entry(name.to_string()).or_default().push(fname);
+    }
+
+    residue
+        .into_iter()
+        .map(|(name, mut files)| {
+            files.sort();
+            Check::warn(format!("dead tunnel {name}: leftover {}", files.join(", ")))
+                .with_hint(format!("gritty tunnel-destroy {name}"))
+        })
+        .collect()
+}
+
+/// Live client processes on this machine, discovered through their forward
+/// sockets. A connectable `fwd-{host}-{id}.sock` means a client process here
+/// is attached to that host:session and serving `lf`/`rf` requests. This is
+/// the only client-side introspection surface gritty has -- the daemon knows
+/// a session is attached, but not from which machine or process.
+fn check_clients(socket_dir: &Path) -> Vec<Check> {
+    let Ok(entries) = std::fs::read_dir(socket_dir) else {
+        return Vec::new();
+    };
+
+    let mut live: Vec<(String, u32)> = entries
+        .filter_map(|e| e.ok())
+        .filter_map(|e| {
+            let name = e.file_name().to_string_lossy().to_string();
+            let stem = name.strip_prefix("fwd-")?.strip_suffix(".sock")?;
+            // The host part may contain `-` (and `.`); the session id is
+            // everything after the last hyphen.
+            let (host, id) = stem.rsplit_once('-')?;
+            let id: u32 = id.parse().ok()?;
+            std::os::unix::net::UnixStream::connect(e.path())
+                .is_ok()
+                .then(|| (host.to_string(), id))
+        })
+        .collect();
+    live.sort();
+
+    live.into_iter()
+        .map(|(host, id)| Check::ok(format!("client on this machine holds {host}:{id}")))
+        .collect()
+}
+
+/// Bind-lock companions whose socket no longer exists. Cleanup paths now
+/// remove the `.bindlock` together with its socket; anything left is litter
+/// from older versions or an unclean process death.
+fn check_stale_bindlocks(socket_dir: &Path) -> Vec<Check> {
+    let Ok(entries) = std::fs::read_dir(socket_dir) else {
+        return Vec::new();
+    };
+
+    let stale: Vec<String> = entries
+        .filter_map(|e| e.ok())
+        .filter_map(|e| {
+            let name = e.file_name().to_string_lossy().to_string();
+            let sock = name.strip_suffix(".bindlock")?;
+            (!socket_dir.join(sock).exists()).then_some(name)
+        })
+        .collect();
+
+    if stale.is_empty() {
+        return Vec::new();
+    }
+    let n = stale.len();
+    let s = if n == 1 { "" } else { "s" };
+    vec![
+        Check::warn(format!("{n} stale bind-lock file{s} (socket already gone)")).with_hint(
+            format!("safe to remove: rm '{}'/*.bindlock", socket_dir.display()),
+        ),
+    ]
+}
+
 fn check_sockets(socket_dir: &Path, live_session_ids: &[u32]) -> Vec<Check> {
     let entries = match std::fs::read_dir(socket_dir) {
         Ok(e) => e,
@@ -514,15 +618,19 @@ pub(crate) async fn doctor(ctl_socket: Option<std::path::PathBuf>) -> anyhow::Re
 
     let config_checks = check_config();
     let (server_checks, sessions) = check_local_server(&ctl_path).await;
-    let tunnel_checks = check_tunnels(&default_dir).await;
+    let mut tunnel_checks = check_tunnels(&default_dir).await;
+    tunnel_checks.extend(check_tunnel_residue(&default_dir));
+    let client_checks = check_clients(&server_dir);
 
     let live_ids: Vec<u32> = sessions.iter().map(|s| s.id).collect();
-    let socket_checks = check_sockets(&server_dir, &live_ids);
+    let mut socket_checks = check_sockets(&server_dir, &live_ids);
+    socket_checks.extend(check_stale_bindlocks(&server_dir));
 
     let groups: Vec<(&str, Vec<Check>)> = vec![
         ("Configuration", config_checks),
         ("Local server", server_checks),
         ("Tunnels", tunnel_checks),
+        ("Clients", client_checks),
         ("Sockets", socket_checks),
     ];
 
@@ -638,5 +746,89 @@ mod tests {
         std::fs::write(dir.path().join("svc-1.sock"), "").unwrap();
         let checks = check_sockets(dir.path(), &[1]);
         assert!(checks.is_empty());
+    }
+
+    // --- check_tunnel_residue ---
+
+    #[test]
+    fn tunnel_residue_flags_lockless_sidecars() {
+        let dir = tempfile::tempdir().unwrap();
+        // Dead tunnel: sock + pid, no lock. Tunnel name contains dots and
+        // hyphens (the realistic case).
+        std::fs::write(dir.path().join("connect-coder.chip-the-human.sock"), "").unwrap();
+        std::fs::write(dir.path().join("connect-coder.chip-the-human.pid"), "123").unwrap();
+        let checks = check_tunnel_residue(dir.path());
+        assert_eq!(checks.len(), 1);
+        assert_eq!(checks[0].status, Status::Warn);
+        assert!(checks[0].message.contains("coder.chip-the-human"));
+        assert!(checks[0].message.contains(".sock"));
+        assert!(checks[0].message.contains(".pid"));
+        assert_eq!(checks[0].hint.as_deref(), Some("gritty tunnel-destroy coder.chip-the-human"));
+    }
+
+    #[test]
+    fn tunnel_residue_skips_locked_tunnels() {
+        let dir = tempfile::tempdir().unwrap();
+        // A tunnel with a .lock file belongs to check_tunnels, not residue.
+        std::fs::write(dir.path().join("connect-devbox.sock"), "").unwrap();
+        std::fs::write(dir.path().join("connect-devbox.lock"), "").unwrap();
+        assert!(check_tunnel_residue(dir.path()).is_empty());
+    }
+
+    #[test]
+    fn tunnel_residue_ignores_deliberate_survivors() {
+        let dir = tempfile::tempdir().unwrap();
+        // Logs and the remote-sock cache survive teardown by design.
+        std::fs::write(dir.path().join("connect-old.log"), "").unwrap();
+        std::fs::write(dir.path().join("connect-old.out"), "").unwrap();
+        std::fs::write(dir.path().join("connect-old.remote-sock"), "").unwrap();
+        assert!(check_tunnel_residue(dir.path()).is_empty());
+    }
+
+    // --- check_stale_bindlocks ---
+
+    #[test]
+    fn stale_bindlocks_counted_when_socket_gone() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("fwd-devbox-3.sock.bindlock"), "").unwrap();
+        std::fs::write(dir.path().join("fwd-devbox-9.sock.bindlock"), "").unwrap();
+        let checks = check_stale_bindlocks(dir.path());
+        assert_eq!(checks.len(), 1);
+        assert_eq!(checks[0].status, Status::Warn);
+        assert!(checks[0].message.contains("2 stale bind-lock files"));
+    }
+
+    #[test]
+    fn bindlock_with_live_socket_not_stale() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("fwd-devbox-3.sock"), "").unwrap();
+        std::fs::write(dir.path().join("fwd-devbox-3.sock.bindlock"), "").unwrap();
+        assert!(check_stale_bindlocks(dir.path()).is_empty());
+    }
+
+    // --- check_clients ---
+
+    #[test]
+    fn clients_reports_connectable_fwd_sockets() {
+        let dir = tempfile::tempdir().unwrap();
+        // A real listener = a live client. Host names contain dots and hyphens;
+        // the session id is after the last hyphen.
+        let _listener = std::os::unix::net::UnixListener::bind(
+            dir.path().join("fwd-fate.x.pattern-net-14.sock"),
+        )
+        .unwrap();
+        let checks = check_clients(dir.path());
+        assert_eq!(checks.len(), 1);
+        assert_eq!(checks[0].status, Status::Ok);
+        assert!(checks[0].message.contains("fate.x.pattern-net:14"));
+    }
+
+    #[test]
+    fn clients_skips_dead_fwd_sockets() {
+        let dir = tempfile::tempdir().unwrap();
+        // A plain file (or a socket nobody listens on) is not a live client --
+        // check_sockets reports it as orphaned instead.
+        std::fs::write(dir.path().join("fwd-devbox-3.sock"), "").unwrap();
+        assert!(check_clients(dir.path()).is_empty());
     }
 }

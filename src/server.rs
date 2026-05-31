@@ -2893,6 +2893,9 @@ fn bind_agent_listener(path: &Path) -> Option<UnixListener> {
 
 fn cleanup_socket(path: &Path) {
     let _ = std::fs::remove_file(path);
+    // The companion `.bindlock` goes with the socket, else one accumulates
+    // per socket ever bound (flock-guarded: a concurrent binder is left alone).
+    crate::security::remove_bind_lock_if_unheld(path);
 }
 
 #[cfg(test)]
