@@ -107,7 +107,7 @@ async fn discover_all_sessions(
         vec![p.to_path_buf()]
     } else {
         let discovered = super::util::discover_daemon_probes();
-        discovered.into_iter().map(|(_, path)| path).collect()
+        discovered.into_iter().map(|p| p.socket).collect()
     };
 
     if probes.is_empty() {

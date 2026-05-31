@@ -3,8 +3,13 @@ use tracing::Instrument;
 
 use super::AutoStart;
 use super::util::{
-    discover_daemon_probes, format_age, format_timestamp, resolve_session_id, server_request,
+    DaemonProbe, discover_daemon_probes, format_age, format_timestamp, resolve_session_id,
+    server_request,
 };
+
+/// The shared session-table column headers (see [`session_status_cols`]).
+const SESSION_TABLE_HEADERS: [&str; 9] =
+    ["ID", "Name", "Cmd", "CWD", "Client", "PTY", "PID", "Created", "Status"];
 
 fn client_config(
     name: &str,
@@ -1139,6 +1144,55 @@ fn session_status_cols(
     ]
 }
 
+/// Order sessions for the `ls` table and flag which belong to the ambient
+/// client: own-namespace sessions first, then foreign sessions grouped by
+/// namespace, legacy unprefixed names last. The sort is stable so the server's
+/// id-order survives within each group. "Own" uses the same rule as the picker
+/// and name elision -- the wire name starts with `<ambient_client_name>/`.
+fn order_sessions<'a>(
+    sessions: &'a [gritty::protocol::SessionEntry],
+    ambient_client_name: &str,
+) -> Vec<(&'a gritty::protocol::SessionEntry, bool)> {
+    let prefix = format!("{ambient_client_name}/");
+    let mut ordered: Vec<(&gritty::protocol::SessionEntry, bool)> = sessions
+        .iter()
+        .map(|s| (s, !ambient_client_name.is_empty() && s.name.starts_with(&prefix)))
+        .collect();
+    ordered.sort_by_key(|(s, own)| {
+        let namespace = s.name.split_once('/').map(|(ns, _)| ns.to_string());
+        (!own, namespace.is_none(), namespace.unwrap_or_default())
+    });
+    ordered
+}
+
+/// Print the session table: ordered by [`order_sessions`], own-client rows in
+/// bold (only when stdout is a terminal -- scripts parsing `ls` output must
+/// not see ANSI codes), every line prefixed with `indent`.
+fn print_session_table(
+    sessions: &[gritty::protocol::SessionEntry],
+    now: u64,
+    client_name: &str,
+    indent: &str,
+) {
+    use std::io::IsTerminal;
+
+    let ordered = order_sessions(sessions, client_name);
+    let rows: Vec<Vec<String>> =
+        ordered.iter().map(|(s, _)| session_status_cols(s, now, client_name)).collect();
+    let lines = gritty::table::format_table(&SESSION_TABLE_HEADERS, &rows);
+    let bold_ok = std::io::stdout().is_terminal();
+
+    // lines[0] is the header; lines[i + 1] renders ordered[i].
+    println!("{indent}{}", lines[0]);
+    for (i, line) in lines[1..].iter().enumerate() {
+        if bold_ok && ordered[i].1 {
+            println!("{indent}\x1b[1m{line}\x1b[0m");
+        } else {
+            println!("{indent}{line}");
+        }
+    }
+}
+
 pub(crate) async fn list_sessions(ctl_path: PathBuf, client_name: &str) -> anyhow::Result<()> {
     use gritty::protocol::Frame;
 
@@ -1153,14 +1207,7 @@ pub(crate) async fn list_sessions(ctl_path: PathBuf, client_name: &str) -> anyho
                     .unwrap_or_default()
                     .as_secs();
 
-                // Build row data
-                let rows: Vec<Vec<String>> =
-                    sessions.iter().map(|s| session_status_cols(s, now, client_name)).collect();
-
-                gritty::table::print_table(
-                    &["ID", "Name", "Cmd", "CWD", "Client", "PTY", "PID", "Created", "Status"],
-                    &rows,
-                );
+                print_session_table(&sessions, now, client_name, "");
             }
             Ok(())
         }
@@ -1170,115 +1217,181 @@ pub(crate) async fn list_sessions(ctl_path: PathBuf, client_name: &str) -> anyho
     }
 }
 
-pub(crate) async fn list_all_sessions(config: &gritty::config::ConfigFile) -> anyhow::Result<()> {
-    use gritty::protocol::{Frame, FrameCodec, SessionEntry};
+/// One probed daemon endpoint: its host name, tunnel display info (when
+/// reached through an SSH tunnel), and the probe outcome -- the daemon's
+/// ephemeral `server_id` plus its sessions, or an error string.
+struct ProbedHost {
+    host: String,
+    /// `(destination, status)` from the tunnel sidecar files; `None` for the
+    /// local daemon and orphaned socket files.
+    tunnel: Option<(String, String)>,
+    outcome: Result<(u64, Vec<gritty::protocol::SessionEntry>), String>,
+}
 
+/// Hosts that resolved to the same daemon, merged for display.
+struct HostGroup {
+    /// `(host_name, tunnel_info)` for each member, in discovery order.
+    members: Vec<(String, Option<(String, String)>)>,
+    result: Result<Vec<gritty::protocol::SessionEntry>, String>,
+}
+
+/// Group probed hosts by daemon identity: successful probes that returned the
+/// same `server_id` collapse into one group (two tunnel names pointing at the
+/// same remote daemon would otherwise list every session twice). Failed probes
+/// never merge -- without a `server_id` there is no identity to merge on.
+/// First-appearance order is preserved, so `local` (discovered first) leads.
+fn group_by_daemon(probed: Vec<ProbedHost>) -> Vec<HostGroup> {
+    let mut keyed: Vec<(Option<u64>, HostGroup)> = Vec::new();
+    for p in probed {
+        let member = (p.host, p.tunnel);
+        match p.outcome {
+            Ok((server_id, sessions)) => {
+                if let Some((_, group)) = keyed.iter_mut().find(|(id, _)| *id == Some(server_id)) {
+                    group.members.push(member);
+                } else {
+                    keyed.push((
+                        Some(server_id),
+                        HostGroup { members: vec![member], result: Ok(sessions) },
+                    ));
+                }
+            }
+            Err(e) => {
+                keyed.push((None, HostGroup { members: vec![member], result: Err(e) }));
+            }
+        }
+    }
+    keyed.into_iter().map(|(_, g)| g).collect()
+}
+
+/// Build the header for one host group: the joined host names plus an optional
+/// parenthetical annotation (informative destinations, a "same daemon" marker
+/// for merged groups, and the tunnel status). Returns `(names, annotation)`;
+/// the caller styles the annotation.
+fn group_header(group: &HostGroup) -> (String, Option<String>) {
+    let names: Vec<&str> = group.members.iter().map(|(h, _)| h.as_str()).collect();
+    let mut parts: Vec<String> = Vec::new();
+
+    // Destinations that add information (differ from every displayed name).
+    for (_, tunnel) in &group.members {
+        if let Some((dest, _)) = tunnel
+            && !names.contains(&dest.as_str())
+            && !parts.contains(dest)
+        {
+            parts.push(dest.clone());
+        }
+    }
+    if group.members.len() > 1 {
+        parts.push("same daemon".to_string());
+    }
+    // Tunnel status: "reconnecting" anywhere wins over "healthy" -- it is the
+    // state a user needs to act on. Local-only groups have no status.
+    let statuses: Vec<&str> = group
+        .members
+        .iter()
+        .filter_map(|(_, t)| t.as_ref().map(|(_, status)| status.as_str()))
+        .collect();
+    if !statuses.is_empty() {
+        let worst = if statuses.iter().any(|s| *s != "healthy") {
+            statuses.iter().find(|s| **s != "healthy").unwrap()
+        } else {
+            "healthy"
+        };
+        parts.push(worst.to_string());
+    }
+
+    let annotation = if parts.is_empty() { None } else { Some(parts.join(", ")) };
+    (names.join(", "), annotation)
+}
+
+/// Probe one daemon endpoint: handshake (capturing `server_id` for identity),
+/// then `ListSessions`. Bounded by a 2s timeout so one dead tunnel cannot
+/// stall the whole listing.
+async fn probe_host(probe: DaemonProbe) -> ProbedHost {
+    use gritty::protocol::{Frame, FrameCodec};
+
+    let DaemonProbe { host, socket, tunnel } = probe;
+    let result = tokio::time::timeout(std::time::Duration::from_secs(2), async {
+        let stream = gritty::security::connect_verified(&socket)
+            .await
+            .map_err(|e| format!("connect: {e}"))?;
+        let mut framed = tokio_util::codec::Framed::new(stream, FrameCodec);
+        let info = gritty::handshake(&mut framed, gritty::get_or_create_device_id())
+            .await
+            .map_err(|e| e.to_string())?;
+        gritty::require_matched_version(&info).map_err(|e| e.to_string())?;
+        futures_util::SinkExt::send(&mut framed, Frame::ListSessions)
+            .await
+            .map_err(|e| format!("send ListSessions: {e}"))?;
+        match Frame::expect_from(futures_util::StreamExt::next(&mut framed).await) {
+            Ok(Frame::SessionInfo { sessions }) => Ok((info.server_id, sessions)),
+            Ok(Frame::Error { message, .. }) => Err(message),
+            Ok(other) => Err(format!("unexpected response: {other:?}")),
+            Err(e) => Err(e.to_string()),
+        }
+    })
+    .await;
+    let outcome = match result {
+        Ok(inner) => inner,
+        Err(_) => Err("probe timed out after 2s".to_string()),
+    };
+    ProbedHost { host, tunnel, outcome }
+}
+
+/// Whether a probed endpoint belongs on the dashboard. A bare socket file
+/// (no live tunnel supervisor, not the local daemon) that refused the probe
+/// is litter from a dead tunnel, not a connection -- a section for it would
+/// dress up junk as state. The local daemon and live tunnels always show,
+/// even when broken: those are real endpoints the user needs to act on.
+fn is_listable(p: &ProbedHost) -> bool {
+    p.host == "local" || p.tunnel.is_some() || p.outcome.is_ok()
+}
+
+/// The bare `gritty ls` connectivity dashboard: every known daemon (local +
+/// all tunnels), grouped by daemon identity, one section per daemon. Outbound
+/// connections are the tunnel sections; inbound connections show up in the
+/// local section's Client column.
+pub(crate) async fn list_all_sessions(config: &gritty::config::ConfigFile) -> anyhow::Result<()> {
     let probes = discover_daemon_probes();
 
     if probes.is_empty() {
-        anyhow::bail!("no server running");
+        anyhow::bail!("no server running and no tunnels found");
     }
 
-    let futures: Vec<_> = probes
-        .into_iter()
-        .map(|(host, path)| async move {
-            let result = tokio::time::timeout(std::time::Duration::from_secs(2), async {
-                let stream = gritty::security::connect_verified(&path)
-                    .await
-                    .map_err(|e| format!("connect: {e}"))?;
-                let mut framed = tokio_util::codec::Framed::new(stream, FrameCodec);
-                let info = gritty::handshake(&mut framed, gritty::get_or_create_device_id())
-                    .await
-                    .map_err(|e| e.to_string())?;
-                gritty::require_matched_version(&info).map_err(|e| e.to_string())?;
-                futures_util::SinkExt::send(&mut framed, Frame::ListSessions)
-                    .await
-                    .map_err(|e| format!("send ListSessions: {e}"))?;
-                match Frame::expect_from(futures_util::StreamExt::next(&mut framed).await) {
-                    Ok(Frame::SessionInfo { sessions }) => Ok(sessions),
-                    Ok(Frame::Error { message, .. }) => Err(message),
-                    Ok(other) => Err(format!("unexpected response: {other:?}")),
-                    Err(e) => Err(e.to_string()),
-                }
-            })
-            .await;
-            let outcome: Result<Vec<SessionEntry>, String> = match result {
-                Ok(inner) => inner,
-                Err(_) => Err("probe timed out after 2s".to_string()),
-            };
-            (host, outcome)
-        })
-        .collect();
-
-    let results: Vec<(String, Result<Vec<SessionEntry>, String>)> =
-        futures_util::future::join_all(futures).await;
-
-    let errors: Vec<(&String, &String)> =
-        results.iter().filter_map(|(h, r)| r.as_ref().err().map(|e| (h, e))).collect();
-    let has_sessions =
-        results.iter().any(|(_, r)| r.as_ref().map(|s| !s.is_empty()).unwrap_or(false));
-
-    if !has_sessions {
-        if errors.is_empty() {
-            println!("no active sessions");
-        } else {
-            println!("no active sessions");
-            for (host, err) in &errors {
-                eprintln!("\x1b[2;33m\u{26a0} {host}: {err}\x1b[0m");
-            }
-        }
-        return Ok(());
+    let probed: Vec<ProbedHost> =
+        futures_util::future::join_all(probes.into_iter().map(probe_host)).await;
+    let probed: Vec<ProbedHost> = probed.into_iter().filter(is_listable).collect();
+    if probed.is_empty() {
+        anyhow::bail!("no server running and no tunnels found");
     }
+    let groups = group_by_daemon(probed);
 
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default()
         .as_secs();
 
-    let ok_hosts: Vec<(&String, &Vec<SessionEntry>)> = results
-        .iter()
-        .filter_map(|(h, r)| match r {
-            Ok(s) if !s.is_empty() => Some((h, s)),
-            _ => None,
-        })
-        .collect();
-    let multi_host = ok_hosts.len() > 1;
-
-    // Build row data: [host, id, name, cmd, cwd, client, pty, pid, created, status].
-    // Per-host: the client_name elision applied to the NAME column uses the
-    // *resolved* client_name for that host -- a host with a per-host
-    // `client_name` override (different from `[defaults].client-name`) gets
-    // its own elision rather than the default one.
-    let rows: Vec<Vec<String>> = ok_hosts
-        .iter()
-        .flat_map(|(host, sessions)| {
-            let host_str = (*host).clone();
-            let client_name = config.resolve_session(Some(&host_str)).client_name;
-            sessions.iter().map(move |s| {
-                let mut row = Vec::with_capacity(10);
-                row.push(host_str.clone());
-                row.extend(session_status_cols(s, now, &client_name));
-                row
-            })
-        })
-        .collect();
-
-    if multi_host {
-        gritty::table::print_table(
-            &["Host", "ID", "Name", "Cmd", "CWD", "Client", "PTY", "PID", "Created", "Status"],
-            &rows,
-        );
-    } else {
-        let host = &rows[0][0];
-        println!("Host: {host}");
-        let trimmed: Vec<Vec<String>> = rows.iter().map(|r| r[1..].to_vec()).collect();
-        gritty::table::print_table(
-            &["ID", "Name", "Cmd", "CWD", "Client", "PTY", "PID", "Created", "Status"],
-            &trimmed,
-        );
-    }
-    for (host, err) in &errors {
-        eprintln!("\x1b[2;33m\u{26a0} {host}: {err}\x1b[0m");
+    for (i, group) in groups.iter().enumerate() {
+        if i > 0 {
+            println!();
+        }
+        let (names, annotation) = group_header(group);
+        match annotation {
+            Some(a) => println!("{names}  \x1b[2m({a})\x1b[0m"),
+            None => println!("{names}"),
+        }
+        match &group.result {
+            Ok(sessions) if sessions.is_empty() => println!("  \x1b[2m(no sessions)\x1b[0m"),
+            Ok(sessions) => {
+                // The client_name elision applied to the NAME column uses the
+                // *resolved* client_name for this host -- a host with a
+                // per-host `client-name` override (different from
+                // `[defaults].client-name`) gets its own elision.
+                let host = &group.members[0].0;
+                let client_name = config.resolve_session(Some(host)).client_name;
+                print_session_table(sessions, now, &client_name, "  ");
+            }
+            Err(e) => println!("  \x1b[2;33m\u{26a0} {e}\x1b[0m"),
+        }
     }
     Ok(())
 }
@@ -1532,5 +1645,175 @@ mod tests {
         s.name = "laptop2/work".to_string();
         let cols = session_status_cols(&s, 100, "mylaptop");
         assert_eq!(cols[1], "laptop2/work"); // foreign prefix kept
+    }
+
+    // -- order_sessions (own-client highlighting and sort) --
+
+    #[test]
+    fn order_sessions_own_namespace_first_and_flagged() {
+        let sessions = vec![
+            auto_entry("laptop2/work", false),
+            auto_entry("mylaptop/build", false),
+            auto_entry("default", false),
+            auto_entry("mylaptop/edit", false),
+        ];
+        let ordered = order_sessions(&sessions, "mylaptop");
+        let names: Vec<&str> = ordered.iter().map(|(s, _)| s.name.as_str()).collect();
+        assert_eq!(names, vec!["mylaptop/build", "mylaptop/edit", "laptop2/work", "default"]);
+        let own_flags: Vec<bool> = ordered.iter().map(|(_, own)| *own).collect();
+        assert_eq!(own_flags, vec![true, true, false, false]);
+    }
+
+    #[test]
+    fn order_sessions_groups_foreign_by_namespace() {
+        // Foreign sessions interleaved by the server's id-order regroup by
+        // namespace; id-order survives within each namespace (stable sort).
+        let sessions = vec![
+            auto_entry("zeta/1", false),
+            auto_entry("alpha/9", false),
+            auto_entry("zeta/0", false),
+            auto_entry("alpha/2", false),
+        ];
+        let ordered = order_sessions(&sessions, "mylaptop");
+        let names: Vec<&str> = ordered.iter().map(|(s, _)| s.name.as_str()).collect();
+        assert_eq!(names, vec!["alpha/9", "alpha/2", "zeta/1", "zeta/0"]);
+    }
+
+    #[test]
+    fn order_sessions_empty_ambient_marks_nothing_own() {
+        // An empty ambient client name (no elision context) must not flag
+        // every session as own -- `"".starts_with("/")` style bugs.
+        let sessions = vec![auto_entry("laptop2/work", false), auto_entry("default", false)];
+        let ordered = order_sessions(&sessions, "");
+        assert!(ordered.iter().all(|(_, own)| !own));
+    }
+
+    // -- group_by_daemon / group_header (bare `gritty ls` dashboard) --
+
+    fn probed_ok(host: &str, dest: &str, server_id: u64) -> ProbedHost {
+        ProbedHost {
+            host: host.to_string(),
+            tunnel: Some((dest.to_string(), "healthy".to_string())),
+            outcome: Ok((server_id, vec![entry()])),
+        }
+    }
+
+    fn probed_local(server_id: u64) -> ProbedHost {
+        ProbedHost { host: "local".to_string(), tunnel: None, outcome: Ok((server_id, vec![])) }
+    }
+
+    fn probed_err(host: &str, dest: &str, status: &str, err: &str) -> ProbedHost {
+        ProbedHost {
+            host: host.to_string(),
+            tunnel: Some((dest.to_string(), status.to_string())),
+            outcome: Err(err.to_string()),
+        }
+    }
+
+    #[test]
+    fn group_by_daemon_merges_same_server_id() {
+        // Two tunnel names pointing at the same remote daemon collapse into
+        // one group -- the duplicate-listing fix.
+        let groups = group_by_daemon(vec![
+            probed_ok("fate", "fate", 42),
+            probed_ok("fate.x.pattern.net", "fate.x.pattern.net", 42),
+        ]);
+        assert_eq!(groups.len(), 1);
+        let names: Vec<&str> = groups[0].members.iter().map(|(h, _)| h.as_str()).collect();
+        assert_eq!(names, vec!["fate", "fate.x.pattern.net"]);
+        // Sessions kept once, not concatenated twice.
+        assert_eq!(groups[0].result.as_ref().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn group_by_daemon_distinct_daemons_stay_separate() {
+        let groups =
+            group_by_daemon(vec![probed_local(1), probed_ok("devbox", "devbox.example.com", 2)]);
+        assert_eq!(groups.len(), 2);
+        assert_eq!(groups[0].members[0].0, "local"); // discovery order preserved
+        assert_eq!(groups[1].members[0].0, "devbox");
+    }
+
+    #[test]
+    fn group_by_daemon_failed_probes_never_merge() {
+        // Two failures (no server_id) must not merge with each other -- there
+        // is no identity to merge on.
+        let groups = group_by_daemon(vec![
+            probed_err("a", "a.example.com", "reconnecting", "probe timed out after 2s"),
+            probed_err("b", "b.example.com", "reconnecting", "probe timed out after 2s"),
+        ]);
+        assert_eq!(groups.len(), 2);
+    }
+
+    #[test]
+    fn group_header_local_has_no_annotation() {
+        let groups = group_by_daemon(vec![probed_local(1)]);
+        assert_eq!(group_header(&groups[0]), ("local".to_string(), None));
+    }
+
+    #[test]
+    fn group_header_shows_informative_destination_and_status() {
+        // Tunnel name `fate` with destination `fate.x.pattern.net`: the
+        // destination adds information, so it appears before the status.
+        let groups = group_by_daemon(vec![probed_ok("fate", "fate.x.pattern.net", 1)]);
+        let (names, annotation) = group_header(&groups[0]);
+        assert_eq!(names, "fate");
+        assert_eq!(annotation.as_deref(), Some("fate.x.pattern.net, healthy"));
+    }
+
+    #[test]
+    fn group_header_elides_redundant_destination() {
+        // Destination identical to the tunnel name adds nothing.
+        let groups = group_by_daemon(vec![probed_ok("fate", "fate", 1)]);
+        let (names, annotation) = group_header(&groups[0]);
+        assert_eq!(names, "fate");
+        assert_eq!(annotation.as_deref(), Some("healthy"));
+    }
+
+    #[test]
+    fn group_header_merged_group_says_same_daemon() {
+        let groups = group_by_daemon(vec![
+            probed_ok("fate", "fate", 42),
+            probed_ok("fate.x.pattern.net", "fate.x.pattern.net", 42),
+        ]);
+        let (names, annotation) = group_header(&groups[0]);
+        assert_eq!(names, "fate, fate.x.pattern.net");
+        assert_eq!(annotation.as_deref(), Some("same daemon, healthy"));
+    }
+
+    #[test]
+    fn is_listable_drops_only_dead_orphaned_sockets() {
+        // A dead orphaned socket file (no tunnel, not local, probe failed) is
+        // litter, not a connection.
+        let orphan_dead = ProbedHost {
+            host: "old-tunnel".to_string(),
+            tunnel: None,
+            outcome: Err("connect: Connection refused".to_string()),
+        };
+        assert!(!is_listable(&orphan_dead));
+
+        // ...but an orphaned socket that answers is a live daemon -- show it.
+        let orphan_live =
+            ProbedHost { host: "old-tunnel".to_string(), tunnel: None, outcome: Ok((9, vec![])) };
+        assert!(is_listable(&orphan_live));
+
+        // A broken local daemon and a broken live tunnel both stay visible.
+        let local_dead = ProbedHost {
+            host: "local".to_string(),
+            tunnel: None,
+            outcome: Err("connect: Connection refused".to_string()),
+        };
+        assert!(is_listable(&local_dead));
+        assert!(is_listable(&probed_err("devbox", "devbox", "reconnecting", "timed out")));
+    }
+
+    #[test]
+    fn group_header_reconnecting_wins_over_healthy() {
+        // A failed probe whose flock says "reconnecting" surfaces that status
+        // -- it is the state the user needs to act on.
+        let groups =
+            group_by_daemon(vec![probed_err("devbox", "devbox", "reconnecting", "timed out")]);
+        let (_, annotation) = group_header(&groups[0]);
+        assert_eq!(annotation.as_deref(), Some("reconnecting"));
     }
 }

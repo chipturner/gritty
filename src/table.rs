@@ -16,11 +16,12 @@ fn format_row<'a>(cells: impl Iterator<Item = &'a str>, widths: &[usize]) -> Str
     line
 }
 
-/// Print rows as a left-aligned table with dynamic column widths.
-/// The last column is never padded. Two spaces separate columns.
-pub fn print_table(headers: &[&str], rows: &[Vec<String>]) {
+/// Format rows as left-aligned table lines (header first) with dynamic column
+/// widths. The last column is never padded. Two spaces separate columns.
+/// Returns no lines when `rows` is empty.
+pub fn format_table(headers: &[&str], rows: &[Vec<String>]) -> Vec<String> {
     if rows.is_empty() {
-        return;
+        return Vec::new();
     }
     let ncols = headers.len();
     let widths: Vec<usize> = (0..ncols)
@@ -30,9 +31,19 @@ pub fn print_table(headers: &[&str], rows: &[Vec<String>]) {
         })
         .collect();
 
-    println!("{}", format_row(headers.iter().copied(), &widths));
+    let mut lines = Vec::with_capacity(rows.len() + 1);
+    lines.push(format_row(headers.iter().copied(), &widths));
     for row in rows {
-        println!("{}", format_row(row.iter().map(String::as_str), &widths));
+        lines.push(format_row(row.iter().map(String::as_str), &widths));
+    }
+    lines
+}
+
+/// Print rows as a left-aligned table with dynamic column widths.
+/// The last column is never padded. Two spaces separate columns.
+pub fn print_table(headers: &[&str], rows: &[Vec<String>]) {
+    for line in format_table(headers, rows) {
+        println!("{line}");
     }
 }
 
@@ -51,5 +62,17 @@ mod tests {
     #[test]
     fn format_row_single_column_unpadded() {
         assert_eq!(format_row(["only"].into_iter(), &[10]), "only");
+    }
+
+    #[test]
+    fn format_table_empty_rows_yields_no_lines() {
+        assert!(format_table(&["A", "B"], &[]).is_empty());
+    }
+
+    #[test]
+    fn format_table_header_then_rows() {
+        let rows = vec![vec!["x".to_string(), "long-value".to_string()]];
+        let lines = format_table(&["ID", "Name"], &rows);
+        assert_eq!(lines, vec!["ID  Name", "x   long-value"]);
     }
 }

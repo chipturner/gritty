@@ -53,7 +53,8 @@ That's it. gritty auto-starts the SSH tunnel and the remote server and drops you
 
 ```
 laptop$ gritty connect devbox:work          # reattach from anywhere
-laptop$ gritty ls devbox                     # list sessions on devbox
+laptop$ gritty ls                            # all hosts, all sessions, tunnel health
+laptop$ gritty ls devbox                     # list sessions on devbox only
 laptop$ gritty tunnels                        # list active tunnels
 ```
 

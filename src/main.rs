@@ -153,14 +153,11 @@ enum Command {
         /// Target host and session (host:session)
         target: Option<String>,
     },
-    /// List active sessions
+    /// List active sessions (no host = all known hosts: local + tunnels)
     #[command(display_order = 1, visible_alias = "ls", visible_alias = "list")]
     ListSessions {
-        /// Target host
+        /// Target host (omit to list every known host)
         target: Option<String>,
-        /// Also probe known tunnels for their sessions (cross-host view)
-        #[arg(long)]
-        include_remote: bool,
     },
     /// Kill a session
     #[command(display_order = 3)]
@@ -808,8 +805,8 @@ async fn run(cli: Cli, config: gritty::config::ConfigFile) -> anyhow::Result<()>
             let code = tail_session(session, ctl_path).await?;
             std::process::exit(code);
         }
-        Command::ListSessions { target, include_remote } => {
-            if include_remote && target.is_none() && cli.ctl_socket.is_none() {
+        Command::ListSessions { target } => {
+            if target.is_none() && cli.ctl_socket.is_none() {
                 list_all_sessions(&config).await
             } else {
                 let host = target.as_deref().map(|t| parse_target(t).0);

@@ -358,18 +358,30 @@ pub(crate) async fn port_forward_client_command(
     Ok(())
 }
 
+/// One daemon endpoint discovered by [`discover_daemon_probes`].
+pub(crate) struct DaemonProbe {
+    pub(crate) host: String,
+    pub(crate) socket: PathBuf,
+    /// `(destination, status)` when this endpoint is reached through an SSH
+    /// tunnel; `None` for the local daemon and orphaned socket files.
+    pub(crate) tunnel: Option<(String, String)>,
+}
+
 /// Enumerate all reachable daemon sockets: local + tunnels + bare socket files.
-/// Returns `(host_name, socket_path)` pairs.
-pub(crate) fn discover_daemon_probes() -> Vec<(String, PathBuf)> {
+pub(crate) fn discover_daemon_probes() -> Vec<DaemonProbe> {
     let mut probes = Vec::new();
     let local = gritty::daemon::control_socket_path();
     if local.exists() {
-        probes.push(("local".to_string(), local));
+        probes.push(DaemonProbe { host: "local".to_string(), socket: local, tunnel: None });
     }
     let mut seen = std::collections::HashSet::new();
     for info in gritty::connect::get_tunnel_info() {
         if seen.insert(info.name.clone()) {
-            probes.push((info.name.clone(), gritty::connect::connection_socket_path(&info.name)));
+            probes.push(DaemonProbe {
+                host: info.name.clone(),
+                socket: gritty::connect::connection_socket_path(&info.name),
+                tunnel: Some((info.destination, info.status)),
+            });
         }
     }
     if let Ok(entries) = std::fs::read_dir(gritty::daemon::socket_dir()) {
@@ -378,7 +390,11 @@ pub(crate) fn discover_daemon_probes() -> Vec<(String, PathBuf)> {
             if let Some(stem) = name.strip_prefix("connect-").and_then(|s| s.strip_suffix(".sock"))
                 && seen.insert(stem.to_string())
             {
-                probes.push((stem.to_string(), entry.path()));
+                probes.push(DaemonProbe {
+                    host: stem.to_string(),
+                    socket: entry.path(),
+                    tunnel: None,
+                });
             }
         }
     }
