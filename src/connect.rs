@@ -1015,26 +1015,34 @@ pub fn connect_dest_path(connection_name: &str) -> PathBuf {
 }
 
 /// Pure core of [`resolve_destination`]: a trimmed, non-empty sidecar value,
-/// else the connection name.
-fn destination_from_sidecar(contents: Option<String>, connection_name: &str) -> String {
+/// else the config-implied destination, else the connection name.
+fn destination_from_sidecar(
+    contents: Option<String>,
+    config_dest: Option<&str>,
+    connection_name: &str,
+) -> String {
     contents
         .and_then(|s| {
             let t = s.trim();
             (!t.is_empty()).then(|| t.to_string())
         })
+        .or_else(|| config_dest.map(str::to_string))
         .unwrap_or_else(|| connection_name.to_string())
 }
 
 /// The SSH destination for a tunnel: the original `user@host:port` (or
 /// `--name` alias target) recorded in the `.dest` sidecar by `connect::run`.
 ///
-/// Falls back to the connection name only when the sidecar is missing or empty
-/// (first-ever connection). Using the connection name unconditionally would
-/// collapse `user@server.example.com:2222` to the friendly alias and break
-/// SSH, so this must stay the single source for that recovery.
-pub fn resolve_destination(connection_name: &str) -> String {
+/// When the sidecar is missing or empty (first-ever connection, or a wiped
+/// socket dir), falls back to `config_dest` -- the first `[host.<name>]
+/// aliases` entry from config -- and only then to the connection name itself.
+/// Using the connection name unconditionally would collapse
+/// `user@server.example.com:2222` to the friendly alias and break SSH, so
+/// this must stay the single source for that recovery.
+pub fn resolve_destination(connection_name: &str, config_dest: Option<&str>) -> String {
     destination_from_sidecar(
         std::fs::read_to_string(connect_dest_path(connection_name)).ok(),
+        config_dest,
         connection_name,
     )
 }
@@ -3046,14 +3054,32 @@ mod tests {
     #[test]
     fn destination_from_sidecar_prefers_trimmed_contents() {
         assert_eq!(
-            destination_from_sidecar(Some("user@host:2222\n".to_string()), "alias"),
+            destination_from_sidecar(Some("user@host:2222\n".to_string()), None, "alias"),
+            "user@host:2222"
+        );
+        // A live sidecar wins over the config-implied destination: it may
+        // carry a more specific user@host:port from an explicit tunnel-create.
+        assert_eq!(
+            destination_from_sidecar(
+                Some("user@host:2222\n".to_string()),
+                Some("host.example.com"),
+                "alias"
+            ),
             "user@host:2222"
         );
     }
 
     #[test]
-    fn destination_from_sidecar_falls_back_on_missing_or_empty() {
-        assert_eq!(destination_from_sidecar(None, "alias"), "alias");
-        assert_eq!(destination_from_sidecar(Some("   \n".to_string()), "alias"), "alias");
+    fn destination_from_sidecar_falls_back_to_config_then_name() {
+        assert_eq!(
+            destination_from_sidecar(None, Some("host.example.com"), "alias"),
+            "host.example.com"
+        );
+        assert_eq!(
+            destination_from_sidecar(Some("   \n".to_string()), Some("host.example.com"), "alias"),
+            "host.example.com"
+        );
+        assert_eq!(destination_from_sidecar(None, None, "alias"), "alias");
+        assert_eq!(destination_from_sidecar(Some("   \n".to_string()), None, "alias"), "alias");
     }
 }

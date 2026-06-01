@@ -51,6 +51,8 @@ laptop$ gritty connect devbox:work          # now "devbox" routes to user@10.0.0
 
 `local` is a reserved connection name for a server on this machine (no SSH tunnel).
 
+A `[host.<name>] aliases` config entry makes alternate spellings resolve to the same connection name, so `gritty connect devbox.example.com:work` and `gritty connect devbox:work` address the same tunnel and sessions (see [Configuration](#configuration)).
+
 **`session`** is a name you choose so you can run several sessions per host. Rules:
 
 - Omitted: `connect` looks only at sessions in your own namespace (`<client>/*`). It attaches the sole detached one, shows a picker when the choice is ambiguous, and falls back to `<client>/0` when your namespace is empty. Auto-created sessions get the next free integer slot in your namespace (`0`, `1`, `2`, ...). Foreign-namespace and legacy unprefixed sessions are ignored -- reach those with the explicit slash-bearing form (`gritty connect host:other/name`).
@@ -167,6 +169,15 @@ gritty works out of the box with no config file. Optionally, set persistent defa
 # Connection name = hostname from destination, or -n override.
 # A connection name with dots (an FQDN) must be quoted, or TOML reads the
 # dots as table separators: [host."prod-db.example.com"].
+[host.devbox]
+# Alternate names: typing an alias as the host part of any target resolves to
+# this connection name, so `gritty c devbox.example.com:work` and
+# `gritty c devbox:work` address the same tunnel (and this config section).
+# The FIRST alias is also used as the SSH destination when no tunnel exists
+# yet, so `gritty c devbox` cold-starts without a prior tunnel-create or an
+# ~/.ssh/config entry.
+aliases = ["devbox.example.com"]
+
 [host.devbox.tunnel]
 ssh-options = ["IdentityFile=~/.ssh/devbox_tunnel_key"]
 
@@ -180,6 +191,8 @@ no-server-start = true
 ```
 
 **Precedence:** CLI flag > `[host.<name>]` > `[defaults]` > built-in default. For `ssh-options`, values are appended (CLI first, then host, then defaults; SSH first-match gives earlier options priority).
+
+**Aliases:** real names always win -- `local` and exact `[host.<name>]` keys are never remapped, and an alias claimed by more than one host warns and is used literally. `aliases` is only meaningful under `[host.<name>]`, not `[defaults]`. A live tunnel's recorded destination (from `tunnel-create`) takes priority over the first-alias destination, so an explicit `user@host:port` is preserved across restarts.
 
 `ring-buffer-size` and `oauth-tunnel-idle-timeout` are resolved by the daemon, which has no per-connection context -- they take effect only from `[defaults]`, not `[host.<name>]`.
 

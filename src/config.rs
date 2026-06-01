@@ -146,6 +146,11 @@ pub struct Defaults {
     pub ring_buffer_size: Option<u64>,
     pub oauth_tunnel_idle_timeout: Option<u64>,
     pub client_name: Option<String>,
+    /// Alternate names for this connection (`[host.<name>]` only; meaningless
+    /// under `[defaults]`). Typing an alias as the host part of a target
+    /// resolves to the canonical connection name, and the *first* alias is
+    /// the SSH destination used when no tunnel exists yet.
+    pub aliases: Option<Vec<String>>,
     pub tunnel: Option<TunnelDefaults>,
 }
 
@@ -178,7 +183,7 @@ pub fn config_path() -> PathBuf {
 /// config "loaded".
 pub enum ConfigStatus {
     NotFound,
-    Valid(ConfigFile),
+    Valid(Box<ConfigFile>),
     Invalid(String),
 }
 
@@ -190,7 +195,7 @@ pub fn config_status(path: &std::path::Path) -> ConfigStatus {
         Err(e) => return ConfigStatus::Invalid(format!("cannot read config: {e}")),
     };
     match toml::from_str(&content) {
-        Ok(cfg) => ConfigStatus::Valid(cfg),
+        Ok(cfg) => ConfigStatus::Valid(Box::new(cfg)),
         Err(e) => ConfigStatus::Invalid(e.to_string()),
     }
 }
@@ -265,6 +270,58 @@ impl ConfigFile {
                 .map(crate::naming::sanitize_client_name)
                 .unwrap_or_else(default_client_name),
         }
+    }
+
+    /// Resolve a typed host name through `[host.*]` aliases to its canonical
+    /// connection name, printing a warning for ambiguous aliases.
+    ///
+    /// Real names always win: `local` and exact `[host.<name>]` keys are
+    /// returned unchanged even if some host claims them as aliases. An alias
+    /// claimed by multiple hosts is ambiguous and resolves to itself.
+    pub fn canonical_host(&self, typed: &str) -> String {
+        self.canonical_host_inner(typed, true)
+    }
+
+    /// Like [`canonical_host`](Self::canonical_host) but silent -- for
+    /// secondary resolutions (e.g. log-path routing) that would otherwise
+    /// duplicate the ambiguity warning within one invocation.
+    pub fn canonical_host_quiet(&self, typed: &str) -> String {
+        self.canonical_host_inner(typed, false)
+    }
+
+    fn canonical_host_inner(&self, typed: &str, warn: bool) -> String {
+        if typed == "local" || self.host.contains_key(typed) {
+            return typed.to_string();
+        }
+        let mut owners: Vec<&str> = self
+            .host
+            .iter()
+            .filter(|(_, h)| h.aliases.iter().flatten().any(|a| a == typed))
+            .map(|(name, _)| name.as_str())
+            .collect();
+        owners.sort_unstable();
+        match owners.as_slice() {
+            [name] => name.to_string(),
+            [] => typed.to_string(),
+            _ => {
+                if warn {
+                    eprintln!(
+                        "warning: alias '{typed}' is claimed by multiple hosts ({}); using '{typed}' literally",
+                        owners.join(", ")
+                    );
+                }
+                typed.to_string()
+            }
+        }
+    }
+
+    /// The SSH destination implied by config for a canonical connection name:
+    /// the first entry of `[host.<name>] aliases`. Used as the fallback when
+    /// no `.dest` sidecar exists yet (first-ever connect, or the socket dir
+    /// was wiped), so `gritty connect FOO:x` can cold-start a tunnel to
+    /// `FOO.BAR.COM` without a prior `tunnel-create`.
+    pub fn alias_destination(&self, host: &str) -> Option<String> {
+        self.host.get(host)?.aliases.as_ref()?.first().cloned()
     }
 
     /// Resolve tunnel settings for a given host.
@@ -544,6 +601,74 @@ mod tests {
         assert_eq!(cfg.resolve_session(None).oauth_tunnel_idle_timeout, 10);
         assert_eq!(cfg.resolve_session(Some("devbox")).oauth_tunnel_idle_timeout, 30);
         assert_eq!(cfg.resolve_session(Some("unknown")).oauth_tunnel_idle_timeout, 10);
+    }
+
+    #[test]
+    fn canonical_host_resolves_alias() {
+        let cfg: ConfigFile = toml::from_str(
+            r#"
+            [host.foo]
+            aliases = ["foo.bar.com", "f"]
+            "#,
+        )
+        .unwrap();
+        assert_eq!(cfg.canonical_host("foo.bar.com"), "foo");
+        assert_eq!(cfg.canonical_host("f"), "foo");
+        assert_eq!(cfg.canonical_host("foo"), "foo");
+        assert_eq!(cfg.canonical_host("unrelated"), "unrelated");
+    }
+
+    // A real `[host.*]` key and the literal `local` must never be remapped,
+    // even if some host claims them as aliases -- otherwise a config typo
+    // could hijack every command targeting the local daemon.
+    #[test]
+    fn canonical_host_exact_names_win_over_aliases() {
+        let cfg: ConfigFile = toml::from_str(
+            r#"
+            [host.thief]
+            aliases = ["local", "victim"]
+
+            [host.victim]
+            forward-agent = true
+            "#,
+        )
+        .unwrap();
+        assert_eq!(cfg.canonical_host("local"), "local");
+        assert_eq!(cfg.canonical_host("victim"), "victim");
+    }
+
+    // An alias claimed by multiple hosts is ambiguous: resolve to neither and
+    // use the typed name literally (a warning is printed on the warn path).
+    #[test]
+    fn canonical_host_ambiguous_alias_unresolved() {
+        let cfg: ConfigFile = toml::from_str(
+            r#"
+            [host.a]
+            aliases = ["dup"]
+
+            [host.b]
+            aliases = ["dup"]
+            "#,
+        )
+        .unwrap();
+        assert_eq!(cfg.canonical_host("dup"), "dup");
+    }
+
+    #[test]
+    fn alias_destination_is_first_alias() {
+        let cfg: ConfigFile = toml::from_str(
+            r#"
+            [host.foo]
+            aliases = ["user@foo.bar.com:2222", "f"]
+
+            [host.bare]
+            forward-agent = true
+            "#,
+        )
+        .unwrap();
+        assert_eq!(cfg.alias_destination("foo"), Some("user@foo.bar.com:2222".to_string()));
+        assert_eq!(cfg.alias_destination("bare"), None);
+        assert_eq!(cfg.alias_destination("unknown"), None);
     }
 
     #[test]

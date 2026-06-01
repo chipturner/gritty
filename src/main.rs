@@ -369,7 +369,11 @@ fn init_tracing(verbose: bool, log_path: Option<&Path>) {
 /// alongside the supervisor's entries instead of spraying stderr into a
 /// raw-mode terminal. One-shot commands, `local`, and explicit
 /// `--ctl-socket` keep stderr.
-fn client_log_path(cmd: &Command, ctl_socket_override: bool) -> Option<PathBuf> {
+fn client_log_path(
+    config: &gritty::config::ConfigFile,
+    cmd: &Command,
+    ctl_socket_override: bool,
+) -> Option<PathBuf> {
     if ctl_socket_override {
         return None;
     }
@@ -377,7 +381,10 @@ fn client_log_path(cmd: &Command, ctl_socket_override: bool) -> Option<PathBuf> 
         Command::Connect { target, .. } | Command::Tail { target } => target.as_deref()?,
         _ => return None,
     };
-    let (host, _) = parse_target(target);
+    // Quiet alias resolution: run() canonicalizes the same target right after
+    // and owns any ambiguity warning.
+    let (host, _) = split_target(target);
+    let host = config.canonical_host_quiet(&host);
     if host == "local" {
         return None;
     }
@@ -393,7 +400,7 @@ fn resolve_target_session(
     target: Option<String>,
 ) -> Option<String> {
     let target = target?;
-    let (host, session) = parse_target(&target);
+    let (host, session) = parse_target(config, &target);
     let session = session?;
     let client_name = config.resolve_session(Some(&host)).client_name;
     let wire = gritty::naming::resolve_session_name(&session, &client_name);
@@ -611,6 +618,10 @@ fn main() {
                     }
                 },
             };
+            // Canonicalize through `[host.*] aliases` so `tunnel-create
+            // FOO.BAR.COM` lands on the same connection name (and config
+            // section) as `connect FOO`.
+            let connection_name = config.canonical_host(&connection_name);
             if connection_name == "local" {
                 eprintln!(
                     "error: 'local' is reserved for the local server; \
@@ -705,7 +716,7 @@ fn main() {
             }
         }
         _ => {
-            let log_path = client_log_path(&cli.command, cli.ctl_socket.is_some());
+            let log_path = client_log_path(&config, &cli.command, cli.ctl_socket.is_some());
             init_tracing(verbose, log_path.as_deref());
             let rt = match tokio::runtime::Runtime::new() {
                 Ok(rt) => rt,
@@ -743,11 +754,14 @@ async fn run(cli: Cli, config: gritty::config::ConfigFile) -> anyhow::Result<()>
             no_pick,
             new_session,
         } => {
-            let (host, session) = split_optional_target(target.as_deref());
+            let (host, session) = split_optional_target(&config, target.as_deref());
             let auto_start_mode = match (&cli.ctl_socket, host.as_deref()) {
                 (Some(_), _) => AutoStart::None,
                 (None, Some("local")) => AutoStart::Server,
-                (None, Some(h)) => AutoStart::Tunnel(h.to_string()),
+                (None, Some(h)) => AutoStart::Tunnel {
+                    name: h.to_string(),
+                    config_dest: config.alias_destination(h),
+                },
                 (None, None) => anyhow::bail!("specify a host or use --ctl-socket"),
             };
             let ctl_path = resolve_ctl_path(cli.ctl_socket, host.as_deref())?;
@@ -788,7 +802,7 @@ async fn run(cli: Cli, config: gritty::config::ConfigFile) -> anyhow::Result<()>
             .await
         }
         Command::Tail { target } => {
-            let (host, session) = split_optional_target(target.as_deref());
+            let (host, session) = split_optional_target(&config, target.as_deref());
             let ctl_path = resolve_ctl_path(cli.ctl_socket, host.as_deref())?;
             let client_name = config.resolve_session(host.as_deref()).client_name;
             let session = match session {
@@ -811,7 +825,7 @@ async fn run(cli: Cli, config: gritty::config::ConfigFile) -> anyhow::Result<()>
             if target.is_none() && cli.ctl_socket.is_none() {
                 list_all_sessions(&config).await
             } else {
-                let host = target.as_deref().map(|t| parse_target(t).0);
+                let host = target.as_deref().map(|t| parse_target(&config, t).0);
                 let ctl_path = resolve_ctl_path(cli.ctl_socket, host.as_deref())?;
                 let client_name = config.resolve_session(host.as_deref()).client_name;
                 list_sessions(ctl_path, &client_name).await
@@ -829,7 +843,7 @@ async fn run(cli: Cli, config: gritty::config::ConfigFile) -> anyhow::Result<()>
             kill_sessions(&targets, cli.ctl_socket.as_deref(), &config).await
         }
         Command::Rename { target, new_name } => {
-            let (host, session) = parse_target(&target);
+            let (host, session) = parse_target(&config, &target);
             let ctl_path = resolve_ctl_path(cli.ctl_socket, Some(&host))?;
             let client_name = config.resolve_session(Some(&host)).client_name;
             let session = match session {
@@ -843,7 +857,7 @@ async fn run(cli: Cli, config: gritty::config::ConfigFile) -> anyhow::Result<()>
             rename_session(session, new_name, ctl_path).await
         }
         Command::KillServer { target } => {
-            let host = target.as_deref().map(|t| parse_target(t).0);
+            let host = target.as_deref().map(|t| parse_target(&config, t).0);
             let ctl_path = resolve_ctl_path(cli.ctl_socket, host.as_deref())?;
             let kill_result = kill_server(ctl_path).await;
             match host.as_deref() {
@@ -862,11 +876,11 @@ async fn run(cli: Cli, config: gritty::config::ConfigFile) -> anyhow::Result<()>
             }
         }
         Command::Restart { target } => {
-            let host = target.as_deref().map(|t| parse_target(t).0);
-            restart(host, cli.ctl_socket).await
+            let host = target.as_deref().map(|t| parse_target(&config, t).0);
+            restart(host, cli.ctl_socket, &config).await
         }
         Command::Refresh { target } => {
-            let host = target.as_deref().map(|t| parse_target(t).0);
+            let host = target.as_deref().map(|t| parse_target(&config, t).0);
             refresh(host, cli.ctl_socket, &config).await
         }
         Command::SocketPath => {
@@ -900,11 +914,12 @@ async fn run(cli: Cli, config: gritty::config::ConfigFile) -> anyhow::Result<()>
         }
         Command::LocalForward { target, port } => {
             let (listen_port, target_port) = parse_port_spec(&port)?;
-            let host = parse_target(&target).0;
+            let (host, session) = parse_target(&config, &target);
             let client_name = config.resolve_session(Some(&host)).client_name;
             port_forward_client_command(
                 cli.ctl_socket,
-                &target,
+                &host,
+                session.as_deref(),
                 &client_name,
                 0,
                 listen_port,
@@ -914,11 +929,12 @@ async fn run(cli: Cli, config: gritty::config::ConfigFile) -> anyhow::Result<()>
         }
         Command::RemoteForward { target, port } => {
             let (listen_port, target_port) = parse_port_spec(&port)?;
-            let host = parse_target(&target).0;
+            let (host, session) = parse_target(&config, &target);
             let client_name = config.resolve_session(Some(&host)).client_name;
             port_forward_client_command(
                 cli.ctl_socket,
-                &target,
+                &host,
+                session.as_deref(),
                 &client_name,
                 1,
                 listen_port,
@@ -927,7 +943,9 @@ async fn run(cli: Cli, config: gritty::config::ConfigFile) -> anyhow::Result<()>
             .await
         }
         Command::Bootstrap { destination, install_dir, ssh_options } => {
-            let host = gritty::connect::parse_host(&destination)?;
+            // Canonicalize so a `[host.FOO]` section (ssh-options etc.)
+            // applies when bootstrapping via an alias destination.
+            let host = config.canonical_host(&gritty::connect::parse_host(&destination)?);
             let resolved = config.resolve_tunnel(&host);
             // Merge configured ssh-options with the CLI ones (CLI first, SSH
             // first-match wins) -- every other SSH path does this, so a host

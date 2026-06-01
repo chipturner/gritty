@@ -16,6 +16,8 @@ pub(crate) enum AutoStart {
     None,
     /// Default path, no host: start local server
     Server,
-    /// Host-routed: start SSH tunnel via `gritty tunnel-create <host>`
-    Tunnel(String),
+    /// Host-routed: start SSH tunnel via `gritty tunnel-create <host>`.
+    /// `config_dest` is the destination implied by `[host.<name>] aliases`
+    /// (first entry), used when no `.dest` sidecar exists yet.
+    Tunnel { name: String, config_dest: Option<String> },
 }

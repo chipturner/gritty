@@ -2,8 +2,11 @@ use std::path::{Path, PathBuf};
 
 use super::AutoStart;
 
-/// Parse a `host[:session]` target string. Splits on the first `:`.
-pub(crate) fn parse_target(s: &str) -> (String, Option<String>) {
+/// Split a `host[:session]` target string on the first `:`, with no alias
+/// resolution. Only for strings whose host part is already canonical (e.g.
+/// rebuilt by `resolve_target_session`); everything else goes through
+/// [`parse_target`].
+pub(crate) fn split_target(s: &str) -> (String, Option<String>) {
     match s.split_once(':') {
         Some((host, session)) if !session.is_empty() => {
             (host.to_string(), Some(session.to_string()))
@@ -13,15 +16,31 @@ pub(crate) fn parse_target(s: &str) -> (String, Option<String>) {
     }
 }
 
+/// Parse a `host[:session]` target string: split on the first `:` and
+/// canonicalize the host through `[host.*]` aliases
+/// ([`gritty::config::ConfigFile::canonical_host`]) -- the single chokepoint
+/// that makes `gritty connect FOO.BAR.COM:x` and `gritty connect FOO:x`
+/// address the same tunnel.
+pub(crate) fn parse_target(
+    config: &gritty::config::ConfigFile,
+    s: &str,
+) -> (String, Option<String>) {
+    let (host, session) = split_target(s);
+    (config.canonical_host(&host), session)
+}
+
 /// Parse an optional `host[:session]` target into `(host, session)`.
 ///
 /// `None` (no target given) yields `(None, None)`; a present target is split
 /// via [`parse_target`]. Shared by the commands that take an optional target
 /// (connect / tail / kill-session) so the mapping is written once.
-pub(crate) fn split_optional_target(target: Option<&str>) -> (Option<String>, Option<String>) {
+pub(crate) fn split_optional_target(
+    config: &gritty::config::ConfigFile,
+    target: Option<&str>,
+) -> (Option<String>, Option<String>) {
     match target {
         Some(t) => {
-            let (host, session) = parse_target(t);
+            let (host, session) = parse_target(config, t);
             (Some(host), session)
         }
         None => (None, None),
@@ -174,12 +193,15 @@ pub(crate) async fn connect_or_start(
                 }
                 true
             }
-            AutoStart::Tunnel(host) => {
+            AutoStart::Tunnel { name: host, config_dest } => {
                 // The connection name alone is not a valid SSH destination
                 // when the user originally passed `user@host`, `host:port`,
                 // or `--name <alias>`. Recover the original destination from
-                // the `.dest` sidecar (falls back to the name if missing).
-                let destination = gritty::connect::resolve_destination(host);
+                // the `.dest` sidecar, falling back to the config-implied
+                // destination (first `[host.<name>] aliases` entry), then
+                // the name itself.
+                let destination =
+                    gritty::connect::resolve_destination(host, config_dest.as_deref());
                 eprintln!("\x1b[2;33m\u{25b8} starting tunnel {host}...\x1b[0m");
                 // Replay any persisted CLI -o options so a reboot/respawn
                 // doesn't silently lose a ProxyJump/IdentityFile/Port.
@@ -308,7 +330,8 @@ pub(crate) async fn resolve_session_id(ctl_path: &Path, target: &str) -> anyhow:
 /// to fwd-{host}-{id}.sock, sends the request, and blocks.
 pub(crate) async fn port_forward_client_command(
     ctl_socket: Option<PathBuf>,
-    target: &str,
+    host: &str,
+    session: Option<&str>,
     client_name: &str,
     direction: u8,
     listen_port: u16,
@@ -316,10 +339,8 @@ pub(crate) async fn port_forward_client_command(
 ) -> anyhow::Result<()> {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
-    let (host, session) = parse_target(target);
-    let session =
-        gritty::naming::resolve_session_name(session.as_deref().unwrap_or("0"), client_name);
-    let ctl_path = resolve_ctl_path(ctl_socket, Some(&host))?;
+    let session = gritty::naming::resolve_session_name(session.unwrap_or("0"), client_name);
+    let ctl_path = resolve_ctl_path(ctl_socket, Some(host))?;
     let session_id = resolve_session_id(&ctl_path, &session).await?;
 
     let fwd_path = gritty::client::forward_socket_path(&ctl_path, session_id);
@@ -652,51 +673,91 @@ pub(crate) fn canonicalize_or_raw(path: PathBuf) -> PathBuf {
 mod tests {
     use super::*;
 
+    /// An empty config: parse_target falls through to a raw split.
+    fn no_aliases() -> gritty::config::ConfigFile {
+        gritty::config::ConfigFile::default()
+    }
+
+    /// A config where `foo.bar.com` aliases the connection name `foo`.
+    fn foo_alias() -> gritty::config::ConfigFile {
+        toml::from_str("[host.foo]\naliases = [\"foo.bar.com\"]\n").unwrap()
+    }
+
     #[test]
     fn parse_target_host_only() {
-        let (host, session) = parse_target("local");
+        let (host, session) = parse_target(&no_aliases(), "local");
         assert_eq!(host, "local");
         assert_eq!(session, None);
     }
 
     #[test]
     fn parse_target_host_and_session() {
-        let (host, session) = parse_target("local:work");
+        let (host, session) = parse_target(&no_aliases(), "local:work");
         assert_eq!(host, "local");
         assert_eq!(session, Some("work".to_string()));
     }
 
     #[test]
+    fn parse_target_canonicalizes_alias_host() {
+        let cfg = foo_alias();
+        assert_eq!(parse_target(&cfg, "foo.bar.com:work"), parse_target(&cfg, "foo:work"));
+        let (host, session) = parse_target(&cfg, "foo.bar.com:work");
+        assert_eq!(host, "foo");
+        assert_eq!(session, Some("work".to_string()));
+        // The session part is never alias-resolved.
+        let (host, session) = parse_target(&cfg, "local:foo.bar.com");
+        assert_eq!(host, "local");
+        assert_eq!(session, Some("foo.bar.com".to_string()));
+    }
+
+    // split_target is the raw core for pre-canonicalized strings -- it must
+    // never alias-resolve, or transfer targets would be remapped twice.
+    #[test]
+    fn split_target_does_not_alias() {
+        let (host, _) = split_target("foo.bar.com:work");
+        assert_eq!(host, "foo.bar.com");
+    }
+
+    #[test]
     fn split_optional_target_none_is_all_none() {
-        assert_eq!(split_optional_target(None), (None, None));
+        assert_eq!(split_optional_target(&no_aliases(), None), (None, None));
     }
 
     #[test]
     fn split_optional_target_splits_present_target() {
+        let cfg = no_aliases();
         assert_eq!(
-            split_optional_target(Some("local:work")),
+            split_optional_target(&cfg, Some("local:work")),
             (Some("local".to_string()), Some("work".to_string()))
         );
-        assert_eq!(split_optional_target(Some("local")), (Some("local".to_string()), None));
+        assert_eq!(split_optional_target(&cfg, Some("local")), (Some("local".to_string()), None));
+    }
+
+    #[test]
+    fn split_optional_target_canonicalizes_alias() {
+        assert_eq!(
+            split_optional_target(&foo_alias(), Some("foo.bar.com:0")),
+            (Some("foo".to_string()), Some("0".to_string()))
+        );
     }
 
     #[test]
     fn parse_target_remote_and_id() {
-        let (host, session) = parse_target("devbox:0");
+        let (host, session) = parse_target(&no_aliases(), "devbox:0");
         assert_eq!(host, "devbox");
         assert_eq!(session, Some("0".to_string()));
     }
 
     #[test]
     fn parse_target_colon_in_session_name() {
-        let (host, session) = parse_target("local:my:weird:name");
+        let (host, session) = parse_target(&no_aliases(), "local:my:weird:name");
         assert_eq!(host, "local");
         assert_eq!(session, Some("my:weird:name".to_string()));
     }
 
     #[test]
     fn parse_target_empty_session() {
-        let (host, session) = parse_target("local:");
+        let (host, session) = parse_target(&no_aliases(), "local:");
         assert_eq!(host, "local");
         assert_eq!(session, None);
     }

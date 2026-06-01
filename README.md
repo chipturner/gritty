@@ -119,7 +119,7 @@ See **[USAGE.md](USAGE.md)** for every command and flag, configuration, escape s
 
 ## Configuration
 
-gritty works out of the box with no config file. To set persistent defaults -- forwarding behavior, per-host SSH options, heartbeat timings -- put them in `config.toml`:
+gritty works out of the box with no config file. To set persistent defaults -- forwarding behavior, per-host SSH options, host aliases, heartbeat timings -- put them in `config.toml`:
 
 ```
 laptop$ gritty config        # create and open it at the right path

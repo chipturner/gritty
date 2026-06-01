@@ -1014,19 +1014,26 @@ enum KillTarget {
 }
 
 /// Parse one `kill-session` argument. `host:session` splits as usual; a bare
-/// word (no `:`) is a host when it names a known one (`local` or an existing
-/// tunnel), otherwise it's a session on `local` -- so reaping after a bare
-/// `gritty ls` is just `gritty kill-session 3 5 work`.
-fn parse_kill_target(target: &str, known_tunnels: &[String]) -> KillTarget {
+/// word (no `:`) is a host when it names a known one (`local`, an existing
+/// tunnel, or a configured alias), otherwise it's a session on `local` -- so
+/// reaping after a bare `gritty ls` is just `gritty kill-session 3 5 work`.
+fn parse_kill_target(
+    config: &gritty::config::ConfigFile,
+    target: &str,
+    known_tunnels: &[String],
+) -> KillTarget {
     if target.contains(':') {
-        let (host, session) = super::util::parse_target(target);
+        let (host, session) = super::util::parse_target(config, target);
         return match session {
             Some(session) => KillTarget::Session { host, session },
             None => KillTarget::HostOnly(host),
         };
     }
-    if target == "local" || known_tunnels.iter().any(|t| t == target) {
-        return KillTarget::HostOnly(target.to_string());
+    // A bare word that resolves through an alias is unambiguously a host --
+    // aliases are only ever configured for connections.
+    let canonical = config.canonical_host_quiet(target);
+    if canonical != target || target == "local" || known_tunnels.iter().any(|t| t == target) {
+        return KillTarget::HostOnly(canonical);
     }
     KillTarget::Session { host: "local".to_string(), session: target.to_string() }
 }
@@ -1070,7 +1077,7 @@ pub(crate) async fn kill_sessions(
     let known_tunnels = gritty::connect::enumerate_tunnels();
     let mut failed = 0usize;
     for target in targets {
-        let result = match parse_kill_target(target, &known_tunnels) {
+        let result = match parse_kill_target(config, target, &known_tunnels) {
             KillTarget::HostOnly(host) => {
                 let ctl_path =
                     super::util::resolve_ctl_path(ctl_socket.map(Path::to_path_buf), Some(&host))?;
@@ -1120,6 +1127,7 @@ pub(crate) async fn kill_server(ctl_path: PathBuf) -> anyhow::Result<()> {
 pub(crate) async fn restart(
     host: Option<String>,
     ctl_socket: Option<PathBuf>,
+    config: &gritty::config::ConfigFile,
 ) -> anyhow::Result<()> {
     use gritty::protocol::Frame;
 
@@ -1160,7 +1168,8 @@ pub(crate) async fn restart(
         // before disconnect wipes it. Using just `host` here would collapse
         // `user@server.example.com:2222` down to the friendly connection
         // name and break SSH.
-        let destination = gritty::connect::resolve_destination(&host);
+        let destination =
+            gritty::connect::resolve_destination(&host, config.alias_destination(&host).as_deref());
         // Capture the recreate args (destination + persisted CLI -o options)
         // *before* disconnect wipes the sidecar files.
         let recreate = gritty::connect::tunnel_recreate_args(&host, &destination);
@@ -1774,36 +1783,63 @@ mod tests {
         KillTarget::Session { host: host.to_string(), session: session.to_string() }
     }
 
+    fn no_aliases() -> gritty::config::ConfigFile {
+        gritty::config::ConfigFile::default()
+    }
+
     #[test]
     fn kill_target_host_session_splits() {
-        assert_eq!(parse_kill_target("local:3", &[]), session_target("local", "3"));
-        assert_eq!(parse_kill_target("remote:work", &[]), session_target("remote", "work"));
+        let cfg = no_aliases();
+        assert_eq!(parse_kill_target(&cfg, "local:3", &[]), session_target("local", "3"));
+        assert_eq!(parse_kill_target(&cfg, "remote:work", &[]), session_target("remote", "work"));
     }
 
     #[test]
     fn kill_target_bare_word_is_local_session() {
+        let cfg = no_aliases();
         // Bare IDs and names go to `local` -- the reap-after-`ls` path.
-        assert_eq!(parse_kill_target("3", &[]), session_target("local", "3"));
-        assert_eq!(parse_kill_target("work", &[]), session_target("local", "work"));
+        assert_eq!(parse_kill_target(&cfg, "3", &[]), session_target("local", "3"));
+        assert_eq!(parse_kill_target(&cfg, "work", &[]), session_target("local", "work"));
     }
 
     #[test]
     fn kill_target_bare_known_host_stays_host() {
+        let cfg = no_aliases();
         // `local` and known tunnel names keep the "list that host" behavior.
         let tunnels = vec!["devbox".to_string()];
-        assert_eq!(parse_kill_target("local", &tunnels), KillTarget::HostOnly("local".to_string()));
         assert_eq!(
-            parse_kill_target("devbox", &tunnels),
+            parse_kill_target(&cfg, "local", &tunnels),
+            KillTarget::HostOnly("local".to_string())
+        );
+        assert_eq!(
+            parse_kill_target(&cfg, "devbox", &tunnels),
             KillTarget::HostOnly("devbox".to_string())
         );
         // Unknown bare word is still a local session even when tunnels exist.
-        assert_eq!(parse_kill_target("work", &tunnels), session_target("local", "work"));
+        assert_eq!(parse_kill_target(&cfg, "work", &tunnels), session_target("local", "work"));
+    }
+
+    #[test]
+    fn kill_target_bare_alias_is_host() {
+        // A bare word that resolves through a configured alias is a host even
+        // with no live tunnel -- aliases are only configured for connections.
+        let cfg: gritty::config::ConfigFile =
+            toml::from_str("[host.foo]\naliases = [\"foo.bar.com\"]\n").unwrap();
+        assert_eq!(
+            parse_kill_target(&cfg, "foo.bar.com", &[]),
+            KillTarget::HostOnly("foo".to_string())
+        );
+        // And the host part of host:session resolves too.
+        assert_eq!(parse_kill_target(&cfg, "foo.bar.com:3", &[]), session_target("foo", "3"));
     }
 
     #[test]
     fn kill_target_trailing_colon_is_host_only() {
         // `host:` (empty session) means the host itself, like parse_target.
-        assert_eq!(parse_kill_target("devbox:", &[]), KillTarget::HostOnly("devbox".to_string()));
+        assert_eq!(
+            parse_kill_target(&no_aliases(), "devbox:", &[]),
+            KillTarget::HostOnly("devbox".to_string())
+        );
     }
 
     #[test]
@@ -1811,7 +1847,7 @@ mod tests {
         // A `/`-qualified name stays a session string; namespace resolution
         // happens later in kill_one (it's passed through literally).
         assert_eq!(
-            parse_kill_target("local:laptop2/work", &[]),
+            parse_kill_target(&no_aliases(), "local:laptop2/work", &[]),
             session_target("local", "laptop2/work")
         );
     }

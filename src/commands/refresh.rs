@@ -187,7 +187,8 @@ async fn refresh_remote(host: &str, config: &gritty::config::ConfigFile) -> anyh
         return Ok(());
     }
 
-    let dest = gritty::connect::resolve_destination(host);
+    let dest =
+        gritty::connect::resolve_destination(host, config.alias_destination(host).as_deref());
     let tun_cfg = config.resolve_tunnel(host);
     // resolve_tunnel only knows config `ssh-options`; the CLI `-o` options the
     // tunnel was created with live in the `.ssh-opts` sidecar. Merge them or a

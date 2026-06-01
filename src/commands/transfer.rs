@@ -1,7 +1,7 @@
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 
-use super::util::{parse_target, resolve_ctl_path};
+use super::util::{resolve_ctl_path, split_target};
 
 /// Sanitize a filename to its basename, rejecting ".." and empty names.
 fn sanitize_basename(name: &str) -> anyhow::Result<String> {
@@ -199,7 +199,9 @@ async fn connect_send_sockets(
 
     // Explicit --session flag
     if let Some(target) = session_flag {
-        let (host, session) = parse_target(&target);
+        // Raw split: main's `resolve_target_session` already rebuilt this
+        // target with the canonical (alias-resolved) host.
+        let (host, session) = split_target(&target);
         let session = session
             .ok_or_else(|| anyhow::anyhow!("--session requires host:session (e.g. local:0)"))?;
         let ctl_path = resolve_ctl_path(ctl_socket, Some(&host))?;

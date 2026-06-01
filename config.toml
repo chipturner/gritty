@@ -29,6 +29,14 @@
 # Per-host overrides, keyed by connection name.
 # Connection name = hostname from destination, or -n <name> override.
 #
+# aliases: alternate names for this connection. Typing an alias as the host
+# part of any target resolves to the canonical name, so `gritty c devbox` and
+# `gritty c devbox.example.com` address the same tunnel. The FIRST alias is
+# also the SSH destination used when no tunnel exists yet.
+#
+# [host.devbox]
+# aliases = ["devbox.example.com"]
+#
 # [host.devbox.tunnel]
 # ssh-options = ["IdentityFile=~/.ssh/devbox_key"]
 #
