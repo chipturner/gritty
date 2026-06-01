@@ -22,7 +22,7 @@ Covered:
 Not covered (separate concerns, documented elsewhere):
 
 - Client reconnect loop (see `ARCHITECTURE.md`, `## Self-Healing Reconnect`).
-- Session-layer takeover and ownership (`CLAUDE.md`, Device-based ownership).
+- Session-layer takeover and ownership ([internals.md](internals.md), Device-based ownership).
 
 ## On-disk artifacts
 

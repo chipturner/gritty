@@ -112,7 +112,7 @@ All communication goes through one Unix domain socket per server instance. The w
 
 For session relay, the daemon hands off the raw `UnixStream` to the session task -- the daemon is no longer in the data path. Session frames include Data (PTY I/O), Resize, Ping/Pong, Env, and the various forwarding frames (Agent, Open, Tunnel, PortForward, Send).
 
-See `CLAUDE.md` for the full protocol reference.
+See [docs/wire-protocol.md](docs/wire-protocol.md) for the full protocol reference.
 
 ## Security Model
 
