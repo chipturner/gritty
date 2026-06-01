@@ -155,6 +155,24 @@ session_exists() {
     gritty ls "${host}" 2>/dev/null | awk 'NR>1 {print $2}' | grep -qFx "${name}"
 }
 
+# Wait until a process is dead: gone from /proc, or lingering as a zombie.
+# `kill -0` alone is the wrong check inside the test container: there is no
+# init (PID 1 is the test runner's bash), so a SIGKILLed daemon stays in the
+# process table as a zombie that `kill -0` still "sees". Dead is dead -- a
+# zombie has already released its sockets, memory, and fds.
+wait_for_process_dead() {
+    local pid="${1}" timeout="${2:-5}"
+    local i state
+    for ((i = 0; i < timeout * 10; i++)); do
+        state=$(awk '{print $3}' "/proc/${pid}/stat" 2>/dev/null || echo "gone")
+        if [ -z "${state}" ] || [ "${state}" = "gone" ] || [ "${state}" = "Z" ]; then
+            return 0
+        fi
+        sleep 0.1
+    done
+    return 1
+}
+
 # Wait until a session is in the "attached" state in `gritty ls`. Useful before
 # probing per-session resources (fwd-*.sock) that only appear once a client has
 # finished its Attach handshake. The status may carry a heartbeat suffix

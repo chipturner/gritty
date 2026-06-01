@@ -232,10 +232,11 @@ test_orphan_reaping() {
 
     # refresh reaps it (includes the ~7s self-heal grace window).
     gritty refresh local 2>&1 || true
-    if ! kill -0 "${orphan_pid}" 2>/dev/null; then
+    if wait_for_process_dead "${orphan_pid}" 5; then
         pass "orphan: refresh reaps unrecoverable orphan"
     else
-        fail "orphan: refresh reaps unrecoverable orphan" "pid ${orphan_pid} still alive"
+        fail "orphan: refresh reaps unrecoverable orphan" \
+            "pid ${orphan_pid} still alive: state=$(awk '{print $3}' "/proc/${orphan_pid}/stat" 2>/dev/null)"
     fi
 }
 
