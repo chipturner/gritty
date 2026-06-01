@@ -8,8 +8,8 @@ use super::util::{
 };
 
 /// The shared session-table column headers (see [`session_status_cols`]).
-const SESSION_TABLE_HEADERS: [&str; 9] =
-    ["ID", "Name", "Cmd", "CWD", "Client", "PTY", "PID", "Created", "Status"];
+const SESSION_TABLE_HEADERS: [&str; 10] =
+    ["ID", "Name", "Cmd", "CWD", "Client", "PTY", "PID", "Created", "Idle", "Status"];
 
 fn client_config(
     name: &str,
@@ -1005,17 +1005,95 @@ pub(crate) async fn rename_session(
     }
 }
 
-pub(crate) async fn kill_session(target: String, ctl_path: PathBuf) -> anyhow::Result<()> {
-    use gritty::protocol::Frame;
+/// How a single `kill-session` argument resolves: a session to kill on a
+/// host, or a bare host name (no session part).
+#[derive(Debug, PartialEq, Eq)]
+enum KillTarget {
+    Session { host: String, session: String },
+    HostOnly(String),
+}
 
-    match server_request(&ctl_path, Frame::KillSession { session: target.clone() }).await? {
+/// Parse one `kill-session` argument. `host:session` splits as usual; a bare
+/// word (no `:`) is a host when it names a known one (`local` or an existing
+/// tunnel), otherwise it's a session on `local` -- so reaping after a bare
+/// `gritty ls` is just `gritty kill-session 3 5 work`.
+fn parse_kill_target(target: &str, known_tunnels: &[String]) -> KillTarget {
+    if target.contains(':') {
+        let (host, session) = super::util::parse_target(target);
+        return match session {
+            Some(session) => KillTarget::Session { host, session },
+            None => KillTarget::HostOnly(host),
+        };
+    }
+    if target == "local" || known_tunnels.iter().any(|t| t == target) {
+        return KillTarget::HostOnly(target.to_string());
+    }
+    KillTarget::Session { host: "local".to_string(), session: target.to_string() }
+}
+
+/// Kill one session. The input is namespace-resolved first (`3` ->
+/// `mylaptop/3`, matching `connect` semantics); when that doesn't exist and
+/// the input is purely numeric, it falls back to the raw session ID -- the ID
+/// column in `gritty ls` -- which the daemon resolves directly.
+async fn kill_one(user_session: &str, client_name: &str, ctl_path: &Path) -> anyhow::Result<()> {
+    use gritty::protocol::{ErrorCode, Frame};
+
+    let wire = gritty::naming::resolve_session_name(user_session, client_name);
+    let mut resp = server_request(ctl_path, Frame::KillSession { session: wire.clone() }).await?;
+    if matches!(resp, Frame::Error { code: ErrorCode::NoSuchSession, .. })
+        && wire != user_session
+        && user_session.parse::<u32>().is_ok()
+    {
+        resp = server_request(ctl_path, Frame::KillSession { session: user_session.to_string() })
+            .await?;
+    }
+    match resp {
         Frame::Ok => {
-            eprintln!("\x1b[32m\u{25b8} session {target} killed\x1b[0m");
+            eprintln!("\x1b[32m\u{25b8} session {user_session} killed\x1b[0m");
             Ok(())
         }
         Frame::Error { message, .. } => anyhow::bail!("{message}"),
         other => anyhow::bail!("unexpected response from server: {other:?}"),
     }
+}
+
+/// Kill one or more sessions. Each target is parsed by [`parse_kill_target`];
+/// a bare known host name lists that host's sessions instead of killing
+/// anything (same as `kill-session` with no arguments). Failures don't stop
+/// the remaining targets -- they're reported per target and summarized at the
+/// end.
+pub(crate) async fn kill_sessions(
+    targets: &[String],
+    ctl_socket: Option<&Path>,
+    config: &gritty::config::ConfigFile,
+) -> anyhow::Result<()> {
+    let known_tunnels = gritty::connect::enumerate_tunnels();
+    let mut failed = 0usize;
+    for target in targets {
+        let result = match parse_kill_target(target, &known_tunnels) {
+            KillTarget::HostOnly(host) => {
+                let ctl_path =
+                    super::util::resolve_ctl_path(ctl_socket.map(Path::to_path_buf), Some(&host))?;
+                let client_name = config.resolve_session(Some(&host)).client_name;
+                // Always bails with the host's session listing.
+                return suggest_session("kill-session", &host, &ctl_path, &client_name).await;
+            }
+            KillTarget::Session { host, session } => {
+                let ctl_path =
+                    super::util::resolve_ctl_path(ctl_socket.map(Path::to_path_buf), Some(&host))?;
+                let client_name = config.resolve_session(Some(&host)).client_name;
+                kill_one(&session, &client_name, &ctl_path).await
+            }
+        };
+        if let Err(e) = result {
+            eprintln!("error: {target}: {e:#}");
+            failed += 1;
+        }
+    }
+    if failed > 0 {
+        anyhow::bail!("failed to kill {failed} of {} session(s)", targets.len());
+    }
+    Ok(())
 }
 
 pub(crate) async fn kill_server(ctl_path: PathBuf) -> anyhow::Result<()> {
@@ -1098,7 +1176,7 @@ pub(crate) async fn restart(
     Ok(())
 }
 
-/// The nine shared session-table columns (ID..Status) for one row. Identical
+/// The ten shared session-table columns (ID..Status) for one row. Identical
 /// between `list_sessions` and `list_all_sessions`; the latter just prepends a
 /// Host column. Single-sourced so the "starting"/attached/heartbeat/detached
 /// status logic and column order cannot drift between the two listings.
@@ -1111,14 +1189,22 @@ fn session_status_cols(
     now: u64,
     ambient_client_name: &str,
 ) -> Vec<String> {
+    use super::util::{format_duration, format_idle};
+
     let name = if s.name.is_empty() {
         "-".to_string()
     } else {
         gritty::naming::display_session_name(&s.name, ambient_client_name).to_string()
     };
-    let (pty, pid, created, status) = if s.shell_pid == 0 {
-        ("-".to_string(), "-".to_string(), "-".to_string(), "starting".to_string())
+    let (pty, pid, created, idle, status) = if s.shell_pid == 0 {
+        let dash = || "-".to_string();
+        (dash(), dash(), dash(), dash(), "starting".to_string())
     } else {
+        // Idle = time since terminal activity (PTY output / keystrokes).
+        // The status parenthetical = time since client presence (attach /
+        // heartbeat / detach). Both matter when deciding what to reap: a
+        // detached session running a build is idle by presence but not by
+        // activity.
         let status = if s.attached {
             if s.last_heartbeat > 0 {
                 let ago = now.saturating_sub(s.last_heartbeat);
@@ -1126,10 +1212,18 @@ fn session_status_cols(
             } else {
                 "attached".to_string()
             }
+        } else if s.last_heartbeat > 0 {
+            format!("detached ({} ago)", format_duration(now.saturating_sub(s.last_heartbeat)))
         } else {
             "detached".to_string()
         };
-        (s.pty_path.clone(), s.shell_pid.to_string(), format_timestamp(s.created_at), status)
+        (
+            s.pty_path.clone(),
+            s.shell_pid.to_string(),
+            format_timestamp(s.created_at),
+            format_idle(now, s.last_activity),
+            status,
+        )
     };
     vec![
         s.id.to_string(),
@@ -1140,6 +1234,7 @@ fn session_status_cols(
         pty,
         pid,
         created,
+        idle,
         status,
     ]
 }
@@ -1502,6 +1597,7 @@ mod tests {
             client_name: "laptop".to_string(),
             agent_forwarding_active: false,
             is_last_attached: false,
+            last_activity: 0,
         }
     }
 
@@ -1604,12 +1700,13 @@ mod tests {
         let mut s = entry();
         s.shell_pid = 0;
         let cols = session_status_cols(&s, 100, "");
-        // id, name(-), cmd, cwd, client, pty(-), pid(-), created(-), status
+        // id, name(-), cmd, cwd, client, pty(-), pid(-), created(-), idle(-), status
         assert_eq!(cols[0], "3");
         assert_eq!(cols[1], "-"); // empty name renders as "-"
         assert_eq!(cols[5], "-"); // pty
         assert_eq!(cols[6], "-"); // pid
-        assert_eq!(cols[8], "starting");
+        assert_eq!(cols[8], "-"); // idle
+        assert_eq!(cols[9], "starting");
     }
 
     #[test]
@@ -1618,17 +1715,41 @@ mod tests {
         s.attached = true;
         s.last_heartbeat = 90;
         let cols = session_status_cols(&s, 100, "");
-        assert_eq!(cols[8], "attached (heartbeat 10s ago)");
+        assert_eq!(cols[9], "attached (heartbeat 10s ago)");
         assert_eq!(cols[6], "1234"); // pid
     }
 
     #[test]
     fn session_status_cols_detached_and_attached_no_heartbeat() {
         let s = entry();
-        assert_eq!(session_status_cols(&s, 100, "")[8], "detached");
+        assert_eq!(session_status_cols(&s, 100, "")[9], "detached");
         let mut s2 = entry();
         s2.attached = true;
-        assert_eq!(session_status_cols(&s2, 100, "")[8], "attached");
+        assert_eq!(session_status_cols(&s2, 100, "")[9], "attached");
+    }
+
+    #[test]
+    fn session_status_cols_detached_shows_presence_age() {
+        // A detached session with a known last client presence (attach /
+        // heartbeat / detach time) reports how long ago that was.
+        let mut s = entry();
+        s.last_heartbeat = 10000 - 7200; // 2h before now
+        assert_eq!(session_status_cols(&s, 10000, "")[9], "detached (2h ago)");
+    }
+
+    #[test]
+    fn session_status_cols_idle_from_last_activity() {
+        // Idle column = time since last terminal activity, compact format.
+        let mut s = entry();
+        s.last_activity = 100 - 60;
+        assert_eq!(session_status_cols(&s, 100, "")[8], "1m");
+    }
+
+    #[test]
+    fn session_status_cols_idle_unknown_is_dash() {
+        // last_activity == 0 (older server) renders as "-", not a huge age.
+        let s = entry();
+        assert_eq!(session_status_cols(&s, 100, "")[8], "-");
     }
 
     #[test]
@@ -1645,6 +1766,54 @@ mod tests {
         s.name = "laptop2/work".to_string();
         let cols = session_status_cols(&s, 100, "mylaptop");
         assert_eq!(cols[1], "laptop2/work"); // foreign prefix kept
+    }
+
+    // -- parse_kill_target (kill-session argument resolution) --
+
+    fn session_target(host: &str, session: &str) -> KillTarget {
+        KillTarget::Session { host: host.to_string(), session: session.to_string() }
+    }
+
+    #[test]
+    fn kill_target_host_session_splits() {
+        assert_eq!(parse_kill_target("local:3", &[]), session_target("local", "3"));
+        assert_eq!(parse_kill_target("remote:work", &[]), session_target("remote", "work"));
+    }
+
+    #[test]
+    fn kill_target_bare_word_is_local_session() {
+        // Bare IDs and names go to `local` -- the reap-after-`ls` path.
+        assert_eq!(parse_kill_target("3", &[]), session_target("local", "3"));
+        assert_eq!(parse_kill_target("work", &[]), session_target("local", "work"));
+    }
+
+    #[test]
+    fn kill_target_bare_known_host_stays_host() {
+        // `local` and known tunnel names keep the "list that host" behavior.
+        let tunnels = vec!["devbox".to_string()];
+        assert_eq!(parse_kill_target("local", &tunnels), KillTarget::HostOnly("local".to_string()));
+        assert_eq!(
+            parse_kill_target("devbox", &tunnels),
+            KillTarget::HostOnly("devbox".to_string())
+        );
+        // Unknown bare word is still a local session even when tunnels exist.
+        assert_eq!(parse_kill_target("work", &tunnels), session_target("local", "work"));
+    }
+
+    #[test]
+    fn kill_target_trailing_colon_is_host_only() {
+        // `host:` (empty session) means the host itself, like parse_target.
+        assert_eq!(parse_kill_target("devbox:", &[]), KillTarget::HostOnly("devbox".to_string()));
+    }
+
+    #[test]
+    fn kill_target_foreign_namespace_passes_through() {
+        // A `/`-qualified name stays a session string; namespace resolution
+        // happens later in kill_one (it's passed through literally).
+        assert_eq!(
+            parse_kill_target("local:laptop2/work", &[]),
+            session_target("local", "laptop2/work")
+        );
     }
 
     // -- order_sessions (own-client highlighting and sort) --

@@ -245,7 +245,13 @@ pub struct SessionMetadata {
     pub shell_pid: AtomicU32,
     pub created_at: u64,
     pub attached: AtomicBool,
+    /// Epoch seconds of the last proof of client presence: attach, heartbeat
+    /// Ping, or detach. Distinct from `last_activity` -- this answers "when
+    /// was a client last here?", not "is anything happening in there?".
     pub last_heartbeat: AtomicU64,
+    /// Epoch seconds of the last terminal activity (PTY output or client
+    /// keystrokes). Drives the `Idle` column in `gritty ls`.
+    pub last_activity: AtomicU64,
     pub client_name: std::sync::Mutex<String>,
     pub wants_agent: AtomicBool,
     pub wants_open: AtomicBool,
@@ -255,6 +261,25 @@ pub struct SessionMetadata {
     /// the Hello's `device_id` differs from this value, the attach is rejected
     /// with `OwnerChanged`.
     pub owner_device_id: AtomicU64,
+}
+
+impl SessionMetadata {
+    /// Record terminal activity (PTY output or client input) at the current
+    /// wall-clock time.
+    pub fn touch_activity(&self) {
+        self.last_activity.store(epoch_now(), Ordering::Relaxed);
+    }
+
+    /// Record client presence (attach, heartbeat, detach) at the current
+    /// wall-clock time.
+    pub fn touch_presence(&self) {
+        self.last_heartbeat.store(epoch_now(), Ordering::Relaxed);
+    }
+}
+
+/// Wall-clock seconds since the Unix epoch (0 if the clock predates 1970).
+fn epoch_now() -> u64 {
+    std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_secs()
 }
 
 /// Wraps a child process and its process group ID.
@@ -1123,6 +1148,11 @@ impl ServerRelay<'_> {
         match frame {
             Some(Ok(Frame::Data(data))) => {
                 debug!(len = data.len(), "socket -> pty (queued)");
+                // Keystrokes are terminal activity even when the program
+                // doesn't echo them (password prompts, some TUIs).
+                if let Some(meta) = self.metadata_slot.get() {
+                    meta.touch_activity();
+                }
                 if *self.pending_input_bytes + data.len() > PENDING_INPUT_CAP {
                     warn!(
                         queued = *self.pending_input_bytes,
@@ -1147,11 +1177,7 @@ impl ServerRelay<'_> {
             }
             Some(Ok(Frame::Ping)) => {
                 if let Some(meta) = self.metadata_slot.get() {
-                    let now = std::time::SystemTime::now()
-                        .duration_since(std::time::UNIX_EPOCH)
-                        .unwrap_or_default()
-                        .as_secs();
-                    meta.last_heartbeat.store(now, Ordering::Relaxed);
+                    meta.touch_presence();
                 }
                 let _ = send_framed_timed(framed, Frame::Pong).await;
             }
@@ -1938,16 +1964,16 @@ pub async fn run(
     // happened after shell spawn, so an Attach that landed during the
     // wait-for-first-client window saw metadata=None and couldn't persist
     // the owner. (See the `initial_device_id` param on server::run.)
-    let created_at = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_secs();
+    let created_at = epoch_now();
     let _ = metadata_slot.set(SessionMetadata {
         pty_path: pty_path.clone(),
         shell_pid: AtomicU32::new(0),
         created_at,
         attached: AtomicBool::new(false),
         last_heartbeat: AtomicU64::new(0),
+        // A fresh session counts as active now; "idle since creation" is the
+        // honest answer until the shell produces its first output.
+        last_activity: AtomicU64::new(created_at),
         client_name: std::sync::Mutex::new(String::new()),
         wants_agent: AtomicBool::new(false),
         wants_open: AtomicBool::new(false),
@@ -2197,7 +2223,9 @@ pub async fn run(
     }
 
     // First client is already connected — enter relay directly
-    metadata_slot.get().unwrap().attached.store(true, Ordering::Relaxed);
+    let meta = metadata_slot.get().unwrap();
+    meta.attached.store(true, Ordering::Relaxed);
+    meta.touch_presence();
 
     // Outer loop: accept clients via channel. PTY persists across reconnects.
     // First iteration skips client-wait (first client already connected above).
@@ -2285,6 +2313,11 @@ pub async fn run(
                                     scrollback.push(&chunk);
                                 }
                                 history.push(&chunk);
+                                // Detached output is still activity -- a
+                                // long-running build must not look idle.
+                                if let Some(meta) = metadata_slot.get() {
+                                    meta.touch_activity();
+                                }
                                 if tail_tx.receiver_count() > 0 {
                                     let _ = tail_tx.send(TailEvent::Data(chunk.clone()));
                                 }
@@ -2385,6 +2418,7 @@ pub async fn run(
 
             if let Some(meta) = metadata_slot.get() {
                 meta.attached.store(true, Ordering::Relaxed);
+                meta.touch_presence();
             }
         }
         let is_reconnect = !first_client;
@@ -2420,6 +2454,7 @@ pub async fn run(
         if flush_failed {
             if let Some(meta) = metadata_slot.get() {
                 meta.attached.store(false, Ordering::Relaxed);
+                meta.touch_presence();
             }
             continue;
         }
@@ -2508,10 +2543,11 @@ pub async fn run(
                                     let _ = old.send(None);
                                 }
                                 // Update client_name from the new Attach
-                                if let Some(meta) = relay.metadata_slot.get()
-                                    && let Ok(mut n) = meta.client_name.lock()
-                                {
-                                    *n = cn;
+                                if let Some(meta) = relay.metadata_slot.get() {
+                                    meta.touch_presence();
+                                    if let Ok(mut n) = meta.client_name.lock() {
+                                        *n = cn;
+                                    }
                                 }
                                 framed = new_framed;
                                 // Give the new client a full idle-evict budget.
@@ -2670,6 +2706,9 @@ pub async fn run(
                                 // offset, so it must land in history -- that's
                                 // what a reconnecting client resumes against.
                                 history.push(&chunk);
+                                if let Some(meta) = relay.metadata_slot.get() {
+                                    meta.touch_activity();
+                                }
                                 if relay.tail_tx.receiver_count() > 0 {
                                     let _ = relay.tail_tx.send(TailEvent::Data(chunk.clone()));
                                 }
@@ -2716,6 +2755,9 @@ pub async fn run(
             RelayExit::ClientGone => {
                 if let Some(meta) = metadata_slot.get() {
                     meta.attached.store(false, Ordering::Relaxed);
+                    // Detach time is the last proof of client presence --
+                    // `ls` shows it as "detached (Xm ago)".
+                    meta.touch_presence();
                 }
                 agent.disable();
                 tunnel.teardown();

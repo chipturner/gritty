@@ -388,6 +388,7 @@ fn roundtrip_session_info() {
                 last_heartbeat: 1700000005,
                 agent_forwarding_active: true,
                 is_last_attached: false,
+                last_activity: 1700000007,
             },
             SessionEntry {
                 id: 1,
@@ -402,12 +403,53 @@ fn roundtrip_session_info() {
                 last_heartbeat: 0,
                 agent_forwarding_active: false,
                 is_last_attached: false,
+                last_activity: 0,
             },
         ],
     };
     codec.encode(original.clone(), &mut buf).unwrap();
     let decoded = codec.decode(&mut buf).unwrap().unwrap();
     assert_eq!(original, decoded);
+}
+
+#[test]
+fn legacy_session_info_without_last_activity_decodes_as_zero() {
+    // A v21 server sends SessionInfo entries without the trailing
+    // last_activity u64 (added in v22). The decoder defaults it to 0.
+    let mut codec = FrameCodec;
+    let mut buf = BytesMut::new();
+    let name = b"sess";
+    let pty = b"/dev/pts/9";
+    let entry_len = 4 + 2 + name.len() + 2 + pty.len() + 4 + 8 + 1 + 8 + 2 + 2 + 2 + 1 + 1;
+    buf.put_u8(0x61); // TYPE_SESSION_INFO
+    buf.put_u32((4 + 4 + entry_len) as u32); // count + entry_len prefix + entry
+    buf.put_u32(1); // count
+    buf.put_u32(entry_len as u32);
+    buf.put_u32(7); // id
+    buf.put_u16(name.len() as u16);
+    buf.put_slice(name);
+    buf.put_u16(pty.len() as u16);
+    buf.put_slice(pty);
+    buf.put_u32(4242); // shell_pid
+    buf.put_u64(1700000000); // created_at
+    buf.put_u8(1); // attached
+    buf.put_u64(1700000005); // last_heartbeat
+    buf.put_u16(0); // foreground_cmd (empty)
+    buf.put_u16(0); // cwd (empty)
+    buf.put_u16(0); // client_name (empty)
+    buf.put_u8(0); // agent_forwarding_active
+    buf.put_u8(1); // is_last_attached
+    let decoded = codec.decode(&mut buf).unwrap().unwrap();
+    match decoded {
+        Frame::SessionInfo { sessions } => {
+            assert_eq!(sessions.len(), 1);
+            assert_eq!(sessions[0].id, 7);
+            assert_eq!(sessions[0].last_heartbeat, 1700000005);
+            assert!(sessions[0].is_last_attached);
+            assert_eq!(sessions[0].last_activity, 0);
+        }
+        other => panic!("expected SessionInfo, got {other:?}"),
+    }
 }
 
 #[test]
@@ -571,6 +613,7 @@ fn session_info_u32_id_roundtrip() {
             last_heartbeat: 0,
             agent_forwarding_active: false,
             is_last_attached: false,
+            last_activity: 1700000050,
         }],
     };
     codec.encode(original.clone(), &mut buf).unwrap();
@@ -641,6 +684,7 @@ fn session_info_preserves_newline_in_name() {
             last_heartbeat: 0,
             agent_forwarding_active: false,
             is_last_attached: false,
+            last_activity: 0,
         }],
     };
     codec.encode(original.clone(), &mut buf).unwrap();

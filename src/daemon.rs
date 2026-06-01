@@ -311,6 +311,7 @@ fn build_session_entries(
                     client_name: meta.client_name.lock().map(|n| n.clone()).unwrap_or_default(),
                     agent_forwarding_active: meta.wants_agent.load(Ordering::Relaxed),
                     is_last_attached,
+                    last_activity: meta.last_activity.load(Ordering::Relaxed),
                 }
             } else {
                 SessionEntry {
@@ -326,6 +327,7 @@ fn build_session_entries(
                     client_name: String::new(),
                     agent_forwarding_active: false,
                     is_last_attached,
+                    last_activity: 0,
                 }
             }
         })
@@ -632,6 +634,7 @@ async fn mark_attached_when_ready(metadata: &Arc<OnceLock<SessionMetadata>>) {
     loop {
         if let Some(m) = metadata.get() {
             m.attached.store(true, Ordering::Relaxed);
+            m.touch_presence();
             return;
         }
         if std::time::Instant::now() >= deadline {
@@ -892,6 +895,7 @@ async fn dispatch_control(
                             // second `connect` steals the session instead of
                             // getting AlreadyAttached.
                             meta.attached.store(true, Ordering::Relaxed);
+                            meta.touch_presence();
                             *last_attached = Some(id);
                             let _ = state.client_tx.send(ClientConn::Active {
                                 framed,

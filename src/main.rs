@@ -25,7 +25,7 @@ Sessions:
   connect (c)            Attach or create a session
   list-sessions (ls)     List active sessions
   tail (t)               Read-only stream of session output
-  kill-session           Kill a session
+  kill-session (kill)    Kill one or more sessions
   rename                 Rename a session
   kill-server            Kill the server and all sessions
   restart                Kill + restart the server (upgrade recovery)
@@ -159,11 +159,13 @@ enum Command {
         /// Target host (omit to list every known host)
         target: Option<String>,
     },
-    /// Kill a session
-    #[command(display_order = 3)]
+    /// Kill one or more sessions
+    #[command(display_order = 3, visible_alias = "kill")]
     KillSession {
-        /// Target host and session (host:session)
-        target: Option<String>,
+        /// Sessions to kill: `host:session`, or a bare name/ID resolved on
+        /// `local` (IDs and names both work; bare known host names list that
+        /// host's sessions instead)
+        targets: Vec<String>,
     },
     /// Kill the server and all sessions
     #[command(display_order = 5)]
@@ -815,24 +817,16 @@ async fn run(cli: Cli, config: gritty::config::ConfigFile) -> anyhow::Result<()>
                 list_sessions(ctl_path, &client_name).await
             }
         }
-        Command::KillSession { target } => {
-            let (host, session) = split_optional_target(target.as_deref());
-            let ctl_path = resolve_ctl_path(cli.ctl_socket, host.as_deref())?;
-            let client_name = config.resolve_session(host.as_deref()).client_name;
-            let session = match session {
-                Some(s) => gritty::naming::resolve_session_name(&s, &client_name),
-                None => {
-                    suggest_session(
-                        "kill-session",
-                        host.as_deref().unwrap_or("host"),
-                        &ctl_path,
-                        &client_name,
-                    )
-                    .await?;
-                    unreachable!()
-                }
-            };
-            kill_session(session, ctl_path).await
+        Command::KillSession { targets } => {
+            if targets.is_empty() {
+                // No targets: same as the old no-target form -- needs a host
+                // (or --ctl-socket), then lists its sessions to pick from.
+                let ctl_path = resolve_ctl_path(cli.ctl_socket, None)?;
+                let client_name = config.resolve_session(None).client_name;
+                suggest_session("kill-session", "host", &ctl_path, &client_name).await?;
+                unreachable!()
+            }
+            kill_sessions(&targets, cli.ctl_socket.as_deref(), &config).await
         }
         Command::Rename { target, new_name } => {
             let (host, session) = parse_target(&target);

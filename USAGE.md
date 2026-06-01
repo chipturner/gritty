@@ -7,9 +7,9 @@ Complete command and flag reference. For an overview and quick start, see [READM
 | Command | Aliases | Description |
 |---------|---------|-------------|
 | `gritty connect [host[:name]]` | `c` | Smart session: attach if exists, create if not |
-| `gritty list-sessions [host]` | `ls`, `list` | List sessions. Bare `gritty ls` shows every known host -- local + all tunnels -- grouped by daemon (tunnels reaching the same daemon are merged). With a host, lists just that host. Your own sessions are bold and sorted first; foreign sessions group by client (foreground process shown on Linux only) |
+| `gritty list-sessions [host]` | `ls`, `list` | List sessions. Bare `gritty ls` shows every known host -- local + all tunnels -- grouped by daemon (tunnels reaching the same daemon are merged). With a host, lists just that host. Your own sessions are bold and sorted first; foreign sessions group by client (foreground process shown on Linux only). The `Idle` column shows time since the session's last terminal activity (output or keystrokes); detached sessions also show how long ago a client was last attached |
 | `gritty tail [host:session]` | `t` | Read-only stream of session output |
-| `gritty kill-session [host:session]` | | Kill a session |
+| `gritty kill-session [targets...]` | `kill` | Kill one or more sessions. Each target is `host:session`, or a bare session name/ID killed on `local` (so after `gritty ls`, `gritty kill 3 5 work` reaps by ID or name). A bare target naming a known host lists that host's sessions instead. Numeric targets match your own namespace name first, then fall back to the raw session ID |
 | `gritty rename <host:session> <name>` | | Rename a session |
 | `gritty kill-server [host]` | | Kill the server and all sessions (works across a protocol version mismatch) |
 | `gritty restart [host]` | | Kill + restart server (and tunnel, for remote hosts). One-shot upgrade recovery |

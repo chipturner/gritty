@@ -429,6 +429,44 @@ async fn daemon_kills_session_by_name() {
 }
 
 #[tokio::test]
+async fn list_sessions_reports_last_activity() {
+    let (_tmp, ctl_path) = test_ctl();
+
+    let ctl = ctl_path.clone();
+    let _daemon = tokio::spawn(async move { gritty::daemon::run(&ctl, None).await });
+    wait_for_daemon(&ctl_path).await;
+
+    let id = create_session(&ctl_path, "activity-list").await;
+
+    // A fresh session reports last_activity (initialized to its creation
+    // time) -- the field survives the SessionEntry encode/decode round trip.
+    // Poll: the session task publishes its metadata asynchronously, and until
+    // then the daemon reports placeholder zeros.
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    loop {
+        let resp = control_request(&ctl_path, Frame::ListSessions).await;
+        let sessions = match &resp {
+            Frame::SessionInfo { sessions } => sessions,
+            other => panic!("expected SessionInfo, got {other:?}"),
+        };
+        assert_eq!(sessions.len(), 1);
+        if sessions[0].last_activity > 0 {
+            assert!(
+                sessions[0].last_activity >= sessions[0].created_at,
+                "last_activity should not predate creation"
+            );
+            break;
+        }
+        if tokio::time::Instant::now() >= deadline {
+            panic!("last_activity never reported, got {:?}", sessions[0]);
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+
+    kill_cleanup(&ctl_path, &id).await;
+}
+
+#[tokio::test]
 async fn daemon_kills_server() {
     let (_tmp, ctl_path) = test_ctl();
 

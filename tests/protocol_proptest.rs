@@ -25,34 +25,31 @@ fn arb_error_code() -> impl Strategy<Value = ErrorCode> {
 }
 
 fn arb_session_entry() -> impl Strategy<Value = SessionEntry> {
+    // Nested tuples: proptest's Strategy impl tops out at 12-element tuples,
+    // and SessionEntry has more fields than that.
     (
-        any::<u32>(),
-        arb_string(),
-        arb_string(),
-        any::<u32>(),
-        any::<u64>(),
-        any::<bool>(),
-        any::<u64>(),
-        arb_string(),
-        arb_string(),
-        arb_string(),
-        any::<bool>(),
-        any::<bool>(),
+        (
+            any::<u32>(),
+            arb_string(),
+            arb_string(),
+            any::<u32>(),
+            any::<u64>(),
+            any::<bool>(),
+            any::<u64>(),
+        ),
+        (arb_string(), arb_string(), arb_string(), any::<bool>(), any::<bool>(), any::<u64>()),
     )
         .prop_map(
             |(
-                id,
-                name,
-                pty_path,
-                shell_pid,
-                created_at,
-                attached,
-                last_heartbeat,
-                foreground_cmd,
-                cwd,
-                client_name,
-                agent_forwarding_active,
-                is_last_attached,
+                (id, name, pty_path, shell_pid, created_at, attached, last_heartbeat),
+                (
+                    foreground_cmd,
+                    cwd,
+                    client_name,
+                    agent_forwarding_active,
+                    is_last_attached,
+                    last_activity,
+                ),
             )| {
                 SessionEntry {
                     id,
@@ -67,6 +64,7 @@ fn arb_session_entry() -> impl Strategy<Value = SessionEntry> {
                     client_name,
                     agent_forwarding_active,
                     is_last_attached,
+                    last_activity,
                 }
             },
         )

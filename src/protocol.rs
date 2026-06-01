@@ -76,7 +76,7 @@ const HEADER_LEN: usize = 5; // type(1) + length(4)
 const MAX_FRAME_SIZE: usize = 1 << 20; // 1 MB
 
 /// Protocol version for handshake negotiation.
-pub const PROTOCOL_VERSION: u16 = 21;
+pub const PROTOCOL_VERSION: u16 = 22;
 
 /// Capability bit: client/server supports clipboard forwarding.
 pub const CAP_CLIPBOARD: u32 = 0x01;
@@ -184,6 +184,10 @@ pub struct SessionEntry {
     /// the client to resolve `"-"` the same way the daemon would, instead of
     /// heuristically picking `max_by_key(last_heartbeat)` which diverges.
     pub is_last_attached: bool,
+    /// Epoch seconds of the last terminal activity (PTY output or client
+    /// keystrokes). 0 = unknown (older server). Drives the `Idle` column in
+    /// `gritty ls` so stale sessions are easy to spot and reap.
+    pub last_activity: u64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -516,6 +520,7 @@ fn encode_session_info(dst: &mut BytesMut, sessions: &[SessionEntry]) {
         dst.extend_from_slice(e.client_name.as_bytes());
         dst.put_u8(if e.agent_forwarding_active { 1 } else { 0 });
         dst.put_u8(if e.is_last_attached { 1 } else { 0 });
+        dst.put_u64(e.last_activity);
     }
 }
 
@@ -533,6 +538,7 @@ fn entry_encoded_len(e: &SessionEntry) -> usize {
     + 2 + e.client_name.len()
     + 1 // agent_forwarding_active
     + 1 // is_last_attached
+    + 8 // last_activity
 }
 
 fn decode_string(payload: BytesMut) -> Result<String, io::Error> {
@@ -765,6 +771,15 @@ fn decode_session_info(payload: BytesMut) -> Result<Option<Frame>, io::Error> {
         } else {
             false
         };
+        // New field (added after is_last_attached): last_activity (8 bytes).
+        // Older servers don't send it; default to 0 (unknown).
+        let last_activity = if eoff + 8 <= entry_slice.len() {
+            let v = read_u64(entry_slice, eoff);
+            eoff += 8;
+            v
+        } else {
+            0
+        };
         let _ = eoff; // remaining bytes skipped via entry_end
         sessions.push(SessionEntry {
             id,
@@ -779,6 +794,7 @@ fn decode_session_info(payload: BytesMut) -> Result<Option<Frame>, io::Error> {
             client_name,
             agent_forwarding_active,
             is_last_attached,
+            last_activity,
         });
         off = entry_end;
     }

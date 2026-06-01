@@ -1019,6 +1019,35 @@ async fn ping_pong_heartbeat() {
 }
 
 #[tokio::test]
+async fn metadata_tracks_activity_and_presence() {
+    let (_tx, mut framed, server, meta) = setup_session().await;
+    wait_for_shell(&mut framed).await;
+    read_available_data(&mut framed, Duration::from_secs(1)).await;
+
+    let m = meta.get().expect("metadata should be set");
+
+    // Attach alone (no Ping sent yet) records client presence.
+    let presence = m.last_heartbeat.load(std::sync::atomic::Ordering::Relaxed);
+    assert!(presence > 0, "attach should record client presence without a Ping");
+
+    // Terminal I/O (keystrokes in, PTY output back) advances last_activity
+    // to at least the wall-clock time the I/O happened.
+    let before =
+        std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs();
+    framed.send(Frame::Data(Bytes::from("echo ACTIVITY_OK\n"))).await.unwrap();
+    let output = read_available_data(&mut framed, Duration::from_secs(2)).await;
+    assert!(String::from_utf8_lossy(&output).contains("ACTIVITY_OK"));
+    let activity = m.last_activity.load(std::sync::atomic::Ordering::Relaxed);
+    assert!(
+        activity >= before,
+        "last_activity ({activity}) should be at or after the I/O ({before})"
+    );
+
+    let _ = framed.send(Frame::Data(Bytes::from("exit\n"))).await;
+    let _ = timeout(Duration::from_secs(3), server).await;
+}
+
+#[tokio::test]
 async fn env_vars_forwarded() {
     let (_tx, mut framed, server, _meta) =
         setup_session_with_env(vec![("TERM".to_string(), "xterm-test-42".to_string())]).await;

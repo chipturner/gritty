@@ -221,17 +221,30 @@ pub(crate) async fn connect_or_start(
     anyhow::bail!("server did not become ready ({})", ctl_path.display())
 }
 
-pub(crate) fn format_age(now: u64, created_at: u64) -> String {
-    let secs = now.saturating_sub(created_at);
+/// Compact duration: "12s", "5m", "3h", "2d".
+pub(crate) fn format_duration(secs: u64) -> String {
     if secs < 60 {
-        format!("{secs}s ago")
+        format!("{secs}s")
     } else if secs < 3600 {
-        format!("{}m ago", secs / 60)
+        format!("{}m", secs / 60)
     } else if secs < 86400 {
-        format!("{}h ago", secs / 3600)
+        format!("{}h", secs / 3600)
     } else {
-        format!("{}d ago", secs / 86400)
+        format!("{}d", secs / 86400)
     }
+}
+
+pub(crate) fn format_age(now: u64, created_at: u64) -> String {
+    format!("{} ago", format_duration(now.saturating_sub(created_at)))
+}
+
+/// Idle column value: compact time since `last_activity`, or "-" when the
+/// timestamp is unknown (0 -- e.g. an older server that doesn't track it).
+pub(crate) fn format_idle(now: u64, last_activity: u64) -> String {
+    if last_activity == 0 {
+        return "-".to_string();
+    }
+    format_duration(now.saturating_sub(last_activity))
 }
 
 pub(crate) fn format_timestamp(epoch_secs: u64) -> String {
@@ -738,6 +751,20 @@ mod tests {
     #[test]
     fn format_age_days() {
         assert_eq!(format_age(200000, 0), "2d ago");
+    }
+
+    #[test]
+    fn format_idle_compact_durations() {
+        assert_eq!(format_idle(100, 70), "30s");
+        assert_eq!(format_idle(1000, 700), "5m");
+        assert_eq!(format_idle(10000, 1), "2h");
+        assert_eq!(format_idle(200000, 1), "2d");
+    }
+
+    #[test]
+    fn format_idle_unknown_is_dash() {
+        // 0 = older server that doesn't report last_activity.
+        assert_eq!(format_idle(100, 0), "-");
     }
 
     #[test]
