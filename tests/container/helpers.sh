@@ -157,12 +157,13 @@ session_exists() {
 
 # Wait until a session is in the "attached" state in `gritty ls`. Useful before
 # probing per-session resources (fwd-*.sock) that only appear once a client has
-# finished its Attach handshake.
+# finished its Attach handshake. The status may carry a heartbeat suffix
+# ("attached (heartbeat 3s ago)"), so match the word rather than the last field.
 wait_for_session_attached() {
     local host="${1}" name="${2}" timeout="${3:-10}"
     local i
     for ((i = 0; i < timeout * 10; i++)); do
-        if gritty ls "${host}" 2>/dev/null | awk -v n="${name}" 'NR>1 && $2 == n && $NF == "attached"' | grep -q .; then
+        if gritty ls "${host}" 2>/dev/null | awk -v n="${name}" 'NR>1 && $2 == n && / attached/' | grep -q .; then
             return 0
         fi
         sleep 0.1
