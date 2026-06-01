@@ -1837,3 +1837,179 @@ async fn attach_dash_no_previous_session() {
         other => panic!("expected Error for attach -, got {other:?}"),
     }
 }
+
+// ---------------------------------------------------------------------------
+// Socket self-heal: the daemon detects loss/replacement of its control socket
+// (e.g. systemd wiping $XDG_RUNTIME_DIR, or /tmp age-based cleanup) and either
+// re-binds in place (sessions survive) or exits cleanly -- it must never
+// linger as an unreachable orphan that needs a manual `kill`.
+// ---------------------------------------------------------------------------
+
+/// Spawn a daemon with a fast socket-check interval so self-heal tests don't
+/// wait for the production default.
+fn spawn_fast_check_daemon(
+    ctl_path: &std::path::Path,
+) -> tokio::task::JoinHandle<anyhow::Result<()>> {
+    let ctl = ctl_path.to_path_buf();
+    tokio::spawn(async move {
+        gritty::daemon::run_with_options(
+            &ctl,
+            None,
+            gritty::daemon::DaemonOptions { socket_check_interval: Duration::from_millis(100) },
+        )
+        .await
+    })
+}
+
+/// Extract the session list or panic.
+fn expect_session_info(resp: &Frame) -> &Vec<gritty::protocol::SessionEntry> {
+    match resp {
+        Frame::SessionInfo { sessions } => sessions,
+        other => panic!("expected SessionInfo, got {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn daemon_rebinds_after_socket_file_removed() {
+    let (_tmp, ctl_path) = test_ctl();
+    let _daemon = spawn_fast_check_daemon(&ctl_path);
+    wait_for_daemon(&ctl_path).await;
+
+    let id = create_session(&ctl_path, "survivor").await;
+
+    // Simulate external cleanup (tmpfiles-style) deleting just the socket.
+    std::fs::remove_file(&ctl_path).unwrap();
+
+    // The daemon should notice and re-bind at the same path.
+    wait_for_daemon(&ctl_path).await;
+
+    // Re-bound, same daemon: the session must have survived.
+    let resp = control_request(&ctl_path, Frame::ListSessions).await;
+    let sessions = expect_session_info(&resp);
+    assert!(
+        sessions.iter().any(|s| s.id.to_string() == id && s.name == "survivor"),
+        "session lost across rebind: {sessions:?}"
+    );
+
+    // The pid-file registration must be restored too, or doctor/refresh
+    // would classify this daemon as an orphan.
+    let pid_path = ctl_path.with_file_name("daemon.pid");
+    let pid: u32 = std::fs::read_to_string(&pid_path)
+        .expect("daemon.pid should be restored after rebind")
+        .trim()
+        .parse()
+        .unwrap();
+    assert_eq!(pid, std::process::id());
+
+    kill_cleanup(&ctl_path, &id).await;
+}
+
+#[tokio::test]
+async fn daemon_rebinds_after_socket_dir_removed() {
+    let (tmp, ctl_path) = test_ctl();
+    let _daemon = spawn_fast_check_daemon(&ctl_path);
+    wait_for_daemon(&ctl_path).await;
+
+    let id = create_session(&ctl_path, "dirloss").await;
+
+    // Simulate $XDG_RUNTIME_DIR-style teardown: the whole socket dir vanishes.
+    std::fs::remove_dir_all(tmp.path()).unwrap();
+
+    // The daemon should recreate the directory and re-bind.
+    wait_for_daemon(&ctl_path).await;
+
+    let resp = control_request(&ctl_path, Frame::ListSessions).await;
+    let sessions = expect_session_info(&resp);
+    assert!(
+        sessions.iter().any(|s| s.id.to_string() == id),
+        "session lost across dir recreation: {sessions:?}"
+    );
+
+    kill_cleanup(&ctl_path, &id).await;
+}
+
+#[tokio::test]
+async fn daemon_exits_when_socket_taken_over_by_live_daemon() {
+    let (_tmp, ctl_path) = test_ctl();
+    let daemon_a = spawn_fast_check_daemon(&ctl_path);
+    wait_for_daemon(&ctl_path).await;
+    let id = create_session(&ctl_path, "doomed").await;
+
+    // A new daemon takes over the path (the post-wipe race: a client
+    // auto-started a fresh daemon before the old one noticed the wipe).
+    std::fs::remove_file(&ctl_path).unwrap();
+    let ctl_b = ctl_path.clone();
+    let _daemon_b = tokio::spawn(async move { gritty::daemon::run(&ctl_b, None).await });
+    wait_for_daemon(&ctl_path).await;
+
+    // Daemon A must notice it lost the path and exit cleanly -- never
+    // linger as an unreachable orphan.
+    let result = timeout(Duration::from_secs(5), daemon_a)
+        .await
+        .expect("daemon A did not exit after losing its socket to a live daemon")
+        .expect("daemon A panicked");
+    assert!(result.is_ok(), "takeover exit should be clean, got {result:?}");
+
+    // Daemon B must be untouched: A's exit must not unlink B's socket or
+    // sidecars (A's session `doomed` died with A; B starts empty).
+    let resp = control_request(&ctl_path, Frame::ListSessions).await;
+    let sessions = expect_session_info(&resp);
+    assert!(
+        !sessions.iter().any(|s| s.id.to_string() == id),
+        "daemon B should not have inherited A's sessions"
+    );
+    let pid_path = ctl_path.with_file_name("daemon.pid");
+    assert!(pid_path.exists(), "daemon B's pid file must survive A's exit");
+}
+
+#[tokio::test]
+async fn daemon_exits_when_socket_dir_unrecoverable() {
+    let (tmp, ctl_path) = test_ctl();
+    let daemon = spawn_fast_check_daemon(&ctl_path);
+    wait_for_daemon(&ctl_path).await;
+
+    // Remove the dir and block its recreation by parking a regular file at
+    // the directory path (stand-in for an unrecreatable $XDG_RUNTIME_DIR).
+    let dir = tmp.path().to_path_buf();
+    std::fs::remove_dir_all(&dir).unwrap();
+    std::fs::write(&dir, b"blocked").unwrap();
+
+    // The daemon cannot recover; it must exit rather than linger unreachable.
+    let result = timeout(Duration::from_secs(5), daemon)
+        .await
+        .expect("daemon did not exit after unrecoverable socket-dir loss")
+        .expect("daemon panicked");
+    assert!(result.is_ok(), "unrecoverable-loss exit should be clean, got {result:?}");
+
+    // Clean up the blocking file so TempDir::drop is happy.
+    let _ = std::fs::remove_file(&dir);
+}
+
+// ---------------------------------------------------------------------------
+// End-to-end protocol probe (used by `gritty refresh <host>` through the
+// tunnel socket; here exercised directly against a daemon socket, which has
+// identical semantics -- that's the point of socket-forwarded tunnels).
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn probe_socket_protocol_returns_daemon_version() {
+    let (_tmp, ctl_path) = test_ctl();
+    let ctl = ctl_path.clone();
+    let _daemon = tokio::spawn(async move { gritty::daemon::run(&ctl, None).await });
+    wait_for_daemon(&ctl_path).await;
+
+    let version = gritty::connect::probe_socket_protocol(&ctl_path)
+        .await
+        .expect("probe against a live daemon should succeed");
+    assert_eq!(version, PROTOCOL_VERSION);
+}
+
+#[tokio::test]
+async fn probe_socket_protocol_fails_cleanly_when_no_daemon() {
+    let (_tmp, ctl_path) = test_ctl();
+    // No daemon bound: the probe must return Err, not hang.
+    let result = timeout(Duration::from_secs(5), gritty::connect::probe_socket_protocol(&ctl_path))
+        .await
+        .expect("probe must not hang on a missing socket");
+    assert!(result.is_err(), "probe of a nonexistent socket should fail, got {result:?}");
+}

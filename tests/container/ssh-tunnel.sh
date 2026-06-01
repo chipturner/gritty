@@ -208,6 +208,37 @@ test_kill_server_via_tunnel() {
 }
 
 # ---------------------------------------------------------------------------
+# 8. refresh through the tunnel -- the supervisor + remote daemon are current
+#    (same binary), the remote-side refresh delegation runs, and the final
+#    end-to-end protocol probe verifies cross-machine compatibility.
+# ---------------------------------------------------------------------------
+test_refresh_via_tunnel() {
+    reset_state
+    local name="test-refresh"
+
+    gritty_ok tunnel-create localhost -n "${name}" >/dev/null
+    cleanup_push "gritty kill-server ${name} 2>/dev/null; gritty tunnel-destroy ${name} 2>/dev/null"
+    wait_for_daemon "${name}" 10 || {
+        fail "refresh via tunnel: initial daemon" ""
+        return
+    }
+
+    local out
+    if ! out=$(gritty refresh "${name}" 2>&1); then
+        fail "refresh via tunnel: command succeeds" "${out}"
+        return
+    fi
+    pass "refresh via tunnel: command succeeds"
+
+    # The end-to-end probe must run and confirm matching protocols.
+    if echo "${out}" | grep -q "end-to-end protocol verified"; then
+        pass "refresh via tunnel: end-to-end protocol verified"
+    else
+        fail "refresh via tunnel: end-to-end protocol verified" "output: ${out}"
+    fi
+}
+
+# ---------------------------------------------------------------------------
 # Run all tests
 # ---------------------------------------------------------------------------
 echo "=== gritty SSH tunnel test ==="
@@ -222,5 +253,6 @@ test_custom_name
 test_info_shows_tunnel
 test_foreground_mode
 test_kill_server_via_tunnel
+test_refresh_via_tunnel
 
 report_and_exit

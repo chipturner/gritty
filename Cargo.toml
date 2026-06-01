@@ -33,7 +33,7 @@ humansize = "2"
 jiff = "0.2"
 libc = "0.2"
 libproc = "0.14.11"
-nix = { version = "0.31", features = ["term", "process", "signal", "fs", "hostname"] }
+nix = { version = "0.31", features = ["term", "process", "signal", "fs", "hostname", "user"] }
 opener = "0.8"
 serde = { version = "1", features = ["derive"] }
 shlex = "2"

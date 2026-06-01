@@ -6,6 +6,7 @@ pub mod daemon;
 pub mod logging;
 pub mod naming;
 pub mod net_watch;
+pub mod procscan;
 pub mod protocol;
 pub mod runinfo;
 pub mod scrollback;

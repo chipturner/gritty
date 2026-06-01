@@ -1426,6 +1426,23 @@ async fn probe_tunnel_alive(local_sock: &std::path::Path) -> Result<u16, &'stati
     tokio::time::timeout(Duration::from_secs(3), probe).await.unwrap_or(Err("probe timeout"))
 }
 
+/// The local socket path of the SSH tunnel for `name` (where clients connect
+/// to reach the remote daemon).
+pub fn tunnel_local_socket_path(name: &str) -> PathBuf {
+    local_socket_path(name)
+}
+
+/// Probe a daemon control socket end to end: Hello/HelloAck, returning the
+/// peer's protocol version.
+///
+/// Works across protocol mismatches (HelloAck always carries the server's
+/// version) and through SSH tunnel forwards, so `gritty refresh <host>` can
+/// verify cross-machine compatibility -- the one thing per-process `.info`
+/// staleness checks fundamentally cannot see.
+pub async fn probe_socket_protocol(sock: &Path) -> Result<u16, String> {
+    probe_tunnel_alive(sock).await.map_err(str::to_string)
+}
+
 pub fn probe_tunnel_status(name: &str) -> TunnelStatus {
     let lock_path = connect_lock_path(name);
     if is_lock_held(&lock_path) {

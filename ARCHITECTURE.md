@@ -72,6 +72,12 @@ Each `Attach` carries an `attach_token` that the daemon minted on the previous s
 
 The tunnel supervisor -- ssh child lifecycle, app-layer probing, exponential backoff, remote-ready re-priming, and the `healthy` / `reconnecting` / `stale` status values -- has its own state machine documented separately; see [docs/tunnel-state-machine.md](docs/tunnel-state-machine.md).
 
+## Self-Healing Daemon Lifecycle
+
+The daemon's identity on disk -- its socket, pid file, and version sidecar -- can be deleted out from under it: systemd wipes `/run/user/<uid>` when the user's last login session ends, and `/tmp` gets age-based sweeps. A daemon that loses its socket is unreachable forever, invisible to every gritty command, and historically had to be found and killed by hand.
+
+Three mechanisms close that gap. First, the daemon runs a periodic socket self-check: if its socket vanished, it re-creates the directory and re-binds at the same path -- sessions survive -- and if the path cannot be reclaimed (a newer daemon already took it, or the directory cannot be recreated) it shuts down cleanly rather than linger as an orphan. Second, `gritty doctor` and `gritty refresh` reconcile the process table against on-disk registrations (Linux): daemons that are running but unregistered -- orphans from older gritty releases, which cannot self-heal -- are reported by `doctor` and reaped by `refresh` after a grace period that spares any daemon still able to recover on its own. Third, `gritty refresh <host>` finishes with an end-to-end protocol probe through the tunnel, catching the case where every process is "current" relative to its own binary but the remote binary itself is a different release -- the one form of staleness per-process checks cannot see -- and prescribing the fix (`gritty bootstrap <host>`).
+
 ## Agent & URL Forwarding
 
 ```mermaid

@@ -44,19 +44,20 @@ just quicktest                        # manual 3-pane tmux test
 
 Single-socket: all communication (control + session relay) through one Unix domain socket per server. Hello/HelloAck version handshake, then control frame declares intent, server routes accordingly.
 
-Fifteen modules behind a lib crate (`src/lib.rs` hosts shared helpers + `FORWARDED_ENV_KEYS`) with thin binary entry (`src/main.rs`):
+Sixteen modules behind a lib crate (`src/lib.rs` hosts shared helpers + `FORWARDED_ENV_KEYS`) with thin binary entry (`src/main.rs`):
 
 | Module | Responsibility |
 |--------|----------------|
 | `security` | Socket/dir creation (0700/0600), ownership validation, `SO_PEERCRED`. **All socket binding and dir creation MUST go through this module** |
 | `config` | TOML config: `[defaults]` + `[host.<name>]`. Precedence: CLI > host > defaults > built-in |
 | `protocol` | `Frame` enum, encoder/decoder, `PROTOCOL_VERSION`, `IDLE_EVICT_TIMEOUT` contract |
-| `daemon` | Accept loop on `ctl.sock`; handshake, route, hand off `Framed<UnixStream>` to session tasks |
+| `daemon` | Accept loop on `ctl.sock`; handshake, route, hand off `Framed<UnixStream>` to session tasks. Periodic socket self-check: re-binds (sessions survive) or exits cleanly if the socket dir is wiped externally |
 | `server` | Per-session: PTY, client relay, offset-indexed `History`, forwarding, file transfer, tail |
 | `connect` | Self-backgrounding SSH tunnel supervisor (implements `tunnel-create`) |
 | `net_watch` | macOS network path-change notifications (advisory; inert stub elsewhere) |
 | `alt_screen` | `AltScreenTracker`: detects alternate screen mode for smart reconnect |
 | `runinfo` | `.info` sidecars (protocol version + git hash) so `doctor`/`refresh` detect stale processes |
+| `procscan` | Process-table scan for orphaned daemons (running but unregistered); Linux only, inert stub elsewhere |
 | `scrollback` | Last-50-lines buffer replayed for fresh viewers |
 | `table` | `print_table()` for tabular output |
 | `logging` | Tracing setup, SIGUSR1 log-level cycling, SIGUSR2 log reopen |
@@ -78,6 +79,8 @@ SSH tunnel supervisor state machine: **[docs/tunnel-state-machine.md](docs/tunne
 - **Channel closed check** -- before `Frame::Ok` for Attach, check `client_tx.is_closed()` (session died between reap and lookup).
 - **`Stdio::from(OwnedFd)`** -- don't reintroduce `FromRawFd` in server.rs.
 - **Fork before tokio** -- `daemonize()` MUST fork before creating the tokio runtime. `main()` is sync (no `#[tokio::main]`).
+- **Orphans get SIGKILL, never SIGTERM** -- an orphaned daemon's SIGTERM handler runs its normal shutdown, which unlinks whatever is at its old socket path; by reap time that path may belong to a newer daemon. Same reason the daemon's own lost-socket exit path (`drain_sessions`) removes no files.
+- **Reap only after the confirm delay** -- `procscan::confirm_and_reap` must wait longer than `daemon::SOCKET_CHECK_INTERVAL` so a self-healing daemon is never killed mid-recovery.
 
 ### Changing the protocol
 - Bump `PROTOCOL_VERSION` whenever frame types, encoding, or `SessionEntry` fields change (currently v22).

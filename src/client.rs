@@ -2445,7 +2445,8 @@ pub async fn run(
                                 "reconnect: exiting -- protocol version mismatch"
                             );
                             bail_reconnect!(&format!(
-                                "protocol version mismatch (local={local} remote={server_version}) -- run `gritty restart` to upgrade"
+                                "protocol version mismatch (local={local} remote={server_version}) -- run `gritty refresh <host>` \
+                                 (if the remote runs an older gritty release, `gritty bootstrap <host>` first)"
                             ));
                         }
                         Ok(Attempt::HandshakeErr(msg)) => {
@@ -2832,7 +2833,8 @@ pub async fn tail(
                                 remote, "tail reconnect: exiting -- protocol version mismatch"
                             );
                             bail_tail!(&format!(
-                                "protocol version mismatch (local={local} remote={remote}) -- run `gritty restart` to upgrade"
+                                "protocol version mismatch (local={local} remote={remote}) -- run `gritty refresh <host>` \
+                                 (if the remote runs an older gritty release, `gritty bootstrap <host>` first)"
                             ));
                         }
                         Ok(Outcome::HandshakeRejected(msg)) => {

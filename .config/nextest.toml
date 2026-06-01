@@ -9,6 +9,13 @@ filter = 'binary(e2e_test) | binary(daemon_test)'
 test-group = 'pty-tests'
 retries = 2
 
+# Spawns real self-daemonized `gritty server` processes; same group + retry
+# policy as the other process-heavy suites.
+[[profile.default.overrides]]
+filter = 'binary(procscan_test)'
+test-group = 'pty-tests'
+retries = 2
+
 [[profile.default.overrides]]
 filter = 'binary(socat_tunnel_test) | binary(socat_bridge_test)'
 test-group = 'serial'

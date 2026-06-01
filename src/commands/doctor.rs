@@ -602,6 +602,23 @@ fn format_size(bytes: u64) -> String {
     }
 }
 
+/// Walk the process table for gritty daemons that are running but no longer
+/// registered on disk -- unreachable "orphans" invisible to `ls`/`refresh`
+/// through the socket dir. These accumulate when something external (systemd
+/// `$XDG_RUNTIME_DIR` teardown on logout, `/tmp` age sweeps) deletes the
+/// socket dir out from under a running daemon.
+fn check_orphan_daemons() -> Vec<Check> {
+    gritty::procscan::find_orphan_daemons()
+        .into_iter()
+        .map(|o| {
+            Check::fail(format!("orphaned daemon: {o}")).with_hint(
+                "run `gritty refresh` to reap it; if this host wipes $XDG_RUNTIME_DIR on \
+                 logout, `loginctl enable-linger` prevents new orphans",
+            )
+        })
+        .collect()
+}
+
 // ---- Entry point ------------------------------------------------------------
 
 pub(crate) async fn doctor(ctl_socket: Option<std::path::PathBuf>) -> anyhow::Result<()> {
@@ -628,6 +645,7 @@ pub(crate) async fn doctor(ctl_socket: Option<std::path::PathBuf>) -> anyhow::Re
     let groups: Vec<(&str, Vec<Check>)> = vec![
         ("Configuration", config_checks),
         ("Local server", server_checks),
+        ("Orphaned processes", check_orphan_daemons()),
         ("Tunnels", tunnel_checks),
         ("Clients", client_checks),
         ("Sockets", socket_checks),

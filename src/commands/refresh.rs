@@ -81,9 +81,10 @@ fn pid_file_alive(pid_path: &Path) -> bool {
         .is_some_and(|pid| unsafe { libc::kill(pid, 0) == 0 })
 }
 
-/// Refresh the local daemon if it's running stale code. Never auto-starts a
-/// daemon that wasn't already running -- refresh is about picking up a new
-/// binary, not about bringing services up.
+/// Refresh the local daemon if it's running stale code, then reap any
+/// orphaned daemons. Never auto-starts a daemon that wasn't already running
+/// -- refresh is about picking up a new binary, not about bringing services
+/// up.
 async fn refresh_local(ctl_socket: Option<PathBuf>) -> anyhow::Result<()> {
     // Snapshot the override before resolve_ctl_path consumes it, so the
     // respawn below lands on the same socket.
@@ -94,35 +95,82 @@ async fn refresh_local(ctl_socket: Option<PathBuf>) -> anyhow::Result<()> {
 
     let verdict = assess(&info_path, || pid_file_alive(&pid_path));
     eprintln!("\x1b[2m\u{25b8} local daemon: {verdict}\x1b[0m");
-    if !verdict.needs_restart() {
-        return Ok(());
+    if verdict.needs_restart() {
+        use gritty::protocol::Frame;
+        match util::server_request_any_version(&ctl_path, Frame::KillServer).await {
+            Ok(Frame::Ok) => {}
+            Ok(Frame::Error { message, .. }) => {
+                eprintln!("\x1b[2;33m\u{25b8} kill-server: {message} (continuing)\x1b[0m");
+            }
+            Ok(other) => {
+                eprintln!(
+                    "\x1b[2;33m\u{25b8} kill-server: unexpected response {other:?} (continuing)\x1b[0m"
+                );
+            }
+            Err(_) => {
+                // Can't reach the daemon (crashed? socket gone?). The PID check
+                // said it was alive, so the socket is wedged -- hit it with
+                // SIGTERM and move on. Best-effort.
+                if let Some(pid) = std::fs::read_to_string(&pid_path)
+                    .ok()
+                    .and_then(|s| s.trim().parse::<i32>().ok())
+                {
+                    unsafe { libc::kill(pid, libc::SIGTERM) };
+                }
+            }
+        }
+        util::auto_start(&util::server_auto_start_args(ctl_socket_arg.as_deref()))?;
+        eprintln!("\x1b[32m\u{25b8} local daemon restarted\x1b[0m");
     }
 
-    use gritty::protocol::Frame;
-    match util::server_request_any_version(&ctl_path, Frame::KillServer).await {
-        Ok(Frame::Ok) => {}
-        Ok(Frame::Error { message, .. }) => {
-            eprintln!("\x1b[2;33m\u{25b8} kill-server: {message} (continuing)\x1b[0m");
-        }
-        Ok(other) => {
-            eprintln!(
-                "\x1b[2;33m\u{25b8} kill-server: unexpected response {other:?} (continuing)\x1b[0m"
-            );
-        }
-        Err(_) => {
-            // Can't reach the daemon (crashed? socket gone?). The PID check
-            // said it was alive, so the socket is wedged -- hit it with
-            // SIGTERM and move on. Best-effort.
-            if let Some(pid) =
-                std::fs::read_to_string(&pid_path).ok().and_then(|s| s.trim().parse::<i32>().ok())
-            {
-                unsafe { libc::kill(pid, libc::SIGTERM) };
+    // Orphan reaping is independent of the registered daemon's verdict --
+    // orphans are by definition *not* the daemon registered in the socket
+    // dir. They are the processes users previously had to `kill` by hand.
+    reap_orphans().await;
+    Ok(())
+}
+
+/// Find and reap orphaned daemons: processes that are running but unreachable
+/// because their socket-dir registration was wiped (systemd `$XDG_RUNTIME_DIR`
+/// teardown, `/tmp` sweeps) or taken over by a newer daemon.
+///
+/// Suspects get a grace period (`procscan::CONFIRM_DELAY`) before the kill:
+/// a current-binary daemon self-heals socket loss within its check interval
+/// and must be spared. Anything still orphaned after the window genuinely
+/// cannot recover -- its sessions are unreachable no matter what -- so
+/// reaping it loses nothing.
+async fn reap_orphans() {
+    use gritty::procscan;
+
+    if !procscan::SUPPORTED {
+        return;
+    }
+    let suspects = procscan::find_orphan_daemons();
+    if suspects.is_empty() {
+        return;
+    }
+    for s in &suspects {
+        eprintln!("\x1b[33m\u{25b8} possible orphaned daemon: {s}\x1b[0m");
+    }
+    eprintln!(
+        "\x1b[2m\u{25b8} confirming ({}s grace for self-heal)...\x1b[0m",
+        procscan::CONFIRM_DELAY.as_secs()
+    );
+    let reaped = procscan::confirm_and_reap(suspects, procscan::CONFIRM_DELAY).await;
+    if reaped.is_empty() {
+        eprintln!("\x1b[32m\u{25b8} no orphans confirmed (recovered on their own)\x1b[0m");
+        return;
+    }
+    for (orphan, outcome) in reaped {
+        match outcome {
+            Ok(()) => {
+                eprintln!("\x1b[32m\u{25b8} reaped orphaned daemon pid {}\x1b[0m", orphan.pid);
+            }
+            Err(e) => {
+                eprintln!("\x1b[33m\u{25b8} could not kill orphan pid {}: {e}\x1b[0m", orphan.pid);
             }
         }
     }
-    util::auto_start(&util::server_auto_start_args(ctl_socket_arg.as_deref()))?;
-    eprintln!("\x1b[32m\u{25b8} local daemon restarted\x1b[0m");
-    Ok(())
 }
 
 /// Refresh a remote host: its tunnel supervisor and, via `gritty refresh
@@ -193,7 +241,43 @@ async fn refresh_remote(host: &str, config: &gritty::config::ConfigFile) -> anyh
         util::auto_start(&recreate)?;
         eprintln!("\x1b[32m\u{25b8} {host} supervisor restarted\x1b[0m");
     }
-    Ok(())
+
+    // Final end-to-end probe: Hello/HelloAck through the tunnel. The checks
+    // above measure each process against its *own* on-disk binary, so they
+    // all report "up to date" even when the remote binary itself is an older
+    // release than ours -- the one failure mode refresh cannot repair. Catch
+    // it here and say exactly what will fix it.
+    let local = gritty::protocol::PROTOCOL_VERSION;
+    match gritty::connect::probe_socket_protocol(&gritty::connect::tunnel_local_socket_path(host))
+        .await
+    {
+        Ok(remote) if remote == local => {
+            eprintln!("\x1b[32m\u{25b8} {host}: end-to-end protocol verified (v{remote})\x1b[0m");
+            Ok(())
+        }
+        Ok(remote) => anyhow::bail!("{}", remote_binary_outdated_msg(host, remote, local)),
+        Err(e) => {
+            // A flaky probe (slow SSH, tunnel mid-reconnect) shouldn't fail
+            // refresh -- the .info-based work above already happened.
+            eprintln!(
+                "\x1b[33m\u{25b8} {host}: could not verify protocol end to end ({e}); \
+                 try `gritty connect {host}` to test the path\x1b[0m"
+            );
+            Ok(())
+        }
+    }
+}
+
+/// The actionable error for a cross-machine protocol mismatch that `refresh`
+/// itself cannot repair: the remote *binary* is older/newer than ours, so
+/// restarting processes on either side changes nothing.
+fn remote_binary_outdated_msg(host: &str, remote: u16, local: u16) -> String {
+    format!(
+        "{host}: remote daemon speaks protocol v{remote} but local gritty speaks v{local} -- \
+         the remote gritty binary itself is a different release, which refresh cannot fix. \
+         Run `gritty bootstrap {host}` (or update gritty on the remote by hand), \
+         then `gritty refresh {host}` again"
+    )
 }
 
 /// `gritty refresh [host]` entrypoint. No host = refresh everything
@@ -301,5 +385,18 @@ mod tests {
         assert_eq!(Verdict::NotRunning.to_string(), "not running");
         assert_eq!(Verdict::Current.to_string(), "up to date");
         assert!(Verdict::Unknown.to_string().contains("predates"));
+    }
+
+    #[test]
+    fn outdated_remote_message_is_actionable() {
+        // The whole point of the end-to-end probe is to break the loop where
+        // every tool reports success while nothing works: the message must
+        // name both versions and the exact commands that fix it.
+        let msg = remote_binary_outdated_msg("devbox", 21, 22);
+        assert!(msg.contains("devbox"));
+        assert!(msg.contains("v21"));
+        assert!(msg.contains("v22"));
+        assert!(msg.contains("gritty bootstrap devbox"));
+        assert!(msg.contains("gritty refresh devbox"));
     }
 }

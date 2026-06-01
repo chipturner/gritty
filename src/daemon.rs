@@ -336,14 +336,17 @@ fn build_session_entries(
     entries
 }
 
-/// Graceful daemon shutdown. Sends `ClientConn::Shutdown` to every session so
-/// they can tell their attached/tail clients `Frame::ServerShutdown` before
-/// exiting -- a client that sees that frame exits immediately instead of
-/// spinning in its reconnect loop against a socket that will never answer
-/// (which, for a remote host behind a live tunnel, can take minutes to
-/// resolve). Waits a bounded window for all sessions to flush, then aborts
-/// any stragglers so `kill-server` stays prompt.
-async fn shutdown(sessions: &mut HashMap<u32, SessionState>, ctl_path: &Path) {
+/// Drain all sessions: send `ClientConn::Shutdown` to each so they can tell
+/// their attached/tail clients `Frame::ServerShutdown` before exiting -- a
+/// client that sees that frame exits immediately instead of spinning in its
+/// reconnect loop against a socket that will never answer (which, for a
+/// remote host behind a live tunnel, can take minutes to resolve). Waits a
+/// bounded window for all sessions to flush, then aborts any stragglers.
+///
+/// Touches no files: callers that own the on-disk registration (normal
+/// shutdown) clean up separately, and callers that have *lost* it (socket
+/// taken over by a newer daemon) must not unlink the new owner's files.
+async fn drain_sessions(sessions: &mut HashMap<u32, SessionState>) {
     // Signal first, collect handles, then await -- so sessions drain
     // concurrently under a single shared deadline rather than serially.
     let mut handles = Vec::with_capacity(sessions.len());
@@ -361,6 +364,12 @@ async fn shutdown(sessions: &mut HashMap<u32, SessionState>, ctl_path: &Path) {
             }
         }
     }
+}
+
+/// Graceful daemon shutdown: drain sessions, then remove the socket and its
+/// sidecar files (pid, `.info`, `.bindlock`).
+async fn shutdown(sessions: &mut HashMap<u32, SessionState>, ctl_path: &Path) {
+    drain_sessions(sessions).await;
     let _ = std::fs::remove_file(ctl_path);
     // The companion `.bindlock` goes with the socket (flock-guarded).
     crate::security::remove_bind_lock_if_unheld(ctl_path);
@@ -459,12 +468,152 @@ async fn connection_handshake(
     let _ = tx.send((frame, framed, negotiated, check, device_id)).await;
 }
 
+/// How often the daemon verifies its control socket still exists on disk and
+/// still belongs to it (see [`DaemonOptions::socket_check_interval`]). Cheap
+/// (one `stat` per tick), so this can be aggressive enough that the window
+/// for a client to auto-start a competing daemon after an external wipe
+/// stays small.
+///
+/// `procscan::CONFIRM_DELAY` (the orphan-reaping grace period) is derived
+/// from this; keep them in sync.
+pub const SOCKET_CHECK_INTERVAL: Duration = Duration::from_secs(5);
+
+/// Tunables for [`run_with_options`]. Production callers use
+/// [`Default::default`]; tests shrink the intervals.
+#[derive(Debug, Clone)]
+pub struct DaemonOptions {
+    /// How often to verify the control socket on disk is still ours.
+    pub socket_check_interval: Duration,
+}
+
+impl Default for DaemonOptions {
+    fn default() -> Self {
+        // `GRITTY_SOCKET_CHECK_SECS` is a test/debugging override -- the
+        // integration tests spawn the real binary and need to either speed
+        // the check up or park it out of the way.
+        let socket_check_interval = std::env::var("GRITTY_SOCKET_CHECK_SECS")
+            .ok()
+            .and_then(|s| s.parse::<u64>().ok())
+            .map(Duration::from_secs)
+            .unwrap_or(SOCKET_CHECK_INTERVAL);
+        Self { socket_check_interval }
+    }
+}
+
+/// Filesystem identity (device + inode) of the control socket we bound.
+///
+/// External cleanup -- systemd wiping `$XDG_RUNTIME_DIR` on logout, `/tmp`
+/// age-based sweeps -- can unlink the socket while the daemon runs, leaving it
+/// reachable by nobody. Comparing the on-disk identity against this snapshot
+/// is how the daemon notices.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct SocketIdentity {
+    dev: u64,
+    ino: u64,
+}
+
+impl SocketIdentity {
+    fn of(path: &Path) -> std::io::Result<Self> {
+        use std::os::unix::fs::MetadataExt;
+        let m = std::fs::metadata(path)?;
+        Ok(Self { dev: m.dev(), ino: m.ino() })
+    }
+}
+
+/// Outcome of the periodic socket self-check.
+enum SocketCheck {
+    /// The socket on disk is still ours.
+    Intact,
+    /// The socket vanished (or was replaced by a dead one) and we re-bound at
+    /// the same path. Adopt the new listener and identity.
+    Recovered { listener: tokio::net::UnixListener, identity: SocketIdentity },
+    /// The path cannot be reclaimed (live competing daemon, or unrecreatable
+    /// directory). The daemon must exit rather than linger as an orphan.
+    Lost(String),
+}
+
+/// Verify the control socket on disk is still the one we bound; if not, try
+/// to reclaim the path.
+///
+/// Reclaiming reuses [`crate::security::bind_unix_listener`], which probes an
+/// existing socket and only removes it when dead -- so a live competing daemon
+/// (a client auto-started one after the wipe, before we noticed) surfaces as
+/// an `AddrInUse` error here, i.e. `Lost`.
+fn check_socket(ctl_path: &Path, ours: SocketIdentity) -> SocketCheck {
+    match SocketIdentity::of(ctl_path) {
+        Ok(found) if found == ours => return SocketCheck::Intact,
+        Ok(_) => warn!(path = %ctl_path.display(), "control socket replaced on disk"),
+        Err(_) => warn!(path = %ctl_path.display(), "control socket missing from disk"),
+    }
+    if let Some(parent) = ctl_path.parent()
+        && let Err(e) = crate::security::secure_create_dir_all(parent)
+    {
+        return SocketCheck::Lost(format!("could not recreate socket dir: {e}"));
+    }
+    match crate::security::bind_unix_listener(ctl_path) {
+        Ok(listener) => match SocketIdentity::of(ctl_path) {
+            Ok(identity) => SocketCheck::Recovered { listener, identity },
+            Err(e) => SocketCheck::Lost(format!("re-bound socket immediately vanished: {e}")),
+        },
+        Err(e) => SocketCheck::Lost(format!("could not re-bind: {e}")),
+    }
+}
+
+/// Write the daemon's pid file (fatal on failure) and `.info` sidecar
+/// (best-effort) next to `ctl_path`. Called at startup and again after a
+/// socket re-bind, since external cleanup takes the sidecars down with the
+/// socket.
+fn write_registration(ctl_path: &Path) -> std::io::Result<()> {
+    std::fs::write(pid_file_path(ctl_path), std::process::id().to_string())?;
+    // Best-effort -- a missing `.info` just means doctor can't flag staleness,
+    // not a hard failure.
+    let _ = crate::runinfo::RunInfo::current().write(&crate::runinfo::daemon_info_path(ctl_path));
+    Ok(())
+}
+
+/// Repair the on-disk registration if it no longer names this process.
+///
+/// External cleanup can delete `daemon.pid`/`daemon.info` without touching
+/// the socket; without repair, `procscan` would classify a perfectly
+/// reachable daemon as an orphan (and `refresh` would reap it). We own the
+/// socket inode on disk -- demonstrated by the caller's `SocketCheck::Intact`
+/// -- so rewriting the registration is always safe here.
+fn ensure_registration(ctl_path: &Path) {
+    let registered: Option<u32> =
+        std::fs::read_to_string(pid_file_path(ctl_path)).ok().and_then(|s| s.trim().parse().ok());
+    if registered != Some(std::process::id()) {
+        warn!(path = %ctl_path.display(), "pid registration was missing/wrong; rewriting");
+        if let Err(e) = write_registration(ctl_path) {
+            warn!("could not rewrite pid/.info: {e}");
+        }
+    }
+}
+
+/// What the accept loop should do after one `select!` round.
+enum LoopAction {
+    Continue,
+    /// Shutdown was already performed by the arm (KillServer / signal); break.
+    Break,
+    /// Run the socket self-check (deferred out of the `select!` because
+    /// recovery needs to replace the listener the arms borrow).
+    CheckSocket,
+}
+
 /// Run the daemon, listening on its socket.
 ///
 /// If `ready_fd` is provided, a single byte is written to it after the socket
 /// is bound, then the fd is dropped. This unblocks the parent process after
 /// `daemonize()` forks.
 pub async fn run(ctl_path: &Path, ready_fd: Option<OwnedFd>) -> anyhow::Result<()> {
+    run_with_options(ctl_path, ready_fd, DaemonOptions::default()).await
+}
+
+/// [`run`] with explicit [`DaemonOptions`].
+pub async fn run_with_options(
+    ctl_path: &Path,
+    ready_fd: Option<OwnedFd>,
+    options: DaemonOptions,
+) -> anyhow::Result<()> {
     // Restrictive umask for all files/sockets created by the daemon
     unsafe {
         libc::umask(0o077);
@@ -475,7 +624,9 @@ pub async fn run(ctl_path: &Path, ready_fd: Option<OwnedFd>) -> anyhow::Result<(
         crate::security::secure_create_dir_all(parent)?;
     }
 
-    let listener = crate::security::bind_unix_listener(ctl_path)?;
+    let mut listener = crate::security::bind_unix_listener(ctl_path)?;
+    let mut socket_identity = SocketIdentity::of(ctl_path)
+        .map_err(|e| anyhow::anyhow!("could not stat just-bound control socket: {e}"))?;
     // Ephemeral identifier included in every HelloAck; a reconnecting client
     // that sees a different value knows this is a different daemon and its
     // session is gone. Nanos XOR pid is unique enough in practice.
@@ -491,12 +642,7 @@ pub async fn run(ctl_path: &Path, ready_fd: Option<OwnedFd>) -> anyhow::Result<(
     // parent has already reported success and exited; the daemon then
     // returns Err into a closed pipe and the user sees no failure. Only a
     // fully-initialized daemon should report ready.
-    let pid_path = pid_file_path(ctl_path);
-    std::fs::write(&pid_path, std::process::id().to_string())?;
-    // Record our identity so `gritty doctor` can detect a stale daemon
-    // (binary replaced on disk after we started). Best-effort -- a missing
-    // `.info` just means doctor can't flag staleness, not a hard failure.
-    let _ = crate::runinfo::RunInfo::current().write(&crate::runinfo::daemon_info_path(ctl_path));
+    write_registration(ctl_path)?;
 
     let mut sessions: HashMap<u32, SessionState> = HashMap::new();
     let mut next_id: u32 = 0;
@@ -531,10 +677,20 @@ pub async fn run(ctl_path: &Path, ready_fd: Option<OwnedFd>) -> anyhow::Result<(
     let (conn_tx, mut conn_rx) =
         mpsc::channel::<(Frame, Framed<UnixStream, FrameCodec>, u32, VersionCheck, u64)>(64);
 
+    // Periodic socket self-check (see `check_socket`). `interval_at` delays
+    // the first tick by one full period -- we just bound and registered, so an
+    // immediate check is pointless (and would race tests that deliberately
+    // perturb the registration right after startup).
+    let mut socket_check = tokio::time::interval_at(
+        tokio::time::Instant::now() + options.socket_check_interval,
+        options.socket_check_interval,
+    );
+    socket_check.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+
     loop {
         reap_sessions(&mut sessions);
 
-        let should_break = tokio::select! {
+        let action = tokio::select! {
             result = listener.accept() => {
                 match result {
                     Ok((stream, _addr)) => {
@@ -557,7 +713,7 @@ pub async fn run(ctl_path: &Path, ready_fd: Option<OwnedFd>) -> anyhow::Result<(
                         tokio::time::sleep(Duration::from_millis(100)).await;
                     }
                 }
-                false
+                LoopAction::Continue
             }
             Some((frame, mut framed, capabilities, check, device_id)) = conn_rx.recv() => {
                 // Under a version mismatch the only frame we honor is
@@ -574,43 +730,78 @@ pub async fn run(ctl_path: &Path, ready_fd: Option<OwnedFd>) -> anyhow::Result<(
                             code: ErrorCode::VersionMismatch,
                             message: format!(
                                 "protocol version mismatch: client={client_version} server={PROTOCOL_VERSION}; \
-                                 only KillServer is accepted -- run `gritty restart` to upgrade"
+                                 only KillServer is accepted -- run `gritty refresh` to upgrade"
                             ),
                         },
                     )
                     .await;
-                    false
+                    LoopAction::Continue
+                } else if dispatch_control(
+                    frame, framed, &mut sessions, &mut next_id, ctl_path, &mut last_attached,
+                    ring_buffer_cap, oauth_tunnel_idle_timeout, capabilities, device_id,
+                ).await {
+                    LoopAction::Break
                 } else {
-                    dispatch_control(
-                        frame, framed, &mut sessions, &mut next_id, ctl_path, &mut last_attached,
-                        ring_buffer_cap, oauth_tunnel_idle_timeout, capabilities, device_id,
-                    ).await
+                    LoopAction::Continue
                 }
             }
             _ = sigterm.recv() => {
                 info!("SIGTERM received, shutting down");
                 shutdown(&mut sessions, ctl_path).await;
-                true
+                LoopAction::Break
             }
             _ = sigint.recv() => {
                 info!("SIGINT received, shutting down");
                 shutdown(&mut sessions, ctl_path).await;
-                true
+                LoopAction::Break
             }
             _ = sigusr1.recv() => {
                 crate::logging::cycle_log_level();
                 info!(level = crate::logging::current_log_level_name(), "log level changed via SIGUSR1");
-                false
+                LoopAction::Continue
             }
             _ = sigusr2.recv() => {
                 crate::logging::reopen_log_file();
                 info!("log file reopened via SIGUSR2");
-                false
+                LoopAction::Continue
             }
+            _ = socket_check.tick() => LoopAction::CheckSocket,
         };
 
-        if should_break {
-            break;
+        match action {
+            LoopAction::Continue => {}
+            LoopAction::Break => break,
+            LoopAction::CheckSocket => match check_socket(ctl_path, socket_identity) {
+                SocketCheck::Intact => ensure_registration(ctl_path),
+                SocketCheck::Recovered { listener: new_listener, identity } => {
+                    warn!(
+                        path = %ctl_path.display(),
+                        sessions = sessions.len(),
+                        "control socket was removed externally; re-bound in place, sessions preserved"
+                    );
+                    listener = new_listener;
+                    socket_identity = identity;
+                    // The sidecars went down with the socket; restore them so
+                    // doctor/refresh don't classify us as an orphan.
+                    if let Err(e) = write_registration(ctl_path) {
+                        warn!("could not rewrite pid/.info after re-bind: {e}");
+                    }
+                }
+                SocketCheck::Lost(reason) => {
+                    error!(
+                        path = %ctl_path.display(),
+                        sessions = sessions.len(),
+                        "control socket lost and not recoverable ({reason}); shutting down instead of \
+                         lingering as an unreachable orphan. If this host wipes $XDG_RUNTIME_DIR on \
+                         logout, `loginctl enable-linger` prevents this."
+                    );
+                    // Drain sessions but deliberately remove NO files: the
+                    // path may now belong to a newer daemon, and unlinking it
+                    // would orphan that daemon's clients.
+                    drain_sessions(&mut sessions).await;
+                    break;
+                }
+            },
         }
     }
 

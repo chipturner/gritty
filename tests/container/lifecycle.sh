@@ -164,6 +164,82 @@ test_kill_server() {
 }
 
 # ---------------------------------------------------------------------------
+# 10. Socket self-heal -- external wipe of the socket dir; the daemon must
+#     re-bind in place (same pid, sessions preserved) instead of becoming an
+#     unreachable orphan.
+# ---------------------------------------------------------------------------
+test_socket_wipe_self_heal() {
+    reset_state
+    # Fast self-heal interval so the test doesn't wait the production default.
+    GRITTY_SOCKET_CHECK_SECS=1 gritty server >/dev/null 2>&1 || true
+    wait_for_daemon local 10 || {
+        fail "self-heal: server started" ""
+        return
+    }
+    local sock_dir pid
+    sock_dir=$(dirname "$(gritty socket-path)")
+    pid=$(cat "${sock_dir}/daemon.pid")
+
+    # External cleanup (tmpfiles/systemd-style) deletes socket + registration.
+    rm -f "${sock_dir}/ctl.sock" "${sock_dir}/daemon.pid" "${sock_dir}/daemon.info"
+
+    # The daemon should notice within ~1s and re-bind at the same path: ls
+    # works again and the registered pid is unchanged (same process).
+    if wait_for_daemon local 10 && [ "$(cat "${sock_dir}/daemon.pid" 2>/dev/null)" = "${pid}" ]; then
+        pass "self-heal: daemon re-binds after external socket wipe"
+    else
+        fail "self-heal: daemon re-binds after external socket wipe" \
+            "registered pid: $(cat "${sock_dir}/daemon.pid" 2>&1), original: ${pid}"
+    fi
+    gritty kill-server local 2>/dev/null || true
+}
+
+# ---------------------------------------------------------------------------
+# 11. Orphan detection + reaping -- a daemon that cannot self-heal (stand-in
+#     for an old-binary daemon) must be reported by doctor and reaped by
+#     refresh after the confirm window.
+# ---------------------------------------------------------------------------
+test_orphan_reaping() {
+    reset_state
+    # Park self-heal so the wiped daemon stays orphaned, like an old binary.
+    GRITTY_SOCKET_CHECK_SECS=3600 gritty server >/dev/null 2>&1 || true
+    wait_for_daemon local 10 || {
+        fail "orphan: server started" ""
+        return
+    }
+    local sock_dir orphan_pid
+    sock_dir=$(dirname "$(gritty socket-path)")
+    orphan_pid=$(cat "${sock_dir}/daemon.pid")
+    cleanup_push "kill -9 ${orphan_pid} 2>/dev/null"
+
+    # Simulate systemd wiping the runtime dir out from under the daemon.
+    rm -rf "${sock_dir}"
+
+    if ! kill -0 "${orphan_pid}" 2>/dev/null; then
+        fail "orphan: daemon still running after wipe" "daemon died unexpectedly"
+        return
+    fi
+
+    # Capture first: doctor exits 1 when it finds problems (the orphan), and
+    # pipefail would otherwise sink the grep result.
+    local doctor_out
+    doctor_out=$(gritty doctor 2>&1) || true
+    if echo "${doctor_out}" | grep -q "orphaned daemon"; then
+        pass "orphan: doctor reports orphaned daemon"
+    else
+        fail "orphan: doctor reports orphaned daemon" "$(echo "${doctor_out}" | tail -5)"
+    fi
+
+    # refresh reaps it (includes the ~7s self-heal grace window).
+    gritty refresh local 2>&1 || true
+    if ! kill -0 "${orphan_pid}" 2>/dev/null; then
+        pass "orphan: refresh reaps unrecoverable orphan"
+    else
+        fail "orphan: refresh reaps unrecoverable orphan" "pid ${orphan_pid} still alive"
+    fi
+}
+
+# ---------------------------------------------------------------------------
 # Run all tests
 # ---------------------------------------------------------------------------
 echo "=== gritty container lifecycle test ==="
@@ -178,6 +254,8 @@ test_rename
 test_kill_session
 test_info
 test_kill_server
+test_socket_wipe_self_heal
+test_orphan_reaping
 
 tmux kill-server 2>/dev/null || true
 

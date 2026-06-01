@@ -136,7 +136,9 @@ The file lives at `~/.config/gritty/config.toml` on Linux (honors `$XDG_CONFIG_H
 
 **"reconnecting..." forever** -- the SSH tunnel is down and not recovering. Check `gritty tunnels`; if a tunnel is stale, `gritty tunnel-destroy <name>` then `gritty tunnel-create <dest>` to rebuild it. `gritty doctor` reports what's wrong and where the logs are.
 
-**Protocol version mismatch after upgrade** -- after upgrading one side, run `gritty refresh` to restart whatever is running stale code (local daemon, tunnel supervisors, and remote daemons). It's idempotent and works across the mismatch without falling back to raw SSH. `gritty doctor` shows what's stale; see [USAGE.md](USAGE.md#debugging) for details.
+**Protocol version mismatch after upgrade** -- after upgrading one side, run `gritty refresh` to restart whatever is running stale code (local daemon, tunnel supervisors, and remote daemons). It's idempotent and works across the mismatch without falling back to raw SSH. For remote hosts it ends with an end-to-end protocol probe: if the remote *binary* itself is an older release, refresh says so and points at `gritty bootstrap <host>`. `gritty doctor` shows what's stale; see [USAGE.md](USAGE.md#debugging) for details.
+
+**Sessions vanished / stray `gritty server` processes on a remote host** -- systemd wipes `/run/user/<uid>` when your last login session on a host ends, deleting the socket directory out from under the daemon. Current daemons self-heal (re-bind within seconds; sessions survive) or exit cleanly when they can't. Daemons from older releases linger as unreachable orphans: `gritty doctor` reports them and `gritty refresh` reaps them. Prevent the wipe entirely with `loginctl enable-linger` on the remote. See [USAGE.md](USAGE.md#debugging).
 
 ## Design
 
