@@ -342,7 +342,11 @@ enum Command {
     Config,
     /// Check for common issues (stale processes, orphaned sockets, config errors)
     #[command(display_order = 22)]
-    Doctor,
+    Doctor {
+        /// Remove socket-dir files this gritty version doesn't recognize
+        #[arg(long)]
+        clean: bool,
+    },
     /// Generate shell completions
     #[command(display_order = 41)]
     Completions {
@@ -968,7 +972,7 @@ async fn run(cli: Cli, config: gritty::config::ConfigFile) -> anyhow::Result<()>
         }
         Command::Info => info(cli.ctl_socket).await,
         Command::Config => config_edit(),
-        Command::Doctor => doctor(cli.ctl_socket).await,
+        Command::Doctor { clean } => doctor(cli.ctl_socket, clean).await,
         Command::ProtocolVersion => {
             println!("{}", gritty::protocol::PROTOCOL_VERSION);
             Ok(())

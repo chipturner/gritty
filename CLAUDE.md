@@ -66,7 +66,7 @@ Sixteen modules behind a lib crate (`src/lib.rs` hosts shared helpers + `FORWARD
 | `client` | Raw mode, escape processor, heartbeat, auto-reconnect, forwarding relay |
 | `commands` | CLI command implementations (`session`, `util`, `doctor`, `refresh`, `transfer`) |
 
-Detailed module descriptions, key patterns (reconnect/replay, ownership, locking, forwarding, security gates), and core signatures: **[docs/internals.md](docs/internals.md)**.
+Detailed module descriptions, the on-disk state inventory (every socket/sidecar/lock file, its writer, readers, and lifecycle -- keep `doctor.rs::is_known_artifact()` in sync with it), key patterns (reconnect/replay, ownership, locking, forwarding, security gates), and core signatures: **[docs/internals.md](docs/internals.md)**.
 
 Wire format (frame codes, byte layouts, handshake/version-mismatch semantics): **[docs/wire-protocol.md](docs/wire-protocol.md)**.
 
@@ -104,7 +104,7 @@ SSH tunnel supervisor state machine: **[docs/tunnel-state-machine.md](docs/tunne
   - **USAGE.md** -- full command table, all flags, `host:session` addressing, session env vars, full config reference, escape sequences, shell completions, debugging
   - **CLAUDE.md** -- module map, build/test commands, critical invariants, doc pointers
   - **ARCHITECTURE.md** -- high-level feature descriptions, diagrams
-  - **docs/internals.md** -- detailed module descriptions, key patterns, core signatures (`server::run()`, `client::run()`, `ClientConn::Active`)
+  - **docs/internals.md** -- detailed module descriptions, on-disk state inventory (any new socket/sidecar/lock file also goes in `doctor.rs::is_known_artifact()`), key patterns, core signatures (`server::run()`, `client::run()`, `ClientConn::Active`)
   - **docs/wire-protocol.md** -- frame types, byte layouts, handshake semantics, `PROTOCOL_VERSION`
   - **docs/tunnel-state-machine.md** -- any change to `connect.rs` supervisor behavior (states, transitions, timing constants, exit-code classification, `TunnelStatus` projection, flock/client-observer contract)
 

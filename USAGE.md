@@ -26,7 +26,7 @@ Complete command and flag reference. For an overview and quick start, see [READM
 | `gritty copy` | | Copy stdin to the client clipboard (for use inside gritty sessions) |
 | `gritty info` | | Show diagnostics (paths, server status, device id, tunnels) |
 | `gritty config` | | Open config in `$VISUAL`/`$EDITOR`/vi (creates from template if missing) |
-| `gritty doctor` | | Show key paths and check for common issues (stale processes, orphaned daemons, orphaned sockets, config errors) |
+| `gritty doctor [--clean]` | | Show key paths and check for common issues (stale processes, orphaned daemons, orphaned sockets, config errors); `--clean` removes socket-dir files this version doesn't recognize |
 | `gritty server` | `s` | Start the server (backgrounds by default; `-f` for foreground) |
 | `gritty completions <shell>` | | Generate shell completions (bash, zsh, fish, elvish, powershell) |
 | `gritty socket-path` | `socket` | Print the default socket path |
@@ -231,7 +231,7 @@ laptop$ gritty completions fish > ~/.config/fish/completions/gritty.fish
 
 ## Debugging
 
-`gritty doctor` is the first stop: it prints the key paths (config file, socket dir, logs, device id) and checks for stale processes, orphaned sockets, and config errors. `gritty info` prints the same paths plus live server/tunnel status.
+`gritty doctor` is the first stop: it prints the key paths (config file, socket dir, logs, device id) and checks for stale processes, orphaned sockets, and config errors. It also flags any file in the socket dir that this gritty version doesn't recognize -- litter from a release whose artifact set differed; `gritty doctor --clean` removes such files (never directories or sockets something is actively serving). `gritty info` prints the same paths plus live server/tunnel status.
 
 **Log levels:** `-v` enables debug logging. `RUST_LOG=gritty=trace` enables the most verbose output (protocol-level frame tracing, alt-screen state machine transitions). `RUST_LOG=gritty::server=debug,gritty=info` enables debug logging for the server module only.
 

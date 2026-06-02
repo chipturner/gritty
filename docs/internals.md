@@ -25,7 +25,44 @@ Sixteen modules behind a lib crate (`src/lib.rs` hosts `collect_env_vars()`, `re
 - **`logging`** -- Tracing subscriber setup with `reload::Layer` for runtime log-level switching (SIGUSR1 cycles info/debug/trace) and `ReopenableWriter` for log-file rotation (SIGUSR2 reopens the file). `init_tracing()` configures file output (daemon mode) or stderr (foreground/client).
 - **`naming`** -- Pure-function helpers for the client-prefixed session-name rule. `resolve_session_name(user_input, client_name)` applies the three-case rule (bare `-` -> `-`; contains `/` -> literal; otherwise `<client>/<input>`). `display_session_name(wire_name, client_name)` strips the ambient prefix for `ls` / picker rendering. `sanitize_client_name(s)` enforces the validation rules (non-empty, no `/`, no whitespace/control) and falls back to `"unknown"` with a warning. Called from `main.rs::run()` for every session-addressing command and from `config.rs::default_client_name()` for the hostname fallback. No protocol surface -- the server sees opaque names, so this feature did not bump the protocol version.
 - **`client`** -- Raw mode, escape processor, idle heartbeat (Ping fires when the client has sent nothing for `heartbeat_interval` / 10s default; 60s inbound idle-timeout declares the link dead), auto-reconnect, forwarding relay. `last_activity` is tracked via `SystemTime` (see `wall_elapsed`), not `Instant`, because `Instant` is `CLOCK_MONOTONIC` on Linux and pauses during laptop suspend -- a wall-clock clock is what correctly reflects "no server frame in N seconds of real time" across a lid-close. Ping cadence keys off `last_outbound_at` (not `last_activity`) so steady inbound server output doesn't suppress probes -- the server uses client frames as liveness for its idle-evict, and inbound data doesn't prove the client can still send. `tail()` is read-only variant.
-- **`commands`** (`src/commands/`) -- CLI command implementations dispatched from `main.rs::run()`. `session.rs`: connect/tail/rename/kill/list/restart and the session picker. `util.rs`: `parse_target()` (config-aware: splits `host:session` and canonicalizes the host through `[host.*] aliases` -- the single chokepoint for every command; raw core `split_target()` only for pre-canonicalized strings), `resolve_ctl_path()`, `server_request()`/`server_request_any_version()`, auto-start, port-forward client, clipboard/URL/info/config helpers, duration formatting. `doctor.rs`: health checks (incl. orphaned-daemon report via `procscan`). `refresh.rs`: staleness assessment + selective restart, orphan reaping (`reap_orphans`), and the end-to-end protocol probe for remote hosts (`probe_socket_protocol` through the tunnel socket; a mismatch after the per-process checks pass means the remote *binary* is a different release, and refresh fails with `gritty bootstrap <host>` guidance). `transfer.rs`: `send`/`receive`.
+- **`commands`** (`src/commands/`) -- CLI command implementations dispatched from `main.rs::run()`. `session.rs`: connect/tail/rename/kill/list/restart and the session picker. `util.rs`: `parse_target()` (config-aware: splits `host:session` and canonicalizes the host through `[host.*] aliases` -- the single chokepoint for every command; raw core `split_target()` only for pre-canonicalized strings), `resolve_ctl_path()`, `server_request()`/`server_request_any_version()`, auto-start, port-forward client, clipboard/URL/info/config helpers, duration formatting. `doctor.rs`: health checks (incl. orphaned-daemon report via `procscan`, and the unknown-file scan against the on-disk state inventory below -- `--clean` removes unrecognized files). `refresh.rs`: staleness assessment + selective restart, orphan reaping (`reap_orphans`), and the end-to-end protocol probe for remote hosts (`probe_socket_protocol` through the tunnel socket; a mismatch after the per-process checks pass means the remote *binary* is a different release, and refresh fails with `gritty bootstrap <host>` guidance). `transfer.rs`: `send`/`receive`.
+
+## On-disk state inventory
+
+Everything gritty writes outside process memory. The unifying property: **none of it is durable state** -- sessions, output history, and scrollback live only in daemon memory, so every file below is disposable runtime registration. Readers treat each as untrusted and reconstructible; the whole socket dir can be wiped externally and the system self-heals (daemon re-binds and re-registers) or degrades cleanly (tunnel respawns on next connect).
+
+`doctor` audits the socket dir against this inventory and warns about anything matching no row; `gritty doctor --clean` removes such unknown files (never directories, never sockets something is actively serving). **The classifier is `is_known_artifact()` in `commands/doctor.rs` -- update it, its tests, and this table in the same commit as any new artifact.**
+
+Socket dir (`$GRITTY_SOCKET_DIR`, default `$XDG_RUNTIME_DIR/gritty/` else `/tmp/gritty-$UID/`; dir 0700, files 0600, all creation through `security`):
+
+| Artifact | Writer | Readers | Lifecycle / if deleted externally |
+|---|---|---|---|
+| `ctl.sock` | daemon | clients | Bound at startup; the 5s socket self-check re-binds if wiped (sessions survive); removed on graceful shutdown only while the daemon still owns the inode |
+| `daemon.pid` | daemon | doctor, refresh, procscan | Written at startup, repaired by every self-check (`ensure_registration`); removed on shutdown. If deleted: rewritten within 5s |
+| `daemon.info` | daemon (via `runinfo`) | doctor, refresh | Protocol version + git hash + exe of the *running* daemon; the only signal that catches a same-protocol rebuild. If deleted: rewritten within 5s |
+| `daemon.log`, `daemon.out` | daemon | user | Append-only diagnostics; SIGUSR2 reopens for external rotation (rotation suffixes are recognized). If deleted: diagnostics lost, nothing breaks |
+| `<socket>.bindlock` | `security` | `security` | flock companion serializing socket binds (TOCTOU guard); removed with its socket. A leftover with no socket is litter (doctor warns) |
+| `connect-{name}.sock` | tunnel supervisor | clients | Local end of the SSH forward. Lifecycle in [tunnel-state-machine.md](tunnel-state-machine.md) |
+| `connect-{name}.pid` | tunnel supervisor | disconnect, doctor | Written immediately on lock acquisition (before the expensive SSH steps), so even an early-failing supervisor is addressable |
+| `connect-{name}.info` | tunnel supervisor (via `runinfo`) | doctor, refresh | Staleness signal for the supervisor -- a pure byte proxy no handshake ever touches, so this file is the *only* way to see it running old code |
+| `connect-{name}.lock` | tunnel supervisor | everyone | flock = liveness probe + startup serialization + cleanup gate. Held on an inode, probed by path; `LockIdentity { dev, ino }` makes cleanup safe after external replacement |
+| `connect-{name}.dest` | tunnel supervisor | restart, auto-start, refresh | Original SSH destination, so restart works when no config alias exists |
+| `connect-{name}.ssh-opts` | tunnel supervisor | restart, refresh | Pre-merge CLI `-o` options only (config options are re-resolved on replay, else they'd double) |
+| `connect-{name}.remote-sock` | tunnel supervisor | next connect | Cache of the remote ctl socket path; deliberately survives teardown to skip the ~2s `ensure_remote_ready` SSH-exec. Invalidated on probe failure |
+| `connect-{name}.log`, `.out` | tunnel supervisor | user, doctor hints | Supervisor tracing and SSH stderr; deliberately survive teardown for post-mortems |
+| `agent-{id}.sock` | session (server.rs) | shell's `ssh` | Lazily bound while an `-A` client is attached; removed on detach/session end (see agent lazy-bind pattern below) |
+| `svc-{id}.sock` | session (server.rs) | `gritty open`/`copy`/`info` inside the session | Bound at session start, removed at session end |
+| `fwd-{host}-{id}.sock` | client | `gritty lf`/`rf` | The only client-side introspection surface; a connectable one = a live attached client on this machine |
+| `gritty-open` | session (server.rs) | shell's `$BROWSER` | Symlink to the gritty binary, recreated at every shell spawn |
+
+Outside the socket dir:
+
+| Artifact | Location | Lifecycle / if deleted |
+|---|---|---|
+| `config.toml` | `$XDG_CONFIG_HOME/gritty/` | User-authored, never written by gritty; missing or invalid falls back to built-in defaults |
+| `device_id` | `$XDG_STATE_HOME/gritty/` | Random u64, written once on first run, never updated. If deleted: regenerated, and sessions owned by the old id need an explicit (fresh) connect to adopt the new one |
+
+Liveness and staleness are deliberately encoded more than once because each signal catches a case the others structurally cannot: the `.lock` flock is the O(1) probe, `procscan` finds processes that crashed before releasing it (Linux only); `.info` catches same-protocol rebuilds, the HelloAck version catches wire mismatches, and `refresh`'s end-to-end probe catches a remote *binary* from a different release.
 
 ## Key Patterns
 
