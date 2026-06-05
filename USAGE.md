@@ -18,8 +18,8 @@ Complete command and flag reference. For an overview and quick start, see [READM
 | `gritty tunnel-create <destination>` | | Set up SSH tunnel to remote host |
 | `gritty tunnel-destroy <name>` | | Tear down an SSH tunnel |
 | `gritty bootstrap <destination>` | | Install gritty on a remote host |
-| `gritty local-forward <target> <port>` | `lf` | Forward a TCP port from session to client |
-| `gritty remote-forward <target> <port>` | `rf` | Forward a TCP port from client to session |
+| `gritty local-forward [target] <port>` | `lf` | Make a local (client-side) port reachable inside the session |
+| `gritty remote-forward [target] <port>` | `rf` | Bring a remote (session-side) port to the client |
 | `gritty send [files...]` | | Send files to a paired receiver |
 | `gritty receive [dir]` | | Receive files from a paired sender |
 | `gritty open <url>` | | Open a URL on the local machine (for use inside gritty sessions) |
@@ -122,7 +122,11 @@ laptop$ gritty receive - | tar xzf -
 
 ## Port forwarding
 
-`gritty lf <target> <port>` and `gritty rf <target> <port>` where `<target>` is a `host:session` specifier (e.g. `devbox:work`). Port spec is `PORT` (same on both ends) or `LISTEN_PORT:TARGET_PORT`.
+`gritty lf [target] <port>` and `gritty rf [target] <port>` where `<target>` is a `host:session` specifier (e.g. `devbox:work`). Port spec is `PORT` (same on both ends) or `LISTEN_PORT:TARGET_PORT` (the first number is always the new listening port, the second the existing service).
+
+The commands are named for where the *service* lives, which is the opposite of SSH's listen-side `-L`/`-R` convention: `rf` brings a **r**emote (session-side) port to the client (`gritty rf 3000`, then browse `localhost:3000` -- the common case, SSH's `-L`), and `lf` makes a **l**ocal (client-side) port reachable inside the session (`gritty lf 5432` to let the session reach local postgres -- SSH's `-R`).
+
+`<target>` may be omitted when exactly one session is attached from this machine: `gritty rf 3000` forwards to it. With zero attached sessions the command errors (forwards need an attached `gritty connect` client -- always run `lf`/`rf` on the client machine, not inside the session); with several, it lists them and asks for an explicit target.
 
 Port forwards are client-initiated -- they communicate with the client process through a local forward socket, and the client sends `PortForwardRequest` frames to the server. A compromised server cannot initiate port forwards. Ctrl-C stops the forward. All forwarding binds to `127.0.0.1` only -- there is no bind-address option (unlike SSH's `-L`/`-R`).
 

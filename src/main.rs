@@ -259,18 +259,18 @@ enum Command {
     /// Forward a port from the session to the client (listen on session, connect on client)
     #[command(display_order = 30, visible_alias = "lf")]
     LocalForward {
-        /// Target session (host[:session])
-        target: String,
+        /// Target session (host[:session]); omit to use the only attached session
+        target: Option<String>,
         /// Port spec: PORT or LISTEN_PORT:TARGET_PORT
-        port: String,
+        port: Option<String>,
     },
     /// Forward a port from the client to the session (listen on client, connect on session)
     #[command(display_order = 31, visible_alias = "rf")]
     RemoteForward {
-        /// Target session (host[:session])
-        target: String,
+        /// Target session (host[:session]); omit to use the only attached session
+        target: Option<String>,
         /// Port spec: PORT or LISTEN_PORT:TARGET_PORT
-        port: String,
+        port: Option<String>,
     },
     // -- Tunnels --
     /// Set up SSH tunnel to a remote host (backgrounds by default)
@@ -917,34 +917,10 @@ async fn run(cli: Cli, config: gritty::config::ConfigFile) -> anyhow::Result<()>
             Ok(())
         }
         Command::LocalForward { target, port } => {
-            let (listen_port, target_port) = parse_port_spec(&port)?;
-            let (host, session) = parse_target(&config, &target);
-            let client_name = config.resolve_session(Some(&host)).client_name;
-            port_forward_client_command(
-                cli.ctl_socket,
-                &host,
-                session.as_deref(),
-                &client_name,
-                0,
-                listen_port,
-                target_port,
-            )
-            .await
+            port_forward_command(&config, cli.ctl_socket, target, port, 0).await
         }
         Command::RemoteForward { target, port } => {
-            let (listen_port, target_port) = parse_port_spec(&port)?;
-            let (host, session) = parse_target(&config, &target);
-            let client_name = config.resolve_session(Some(&host)).client_name;
-            port_forward_client_command(
-                cli.ctl_socket,
-                &host,
-                session.as_deref(),
-                &client_name,
-                1,
-                listen_port,
-                target_port,
-            )
-            .await
+            port_forward_command(&config, cli.ctl_socket, target, port, 1).await
         }
         Command::Bootstrap { destination, install_dir, ssh_options } => {
             // Canonicalize so a `[host.FOO]` section (ssh-options etc.)

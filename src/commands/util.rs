@@ -325,30 +325,225 @@ pub(crate) async fn resolve_session_id(ctl_path: &Path, target: &str) -> anyhow:
         .ok_or_else(|| anyhow::anyhow!("no such session: {target}"))
 }
 
-/// Run a port forward command via the client-side forward socket.
-/// Resolves the session name to its numeric id via the daemon, then connects
-/// to fwd-{host}-{id}.sock, sends the request, and blocks.
-pub(crate) async fn port_forward_client_command(
+/// The one usage line for `lf`/`rf` errors -- single authoring point so the
+/// zero-arg and bad-port-spec paths cannot drift apart.
+fn forward_usage(alias: &str) -> String {
+    format!("usage: gritty {alias} [host[:session]] <PORT|LISTEN:TARGET>")
+}
+
+/// Split the `lf`/`rf` positionals: with both args, `(Some(target), port)`;
+/// with one arg it is the port spec and the target is discovered.
+pub(crate) fn forward_args(
+    alias: &str,
+    target: Option<String>,
+    port: Option<String>,
+) -> anyhow::Result<(Option<String>, String)> {
+    match (target, port) {
+        (Some(t), Some(p)) => Ok((Some(t), p)),
+        (Some(p), None) => Ok((None, p)),
+        _ => anyhow::bail!("{}", forward_usage(alias)),
+    }
+}
+
+/// Appended to "no client attached" errors when running inside a gritty
+/// session, where these commands can never work: the forward socket lives on
+/// the machine running `gritty connect`.
+pub(crate) fn in_session_hint(in_session: bool) -> &'static str {
+    if in_session {
+        "\nhint: you're inside a gritty session -- run port forwards from the machine running `gritty connect`, not from inside the session"
+    } else {
+        ""
+    }
+}
+
+fn inside_session() -> bool {
+    std::env::var_os("GRITTY_SESSION").is_some()
+}
+
+/// Hint for listen-port collisions: teach the LISTEN:TARGET form. Keyed on
+/// the fwd-socket error strings authored in `client.rs` (plus a generic
+/// "in use" so messages from other binary versions still match).
+pub(crate) fn busy_port_hint(msg: &str, listen_port: u16, target_port: u16) -> Option<String> {
+    let bind_failure = msg.contains(gritty::client::FWD_ERR_SERVER_BIND)
+        || msg.contains(gritty::client::FWD_ERR_BIND_PREFIX)
+        || msg.to_ascii_lowercase().contains("in use");
+    if !bind_failure {
+        return None;
+    }
+    let alt = if listen_port == u16::MAX { listen_port - 1 } else { listen_port + 1 };
+    Some(format!(
+        "\nhint: the listen port may be busy -- pick a free one with LISTEN:TARGET, e.g. `{alt}:{target_port}`"
+    ))
+}
+
+/// A live forward socket in the socket dir: an attached `gritty connect`
+/// client on this machine that can carry a port forward.
+pub(crate) struct ForwardCandidate {
+    pub(crate) path: PathBuf,
+    pub(crate) host: String,
+    pub(crate) session_id: u32,
+}
+
+/// Fallback display when the daemon cannot be asked for the session name.
+fn candidate_fallback_label(c: &ForwardCandidate) -> String {
+    format!("{} (session #{})", c.host, c.session_id)
+}
+
+/// Best-effort typeable label for a candidate: `host:session-name` (own
+/// client prefix elided, so it round-trips as a CLI target) when the daemon
+/// answers, else the untypeable-but-informative `host (session #id)`.
+async fn forward_candidate_label(
+    config: &gritty::config::ConfigFile,
+    c: &ForwardCandidate,
+) -> String {
+    use gritty::protocol::Frame;
+
+    let Ok(ctl_path) = resolve_ctl_path(None, Some(&c.host)) else {
+        return candidate_fallback_label(c);
+    };
+    let Ok(Frame::SessionInfo { sessions }) = server_request(&ctl_path, Frame::ListSessions).await
+    else {
+        return candidate_fallback_label(c);
+    };
+    let Some(entry) = sessions.iter().find(|e| e.id == c.session_id) else {
+        return candidate_fallback_label(c);
+    };
+    let client_name = config.resolve_session(Some(&c.host)).client_name;
+    format!("{}:{}", c.host, gritty::naming::display_session_name(&entry.name, &client_name))
+}
+
+/// List the live forward sockets in `dir`, sorted by path. Liveness is probed
+/// by connecting (the attached client treats connect-then-EOF as a no-op);
+/// stale sockets left by crashed clients are skipped.
+pub(crate) fn live_forward_sockets(dir: &Path) -> Vec<ForwardCandidate> {
+    let mut live = Vec::new();
+    if let Ok(entries) = std::fs::read_dir(dir) {
+        for entry in entries.flatten() {
+            let name = entry.file_name();
+            let Some((host, session_id)) =
+                name.to_str().and_then(gritty::client::parse_forward_socket_name)
+            else {
+                continue;
+            };
+            let path = entry.path();
+            if std::os::unix::net::UnixStream::connect(&path).is_err() {
+                continue; // stale socket from a crashed client
+            }
+            live.push(ForwardCandidate { host: host.to_string(), session_id, path });
+        }
+    }
+    live.sort_by(|a, b| a.path.cmp(&b.path));
+    live
+}
+
+/// A digit-shaped connection name collides with the one-arg port form
+/// (`gritty rf 3000` where `3000` is a tunnel). Error rather than guess when
+/// the lone arg also names a known tunnel or host alias.
+fn ambiguous_host_guard(
+    config: &gritty::config::ConfigFile,
+    socket_dir: &Path,
+    arg: &str,
+    alias: &str,
+) -> anyhow::Result<()> {
+    let is_alias = config.canonical_host(arg) != arg;
+    let is_tunnel = socket_dir.join(format!("connect-{arg}.sock")).exists();
+    if is_alias || is_tunnel {
+        anyhow::bail!(
+            "'{arg}' is also a connection name -- pass an explicit port: gritty {alias} {arg} <port>"
+        );
+    }
+    Ok(())
+}
+
+/// Implements `gritty lf`/`rf`. With a target, resolves the session name to
+/// its numeric id via the daemon; without one, discovers the single attached
+/// session by its forward socket. Then connects to fwd-{host}-{id}.sock,
+/// sends the request, and blocks.
+pub(crate) async fn port_forward_command(
+    config: &gritty::config::ConfigFile,
     ctl_socket: Option<PathBuf>,
-    host: &str,
-    session: Option<&str>,
-    client_name: &str,
+    target: Option<String>,
+    port: Option<String>,
+    direction: u8,
+) -> anyhow::Result<()> {
+    let alias = if direction == 0 { "lf" } else { "rf" };
+    let (target, port) = forward_args(alias, target, port)?;
+    let (listen_port, target_port) =
+        parse_port_spec(&port).map_err(|e| anyhow::anyhow!("{e} ({})", forward_usage(alias)))?;
+
+    let (fwd_path, label) = match target {
+        Some(t) => {
+            let (host, session) = parse_target(config, &t);
+            let client_name = config.resolve_session(Some(&host)).client_name;
+            let session = gritty::naming::resolve_session_name(
+                session.as_deref().unwrap_or("0"),
+                &client_name,
+            );
+            let ctl_path = resolve_ctl_path(ctl_socket, Some(&host))?;
+            let session_id = resolve_session_id(&ctl_path, &session).await?;
+            let display = gritty::naming::display_session_name(&session, &client_name);
+            (
+                gritty::client::forward_socket_path(&ctl_path, session_id),
+                format!("{host}:{display}"),
+            )
+        }
+        None => {
+            let dir = match &ctl_socket {
+                Some(p) => p
+                    .parent()
+                    .filter(|d| !d.as_os_str().is_empty())
+                    .unwrap_or(Path::new("."))
+                    .to_path_buf(),
+                None => gritty::daemon::socket_dir(),
+            };
+            ambiguous_host_guard(config, &dir, &port, alias)?;
+            let mut live = live_forward_sockets(&dir);
+            match live.len() {
+                1 => {
+                    let c = live.swap_remove(0);
+                    let label = forward_candidate_label(config, &c).await;
+                    (c.path, label)
+                }
+                0 => anyhow::bail!(
+                    "no attached session found (port forwards need an attached `gritty connect` client){}",
+                    in_session_hint(inside_session())
+                ),
+                _ => {
+                    let mut labels = Vec::with_capacity(live.len());
+                    for c in &live {
+                        labels.push(forward_candidate_label(config, c).await);
+                    }
+                    // Example must be typeable; fall back to a placeholder if
+                    // the first label is an id-only form.
+                    let example = labels.iter().find(|l| l.contains(':')).map(String::as_str);
+                    anyhow::bail!(
+                        "multiple attached sessions: {} -- specify a target, e.g. `gritty {alias} {} {port}`",
+                        labels.join(", "),
+                        example.unwrap_or("<host:session>")
+                    )
+                }
+            }
+        }
+    };
+    run_forward(&fwd_path, &label, direction, listen_port, target_port).await
+}
+
+/// Send the forward request over an attached client's forward socket and
+/// block until Ctrl-C or teardown.
+async fn run_forward(
+    fwd_path: &Path,
+    label: &str,
     direction: u8,
     listen_port: u16,
     target_port: u16,
 ) -> anyhow::Result<()> {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
-    let session = gritty::naming::resolve_session_name(session.unwrap_or("0"), client_name);
-    let ctl_path = resolve_ctl_path(ctl_socket, Some(host))?;
-    let session_id = resolve_session_id(&ctl_path, &session).await?;
-
-    let fwd_path = gritty::client::forward_socket_path(&ctl_path, session_id);
-
-    let mut stream = tokio::net::UnixStream::connect(&fwd_path).await.map_err(|_| {
+    let mut stream = tokio::net::UnixStream::connect(fwd_path).await.map_err(|_| {
         anyhow::anyhow!(
-            "no client attached to {host}:{session} (could not connect to {})",
-            fwd_path.display()
+            "no client attached to {label} (could not connect to {}){}",
+            fwd_path.display(),
+            in_session_hint(inside_session())
         )
     })?;
 
@@ -366,7 +561,8 @@ pub(crate) async fn port_forward_client_command(
         let mut msg = Vec::new();
         stream.read_to_end(&mut msg).await?;
         let msg = String::from_utf8_lossy(&msg);
-        anyhow::bail!("{msg}");
+        let hint = busy_port_hint(&msg, listen_port, target_port).unwrap_or_default();
+        anyhow::bail!("{msg}{hint}");
     }
     if resp[0] != 0x01 {
         anyhow::bail!("unexpected response: 0x{:02x}", resp[0]);
@@ -378,7 +574,7 @@ pub(crate) async fn port_forward_client_command(
     } else {
         format!("{listen_port}:{target_port}")
     };
-    eprintln!("\x1b[32m\u{25b8} {dir_str}-forward {port_str} active\x1b[0m");
+    eprintln!("\x1b[32m\u{25b8} {dir_str}-forward {port_str} active ({label})\x1b[0m");
 
     // Block until SIGINT or stream EOF (teardown on disconnect)
     let mut sigint = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::interrupt())?;
@@ -862,6 +1058,135 @@ mod tests {
         assert!(parse_port_spec("abc").is_err());
         assert!(parse_port_spec("80:xyz").is_err());
         assert!(parse_port_spec("99999").is_err());
+    }
+
+    #[test]
+    fn forward_args_both() {
+        let (target, port) =
+            forward_args("lf", Some("devbox:work".into()), Some("8080".into())).unwrap();
+        assert_eq!(target.as_deref(), Some("devbox:work"));
+        assert_eq!(port, "8080");
+    }
+
+    #[test]
+    fn forward_args_single_is_port() {
+        let (target, port) = forward_args("lf", Some("8080".into()), None).unwrap();
+        assert_eq!(target, None);
+        assert_eq!(port, "8080");
+    }
+
+    #[test]
+    fn forward_args_none_errors_with_usage() {
+        let err = forward_args("rf", None, None).unwrap_err().to_string();
+        assert!(err.contains("usage: gritty rf"), "got: {err}");
+    }
+
+    #[test]
+    fn in_session_hint_only_inside() {
+        assert!(in_session_hint(false).is_empty());
+        assert!(in_session_hint(true).contains("inside a gritty session"));
+    }
+
+    #[test]
+    fn busy_port_hint_matches_both_producer_strings() {
+        // rf path: client-side bind embeds the OS error.
+        let rf =
+            format!("{}Address already in use (os error 48)", gritty::client::FWD_ERR_BIND_PREFIX);
+        let hint = busy_port_hint(&rf, 8080, 3000).unwrap();
+        assert!(hint.contains("8081:3000"), "got: {hint}");
+        // lf path: the server relays no OS error text, only the fixed string.
+        let hint = busy_port_hint(gritty::client::FWD_ERR_SERVER_BIND, 5432, 5432).unwrap();
+        assert!(hint.contains("5433:5432"), "got: {hint}");
+        assert!(busy_port_hint("connection refused", 8080, 3000).is_none());
+    }
+
+    #[test]
+    fn busy_port_hint_at_port_max_suggests_lower() {
+        let hint = busy_port_hint("Address already in use", u16::MAX, 80).unwrap();
+        assert!(hint.contains("65534:80"), "got: {hint}");
+    }
+
+    #[test]
+    fn parse_forward_socket_name_roundtrip() {
+        let p = gritty::client::forward_socket_path(Path::new("/run/g/connect-my-devbox.sock"), 12);
+        let name = p.file_name().unwrap().to_str().unwrap();
+        assert_eq!(gritty::client::parse_forward_socket_name(name), Some(("my-devbox", 12)));
+        assert_eq!(
+            gritty::client::parse_forward_socket_name("fwd-devbox-3.sock"),
+            Some(("devbox", 3))
+        );
+        assert_eq!(gritty::client::parse_forward_socket_name("fwd-devbox-x.sock"), None);
+        assert_eq!(gritty::client::parse_forward_socket_name("ctl.sock"), None);
+    }
+
+    #[test]
+    fn live_forward_sockets_single_live() {
+        let dir = tempfile::tempdir().unwrap();
+        let _live =
+            std::os::unix::net::UnixListener::bind(dir.path().join("fwd-devbox-3.sock")).unwrap();
+        let live = live_forward_sockets(dir.path());
+        assert_eq!(live.len(), 1);
+        assert_eq!(live[0].host, "devbox");
+        assert_eq!(live[0].session_id, 3);
+        assert!(live[0].path.ends_with("fwd-devbox-3.sock"));
+        assert_eq!(candidate_fallback_label(&live[0]), "devbox (session #3)");
+    }
+
+    #[test]
+    fn live_forward_sockets_hyphenated_host() {
+        let dir = tempfile::tempdir().unwrap();
+        let _live =
+            std::os::unix::net::UnixListener::bind(dir.path().join("fwd-my-devbox-12.sock"))
+                .unwrap();
+        let live = live_forward_sockets(dir.path());
+        assert_eq!(live.len(), 1);
+        assert_eq!(live[0].host, "my-devbox");
+        assert_eq!(live[0].session_id, 12);
+    }
+
+    #[test]
+    fn live_forward_sockets_skips_stale_and_other_sockets() {
+        let dir = tempfile::tempdir().unwrap();
+        // A crashed client leaves the socket file behind with no listener.
+        drop(std::os::unix::net::UnixListener::bind(dir.path().join("fwd-dead-1.sock")).unwrap());
+        let _ctl = std::os::unix::net::UnixListener::bind(dir.path().join("ctl.sock")).unwrap();
+        let _live =
+            std::os::unix::net::UnixListener::bind(dir.path().join("fwd-devbox-2.sock")).unwrap();
+        let live = live_forward_sockets(dir.path());
+        assert_eq!(live.len(), 1);
+        assert_eq!(live[0].host, "devbox");
+    }
+
+    #[test]
+    fn live_forward_sockets_empty_and_multiple() {
+        let dir = tempfile::tempdir().unwrap();
+        assert!(live_forward_sockets(dir.path()).is_empty());
+        let _a =
+            std::os::unix::net::UnixListener::bind(dir.path().join("fwd-devbox-2.sock")).unwrap();
+        let _b =
+            std::os::unix::net::UnixListener::bind(dir.path().join("fwd-fate-7.sock")).unwrap();
+        let live = live_forward_sockets(dir.path());
+        assert_eq!(live.len(), 2);
+        // Sorted by path for stable listings.
+        assert_eq!(live[0].host, "devbox");
+        assert_eq!(live[1].host, "fate");
+    }
+
+    #[test]
+    fn ambiguous_host_guard_flags_alias_and_tunnel() {
+        let dir = tempfile::tempdir().unwrap();
+        // Alias collision: `foo.bar.com` canonicalizes to `foo`.
+        let err = ambiguous_host_guard(&foo_alias(), dir.path(), "foo.bar.com", "lf")
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("also a connection name"), "got: {err}");
+        // Tunnel collision: a connect-3000.sock exists.
+        std::fs::write(dir.path().join("connect-3000.sock"), b"").unwrap();
+        let err =
+            ambiguous_host_guard(&no_aliases(), dir.path(), "3000", "rf").unwrap_err().to_string();
+        assert!(err.contains("gritty rf 3000 <port>"), "got: {err}");
+        // No collision: plain port passes.
+        assert!(ambiguous_host_guard(&no_aliases(), dir.path(), "8080", "lf").is_ok());
     }
 
     #[test]

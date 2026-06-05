@@ -55,6 +55,21 @@ pub fn forward_socket_path(ctl_path: &Path, session_id: u32) -> PathBuf {
     dir.join(format!("fwd-{host}-{session_id}.sock"))
 }
 
+/// Parse a `fwd-{host}-{id}.sock` file name (the format written by
+/// [`forward_socket_path`]). The host part may itself contain `-` (and `.`);
+/// the session id is everything after the last hyphen.
+pub fn parse_forward_socket_name(file_name: &str) -> Option<(&str, u32)> {
+    let stem = file_name.strip_prefix("fwd-")?.strip_suffix(".sock")?;
+    let (host, id) = stem.rsplit_once('-')?;
+    Some((host, id.parse().ok()?))
+}
+
+/// Error strings written to the forward socket when a forward fails. The CLI
+/// matches on these to attach guidance (`busy_port_hint` in commands::util),
+/// so reword them only together with that matcher.
+pub const FWD_ERR_SERVER_BIND: &str = "server bind failed";
+pub const FWD_ERR_BIND_PREFIX: &str = "bind failed: ";
+
 /// Outcome from a client relay loop iteration.
 enum RelayExit {
     /// Shell or server reported an exit code (or detach/signal).
@@ -1277,7 +1292,7 @@ impl ClientRelay<'_> {
                     use tokio::io::AsyncWriteExt;
                     warn!(forward_id, "local-forward: server bind failed");
                     let _ = fwd_stream.write_all(&[0x02]).await;
-                    let _ = fwd_stream.write_all(b"server bind failed").await;
+                    let _ = fwd_stream.write_all(FWD_ERR_SERVER_BIND.as_bytes()).await;
                 }
                 if let Some(fwd) = self.pf.forwards.remove(&forward_id) {
                     if let Some(h) = fwd.listener_handle {
@@ -1510,7 +1525,8 @@ impl ClientRelay<'_> {
                 Err(e) => {
                     warn!(listen_port, "remote-forward: bind failed: {e}");
                     let _ = fwd_stream.write_all(&[0x02]).await;
-                    let _ = fwd_stream.write_all(format!("bind failed: {e}").as_bytes()).await;
+                    let _ =
+                        fwd_stream.write_all(format!("{FWD_ERR_BIND_PREFIX}{e}").as_bytes()).await;
                     return;
                 }
             }

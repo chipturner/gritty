@@ -488,11 +488,7 @@ fn check_clients(socket_dir: &Path) -> Vec<Check> {
         .filter_map(|e| e.ok())
         .filter_map(|e| {
             let name = e.file_name().to_string_lossy().to_string();
-            let stem = name.strip_prefix("fwd-")?.strip_suffix(".sock")?;
-            // The host part may contain `-` (and `.`); the session id is
-            // everything after the last hyphen.
-            let (host, id) = stem.rsplit_once('-')?;
-            let id: u32 = id.parse().ok()?;
+            let (host, id) = gritty::client::parse_forward_socket_name(&name)?;
             std::os::unix::net::UnixStream::connect(e.path())
                 .is_ok()
                 .then(|| (host.to_string(), id))
