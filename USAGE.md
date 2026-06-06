@@ -238,7 +238,7 @@ laptop$ gritty completions fish > ~/.config/fish/completions/gritty.fish
 
 `gritty doctor` is the first stop: it prints the key paths (config file, socket dir, logs, device id) and checks for stale processes, orphaned sockets, and config errors. It also flags any file in the socket dir that this gritty version doesn't recognize -- litter from a release whose artifact set differed; `gritty doctor --clean` removes such files (never directories or sockets something is actively serving). `gritty info` prints the same paths plus live server/tunnel status.
 
-**Log levels:** `-v` enables debug logging. `RUST_LOG=gritty=trace` enables the most verbose output (protocol-level frame tracing, alt-screen state machine transitions). `RUST_LOG=gritty::server=debug,gritty=info` enables debug logging for the server module only.
+**Log levels:** log files (daemon, tunnel) default to `info`; client commands logging to the terminal default to `warn` so routine telemetry stays out of interactive output (`server -f` and `tunnel-create -f` keep `info` on stderr -- foreground is a diagnostic mode). `-v` enables debug logging. `RUST_LOG=gritty=trace` enables the most verbose output (protocol-level frame tracing, alt-screen state machine transitions). `RUST_LOG=gritty::server=debug,gritty=info` enables debug logging for the server module only.
 
 **Runtime log-level adjustment:** Send SIGUSR1 to the daemon to cycle through log levels (info -> debug -> trace -> info) without restarting and losing sessions:
 

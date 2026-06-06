@@ -117,25 +117,45 @@ fn open_log_file(path: &Path) -> Option<std::fs::File> {
     std::fs::OpenOptions::new().create(true).append(true).mode(0o600).open(path).ok()
 }
 
+/// Pick the default filter spec. `None` means "defer to RUST_LOG".
+///
+/// Log files keep `info` -- they are forensics, and entries like the
+/// invocation audit line are cheap there. On stderr the caller chooses
+/// `stderr_default`: interactive client commands pass `gritty=warn` so
+/// routine telemetry stays out of the terminal, while `server -f` /
+/// `tunnel-create -f` pass `gritty=info` because foreground mode exists
+/// to watch the process.
+fn choose_filter_spec(
+    rust_log_set: bool,
+    verbose: bool,
+    to_file: bool,
+    stderr_default: &'static str,
+) -> Option<&'static str> {
+    if rust_log_set {
+        return None; // RUST_LOG takes priority, no cycling
+    }
+    if verbose {
+        return Some("gritty=debug");
+    }
+    Some(if to_file { "gritty=info" } else { stderr_default })
+}
+
 /// Initialize the tracing subscriber.
 ///
 /// When `log_path` is `Some`, logs to a file with reload support (SIGUSR1
-/// cycles the level, SIGUSR2 reopens the file). Otherwise logs to stderr.
-pub fn init_tracing(verbose: bool, log_path: Option<&Path>) {
+/// cycles the level, SIGUSR2 reopens the file). Otherwise logs to stderr
+/// with `stderr_default` as the filter (see `choose_filter_spec`).
+pub fn init_tracing(verbose: bool, log_path: Option<&Path>, stderr_default: &'static str) {
     use tracing_subscriber::EnvFilter;
     use tracing_subscriber::layer::SubscriberExt;
     use tracing_subscriber::util::SubscriberInitExt;
 
     let rust_log_set = std::env::var("RUST_LOG").is_ok();
     RUST_LOG_ACTIVE.store(rust_log_set, Ordering::Relaxed);
-    let filter_spec = if rust_log_set {
-        None // RUST_LOG takes priority, no cycling
-    } else if verbose {
+    if !rust_log_set && verbose {
         LOG_LEVEL_INDEX.store(1, Ordering::Relaxed);
-        Some("gritty=debug")
-    } else {
-        Some("gritty=info")
-    };
+    }
+    let filter_spec = choose_filter_spec(rust_log_set, verbose, log_path.is_some(), stderr_default);
 
     let filter = match filter_spec {
         Some(spec) => EnvFilter::new(spec),
@@ -187,6 +207,29 @@ pub fn init_tracing(verbose: bool, log_path: Option<&Path>) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn rust_log_overrides_everything() {
+        assert_eq!(choose_filter_spec(true, true, true, "gritty=warn"), None);
+        assert_eq!(choose_filter_spec(true, false, false, "gritty=warn"), None);
+    }
+
+    #[test]
+    fn verbose_beats_defaults() {
+        assert_eq!(choose_filter_spec(false, true, true, "gritty=warn"), Some("gritty=debug"));
+        assert_eq!(choose_filter_spec(false, true, false, "gritty=warn"), Some("gritty=debug"));
+    }
+
+    #[test]
+    fn file_logging_defaults_to_info_regardless_of_stderr_default() {
+        assert_eq!(choose_filter_spec(false, false, true, "gritty=warn"), Some("gritty=info"));
+    }
+
+    #[test]
+    fn stderr_uses_caller_default() {
+        assert_eq!(choose_filter_spec(false, false, false, "gritty=warn"), Some("gritty=warn"));
+        assert_eq!(choose_filter_spec(false, false, false, "gritty=info"), Some("gritty=info"));
+    }
 
     #[test]
     fn local_timestamp_has_rfc3339_shape_and_offset() {

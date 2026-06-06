@@ -394,9 +394,12 @@ enum Command {
     ProtocolVersion,
 }
 
-fn init_tracing(verbose: bool, log_path: Option<&Path>) {
-    gritty::logging::init_tracing(verbose, log_path);
+fn init_tracing(verbose: bool, log_path: Option<&Path>, stderr_default: &'static str) {
+    gritty::logging::init_tracing(verbose, log_path, stderr_default);
     let argv: Vec<String> = std::env::args().collect();
+    // Audit line for log files (which command/pid started this process, which
+    // client invocations attached over a tunnel). Filtered out on an
+    // interactive terminal by the client's `gritty=warn` stderr default.
     tracing::info!(cmd = %argv.join(" "), pid = std::process::id(), "gritty invoked");
 }
 
@@ -619,8 +622,13 @@ fn main() {
                 }
             };
 
-            // Init tracing AFTER fork: file in daemon mode, stderr in foreground
-            init_tracing(verbose, if ready_fd.is_some() { Some(&log_path) } else { None });
+            // Init tracing AFTER fork: file in daemon mode, stderr in foreground.
+            // Foreground is a diagnostic mode -- keep info on stderr.
+            init_tracing(
+                verbose,
+                if ready_fd.is_some() { Some(&log_path) } else { None },
+                "gritty=info",
+            );
 
             let rt = match tokio::runtime::Runtime::new() {
                 Ok(rt) => rt,
@@ -719,7 +727,12 @@ fn main() {
             // In the parent process, daemonize() exits via std::process::exit.
             // If we're here, we're either the child or running in foreground.
 
-            init_tracing(verbose, if ready_fd.is_some() { Some(&log_path) } else { None });
+            // Foreground is a diagnostic mode -- keep info on stderr.
+            init_tracing(
+                verbose,
+                if ready_fd.is_some() { Some(&log_path) } else { None },
+                "gritty=info",
+            );
 
             let rt = match tokio::runtime::Runtime::new() {
                 Ok(rt) => rt,
@@ -753,7 +766,9 @@ fn main() {
         }
         _ => {
             let log_path = client_log_path(&config, &cli.command, cli.ctl_socket.is_some());
-            init_tracing(verbose, log_path.as_deref());
+            // Client commands log telemetry, not UI: keep stderr quiet (warn)
+            // so e.g. `gritty ls` doesn't print its own invocation audit line.
+            init_tracing(verbose, log_path.as_deref(), "gritty=warn");
             let rt = match tokio::runtime::Runtime::new() {
                 Ok(rt) => rt,
                 Err(e) => {
