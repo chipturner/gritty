@@ -1103,6 +1103,114 @@ pub(crate) async fn kill_sessions(
     Ok(())
 }
 
+/// Select prune victims. Attached sessions are never selected -- prune exists
+/// to reap sessions nobody is using, and a rebooted client by definition has
+/// nothing attached. Otherwise every present filter must pass:
+///
+/// - `clients`: the session's creator namespace (the wire-name prefix before
+///   `/`) must equal one of the given names. Legacy unprefixed names have no
+///   namespace and match no client.
+/// - `idle_secs`: at least this long since the last terminal activity.
+///   `last_activity == 0` (an older server that doesn't track it) never
+///   matches -- unknown is not the same as idle.
+/// - `all`: select every detached session (the caller guarantees `all` is
+///   mutually exclusive with the filters).
+fn prune_selection<'a>(
+    sessions: &'a [gritty::protocol::SessionEntry],
+    now: u64,
+    clients: &[String],
+    idle_secs: Option<u64>,
+    all: bool,
+) -> Vec<&'a gritty::protocol::SessionEntry> {
+    sessions
+        .iter()
+        .filter(|s| !s.attached)
+        .filter(|s| {
+            if all {
+                return true;
+            }
+            if !clients.is_empty() {
+                let namespace = s.name.split_once('/').map(|(ns, _)| ns);
+                if !namespace.is_some_and(|ns| clients.iter().any(|c| c == ns)) {
+                    return false;
+                }
+            }
+            if let Some(min) = idle_secs
+                && (s.last_activity == 0 || now.saturating_sub(s.last_activity) < min)
+            {
+                return false;
+            }
+            true
+        })
+        .collect()
+}
+
+/// Bulk-kill stale detached sessions. Dry-run by default: prints the
+/// selection in the `ls` table format and stops; only `-y` kills. Victims are
+/// killed by raw session ID, not name -- these are enumerated entries, not
+/// typed input, so the namespace resolution in [`kill_one`] would mangle
+/// foreign-client names (`oldlaptop/0` -> `thislaptop/oldlaptop/0`).
+pub(crate) async fn prune_sessions(
+    ctl_path: PathBuf,
+    client_name: &str,
+    clients: &[String],
+    idle: Option<&str>,
+    all: bool,
+    yes: bool,
+) -> anyhow::Result<()> {
+    use gritty::protocol::Frame;
+
+    let idle_secs = idle.map(super::util::parse_duration).transpose()?;
+
+    let resp = server_request(&ctl_path, Frame::ListSessions).await?;
+    let Frame::SessionInfo { sessions } = resp else {
+        anyhow::bail!("unexpected response from server: {resp:?}");
+    };
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+
+    let victims: Vec<gritty::protocol::SessionEntry> =
+        prune_selection(&sessions, now, clients, idle_secs, all).into_iter().cloned().collect();
+    if victims.is_empty() {
+        println!("nothing to prune");
+        return Ok(());
+    }
+
+    print_session_table(&victims, now, client_name, "");
+    if !yes {
+        eprintln!("\x1b[2m\u{25b8} dry run -- pass -y to kill {} session(s)\x1b[0m", victims.len());
+        return Ok(());
+    }
+
+    let mut failed = 0usize;
+    for s in &victims {
+        let display = gritty::naming::display_session_name(&s.name, client_name);
+        match server_request(&ctl_path, Frame::KillSession { session: s.id.to_string() }).await {
+            Ok(Frame::Ok) => {
+                eprintln!("\x1b[32m\u{25b8} session {display} killed\x1b[0m");
+            }
+            Ok(Frame::Error { message, .. }) => {
+                eprintln!("error: {display}: {message}");
+                failed += 1;
+            }
+            Ok(other) => {
+                eprintln!("error: {display}: unexpected response from server: {other:?}");
+                failed += 1;
+            }
+            Err(e) => {
+                eprintln!("error: {display}: {e:#}");
+                failed += 1;
+            }
+        }
+    }
+    if failed > 0 {
+        anyhow::bail!("failed to kill {failed} of {} session(s)", victims.len());
+    }
+    Ok(())
+}
+
 pub(crate) async fn kill_server(ctl_path: PathBuf) -> anyhow::Result<()> {
     use gritty::protocol::Frame;
 
@@ -1615,6 +1723,98 @@ mod tests {
         e.name = name.to_string();
         e.attached = attached;
         e
+    }
+
+    // -- prune_selection (prune filter logic) --
+
+    fn prune_entry(
+        name: &str,
+        attached: bool,
+        last_activity: u64,
+    ) -> gritty::protocol::SessionEntry {
+        let mut e = auto_entry(name, attached);
+        e.last_activity = last_activity;
+        e
+    }
+
+    fn names(selected: &[&gritty::protocol::SessionEntry]) -> Vec<String> {
+        selected.iter().map(|s| s.name.clone()).collect()
+    }
+
+    #[test]
+    fn prune_never_selects_attached() {
+        let sessions = vec![prune_entry("dead/0", true, 100), prune_entry("dead/1", false, 100)];
+        let v = prune_selection(&sessions, 1000, &["dead".to_string()], None, false);
+        assert_eq!(names(&v), ["dead/1"]);
+        // Even --all skips attached sessions.
+        let v = prune_selection(&sessions, 1000, &[], None, true);
+        assert_eq!(names(&v), ["dead/1"]);
+    }
+
+    #[test]
+    fn prune_client_matches_namespace_prefix_exactly() {
+        let sessions = vec![
+            prune_entry("dead/0", false, 100),
+            prune_entry("deadbeef/0", false, 100), // not a prefix match
+            prune_entry("alive/0", false, 100),
+            prune_entry("legacy", false, 100), // unprefixed: matches no client
+        ];
+        let v = prune_selection(&sessions, 1000, &["dead".to_string()], None, false);
+        assert_eq!(names(&v), ["dead/0"]);
+    }
+
+    #[test]
+    fn prune_client_is_repeatable() {
+        let sessions = vec![
+            prune_entry("a/0", false, 100),
+            prune_entry("b/0", false, 100),
+            prune_entry("c/0", false, 100),
+        ];
+        let v = prune_selection(&sessions, 1000, &["a".to_string(), "c".to_string()], None, false);
+        assert_eq!(names(&v), ["a/0", "c/0"]);
+    }
+
+    #[test]
+    fn prune_idle_threshold() {
+        let sessions = vec![
+            prune_entry("a/old", false, 100),  // idle 900s
+            prune_entry("a/busy", false, 950), // idle 50s
+        ];
+        let v = prune_selection(&sessions, 1000, &[], Some(600), false);
+        assert_eq!(names(&v), ["a/old"]);
+    }
+
+    #[test]
+    fn prune_idle_unknown_never_matches() {
+        // last_activity == 0 means an older server that doesn't track it --
+        // conservative: never treat unknown as idle.
+        let sessions = vec![prune_entry("a/0", false, 0)];
+        assert!(prune_selection(&sessions, 1000, &[], Some(1), false).is_empty());
+        // ...but --client and --all still select it.
+        let v = prune_selection(&sessions, 1000, &["a".to_string()], None, false);
+        assert_eq!(names(&v), ["a/0"]);
+    }
+
+    #[test]
+    fn prune_filters_and_together() {
+        let sessions = vec![
+            prune_entry("dead/old", false, 100),
+            prune_entry("dead/fresh", false, 990),
+            prune_entry("alive/old", false, 100),
+        ];
+        let v = prune_selection(&sessions, 1000, &["dead".to_string()], Some(600), false);
+        assert_eq!(names(&v), ["dead/old"]);
+    }
+
+    #[test]
+    fn prune_all_selects_every_detached() {
+        let sessions = vec![
+            prune_entry("a/0", false, 0),
+            prune_entry("legacy", false, 100),
+            prune_entry("b/0", true, 100),
+        ];
+        let v = prune_selection(&sessions, 1000, &[], None, true);
+        assert_eq!(names(&v), ["a/0", "legacy"]);
     }
 
     #[test]

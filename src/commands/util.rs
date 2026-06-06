@@ -269,6 +269,23 @@ pub(crate) fn format_idle(now: u64, last_activity: u64) -> String {
     format_duration(now.saturating_sub(last_activity))
 }
 
+/// Parse a compact duration into seconds: bare seconds ("90") or a number
+/// with one of [`format_duration`]'s unit suffixes ("90s", "30m", "12h",
+/// "7d") -- what `gritty ls` prints in the Idle column is valid input here.
+pub(crate) fn parse_duration(s: &str) -> anyhow::Result<u64> {
+    let err = || anyhow::anyhow!("invalid duration: {s:?} (use e.g. 90s, 30m, 12h, 7d)");
+    let (number, multiplier) = match s.chars().last() {
+        Some('s') => (&s[..s.len() - 1], 1),
+        Some('m') => (&s[..s.len() - 1], 60),
+        Some('h') => (&s[..s.len() - 1], 3600),
+        Some('d') => (&s[..s.len() - 1], 86400),
+        Some(c) if c.is_ascii_digit() => (s, 1),
+        _ => return Err(err()),
+    };
+    let n: u64 = number.parse().map_err(|_| err())?;
+    n.checked_mul(multiplier).ok_or_else(err)
+}
+
 pub(crate) fn format_timestamp(epoch_secs: u64) -> String {
     let Ok(ts) = jiff::Timestamp::from_second(epoch_secs as i64) else {
         return "-".to_string();
@@ -1022,6 +1039,27 @@ mod tests {
     fn format_idle_unknown_is_dash() {
         // 0 = older server that doesn't report last_activity.
         assert_eq!(format_idle(100, 0), "-");
+    }
+
+    #[test]
+    fn parse_duration_units() {
+        // The inverse of format_duration: same units, same meanings.
+        assert_eq!(parse_duration("90s").unwrap(), 90);
+        assert_eq!(parse_duration("30m").unwrap(), 30 * 60);
+        assert_eq!(parse_duration("12h").unwrap(), 12 * 3600);
+        assert_eq!(parse_duration("7d").unwrap(), 7 * 86400);
+    }
+
+    #[test]
+    fn parse_duration_bare_number_is_seconds() {
+        assert_eq!(parse_duration("90").unwrap(), 90);
+    }
+
+    #[test]
+    fn parse_duration_rejects_garbage() {
+        for bad in ["", "d", "7w", "1.5h", "-3m", "1h30m", "99999999999999999999d"] {
+            assert!(parse_duration(bad).is_err(), "accepted: {bad:?}");
+        }
     }
 
     #[test]

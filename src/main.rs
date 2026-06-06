@@ -26,6 +26,7 @@ Sessions:
   list-sessions (ls)     List active sessions
   tail (t)               Read-only stream of session output
   kill-session (kill)    Kill one or more sessions
+  prune                  Bulk-kill stale detached sessions (dry-run unless -y)
   rename                 Rename a session
   kill-server            Kill the server and all sessions
   restart                Kill + restart the server (upgrade recovery)
@@ -167,8 +168,32 @@ enum Command {
         /// host's sessions instead)
         targets: Vec<String>,
     },
+    /// Bulk-kill stale detached sessions (dry-run unless -y)
+    #[command(display_order = 4, group = clap::ArgGroup::new("prune_filter").required(true).multiple(true))]
+    Prune {
+        /// Target host (defaults to `local`)
+        target: Option<String>,
+
+        /// Only sessions created by this client (the `name/` prefix shown in
+        /// `gritty ls`). Repeatable.
+        #[arg(long = "client", value_name = "NAME", group = "prune_filter")]
+        clients: Vec<String>,
+
+        /// Only sessions with no terminal activity for at least this long
+        /// (e.g. 90s, 30m, 12h, 7d)
+        #[arg(long, value_name = "DURATION", group = "prune_filter")]
+        idle: Option<String>,
+
+        /// Select every detached session
+        #[arg(long, group = "prune_filter", conflicts_with_all = ["clients", "idle"])]
+        all: bool,
+
+        /// Actually kill the selection (without this, prune only prints it)
+        #[arg(short = 'y', long)]
+        yes: bool,
+    },
     /// Kill the server and all sessions
-    #[command(display_order = 5)]
+    #[command(display_order = 6)]
     KillServer {
         /// Target host
         target: Option<String>,
@@ -176,7 +201,7 @@ enum Command {
     /// Restart the server (and tunnel, for remote hosts). One-shot recovery
     /// for protocol version upgrades: kills the daemon (tolerant of a
     /// mismatched handshake), tears down the tunnel, and starts both back up.
-    #[command(display_order = 6)]
+    #[command(display_order = 7)]
     Restart {
         /// Target host (defaults to `local`)
         target: Option<String>,
@@ -185,13 +210,13 @@ enum Command {
     /// supervisor, remote daemon). Idempotent: a second run is a no-op.
     /// Use after upgrading the gritty binary to pick it up everywhere
     /// without the scorched-earth `restart`.
-    #[command(display_order = 7)]
+    #[command(display_order = 8)]
     Refresh {
         /// Target host (defaults to `local` plus all active tunnels)
         target: Option<String>,
     },
     /// Rename a session
-    #[command(display_order = 4)]
+    #[command(display_order = 5)]
     Rename {
         /// Target host and session (host:session)
         target: String,
@@ -845,6 +870,12 @@ async fn run(cli: Cli, config: gritty::config::ConfigFile) -> anyhow::Result<()>
                 unreachable!()
             }
             kill_sessions(&targets, cli.ctl_socket.as_deref(), &config).await
+        }
+        Command::Prune { target, clients, idle, all, yes } => {
+            let host = target.as_deref().map(|t| parse_target(&config, t).0);
+            let ctl_path = resolve_ctl_path(cli.ctl_socket, host.as_deref())?;
+            let client_name = config.resolve_session(host.as_deref()).client_name;
+            prune_sessions(ctl_path, &client_name, &clients, idle.as_deref(), all, yes).await
         }
         Command::Rename { target, new_name } => {
             let (host, session) = parse_target(&config, &target);

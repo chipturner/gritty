@@ -428,6 +428,74 @@ async fn daemon_kills_session_by_name() {
     }
 }
 
+/// End-to-end `gritty prune` through the real binary: the dry run (no `-y`)
+/// kills nothing; `--client dead -y` kills exactly that namespace's detached
+/// sessions and leaves the rest alone.
+#[tokio::test]
+async fn prune_kills_only_matching_client_sessions() {
+    let (tmp, ctl_path) = test_ctl();
+
+    let ctl = ctl_path.clone();
+    let _daemon = tokio::spawn(async move { gritty::daemon::run(&ctl, None).await });
+    wait_for_daemon(&ctl_path).await;
+
+    create_session(&ctl_path, "dead/0").await;
+    create_session(&ctl_path, "dead/1").await;
+    create_session(&ctl_path, "alive/0").await;
+
+    // Wait for all three to show detached: the creating connections are
+    // dropped, but the session tasks notice the EOF asynchronously, and prune
+    // refuses to touch attached sessions.
+    let list = || async {
+        match control_request(&ctl_path, Frame::ListSessions).await {
+            Frame::SessionInfo { sessions } => sessions,
+            other => panic!("expected SessionInfo, got {other:?}"),
+        }
+    };
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    loop {
+        let sessions = list().await;
+        if sessions.len() == 3 && sessions.iter().all(|s| !s.attached) {
+            break;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "sessions never settled detached: {sessions:?}"
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+
+    // XDG_CONFIG_HOME points at the empty tempdir so the user's real config
+    // (host aliases, client_name) can't leak into the test. The command must
+    // run async: blocking the (single-threaded) test runtime would starve the
+    // in-process daemon task and stall the binary's handshake.
+    let prune = async |extra: &[&str]| {
+        let out = tokio::process::Command::new(env!("CARGO_BIN_EXE_gritty"))
+            .arg("prune")
+            .arg("--ctl-socket")
+            .arg(&ctl_path)
+            .args(extra)
+            .env("XDG_CONFIG_HOME", tmp.path())
+            .output()
+            .await
+            .expect("failed to run gritty prune");
+        assert!(
+            out.status.success(),
+            "prune {extra:?} failed: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+    };
+
+    // Dry run: prints the selection, kills nothing.
+    prune(&["--client", "dead"]).await;
+    assert_eq!(list().await.len(), 3, "dry run must not kill anything");
+
+    prune(&["--client", "dead", "-y"]).await;
+    let sessions = list().await;
+    let names: Vec<&str> = sessions.iter().map(|s| s.name.as_str()).collect();
+    assert_eq!(names, ["alive/0"], "only the dead/ namespace should be pruned");
+}
+
 #[tokio::test]
 async fn list_sessions_reports_last_activity() {
     let (_tmp, ctl_path) = test_ctl();
