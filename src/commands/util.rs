@@ -29,22 +29,29 @@ pub(crate) fn parse_target(
     (config.canonical_host(&host), session)
 }
 
-/// Parse an optional `host[:session]` target into `(host, session)`.
+/// Parse an optional `host[:session]` target into `(host, session)`,
+/// defaulting the host to `local` when no target is given.
 ///
-/// `None` (no target given) yields `(None, None)`; a present target is split
-/// via [`parse_target`]. Shared by the commands that take an optional target
-/// (connect / tail / kill-session) so the mapping is written once.
+/// Shared by the commands that take an optional target (connect / tail) so
+/// the omitted-host-means-local rule is written once. Commands where an
+/// omitted host means "every known host" (ls / refresh) must not use this.
 pub(crate) fn split_optional_target(
     config: &gritty::config::ConfigFile,
     target: Option<&str>,
-) -> (Option<String>, Option<String>) {
+) -> (String, Option<String>) {
     match target {
-        Some(t) => {
-            let (host, session) = parse_target(config, t);
-            (Some(host), session)
-        }
-        None => (None, None),
+        Some(t) => parse_target(config, t),
+        None => ("local".to_string(), None),
     }
+}
+
+/// Canonicalize an optional host-only target (prune / kill-server),
+/// defaulting to `local` when omitted.
+pub(crate) fn parse_host_or_local(
+    config: &gritty::config::ConfigFile,
+    target: Option<&str>,
+) -> String {
+    target.map_or_else(|| "local".to_string(), |t| parse_target(config, t).0)
 }
 
 pub(crate) fn resolve_ctl_path(
@@ -932,8 +939,8 @@ mod tests {
     }
 
     #[test]
-    fn split_optional_target_none_is_all_none() {
-        assert_eq!(split_optional_target(&no_aliases(), None), (None, None));
+    fn split_optional_target_none_defaults_to_local() {
+        assert_eq!(split_optional_target(&no_aliases(), None), ("local".to_string(), None));
     }
 
     #[test]
@@ -941,17 +948,27 @@ mod tests {
         let cfg = no_aliases();
         assert_eq!(
             split_optional_target(&cfg, Some("local:work")),
-            (Some("local".to_string()), Some("work".to_string()))
+            ("local".to_string(), Some("work".to_string()))
         );
-        assert_eq!(split_optional_target(&cfg, Some("local")), (Some("local".to_string()), None));
+        assert_eq!(split_optional_target(&cfg, Some("local")), ("local".to_string(), None));
     }
 
     #[test]
     fn split_optional_target_canonicalizes_alias() {
         assert_eq!(
             split_optional_target(&foo_alias(), Some("foo.bar.com:0")),
-            (Some("foo".to_string()), Some("0".to_string()))
+            ("foo".to_string(), Some("0".to_string()))
         );
+    }
+
+    #[test]
+    fn parse_host_or_local_none_defaults_to_local() {
+        assert_eq!(parse_host_or_local(&no_aliases(), None), "local");
+    }
+
+    #[test]
+    fn parse_host_or_local_canonicalizes_alias() {
+        assert_eq!(parse_host_or_local(&foo_alias(), Some("foo.bar.com")), "foo");
     }
 
     #[test]

@@ -8,7 +8,7 @@ Persistent TTY sessions over Unix domain sockets. Single binary, tmux-like CLI. 
 
 The full command table and all flags live in [USAGE.md](USAGE.md). Session addressing essentials:
 
-- Sessions are addressed `host:session`. `<host>` is `local` or a connection name from `tunnel-create`. `-` = last-attached session. Session name defaults to the next free integer slot in your namespace (`0`, `1`, ...) when omitted.
+- Sessions are addressed `host:session`. `<host>` is `local` or a connection name from `tunnel-create`. `-` = last-attached session. Session name defaults to the next free integer slot in your namespace (`0`, `1`, ...) when omitted. Omitted host = `local` (`commands/util.rs::split_optional_target` / `parse_host_or_local`); exceptions: `ls` and `refresh`, where no host means all known hosts.
 - **Host aliases** (`config` module): `[host.<name>] aliases` makes alternate spellings canonicalize to one connection name -- every typed host goes through `commands/util.rs::parse_target()` (config-aware; raw core `split_target()`). The first alias is the SSH-destination fallback when no `.dest` sidecar exists. Real names win: `local` and exact `[host.*]` keys never remap.
 - **Client-prefixed names** (`naming` module): every short name (no `/`) the user types is silently rewritten to `<client_name>/<name>` on the wire, so two laptops typing `0` end up in distinct sessions. A name containing `/` is taken literally -- the foreign-access / shared-session form. The daemon is oblivious; names are opaque strings to it. `gritty ls` elides your own prefix for readability.
 - Purely numeric wire names are rejected by the server (ambiguous with session IDs) -- harmless in practice because the client prefix makes typed `0` resolve to `<client>/0`.

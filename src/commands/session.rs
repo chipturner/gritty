@@ -347,9 +347,11 @@ async fn pick_or_list(
 }
 
 struct Row {
+    id: u32, // server session id -- stable across list refreshes
     name: String,
     attached: bool,
     age: String,
+    idle: String,
     cmd: String,
     cwd: String,
     client: String,
@@ -372,9 +374,11 @@ fn build_rows(sessions: &[gritty::protocol::SessionEntry], client_name: &str) ->
         .iter()
         .enumerate()
         .map(|(i, s)| Row {
+            id: s.id,
             name: session_wire_name(s),
             attached: s.attached,
             age: format_age(now, s.created_at),
+            idle: super::util::format_idle(now, s.last_activity),
             cmd: s.foreground_cmd.clone(),
             cwd: shorten_home(&s.cwd, &home),
             client: s.client_name.clone(),
@@ -391,6 +395,33 @@ fn shorten_home(path: &str, home: &str) -> String {
         }
     }
     path.to_string()
+}
+
+/// Restores the terminal on drop: cursor visible, raw mode off. Shared by the
+/// connect picker and the prune mark-picker so an early return or panic never
+/// leaves the terminal raw.
+struct PickerTermGuard;
+impl Drop for PickerTermGuard {
+    fn drop(&mut self) {
+        use std::io::Write;
+        let _ = write!(std::io::stderr(), "\x1b[?25h");
+        let _ = std::io::stderr().flush();
+        let _ = crossterm::terminal::disable_raw_mode();
+    }
+}
+
+/// Erase the last `n` rendered picker lines and leave the cursor at the top,
+/// ready to redraw (or hand the area back to the shell).
+fn erase_picker_lines(stderr: &mut std::io::Stderr, n: usize) {
+    use std::io::Write;
+    if n == 0 {
+        return;
+    }
+    let _ = write!(stderr, "\x1b[{n}A");
+    for _ in 0..n {
+        let _ = write!(stderr, "\x1b[2K\r\n");
+    }
+    let _ = write!(stderr, "\x1b[{n}A");
 }
 
 /// Interactive session picker. Returns selected session name (wire form), or
@@ -428,15 +459,6 @@ async fn tui_pick_session(
     let mut status: Option<String> = None;
     let mut prev_total_lines: usize = 0;
 
-    struct PickerTermGuard;
-    impl Drop for PickerTermGuard {
-        fn drop(&mut self) {
-            use std::io::Write;
-            let _ = write!(std::io::stderr(), "\x1b[?25h");
-            let _ = std::io::stderr().flush();
-            let _ = crossterm::terminal::disable_raw_mode();
-        }
-    }
     // Enter raw mode
     let _ = terminal::enable_raw_mode();
     let _ = write!(stderr, "\x1b[?25l"); // hide cursor
@@ -476,13 +498,7 @@ async fn tui_pick_session(
         let total_lines = rows.len() + 3 + usize::from(status.is_some());
 
         // If we drew before, erase old output first
-        if prev_total_lines > 0 {
-            let _ = write!(stderr, "\x1b[{}A", prev_total_lines);
-            for _ in 0..prev_total_lines {
-                let _ = write!(stderr, "\x1b[2K\r\n");
-            }
-            let _ = write!(stderr, "\x1b[{}A", prev_total_lines);
-        }
+        erase_picker_lines(stderr, prev_total_lines);
 
         // Show/hide cursor based on mode
         match mode {
@@ -901,13 +917,7 @@ async fn tui_pick_session(
     };
 
     // Cleanup: erase picker lines (terminal restore handled by PickerTermGuard)
-    if prev_total_lines > 0 {
-        let _ = write!(stderr, "\x1b[{}A", prev_total_lines);
-        for _ in 0..prev_total_lines {
-            let _ = write!(stderr, "\x1b[2K\r\n");
-        }
-        let _ = write!(stderr, "\x1b[{}A", prev_total_lines);
-    }
+    erase_picker_lines(&mut stderr, prev_total_lines);
     let _ = stderr.flush();
 
     result
@@ -1145,17 +1155,219 @@ fn prune_selection<'a>(
         .collect()
 }
 
+/// Toggle the whole candidate set: if every id is already marked, clear them
+/// all; otherwise mark them all. Marks are keyed by session ID, not row
+/// index, so they stay attached to the right session.
+fn toggle_all_marks(marked: &mut std::collections::HashSet<u32>, ids: &[u32]) {
+    if ids.iter().all(|id| marked.contains(id)) {
+        for id in ids {
+            marked.remove(id);
+        }
+    } else {
+        marked.extend(ids.iter().copied());
+    }
+}
+
+/// Interactive multi-select for `prune --pick`: space marks, enter kills the
+/// marked set after a y/n confirm. Returns the marked sessions (in candidate
+/// order) once confirmed, or `None` on abort. All candidates are detached --
+/// `prune_selection` never offers attached sessions.
+async fn tui_mark_sessions(
+    host: &str,
+    candidates: &[gritty::protocol::SessionEntry],
+    client_name: &str,
+) -> Option<Vec<gritty::protocol::SessionEntry>> {
+    use crossterm::{
+        event::{self, Event, KeyCode, KeyEvent, KeyModifiers},
+        terminal,
+    };
+    use std::collections::HashSet;
+    use std::io::Write;
+
+    let mut stderr = std::io::stderr();
+    let rows = build_rows(candidates, client_name);
+    let ids: Vec<u32> = rows.iter().map(|r| r.id).collect();
+    let mut cursor = 0usize;
+    let mut marked: HashSet<u32> = HashSet::new();
+    let mut confirm = false;
+    let mut status: Option<String> = None;
+
+    let _ = terminal::enable_raw_mode();
+    let _ = write!(stderr, "\x1b[?25l"); // hide cursor
+    let _term_guard = PickerTermGuard;
+
+    let render = |stderr: &mut std::io::Stderr,
+                  cursor: usize,
+                  marked: &HashSet<u32>,
+                  confirm: bool,
+                  status: Option<&str>,
+                  prev_total_lines: usize| {
+        let name_w = rows.iter().map(|r| r.name.len()).max().unwrap_or(0).max(3);
+        let age_w = rows.iter().map(|r| r.age.len()).max().unwrap_or(0);
+        let idle_w = rows.iter().map(|r| r.idle.len()).max().unwrap_or(0).max(4);
+        let cmd_w = rows.iter().map(|r| r.cmd.len()).max().unwrap_or(0);
+        let client_w = rows.iter().map(|r| r.client.len()).max().unwrap_or(0);
+        // header + rows + hint, plus an optional status line.
+        let total_lines = rows.len() + 2 + usize::from(status.is_some());
+
+        erase_picker_lines(stderr, prev_total_lines);
+
+        let _ = write!(stderr, "\x1b[36;1mPrune sessions on {host} -- mark and kill:\x1b[0m\r\n");
+        for (i, row) in rows.iter().enumerate() {
+            let pointer = if i == cursor { "\x1b[32;1m\u{25b8}\x1b[0m" } else { " " };
+            let mark = if marked.contains(&row.id) { "\x1b[31;1m[x]\x1b[0m" } else { "[ ]" };
+            let hk = row.hotkey.map_or(String::from("  "), |c| format!("{c})"));
+            if i == cursor {
+                let _ = write!(
+                    stderr,
+                    "{pointer} {mark} \x1b[2m{hk}\x1b[0m \x1b[32;1m{:<name_w$}\x1b[0m  \x1b[32m{:<age_w$}\x1b[0m  \x1b[32m{:<idle_w$}\x1b[0m  \x1b[32m{:<cmd_w$}\x1b[0m  \x1b[32m{:<client_w$}\x1b[0m  \x1b[32m{}\x1b[0m\r\n",
+                    row.name, row.age, row.idle, row.cmd, row.client, row.cwd,
+                );
+            } else {
+                let _ = write!(
+                    stderr,
+                    "{pointer} {mark} \x1b[2m{hk}\x1b[0m {:<name_w$}  \x1b[2m{:<age_w$}  {:<idle_w$}  {:<cmd_w$}  {:<client_w$}  {}\x1b[0m\r\n",
+                    row.name, row.age, row.idle, row.cmd, row.client, row.cwd,
+                );
+            }
+        }
+        let hints = if confirm {
+            format!("\x1b[31;1mkill {} session(s)? y/n\x1b[0m", marked.len())
+        } else {
+            "\x1b[2m  space mark  a mark all  1-9 toggle  enter kill marked  esc quit\x1b[0m"
+                .to_string()
+        };
+        let _ = write!(stderr, "{hints}\r\n");
+        if let Some(msg) = status {
+            let _ = write!(stderr, "\x1b[31m  {msg}\x1b[0m\r\n");
+        }
+        let _ = stderr.flush();
+        total_lines
+    };
+
+    let mut prev_total_lines = render(&mut stderr, cursor, &marked, confirm, status.as_deref(), 0);
+
+    let result = loop {
+        // Poll-based loop so we can yield to the async runtime
+        if !event::poll(std::time::Duration::from_millis(100)).unwrap_or(false) {
+            tokio::task::yield_now().await;
+            continue;
+        }
+        let Ok(ev) = event::read() else {
+            break None;
+        };
+        if confirm {
+            match ev {
+                Event::Key(KeyEvent { code: KeyCode::Char('y'), .. }) => {
+                    break Some(
+                        candidates.iter().filter(|s| marked.contains(&s.id)).cloned().collect(),
+                    );
+                }
+                _ => confirm = false,
+            }
+        } else {
+            match ev {
+                Event::Key(KeyEvent {
+                    code: KeyCode::Up | KeyCode::Char('k'),
+                    modifiers: KeyModifiers::NONE,
+                    ..
+                }) => {
+                    cursor = cursor.saturating_sub(1);
+                }
+                Event::Key(KeyEvent {
+                    code: KeyCode::Down | KeyCode::Char('j'),
+                    modifiers: KeyModifiers::NONE,
+                    ..
+                }) => {
+                    cursor = (cursor + 1).min(rows.len() - 1);
+                }
+                // Space -> toggle mark at cursor, then advance (fzf-style)
+                Event::Key(KeyEvent {
+                    code: KeyCode::Char(' '),
+                    modifiers: KeyModifiers::NONE,
+                    ..
+                }) => {
+                    let id = rows[cursor].id;
+                    if !marked.remove(&id) {
+                        marked.insert(id);
+                    }
+                    cursor = (cursor + 1).min(rows.len() - 1);
+                    status = None;
+                }
+                // 'a' -> mark all / clear all
+                Event::Key(KeyEvent {
+                    code: KeyCode::Char('a'),
+                    modifiers: KeyModifiers::NONE,
+                    ..
+                }) => {
+                    toggle_all_marks(&mut marked, &ids);
+                    status = None;
+                }
+                // Hotkeys 1-9 toggle that row's mark
+                Event::Key(KeyEvent {
+                    code: KeyCode::Char(ch @ '1'..='9'),
+                    modifiers: KeyModifiers::NONE,
+                    ..
+                }) => {
+                    let idx = (ch as u8 - b'1') as usize;
+                    if idx < rows.len() {
+                        let id = rows[idx].id;
+                        if !marked.remove(&id) {
+                            marked.insert(id);
+                        }
+                        status = None;
+                    }
+                }
+                Event::Key(KeyEvent { code: KeyCode::Enter, .. }) => {
+                    if marked.is_empty() {
+                        status = Some("nothing marked -- space to mark".to_string());
+                    } else {
+                        status = None;
+                        confirm = true;
+                    }
+                }
+                Event::Key(KeyEvent {
+                    code: KeyCode::Esc | KeyCode::Char('q'),
+                    modifiers: KeyModifiers::NONE,
+                    ..
+                }) => {
+                    break None;
+                }
+                Event::Key(KeyEvent {
+                    code: KeyCode::Char('c') | KeyCode::Char('g'),
+                    modifiers: KeyModifiers::CONTROL,
+                    ..
+                }) => {
+                    break None;
+                }
+                _ => continue,
+            }
+        }
+        prev_total_lines =
+            render(&mut stderr, cursor, &marked, confirm, status.as_deref(), prev_total_lines);
+    };
+
+    // Cleanup: erase picker lines (terminal restore handled by PickerTermGuard)
+    erase_picker_lines(&mut stderr, prev_total_lines);
+    let _ = stderr.flush();
+
+    result
+}
+
 /// Bulk-kill stale detached sessions. Dry-run by default: prints the
-/// selection in the `ls` table format and stops; only `-y` kills. Victims are
-/// killed by raw session ID, not name -- these are enumerated entries, not
-/// typed input, so the namespace resolution in [`kill_one`] would mangle
-/// foreign-client names (`oldlaptop/0` -> `thislaptop/oldlaptop/0`).
+/// selection in the `ls` table format and stops; only `-y` kills. With
+/// `pick`, an interactive mark-picker chooses the victims instead (and
+/// confirms in-TUI, so `-y` does not apply). Victims are killed by raw
+/// session ID, not name -- these are enumerated entries, not typed input, so
+/// the namespace resolution in [`kill_one`] would mangle foreign-client names
+/// (`oldlaptop/0` -> `thislaptop/oldlaptop/0`).
 pub(crate) async fn prune_sessions(
     ctl_path: PathBuf,
     client_name: &str,
     clients: &[String],
     idle: Option<&str>,
     all: bool,
+    pick: bool,
     yes: bool,
 ) -> anyhow::Result<()> {
     use gritty::protocol::Frame;
@@ -1171,18 +1383,42 @@ pub(crate) async fn prune_sessions(
         .unwrap_or_default()
         .as_secs();
 
-    let victims: Vec<gritty::protocol::SessionEntry> =
-        prune_selection(&sessions, now, clients, idle_secs, all).into_iter().cloned().collect();
-    if victims.is_empty() {
+    // `--pick` with no narrowing filters offers every detached session;
+    // `--client`/`--idle` narrow the candidate list before the picker.
+    let offer_all = all || (pick && clients.is_empty() && idle_secs.is_none());
+    let candidates: Vec<gritty::protocol::SessionEntry> =
+        prune_selection(&sessions, now, clients, idle_secs, offer_all)
+            .into_iter()
+            .cloned()
+            .collect();
+    if candidates.is_empty() {
         println!("nothing to prune");
         return Ok(());
     }
 
-    print_session_table(&victims, now, client_name, "");
-    if !yes {
-        eprintln!("\x1b[2m\u{25b8} dry run -- pass -y to kill {} session(s)\x1b[0m", victims.len());
-        return Ok(());
-    }
+    let victims = if pick {
+        if !std::io::IsTerminal::is_terminal(&std::io::stderr()) {
+            anyhow::bail!("--pick requires a terminal; use --client/--idle/--all with -y instead");
+        }
+        let host = host_from_ctl_path(&ctl_path);
+        match tui_mark_sessions(&host, &candidates, client_name).await {
+            Some(marked) => marked,
+            None => {
+                eprintln!("\x1b[2m\u{25b8} aborted -- nothing killed\x1b[0m");
+                return Ok(());
+            }
+        }
+    } else {
+        print_session_table(&candidates, now, client_name, "");
+        if !yes {
+            eprintln!(
+                "\x1b[2m\u{25b8} dry run -- pass -y to kill {} session(s)\x1b[0m",
+                candidates.len()
+            );
+            return Ok(());
+        }
+        candidates
+    };
 
     let mut failed = 0usize;
     for s in &victims {
@@ -1660,9 +1896,11 @@ mod tests {
 
     fn row(name: &str) -> Row {
         Row {
+            id: 0,
             name: name.to_string(),
             attached: false,
             age: String::new(),
+            idle: String::new(),
             cmd: String::new(),
             cwd: String::new(),
             client: String::new(),
@@ -1820,6 +2058,29 @@ mod tests {
     #[test]
     fn auto_attach_no_sessions_creates_zero() {
         assert_eq!(auto_attach_target(&[], "defiant"), Some("defiant/0".to_string()));
+    }
+
+    // -- toggle_all_marks (prune --pick mark logic) --
+
+    #[test]
+    fn toggle_all_marks_marks_everything_when_none_marked() {
+        let mut marked = std::collections::HashSet::new();
+        toggle_all_marks(&mut marked, &[1, 2, 3]);
+        assert_eq!(marked, [1, 2, 3].into());
+    }
+
+    #[test]
+    fn toggle_all_marks_completes_a_partial_selection() {
+        let mut marked: std::collections::HashSet<u32> = [2].into();
+        toggle_all_marks(&mut marked, &[1, 2, 3]);
+        assert_eq!(marked, [1, 2, 3].into());
+    }
+
+    #[test]
+    fn toggle_all_marks_clears_when_all_marked() {
+        let mut marked: std::collections::HashSet<u32> = [1, 2, 3].into();
+        toggle_all_marks(&mut marked, &[1, 2, 3]);
+        assert!(marked.is_empty());
     }
 
     #[test]

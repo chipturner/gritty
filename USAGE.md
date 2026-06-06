@@ -10,7 +10,7 @@ Complete command and flag reference. For an overview and quick start, see [READM
 | `gritty list-sessions [host]` | `ls`, `list` | List sessions. Bare `gritty ls` shows every known host -- local + all tunnels -- grouped by daemon (tunnels reaching the same daemon are merged). With a host, lists just that host. Your own sessions are bold and sorted first; foreign sessions group by client (foreground process shown on Linux only). The `Idle` column shows time since the session's last terminal activity (output or keystrokes); detached sessions also show how long ago a client was last attached |
 | `gritty tail [host:session]` | `t` | Read-only stream of session output |
 | `gritty kill-session [targets...]` | `kill` | Kill one or more sessions. Each target is `host:session`, or a bare session name/ID killed on `local` (so after `gritty ls`, `gritty kill 3 5 work` reaps by ID or name). A bare target naming a known host lists that host's sessions instead. Numeric targets match your own namespace name first, then fall back to the raw session ID |
-| `gritty prune [host]` | | Bulk-kill stale detached sessions. Select with `--client <name>` (sessions created by that client, repeatable -- e.g. a laptop you know rebooted), `--idle <duration>` (no terminal activity for at least that long: `90s`, `30m`, `12h`, `7d`), or `--all`; filters AND together. Dry run by default: prints the selection and stops; pass `-y` to kill it. Attached sessions are never touched |
+| `gritty prune [host]` | | Bulk-kill stale detached sessions. Select with `--client <name>` (sessions created by that client, repeatable -- e.g. a laptop you know rebooted), `--idle <duration>` (no terminal activity for at least that long: `90s`, `30m`, `12h`, `7d`), or `--all`; filters AND together. Or pick interactively with `--pick` (TUI: space marks, `a` marks all, `1`-`9` toggle, enter kills the marked set after a y/n confirm; `--client`/`--idle` narrow the candidate list). Dry run by default: prints the selection and stops; pass `-y` to kill it. Attached sessions are never touched |
 | `gritty rename <host:session> <name>` | | Rename a session |
 | `gritty kill-server [host]` | | Kill the server and all sessions (works across a protocol version mismatch) |
 | `gritty restart [host]` | | Kill + restart server (and tunnel, for remote hosts). One-shot upgrade recovery |
@@ -50,7 +50,7 @@ laptop$ gritty tunnel-create user@10.0.0.5 -n devbox
 laptop$ gritty connect devbox:work          # now "devbox" routes to user@10.0.0.5
 ```
 
-`local` is a reserved connection name for a server on this machine (no SSH tunnel).
+`local` is a reserved connection name for a server on this machine (no SSH tunnel). Omitting the host entirely targets `local`: bare `gritty connect`, `gritty tail`, `gritty prune --pick`, `gritty kill-server`, and `gritty restart` all address the local daemon. The exceptions are `gritty ls` and `gritty refresh`, where no host means every known host.
 
 A `[host.<name>] aliases` config entry makes alternate spellings resolve to the same connection name, so `gritty connect devbox.example.com:work` and `gritty connect devbox:work` address the same tunnel and sessions (see [Configuration](#configuration)).
 

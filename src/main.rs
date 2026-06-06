@@ -83,7 +83,8 @@ enum Command {
     /// Smart session: attach if exists, create if not
     #[command(display_order = 0, visible_alias = "c")]
     Connect {
-        /// Target host, with optional session name (host or host:name)
+        /// Target host, with optional session name (host or host:name);
+        /// host defaults to `local` when omitted
         target: Option<String>,
 
         /// Command to run instead of login shell
@@ -151,7 +152,7 @@ enum Command {
     /// Tail a session's output (read-only, like tail -f)
     #[command(display_order = 2, visible_alias = "t")]
     Tail {
-        /// Target host and session (host:session)
+        /// Target host and session (host:session); host defaults to `local`
         target: Option<String>,
     },
     /// List active sessions (no host = all known hosts: local + tunnels)
@@ -188,6 +189,12 @@ enum Command {
         #[arg(long, group = "prune_filter", conflicts_with_all = ["clients", "idle"])]
         all: bool,
 
+        /// Pick victims interactively (TUI): space marks, enter kills the
+        /// marked set after a y/n confirm. `--client`/`--idle` narrow the
+        /// candidate list
+        #[arg(long, group = "prune_filter", conflicts_with_all = ["all", "yes"])]
+        pick: bool,
+
         /// Actually kill the selection (without this, prune only prints it)
         #[arg(short = 'y', long)]
         yes: bool,
@@ -195,7 +202,7 @@ enum Command {
     /// Kill the server and all sessions
     #[command(display_order = 6)]
     KillServer {
-        /// Target host
+        /// Target host (defaults to `local`)
         target: Option<String>,
     },
     /// Restart the server (and tunnel, for remote hosts). One-shot recovery
@@ -784,17 +791,16 @@ async fn run(cli: Cli, config: gritty::config::ConfigFile) -> anyhow::Result<()>
             new_session,
         } => {
             let (host, session) = split_optional_target(&config, target.as_deref());
-            let auto_start_mode = match (&cli.ctl_socket, host.as_deref()) {
+            let auto_start_mode = match (&cli.ctl_socket, host.as_str()) {
                 (Some(_), _) => AutoStart::None,
-                (None, Some("local")) => AutoStart::Server,
-                (None, Some(h)) => AutoStart::Tunnel {
+                (None, "local") => AutoStart::Server,
+                (None, h) => AutoStart::Tunnel {
                     name: h.to_string(),
                     config_dest: config.alias_destination(h),
                 },
-                (None, None) => anyhow::bail!("specify a host or use --ctl-socket"),
             };
-            let ctl_path = resolve_ctl_path(cli.ctl_socket, host.as_deref())?;
-            let resolved = config.resolve_session(host.as_deref());
+            let ctl_path = resolve_ctl_path(cli.ctl_socket, Some(&host))?;
+            let resolved = config.resolve_session(Some(&host));
             let settings = gritty::config::SessionSettings {
                 no_escape: no_escape || resolved.no_escape,
                 forward_agent: if no_forward_agent {
@@ -832,18 +838,12 @@ async fn run(cli: Cli, config: gritty::config::ConfigFile) -> anyhow::Result<()>
         }
         Command::Tail { target } => {
             let (host, session) = split_optional_target(&config, target.as_deref());
-            let ctl_path = resolve_ctl_path(cli.ctl_socket, host.as_deref())?;
-            let client_name = config.resolve_session(host.as_deref()).client_name;
+            let ctl_path = resolve_ctl_path(cli.ctl_socket, Some(&host))?;
+            let client_name = config.resolve_session(Some(&host)).client_name;
             let session = match session {
                 Some(s) => gritty::naming::resolve_session_name(&s, &client_name),
                 None => {
-                    suggest_session(
-                        "tail",
-                        host.as_deref().unwrap_or("host"),
-                        &ctl_path,
-                        &client_name,
-                    )
-                    .await?;
+                    suggest_session("tail", &host, &ctl_path, &client_name).await?;
                     unreachable!()
                 }
             };
@@ -871,11 +871,11 @@ async fn run(cli: Cli, config: gritty::config::ConfigFile) -> anyhow::Result<()>
             }
             kill_sessions(&targets, cli.ctl_socket.as_deref(), &config).await
         }
-        Command::Prune { target, clients, idle, all, yes } => {
-            let host = target.as_deref().map(|t| parse_target(&config, t).0);
-            let ctl_path = resolve_ctl_path(cli.ctl_socket, host.as_deref())?;
-            let client_name = config.resolve_session(host.as_deref()).client_name;
-            prune_sessions(ctl_path, &client_name, &clients, idle.as_deref(), all, yes).await
+        Command::Prune { target, clients, idle, all, pick, yes } => {
+            let host = parse_host_or_local(&config, target.as_deref());
+            let ctl_path = resolve_ctl_path(cli.ctl_socket, Some(&host))?;
+            let client_name = config.resolve_session(Some(&host)).client_name;
+            prune_sessions(ctl_path, &client_name, &clients, idle.as_deref(), all, pick, yes).await
         }
         Command::Rename { target, new_name } => {
             let (host, session) = parse_target(&config, &target);
@@ -892,22 +892,21 @@ async fn run(cli: Cli, config: gritty::config::ConfigFile) -> anyhow::Result<()>
             rename_session(session, new_name, ctl_path).await
         }
         Command::KillServer { target } => {
-            let host = target.as_deref().map(|t| parse_target(&config, t).0);
-            let ctl_path = resolve_ctl_path(cli.ctl_socket, host.as_deref())?;
+            let host = parse_host_or_local(&config, target.as_deref());
+            let ctl_path = resolve_ctl_path(cli.ctl_socket, Some(&host))?;
             let kill_result = kill_server(ctl_path).await;
-            match host.as_deref() {
-                Some(h) if h != "local" => {
-                    // Always tear down the tunnel supervisor: if the remote
-                    // daemon is already down it would otherwise reconnect
-                    // forever. A kill_server error here usually just means the
-                    // remote daemon was already gone -- downgrade it to a
-                    // warning and let the tunnel teardown decide the outcome.
-                    if let Err(e) = &kill_result {
-                        eprintln!("\x1b[2;33m\u{25b8} {h}: {e}\x1b[0m");
-                    }
-                    gritty::connect::disconnect(h).await
+            if host == "local" {
+                kill_result
+            } else {
+                // Always tear down the tunnel supervisor: if the remote
+                // daemon is already down it would otherwise reconnect
+                // forever. A kill_server error here usually just means the
+                // remote daemon was already gone -- downgrade it to a
+                // warning and let the tunnel teardown decide the outcome.
+                if let Err(e) = &kill_result {
+                    eprintln!("\x1b[2;33m\u{25b8} {host}: {e}\x1b[0m");
                 }
-                _ => kill_result,
+                gritty::connect::disconnect(&host).await
             }
         }
         Command::Restart { target } => {
