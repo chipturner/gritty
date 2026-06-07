@@ -134,7 +134,7 @@ The file lives at `~/.config/gritty/config.toml` on Linux (honors `$XDG_CONFIG_H
 
 **First connect hangs or fails** -- gritty backgrounds the SSH tunnel, so it can't prompt for a password or host key. Make sure `ssh <destination>` works first, then retry.
 
-**"reconnecting..." forever** -- the SSH tunnel is down and not recovering. Check `gritty tunnels`; if a tunnel is stale, `gritty tunnel-destroy <name>` then `gritty tunnel-create <dest>` to rebuild it. `gritty doctor` reports what's wrong and where the logs are.
+**"reconnecting..." forever** -- the SSH tunnel is down and not recovering. Check `gritty tunnels`; if a tunnel is stale, `gritty tunnel-destroy <name>` then `gritty tunnel-create <dest>` to rebuild it. `gritty doctor` reports what's wrong and where the logs are. While the status line is up, any key forces an immediate retry (including past a stale `waiting for network`); `^C` gives up.
 
 **Protocol version mismatch after upgrade** -- after upgrading one side, run `gritty refresh` to restart whatever is running stale code (local daemon, tunnel supervisors, and remote daemons). It's idempotent and works across the mismatch without falling back to raw SSH. For remote hosts it ends with an end-to-end protocol probe: if the remote *binary* itself is an older release, refresh says so and points at `gritty bootstrap <host>`. `gritty doctor` shows what's stale; see [USAGE.md](USAGE.md#debugging) for details.
 

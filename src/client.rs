@@ -423,6 +423,8 @@ enum ReconnectPhase {
     Retrying,
     /// OS reports no usable route; parked on `net.changed()`.
     WaitingForNetwork,
+    /// A keystroke forced an immediate attempt; acknowledge it visibly.
+    RetryNow,
 }
 
 /// Outcome of a single reconnect attempt (connect + handshake + Attach).
@@ -447,14 +449,29 @@ enum Attempt {
 
 /// Render the in-place reconnect status line. `spin` indexes the spinner
 /// frames (any monotonically increasing counter); `elapsed_s` is seconds since
-/// the loop started (or since the network came back).
-fn reconnect_status_line(spin: usize, elapsed_s: u64, phase: ReconnectPhase) -> String {
+/// the loop started (or since the network came back). `keys_retry` advertises
+/// the any-key-retries shortcut -- true only for the interactive loop, whose
+/// backoff wait actually watches stdin (tail mode doesn't).
+fn reconnect_status_line(
+    spin: usize,
+    elapsed_s: u64,
+    phase: ReconnectPhase,
+    keys_retry: bool,
+) -> String {
     let glyph = SPINNER[spin % SPINNER.len()];
     let body = match phase {
         ReconnectPhase::Retrying => format!("reconnecting {elapsed_s}s"),
         ReconnectPhase::WaitingForNetwork => "waiting for network".to_string(),
+        ReconnectPhase::RetryNow => "retrying now".to_string(),
     };
-    format!("\r\x1b[2m{glyph} {body} \u{b7} ^C aborts\x1b[0m\x1b[K")
+    // RetryNow *is* the acknowledgment of a keypress -- repeating the hint
+    // there would be noise.
+    let hint = if keys_retry && phase != ReconnectPhase::RetryNow {
+        " \u{b7} any key retries"
+    } else {
+        ""
+    };
+    format!("\r\x1b[2m{glyph} {body}{hint} \u{b7} ^C aborts\x1b[0m\x1b[K")
 }
 
 /// Terminal failure line: replaces the status line, then newline. Caller is
@@ -495,7 +512,7 @@ async fn paint_reconnect_status(
             let elapsed = reconnect_started.elapsed().as_secs();
             write_stdout_async(
                 async_stdout,
-                reconnect_status_line(spin, elapsed, phase).as_bytes(),
+                reconnect_status_line(spin, elapsed, phase, true).as_bytes(),
             )
             .await?;
         }
@@ -2142,6 +2159,7 @@ pub async fn run(
                     let sleep_for = next_reconnect_delay(backoff);
                     let deadline = tokio::time::Instant::now() + sleep_for;
                     let mut net_hint = false;
+                    let mut key_hint = false;
                     // Wait out the backoff, animating the status line. Each
                     // arm either breaks to attempt a connect or returns.
                     loop {
@@ -2185,27 +2203,58 @@ pub async fn run(
                                 write_stdout_async(&async_stdout, b"\r\n").await?;
                                 return Ok(1);
                             }
-                            ready = async_stdin.readable() => {
+                            // Gated on the chrome delay: inside the first
+                            // second the outage is invisible (no status line
+                            // yet), so bytes on stdin are input typed at the
+                            // shell during a blip -- leave them in the kernel
+                            // buffer for the relay to deliver after resume.
+                            // Only once the reconnect visibly drags do keys
+                            // become retry commands. Time-based rather than
+                            // `chrome_shown` so alt-screen (which never
+                            // paints chrome) keeps the shortcut.
+                            ready = async_stdin.readable(),
+                                if reconnect_started.elapsed() >= RECONNECT_CHROME_DELAY =>
+                            {
                                 let mut guard = ready?;
-                                let mut peek = [0u8; 1];
-                                match guard.try_io(|inner| inner.get_ref().read(&mut peek)) {
-                                    Ok(Ok(1)) if peek[0] == 0x03 => {
-                                        info!("reconnect: exiting -- Ctrl-C");
-                                        write_stdout_async(&async_stdout, b"\r\n").await?;
-                                        return Ok(1);
+                                // Drain everything pending so one multi-byte
+                                // key (arrow, paste) counts as one retry, not
+                                // one per byte. Past the chrome delay the
+                                // bytes are impatience, not input -- discard.
+                                let mut drained = 0usize;
+                                loop {
+                                    let mut buf = [0u8; 64];
+                                    match guard.try_io(|inner| inner.get_ref().read(&mut buf)) {
+                                        Ok(Ok(0)) | Ok(Err(_)) => {
+                                            info!("reconnect: exiting -- stdin EOF/error");
+                                            return Ok(1);
+                                        }
+                                        Ok(Ok(n)) => {
+                                            if buf[..n].contains(&0x03) {
+                                                info!("reconnect: exiting -- Ctrl-C");
+                                                write_stdout_async(&async_stdout, b"\r\n").await?;
+                                                return Ok(1);
+                                            }
+                                            drained += n;
+                                        }
+                                        // WouldBlock -- stdin is empty.
+                                        Err(_) => break,
                                     }
-                                    Ok(Ok(0)) | Ok(Err(_)) => {
-                                        info!("reconnect: exiting -- stdin EOF/error");
-                                        return Ok(1);
-                                    }
-                                    _ => {}
+                                }
+                                if drained == 0 {
+                                    // Spurious readiness; keep waiting.
+                                    continue;
                                 }
                                 // Impatient keystroke (not Ctrl-C) cuts the
                                 // current sleep short and triggers an attempt
                                 // now rather than restarting the outer loop --
                                 // restarting re-raced the same sleep, so a
                                 // user holding a key (>1 keystroke/sec)
-                                // starved every reconnect attempt.
+                                // starved every reconnect attempt. The
+                                // "retrying now" ack is painted later, once
+                                // every gate has passed -- painting here would
+                                // promise an attempt that the socket-gone
+                                // grace window can still swallow.
+                                key_hint = true;
                                 break;
                             }
                         }
@@ -2219,14 +2268,24 @@ pub async fn run(
                     // "reconnecting 0s" from the moment the network actually
                     // returned, not from whenever the loop first entered
                     // (which may include hours of lid-closed time).
-                    if is_remote && net.status() == PathStatus::Unsatisfied {
+                    //
+                    // A keystroke punches through the gate: post-wake path
+                    // status can lag reality, and the user banging a key is
+                    // claiming the network is back. Probe once; on failure
+                    // the next iteration parks again. `was_offline` stays set
+                    // so a genuine unsatisfied->satisfied edge still gets the
+                    // timer/backoff reset.
+                    let offline_now = is_remote && net.status() == PathStatus::Unsatisfied;
+                    if offline_now && !key_hint {
                         if !was_offline {
                             info!("reconnect: path unsatisfied, parking until network returns");
                         }
                         was_offline = true;
                         continue;
                     }
-                    if was_offline {
+                    if offline_now {
+                        info!("reconnect: path unsatisfied, keystroke forces a probe");
+                    } else if was_offline {
                         info!(
                             "reconnect: path available, resuming attempts (backoff and timer reset)"
                         );
@@ -2234,7 +2293,18 @@ pub async fn run(
                         reconnect_started = Instant::now();
                         net_hint = true;
                     }
-                    backoff = if net_hint { Duration::ZERO } else { sleep_for };
+                    // A net event resets the schedule (evidence the network
+                    // returned); a served sleep advances it; a key-forced
+                    // attempt leaves it untouched -- the keystroke served
+                    // none of the sleep, so advancing here would let a few
+                    // quick taps walk the exponential to its cap and delay
+                    // the next *automatic* attempt beyond the schedule an
+                    // untouched keyboard would have gotten.
+                    if net_hint {
+                        backoff = Duration::ZERO;
+                    } else if !key_hint {
+                        backoff = sleep_for;
+                    }
 
                     // For tunnels, the supervisor holds an flock on a
                     // companion `.lock` even while it's respawning the SSH
@@ -2274,6 +2344,24 @@ pub async fn run(
                     }
                     if socket_gone_now {
                         continue;
+                    }
+
+                    // Every gate has passed -- an attempt is genuinely about
+                    // to start, so a key-forced one can now be acknowledged
+                    // honestly. (Pre-attempt, so first_paint_ok = true is
+                    // safe: the Attach below snapshots `chrome_shown` after
+                    // this paint.)
+                    if key_hint {
+                        paint_reconnect_status(
+                            &async_stdout,
+                            show_chrome,
+                            reconnect_started,
+                            &mut chrome_shown,
+                            spin,
+                            ReconnectPhase::RetryNow,
+                            true,
+                        )
+                        .await?;
                     }
 
                     attempt_n += 1;
@@ -2368,6 +2456,10 @@ pub async fn run(
                     // Keep the spinner alive during a slow attempt (e.g. tunnel
                     // socket up but remote handshake stalled). The attempt
                     // future owns the wire; the tick arm only touches stdout.
+                    // A key-triggered attempt keeps the "retrying now"
+                    // acknowledgment up for its whole duration.
+                    let attempt_phase =
+                        if key_hint { ReconnectPhase::RetryNow } else { ReconnectPhase::Retrying };
                     let attempt = loop {
                         tokio::select! {
                             r = &mut attempt_fut => break r,
@@ -2382,7 +2474,7 @@ pub async fn run(
                                     reconnect_started,
                                     &mut chrome_shown,
                                     spin,
-                                    ReconnectPhase::Retrying,
+                                    attempt_phase,
                                     false,
                                 )
                                 .await?;
@@ -2691,7 +2783,7 @@ pub async fn tail(
                                 chrome_shown = true;
                             }
                             let elapsed = reconnect_started.elapsed().as_secs();
-                            eprint!("{}", reconnect_status_line(spin, elapsed, $phase));
+                            eprint!("{}", reconnect_status_line(spin, elapsed, $phase, false));
                         }
                     }};
                 }
@@ -3153,11 +3245,12 @@ mod tests {
 
     #[test]
     fn reconnect_status_line_retrying() {
-        let line = reconnect_status_line(0, 4, ReconnectPhase::Retrying);
+        let line = reconnect_status_line(0, 4, ReconnectPhase::Retrying, true);
         // In-place repaint: CR to column 0, dim, clear-to-eol, SGR reset.
         assert!(line.starts_with("\r\x1b[2m"), "{line:?}");
         assert!(line.ends_with("\x1b[0m\x1b[K"), "{line:?}");
         assert!(line.contains("reconnecting 4s"), "{line:?}");
+        assert!(line.contains("any key retries"), "{line:?}");
         assert!(line.contains("^C aborts"), "{line:?}");
         // Spinner glyph is the frame at index 0.
         assert!(line.contains(SPINNER[0]), "{line:?}");
@@ -3165,19 +3258,41 @@ mod tests {
 
     #[test]
     fn reconnect_status_line_waiting() {
-        let line = reconnect_status_line(3, 99, ReconnectPhase::WaitingForNetwork);
+        let line = reconnect_status_line(3, 99, ReconnectPhase::WaitingForNetwork, true);
         assert!(line.contains("waiting for network"), "{line:?}");
+        // Keystroke punch-through works even while parked, so the hint shows.
+        assert!(line.contains("any key retries"), "{line:?}");
         // No elapsed counter while parked offline.
         assert!(!line.contains("99s"), "{line:?}");
         assert!(line.contains(SPINNER[3]), "{line:?}");
     }
 
     #[test]
+    fn reconnect_status_line_retry_now() {
+        let line = reconnect_status_line(0, 7, ReconnectPhase::RetryNow, true);
+        assert!(line.contains("retrying now"), "{line:?}");
+        // The keypress was already acknowledged -- no redundant hint, no
+        // elapsed counter (the attempt just started).
+        assert!(!line.contains("any key retries"), "{line:?}");
+        assert!(!line.contains("7s"), "{line:?}");
+        assert!(line.contains("^C aborts"), "{line:?}");
+    }
+
+    #[test]
+    fn reconnect_status_line_tail_hides_key_hint() {
+        // Tail mode doesn't watch stdin, so advertising a key retry would lie.
+        let line = reconnect_status_line(0, 4, ReconnectPhase::Retrying, false);
+        assert!(!line.contains("any key retries"), "{line:?}");
+        assert!(line.contains("reconnecting 4s"), "{line:?}");
+        assert!(line.contains("^C aborts"), "{line:?}");
+    }
+
+    #[test]
     fn reconnect_status_line_spinner_wraps() {
-        let a = reconnect_status_line(1, 0, ReconnectPhase::Retrying);
-        let b = reconnect_status_line(1 + SPINNER.len(), 0, ReconnectPhase::Retrying);
+        let a = reconnect_status_line(1, 0, ReconnectPhase::Retrying, true);
+        let b = reconnect_status_line(1 + SPINNER.len(), 0, ReconnectPhase::Retrying, true);
         assert_eq!(a, b);
-        let c = reconnect_status_line(2, 0, ReconnectPhase::Retrying);
+        let c = reconnect_status_line(2, 0, ReconnectPhase::Retrying, true);
         assert_ne!(a, c);
     }
 
