@@ -88,7 +88,7 @@ See **[USAGE.md](USAGE.md)** for every command and flag, configuration, escape s
 - **SSH agent forwarding** -- `git push`, `ssh`, and other agent-dependent commands work remotely using your local keys (opt-in via `-A`); survives reconnects without stale sockets
 - **URL open forwarding** -- `$BROWSER` requests forwarded to your local machine, with automatic OAuth callback tunneling (on by default; disable with `--no-forward-open`)
 - **Port forwarding** -- `gritty rf 8080` to quick-check a remote web server locally, `gritty lf 5432` to let the session reach local postgres (the target defaults to your attached session; name one with `gritty rf devbox:work 8080`); client-initiated only (a compromised server cannot open forwards)
-- **File transfer** -- `gritty send` / `gritty receive` through the session connection, preserving permissions; `-r` for recursive directory transfer; pipe mode with `-` for composing with `tar` etc.
+- **File transfer** -- `gritty send` / `gritty receive` through the session connection, preserving permissions; `-r` for recursive directory transfer; pipe mode with `-` (implied when stdout is redirected) for composing with `tar` etc.
 - **Clipboard forwarding** -- `gritty copy` pushes clipboard content from a remote session to your local machine (uses `pbcopy` on macOS, `wl-copy`/`xclip`/`xsel` on Linux); copy-only by design (the server cannot read the client clipboard)
 - **Single binary, no network protocol** -- Unix domain sockets locally, SSH handles encryption and auth; optional TOML config for per-host defaults
 

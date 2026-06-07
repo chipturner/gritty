@@ -7,7 +7,7 @@ mod util;
 pub(crate) use doctor::doctor;
 pub(crate) use refresh::refresh;
 pub(crate) use session::*;
-pub(crate) use transfer::{receive_command, send_command};
+pub(crate) use transfer::{receive_command, resolve_receive_output, send_command};
 pub(crate) use util::*;
 
 /// What to auto-start when connect can't reach the server.

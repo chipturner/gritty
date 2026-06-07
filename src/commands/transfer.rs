@@ -520,6 +520,23 @@ where
     Ok(received)
 }
 
+/// Resolve receive's output mode from the CLI args plus whether stdout is a
+/// terminal. Stdout mode when: `--stdout`, a `-` destination, or no
+/// destination at all while stdout is redirected -- a bare
+/// `gritty receive > foo` almost certainly wants the data on stdout, not a
+/// `./stdin` file in the cwd. Returns `(use_stdout, dest_dir, auto_switched)`;
+/// `auto_switched` lets the caller announce the implicit mode change.
+pub(crate) fn resolve_receive_output(
+    stdout_flag: bool,
+    dir: Option<PathBuf>,
+    stdout_is_tty: bool,
+) -> (bool, Option<PathBuf>, bool) {
+    let dash = dir.as_deref().is_some_and(|d| d.as_os_str() == "-");
+    let auto = !stdout_flag && dir.is_none() && !stdout_is_tty;
+    let use_stdout = stdout_flag || dash || auto;
+    (use_stdout, if use_stdout { None } else { dir }, auto)
+}
+
 pub(crate) async fn receive_command(
     ctl_socket: Option<PathBuf>,
     session: Option<String>,
@@ -668,6 +685,35 @@ pub(crate) async fn receive_command(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn resolve(flag: bool, dir: Option<&str>, tty: bool) -> (bool, Option<PathBuf>, bool) {
+        resolve_receive_output(flag, dir.map(PathBuf::from), tty)
+    }
+
+    #[test]
+    fn receive_output_stdout_flag_wins() {
+        assert_eq!(resolve(true, None, true), (true, None, false));
+    }
+
+    #[test]
+    fn receive_output_dash_means_stdout() {
+        assert_eq!(resolve(false, Some("-"), true), (true, None, false));
+    }
+
+    #[test]
+    fn receive_output_bare_tty_is_dir_mode() {
+        assert_eq!(resolve(false, None, true), (false, None, false));
+    }
+
+    #[test]
+    fn receive_output_bare_redirected_auto_switches() {
+        assert_eq!(resolve(false, None, false), (true, None, true));
+    }
+
+    #[test]
+    fn receive_output_explicit_dir_redirected_stays_dir_mode() {
+        assert_eq!(resolve(false, Some("out"), false), (false, Some(PathBuf::from("out")), false));
+    }
 
     #[test]
     fn sanitize_basename_simple() {

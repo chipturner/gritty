@@ -276,7 +276,8 @@ enum Command {
         #[arg(long)]
         no_timeout: bool,
 
-        /// Destination directory (default: current directory, - for stdout)
+        /// Destination directory (default: current directory, - for stdout;
+        /// stdout is implied when omitted and stdout is redirected)
         dir: Option<PathBuf>,
     },
     /// Open a URL on the local machine (for use inside gritty sessions)
@@ -947,8 +948,14 @@ async fn run(cli: Cli, config: gritty::config::ConfigFile) -> anyhow::Result<()>
             send_command(cli.ctl_socket, session, use_stdin, timeout, recursive, files).await
         }
         Command::Receive { session, stdout, timeout, no_timeout, dir } => {
-            let use_stdout = stdout || dir.as_deref().is_some_and(|d| d.as_os_str() == "-");
-            let dir = if use_stdout { None } else { dir };
+            use std::io::IsTerminal;
+            let (use_stdout, dir, auto) =
+                resolve_receive_output(stdout, dir, std::io::stdout().is_terminal());
+            if auto {
+                eprintln!(
+                    "\x1b[2;33m\u{25b8} stdout is redirected; streaming data to it (pass a directory to receive files instead)\x1b[0m"
+                );
+            }
             let timeout = if no_timeout { None } else { Some(timeout) };
             let session = resolve_target_session(&config, session);
             receive_command(cli.ctl_socket, session, use_stdout, timeout, dir).await

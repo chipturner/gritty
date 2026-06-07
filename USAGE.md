@@ -101,7 +101,7 @@ A `[host.<name>] aliases` config entry makes alternate spellings resolve to the 
 
 - `--session host:session`: target a specific session
 - `-r` / `--recursive` (`send`): send directories recursively (preserves structure, skips symlinks)
-- `-` (`send`): read data from stdin; (`receive`): write data to stdout
+- `-` (`send`): read data from stdin; (`receive`): write data to stdout. `receive` with no destination also auto-switches to stdout when its stdout is redirected (e.g. `gritty receive > foo` or piped); pass a directory to force file mode
 - `--timeout <seconds>`: deadline for pairing with a receiver/sender (default 300; `--no-timeout` waits indefinitely)
 
 File permissions are preserved. Directories can be sent with `-r`, or via tar for compression:
