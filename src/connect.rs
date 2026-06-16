@@ -608,6 +608,7 @@ async fn respawn_tunnel(
             );
             return RespawnResult::Exit;
         }
+        refresh_lock_mtime(&cfg.lock_path);
         info!("respawn: sleeping {}s (backoff)", sleep.as_secs());
         // Fixed deadline so net.changed() noise doesn't restart the sleep.
         let deadline = tokio::time::Instant::now() + sleep;
@@ -840,6 +841,7 @@ async fn tunnel_monitor(
                     let _ = state.child.kill().await;
                     return;
                 }
+                refresh_lock_mtime(&cfg.lock_path);
                 match probe_tunnel_alive(&cfg.local_sock).await {
                     Ok(_) => {
                         if state.probe_failures > 0 {
@@ -1330,6 +1332,23 @@ impl LockIdentity {
 /// supervisor exit and tear down a working tunnel.
 fn lock_still_owned(held: Option<LockIdentity>, path: &Path) -> bool {
     held.is_none_or(|id| id.matches_path(path))
+}
+
+/// Bump the lock file's atime+mtime to "now". The lock file is otherwise
+/// write-once (created at supervisor start, never touched again -- the
+/// flock is on the open fd, not the path), so an age-based /tmp sweeper
+/// (macOS `tmp_cleaner` at midnight, `dirhelper` at 3:35am) will eventually
+/// unlink it out from under a long-lived supervisor. Once unlinked,
+/// `is_lock_held` and `lock_still_owned` both report false and every
+/// attached client gives up after `DAEMON_GONE_GRACE`. Called from both the
+/// healthy probe tick and the respawn backoff loop so neither steady state
+/// lets the file age past the sweeper's threshold.
+fn refresh_lock_mtime(path: &Path) {
+    let now = std::time::SystemTime::now();
+    let times = std::fs::FileTimes::new().set_accessed(now).set_modified(now);
+    if let Ok(f) = std::fs::OpenOptions::new().write(true).open(path) {
+        let _ = f.set_times(times);
+    }
 }
 
 /// Remove a stale tunnel's sidecar files, but only after proving no live
@@ -2622,6 +2641,42 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let missing = dir.path().join("never-created.lock");
         assert!(lock_still_owned(None, &missing));
+    }
+
+    #[test]
+    fn refresh_lock_mtime_bumps_timestamps_without_disturbing_flock() {
+        let dir = tempfile::tempdir().unwrap();
+        let lock_path = dir.path().join("test.lock");
+
+        let held = try_acquire_lock(&lock_path).unwrap();
+        assert!(is_lock_held(&lock_path));
+
+        // Age the file into /tmp-sweeper territory.
+        let old = std::time::SystemTime::now() - Duration::from_secs(7 * 24 * 60 * 60);
+        let old_times = std::fs::FileTimes::new().set_accessed(old).set_modified(old);
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open(&lock_path)
+            .unwrap()
+            .set_times(old_times)
+            .unwrap();
+        let before = std::fs::metadata(&lock_path).unwrap().modified().unwrap();
+        assert!(before <= old + Duration::from_secs(1));
+
+        refresh_lock_mtime(&lock_path);
+
+        let after = std::fs::metadata(&lock_path).unwrap().modified().unwrap();
+        let age = std::time::SystemTime::now().duration_since(after).unwrap_or_default();
+        assert!(age < Duration::from_secs(60), "mtime should be ~now, got age {age:?}");
+        // Second open+close for the touch must not have released the flock.
+        assert!(is_lock_held(&lock_path), "refresh must not disturb the held flock");
+        drop(held);
+    }
+
+    #[test]
+    fn refresh_lock_mtime_ignores_missing_file() {
+        let dir = tempfile::tempdir().unwrap();
+        refresh_lock_mtime(&dir.path().join("absent.lock"));
     }
 
     #[test]

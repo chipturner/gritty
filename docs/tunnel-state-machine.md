@@ -47,7 +47,11 @@ The subtle corollary: the flock is held on an *inode*, but `is_lock_held()`
 probes the *path*. If the lock file is unlinked out from under a running
 supervisor (external `rm`, a `/tmp` sweeper, or a pre-fix racy cleanup), the
 supervisor keeps a valid flock on a deleted inode while the path reports the
-lock as free. A fresh `tunnel-create` then `O_CREAT`s a new inode and becomes
+lock as free. To keep age-based `/tmp` sweepers (macOS `tmp_cleaner` runs at
+midnight; `dirhelper` uses a 3-day threshold) from being that external `rm`,
+the supervisor touches the lock file's atime/mtime via `refresh_lock_mtime` on
+every `PROBE_INTERVAL` tick and every respawn-backoff iteration -- the file is
+otherwise write-once and would age out under a multi-day supervisor. A fresh `tunnel-create` then `O_CREAT`s a new inode and becomes
 the observable owner -- two supervisors exist concurrently, only one visible.
 
 Three guards keep that state from becoming destructive:
