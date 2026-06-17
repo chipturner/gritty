@@ -89,6 +89,51 @@ pub fn pid_file_path(ctl_path: &Path) -> PathBuf {
     ctl_path.with_file_name("daemon.pid")
 }
 
+/// Reap sessions whose linger has expired: unattached, with a non-zero
+/// `linger_secs`, and whose `last_heartbeat` (the last time a client was
+/// present) is older than that. The teardown is identical to
+/// `Frame::KillSession` -- remove from `sessions` and `handle.abort()`,
+/// which drops the session task; its `ManagedChild` drop guard sends
+/// `SIGHUP` to the shell's process group (ssh-hangup semantics:
+/// `nohup`/`disown`/`setsid` survivors keep running, everything else
+/// exits).
+fn reap_lingering(sessions: &mut HashMap<u32, SessionState>) {
+    let now = server::epoch_now();
+    let expired: Vec<u32> = sessions
+        .iter()
+        .filter_map(|(&id, state)| {
+            let meta = state.metadata.get()?;
+            let linger = meta.linger_secs.load(Ordering::Relaxed);
+            // `Acquire` pairs with `mark_detached`'s `Release` store so the
+            // `last_heartbeat` write that precedes it is visible here -- a
+            // freshly-detached session is never seen with a stale heartbeat.
+            if linger == 0 || meta.attached.load(Ordering::Acquire) {
+                return None;
+            }
+            let last = SessionMetadata::linger_baseline(
+                meta.last_heartbeat.load(Ordering::Relaxed),
+                meta.created_at,
+            );
+            (now.saturating_sub(last) >= linger).then_some(id)
+        })
+        .collect();
+    for id in expired {
+        abort_session(sessions, id, "linger expired");
+    }
+}
+
+/// Remove a session from the map and abort its task -- the shared
+/// teardown for `KillSession`, `reap_lingering`, and the
+/// creator-vanished rollback in `NewSession`. Aborting drops the task,
+/// whose `ManagedChild` drop guard sends `SIGHUP` to the shell's process
+/// group.
+fn abort_session(sessions: &mut HashMap<u32, SessionState>, id: u32, reason: &str) {
+    if let Some(state) = sessions.remove(&id) {
+        info!(id, name = state.name.as_deref().unwrap_or(""), reason, "session aborted");
+        state.handle.abort();
+    }
+}
+
 fn reap_sessions(sessions: &mut HashMap<u32, SessionState>) {
     use futures_util::future::FutureExt;
     let finished: Vec<u32> = sessions
@@ -312,6 +357,7 @@ fn build_session_entries(
                     agent_forwarding_active: meta.wants_agent.load(Ordering::Relaxed),
                     is_last_attached,
                     last_activity: meta.last_activity.load(Ordering::Relaxed),
+                    linger_secs: meta.linger_secs.load(Ordering::Relaxed),
                 }
             } else {
                 SessionEntry {
@@ -328,6 +374,7 @@ fn build_session_entries(
                     agent_forwarding_active: false,
                     is_last_attached,
                     last_activity: 0,
+                    linger_secs: 0,
                 }
             }
         })
@@ -688,6 +735,7 @@ pub async fn run_with_options(
     socket_check.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
 
     loop {
+        reap_lingering(&mut sessions);
         reap_sessions(&mut sessions);
 
         let action = tokio::select! {
@@ -852,7 +900,7 @@ async fn dispatch_control(
     device_id: u64,
 ) -> bool {
     match frame {
-        Frame::NewSession { name, command, cwd, cols, rows, client_name } => {
+        Frame::NewSession { name, command, cwd, cols, rows, client_name, linger_secs } => {
             // Reap before checking for duplicate names -- a session that
             // just exited still lives in `sessions` until the next reap,
             // and would otherwise trigger a spurious NameAlreadyExists.
@@ -902,6 +950,7 @@ async fn dispatch_control(
                         cwd: cwd_for_server,
                         initial_device_id: device_id,
                         idle_evict_timeout: crate::protocol::IDLE_EVICT_TIMEOUT,
+                        linger_secs,
                     },
                 )
                 .instrument(session_span),
@@ -929,10 +978,7 @@ async fn dispatch_control(
                     .await
                     .is_ok();
             if !send_ok {
-                if let Some(state) = sessions.remove(&id) {
-                    state.handle.abort();
-                }
-                info!(id, "NewSession creator gone before hand-off; rolled back");
+                abort_session(sessions, id, "creator gone before hand-off; rolled back");
                 return false;
             }
 
@@ -1144,9 +1190,7 @@ async fn dispatch_control(
                     return false;
                 }
             };
-            let state = sessions.remove(&id).unwrap();
-            state.handle.abort();
-            info!(id, "session killed");
+            abort_session(sessions, id, "kill-session");
             let _ = timed_send(&mut framed, Frame::Ok).await;
             false
         }
@@ -1193,6 +1237,30 @@ async fn dispatch_control(
             sessions.get_mut(&id).unwrap().name = Some(new_name.clone());
             info!(id, new_name, "session renamed");
             let _ = timed_send(&mut framed, Frame::Ok).await;
+            false
+        }
+        Frame::SetLinger { session, linger_secs } => {
+            let id = match resolve_live_session(sessions, &session, *last_attached) {
+                Ok(id) => id,
+                Err(f) => {
+                    let _ = timed_send(&mut framed, f).await;
+                    return false;
+                }
+            };
+            if let Some(meta) = sessions[&id].metadata.get() {
+                meta.linger_secs.store(linger_secs, Ordering::Relaxed);
+                info!(id, linger_secs, "linger updated");
+                let _ = timed_send(&mut framed, Frame::Ok).await;
+            } else {
+                let _ = timed_send(
+                    &mut framed,
+                    Frame::Error {
+                        code: ErrorCode::NoSuchSession,
+                        message: "session not yet initialized".to_string(),
+                    },
+                )
+                .await;
+            }
             false
         }
         Frame::KillServer => {

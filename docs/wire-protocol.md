@@ -8,11 +8,11 @@ Byte-level reference for the gritty wire protocol (`src/protocol.rs`).
 
 ## Framing
 
-All frames are `[type: u8][length: u32 BE][payload]`. Payloads <= 1MB. `PROTOCOL_VERSION: u16` is currently **22**.
+All frames are `[type: u8][length: u32 BE][payload]`. Payloads <= 1MB. `PROTOCOL_VERSION: u16` is currently **23**.
 
 ## Frame type codes
 
-Handshake: `0x01` Hello, `0x02` HelloAck. Relay: `0x10` Data, `0x11` Resize, `0x12` Exit, `0x13` Detached, `0x14` Ping, `0x15` Pong, `0x16` Env, `0x17` DiagRequest, `0x18` DiagResponse, `0x19` ServerShutdown, `0x1A` Resume, `0x1B` Notice. Agent: `0x20` AgentForward, `0x21` AgentOpen, `0x22` AgentData, `0x23` AgentClose. URL/clipboard: `0x28` OpenForward, `0x29` OpenUrl, `0x2A` ClipboardSet, `0x2B` ClipboardGet, `0x2C` ClipboardData. Tunnel: `0x30` TunnelListen, `0x31` TunnelOpen, `0x32` TunnelData, `0x33` TunnelClose. Transfer: `0x38` SendOffer, `0x39` SendDone, `0x3A` SendCancel, `0x3B` SendFile. Port forward: `0x40` PFListen, `0x41` PFReady, `0x42` PFOpen, `0x43` PFData, `0x44` PFClose, `0x45` PFStop, `0x46` PortForwardRequest. Control: `0x50` NewSession, `0x51` Attach, `0x52` ListSessions, `0x53` KillSession, `0x54` KillServer, `0x55` Tail, `0x56` RenameSession. Responses: `0x60` SessionCreated, `0x61` SessionInfo, `0x62` Ok, `0x63` Error, `0x64` AttachAck. Reserved: `0x80-0xFF`.
+Handshake: `0x01` Hello, `0x02` HelloAck. Relay: `0x10` Data, `0x11` Resize, `0x12` Exit, `0x13` Detached, `0x14` Ping, `0x15` Pong, `0x16` Env, `0x17` DiagRequest, `0x18` DiagResponse, `0x19` ServerShutdown, `0x1A` Resume, `0x1B` Notice. Agent: `0x20` AgentForward, `0x21` AgentOpen, `0x22` AgentData, `0x23` AgentClose. URL/clipboard: `0x28` OpenForward, `0x29` OpenUrl, `0x2A` ClipboardSet, `0x2B` ClipboardGet, `0x2C` ClipboardData. Tunnel: `0x30` TunnelListen, `0x31` TunnelOpen, `0x32` TunnelData, `0x33` TunnelClose. Transfer: `0x38` SendOffer, `0x39` SendDone, `0x3A` SendCancel, `0x3B` SendFile. Port forward: `0x40` PFListen, `0x41` PFReady, `0x42` PFOpen, `0x43` PFData, `0x44` PFClose, `0x45` PFStop, `0x46` PortForwardRequest. Control: `0x50` NewSession, `0x51` Attach, `0x52` ListSessions, `0x53` KillSession, `0x54` KillServer, `0x55` Tail, `0x56` RenameSession, `0x57` SetLinger. Responses: `0x60` SessionCreated, `0x61` SessionInfo, `0x62` Ok, `0x63` Error, `0x64` AttachAck. Reserved: `0x80-0xFF`.
 
 ## Handshake
 
@@ -26,7 +26,9 @@ This is deliberate -- `kill-server` and `restart` need to work across a mismatch
 
 ## Control frames
 
-`NewSession`: `[name_len: u16][name][cmd_len: u16][cmd][cwd_len: u16][cwd][cols: u16][rows: u16][client_name_len: u16][client_name]`. Empty cwd = `$HOME`. Zero cols/rows = default 80x24. `client_name` propagated to session metadata.
+`NewSession`: `[name_len: u16][name][cmd_len: u16][cmd][cwd_len: u16][cwd][cols: u16][rows: u16][client_name_len: u16][client_name][linger_secs: u64]`. Empty cwd = `$HOME`. Zero cols/rows = default 80x24. `client_name` propagated to session metadata. `linger_secs` (0 = never) is how long the session survives with zero attached clients before the daemon reaps it -- resolved client-side from `--linger` / config so the server just stores and enforces.
+
+`SetLinger`: `[session_len: u16][session][linger_secs: u64]`. Updates a live session's linger (0 = never). Sent on the control socket by name/id, or on the session stream by `~K` (where `session` is ignored -- the target is implicit). Reaping uses the same teardown as `KillSession` (`killpg(SIGHUP)` via the `ManagedChild` drop guard).
 
 `Attach`: `[session_len: u16][session][client_name_len: u16][client_name][force: u8][no_replay: u8][cols: u16][rows: u16][attach_token: u64][rendered_offset: u64][line_dirty: u8]`. `attach_token` is an ownership claim flag: `0` = explicit connect (no ownership check; server adopts the Hello's `device_id` as new owner; also signals "fresh viewer" so the server replays scrollback context instead of an incremental resume), non-zero = auto-reconnect (server compares Hello's `device_id` against stored `owner_device_id`; mismatch → `OwnerChanged`). Server enforces: if attached and `!force`, returns `AlreadyAttached` error. `no_replay` = existence probe only (daemon replies `Ok` without session handoff). `cols`/`rows` are the client's current terminal size, applied to the PTY before reconnect replay so regenerated prompts and TUI repaints use the right winsize (0 = unknown). `rendered_offset` is how far the client has rendered into the session's PTY output stream -- the server resumes from there (see `Resume`/`Notice` and the smart-reconnect pattern in [internals.md](internals.md)). `line_dirty` = the client painted a reconnect status line, so its cursor left `rendered_offset`'s position and the server repaints the current line before resuming.
 
@@ -38,7 +40,7 @@ This is deliberate -- `kill-server` and `restart` need to work across a mismatch
 
 `Error`: `[code: u16][message: remaining bytes]`. `ErrorCode`: `NoSuchSession(1)`, `NameAlreadyExists(2)`, `InvalidName(3)`, `EmptyName(4)`, `VersionMismatch(5)`, `UnexpectedFrame(6)`, `AlreadyAttached(7)`, `OwnerChanged(8)`, `Unknown(u16)`. Match on code for programmatic error handling, display message for humans. `OwnerChanged(8)` is terminal: the client's reconnect loop treats it like `ServerRestarted` and exits without retrying.
 
-`SessionInfo`: `[count: u32][per entry: [entry_len: u32][id: u32][name: u16-len + bytes][pty_path: u16-len + bytes][shell_pid: u32][created_at: u64][attached: u8][last_heartbeat: u64][foreground_cmd: u16-len + bytes][cwd: u16-len + bytes][client_name: u16-len + bytes][agent_forwarding_active: u8][is_last_attached: u8][last_activity: u64]]`. Decoder skips unknown trailing bytes within each entry_len; new fields default gracefully when absent (older servers).
+`SessionInfo`: `[count: u32][per entry: [entry_len: u32][id: u32][name: u16-len + bytes][pty_path: u16-len + bytes][shell_pid: u32][created_at: u64][attached: u8][last_heartbeat: u64][foreground_cmd: u16-len + bytes][cwd: u16-len + bytes][client_name: u16-len + bytes][agent_forwarding_active: u8][is_last_attached: u8][last_activity: u64][linger_secs: u64]]`. Decoder skips unknown trailing bytes within each entry_len; new fields default gracefully when absent (older servers).
 
 ## Diagnostics and shutdown
 

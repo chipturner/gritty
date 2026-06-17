@@ -15,6 +15,23 @@ const fn idle_evict_ceiling_secs() -> u64 {
     IDLE_EVICT_TIMEOUT.as_secs() - IDLE_EVICT_SAFETY_MARGIN.as_secs()
 }
 
+/// Parse a `linger` config/CLI value into seconds. Accepts the literal
+/// `"never"` (mapped to the 0 sentinel = no auto-reap) or any non-zero
+/// duration accepted by [`crate::parse_duration`] (`"30m"`, `"1h"`, bare
+/// seconds). A literal `0` / `0s` is rejected: it would otherwise alias
+/// to `never`, which is the opposite of what someone writing 0 means.
+pub fn parse_linger(s: &str) -> anyhow::Result<u64> {
+    if s.eq_ignore_ascii_case("never") {
+        return Ok(0);
+    }
+    match crate::parse_duration(s)? {
+        0 => anyhow::bail!(
+            "linger of 0 is ambiguous -- use \"never\" to disable auto-reap, or \"1s\" for immediate"
+        ),
+        secs => Ok(secs),
+    }
+}
+
 /// Clamp the heartbeat interval/timeout to the three invariants the client and
 /// server both rely on -- `interval >= 1`, `timeout > interval`, and
 /// `interval + timeout <= ceiling` -- and return the clamped pair plus any
@@ -79,6 +96,14 @@ pub struct SessionSettings {
     pub ring_buffer_size: u64,
     pub oauth_tunnel_idle_timeout: u64,
     pub client_name: String,
+    /// How long a session survives with zero attached clients before the
+    /// daemon reaps it. Seconds; 0 = never. Applies to sessions the user
+    /// explicitly named (`host:foo`).
+    pub linger: u64,
+    /// Same as `linger` but for sessions where the user omitted the session
+    /// part (`host` -> auto-numbered slot). Falls back to `linger` if not
+    /// set in config.
+    pub linger_unnamed: u64,
 }
 
 /// Resolve a default `client_name` from the system hostname, sanitized through
@@ -103,6 +128,8 @@ impl Default for SessionSettings {
             ring_buffer_size: 1 << 20, // 1 MB
             oauth_tunnel_idle_timeout: 5,
             client_name: default_client_name(),
+            linger: 0,
+            linger_unnamed: 0,
         }
     }
 }
@@ -146,6 +173,12 @@ pub struct Defaults {
     pub ring_buffer_size: Option<u64>,
     pub oauth_tunnel_idle_timeout: Option<u64>,
     pub client_name: Option<String>,
+    /// Linger for explicitly-named sessions (e.g. `"30m"`, `"1h"`,
+    /// `"never"`). See [`SessionSettings::linger`].
+    pub linger: Option<String>,
+    /// Linger for sessions where the user omitted the name. Falls back to
+    /// `linger` if unset. See [`SessionSettings::linger_unnamed`].
+    pub linger_unnamed: Option<String>,
     /// Alternate names for this connection (`[host.<name>]` only; meaningless
     /// under `[defaults]`). Typing an alias as the host part of a target
     /// resolves to the canonical connection name, and the *first* alias is
@@ -240,8 +273,34 @@ impl ConfigFile {
         let raw_interval =
             h.and_then(|h| h.heartbeat_interval).or(d.heartbeat_interval).unwrap_or(10);
         let raw_timeout = h.and_then(|h| h.heartbeat_timeout).or(d.heartbeat_timeout).unwrap_or(60);
-        let (heartbeat_interval, heartbeat_timeout, warnings) =
+        let (heartbeat_interval, heartbeat_timeout, mut warnings) =
             clamp_heartbeat(raw_interval, raw_timeout);
+
+        // Linger durations are stored as strings in config (so users can
+        // write `"30m"` / `"never"`); a malformed value warns and is skipped
+        // so the next layer in the precedence chain applies.
+        let mut resolve_linger = |key: &str, raw: Option<&str>| -> Option<u64> {
+            let raw = raw?;
+            match parse_linger(raw) {
+                Ok(secs) => Some(secs),
+                Err(e) => {
+                    warnings.push(format!("ignoring {key} = {raw:?}: {e}"));
+                    None
+                }
+            }
+        };
+        let h_linger = resolve_linger("linger", h.and_then(|h| h.linger.as_deref()));
+        let h_unnamed =
+            resolve_linger("linger-unnamed", h.and_then(|h| h.linger_unnamed.as_deref()));
+        let d_linger = resolve_linger("linger", d.linger.as_deref());
+        let d_unnamed = resolve_linger("linger-unnamed", d.linger_unnamed.as_deref());
+        let linger = h_linger.or(d_linger).unwrap_or(0);
+        // `linger_unnamed` precedence: host.linger_unnamed > host.linger >
+        // defaults.linger_unnamed > defaults.linger. A host that sets only
+        // `linger = "never"` shields its unnamed sessions too, even if
+        // `[defaults] linger-unnamed` is set.
+        let linger_unnamed = h_unnamed.or(h_linger).or(d_unnamed).or(d_linger).unwrap_or(0);
+
         if warn {
             for w in &warnings {
                 eprintln!("warning: {w}");
@@ -269,6 +328,8 @@ impl ConfigFile {
                 .or_else(|| d.client_name.clone())
                 .map(crate::naming::sanitize_client_name)
                 .unwrap_or_else(default_client_name),
+            linger,
+            linger_unnamed,
         }
     }
 
@@ -778,6 +839,131 @@ mod tests {
         assert!(s.heartbeat_interval + s.heartbeat_timeout <= idle_evict_ceiling_secs());
         assert_eq!(s.heartbeat_interval, 10);
         assert_eq!(s.heartbeat_timeout, 60);
+    }
+
+    #[test]
+    fn parse_linger_accepts_never_and_durations() {
+        assert_eq!(parse_linger("never").unwrap(), 0);
+        assert_eq!(parse_linger("Never").unwrap(), 0);
+        assert_eq!(parse_linger("30m").unwrap(), 30 * 60);
+        assert_eq!(parse_linger("1h").unwrap(), 3600);
+        assert_eq!(parse_linger("90").unwrap(), 90);
+        assert!(parse_linger("nope").is_err());
+        assert!(parse_linger("").is_err());
+    }
+
+    #[test]
+    fn parse_linger_rejects_zero() {
+        // 0 would alias to the `never` sentinel -- the opposite of what
+        // someone writing 0 means -- so reject it explicitly.
+        for z in ["0", "0s", "0m", "0h", "0d"] {
+            let e = parse_linger(z).unwrap_err().to_string();
+            assert!(e.contains("never"), "wrong error for {z}: {e}");
+        }
+    }
+
+    #[test]
+    fn linger_defaults_to_never() {
+        let cfg: ConfigFile = toml::from_str("").unwrap();
+        let s = cfg.resolve_session(None);
+        assert_eq!(s.linger, 0);
+        assert_eq!(s.linger_unnamed, 0);
+    }
+
+    #[test]
+    fn linger_unnamed_falls_back_to_linger() {
+        let cfg: ConfigFile = toml::from_str(
+            r#"
+            [defaults]
+            linger = "1h"
+        "#,
+        )
+        .unwrap();
+        let s = cfg.resolve_session(None);
+        assert_eq!(s.linger, 3600);
+        assert_eq!(s.linger_unnamed, 3600);
+    }
+
+    #[test]
+    fn linger_unnamed_overrides_linger() {
+        let cfg: ConfigFile = toml::from_str(
+            r#"
+            [defaults]
+            linger = "never"
+            linger-unnamed = "30m"
+        "#,
+        )
+        .unwrap();
+        let s = cfg.resolve_session(None);
+        assert_eq!(s.linger, 0);
+        assert_eq!(s.linger_unnamed, 1800);
+    }
+
+    #[test]
+    fn linger_per_host_overrides_default() {
+        let cfg: ConfigFile = toml::from_str(
+            r#"
+            [defaults]
+            linger = "1h"
+            [host.work]
+            linger = "never"
+        "#,
+        )
+        .unwrap();
+        assert_eq!(cfg.resolve_session(None).linger, 3600);
+        assert_eq!(cfg.resolve_session(Some("work")).linger, 0);
+    }
+
+    #[test]
+    fn host_linger_shields_unnamed_from_defaults() {
+        // Precedence: host.linger_unnamed > host.linger >
+        // defaults.linger_unnamed > defaults.linger. Setting
+        // `[host.prod] linger = "never"` must protect prod's unnamed
+        // sessions even when a global linger-unnamed fuse is set.
+        let cfg: ConfigFile = toml::from_str(
+            r#"
+            [defaults]
+            linger-unnamed = "30m"
+            [host.prod]
+            linger = "never"
+        "#,
+        )
+        .unwrap();
+        let s = cfg.resolve_session(Some("prod"));
+        assert_eq!(s.linger, 0);
+        assert_eq!(s.linger_unnamed, 0);
+        // Other hosts still get the global unnamed fuse.
+        assert_eq!(cfg.resolve_session(None).linger_unnamed, 1800);
+    }
+
+    #[test]
+    fn linger_malformed_host_value_falls_through_to_default() {
+        // A typo at the host layer should warn and inherit the valid
+        // [defaults] value, not silently disable the feature.
+        let cfg: ConfigFile = toml::from_str(
+            r#"
+            [defaults]
+            linger = "1h"
+            [host.work]
+            linger = "1 h"
+        "#,
+        )
+        .unwrap();
+        let s = cfg.resolve_session_inner(Some("work"), false);
+        assert_eq!(s.linger, 3600);
+    }
+
+    #[test]
+    fn linger_malformed_default_falls_back_to_never() {
+        let cfg: ConfigFile = toml::from_str(
+            r#"
+            [defaults]
+            linger = "30x"
+        "#,
+        )
+        .unwrap();
+        let s = cfg.resolve_session_inner(None, false);
+        assert_eq!(s.linger, 0);
     }
 
     // A large heartbeat_interval must not drive the resolved timeout below

@@ -17,6 +17,11 @@
 # heartbeat-timeout = 60
 # ring-buffer-size = 1048576
 # oauth-tunnel-idle-timeout = 5
+# linger = "never"           # auto-reap a session this long after the last
+#                            # client detaches (e.g. "30m", "1h"); applies to
+#                            # sessions you explicitly named (`host:foo`)
+# linger-unnamed = "never"   # same, for auto-numbered sessions (`host` with
+#                            # no name); falls back to `linger` if unset
 # client-name = "my-laptop"  # default: hostname
 
 # Tunnel-specific global defaults (for tunnel-create).

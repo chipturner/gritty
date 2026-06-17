@@ -95,6 +95,7 @@ fn roundtrip_new_session() {
         cols: 0,
         rows: 0,
         client_name: "alice-laptop".to_string(),
+        linger_secs: 1800,
     };
     codec.encode(original.clone(), &mut buf).unwrap();
     let decoded = codec.decode(&mut buf).unwrap().unwrap();
@@ -112,6 +113,7 @@ fn roundtrip_new_session_empty_name() {
         cols: 0,
         rows: 0,
         client_name: String::new(),
+        linger_secs: 0,
     };
     codec.encode(original.clone(), &mut buf).unwrap();
     let decoded = codec.decode(&mut buf).unwrap().unwrap();
@@ -129,6 +131,7 @@ fn roundtrip_new_session_with_command() {
         cols: 0,
         rows: 0,
         client_name: String::new(),
+        linger_secs: 0,
     };
     codec.encode(original.clone(), &mut buf).unwrap();
     let decoded = codec.decode(&mut buf).unwrap().unwrap();
@@ -146,6 +149,7 @@ fn roundtrip_new_session_command_only() {
         cols: 0,
         rows: 0,
         client_name: String::new(),
+        linger_secs: 0,
     };
     codec.encode(original.clone(), &mut buf).unwrap();
     let decoded = codec.decode(&mut buf).unwrap().unwrap();
@@ -172,6 +176,18 @@ fn roundtrip_rename_session_by_name() {
     codec.encode(original.clone(), &mut buf).unwrap();
     let decoded = codec.decode(&mut buf).unwrap().unwrap();
     assert_eq!(original, decoded);
+}
+
+#[test]
+fn roundtrip_set_linger() {
+    let mut codec = FrameCodec;
+    let mut buf = BytesMut::new();
+    for (session, linger_secs) in [("myproject", 1800u64), ("", 0), ("-", u64::MAX)] {
+        let original = Frame::SetLinger { session: session.to_string(), linger_secs };
+        codec.encode(original.clone(), &mut buf).unwrap();
+        let decoded = codec.decode(&mut buf).unwrap().unwrap();
+        assert_eq!(original, decoded);
+    }
 }
 
 #[test]
@@ -389,6 +405,7 @@ fn roundtrip_session_info() {
                 agent_forwarding_active: true,
                 is_last_attached: false,
                 last_activity: 1700000007,
+                linger_secs: 1800,
             },
             SessionEntry {
                 id: 1,
@@ -404,6 +421,7 @@ fn roundtrip_session_info() {
                 agent_forwarding_active: false,
                 is_last_attached: false,
                 last_activity: 0,
+                linger_secs: 0,
             },
         ],
     };
@@ -447,6 +465,7 @@ fn legacy_session_info_without_last_activity_decodes_as_zero() {
             assert_eq!(sessions[0].last_heartbeat, 1700000005);
             assert!(sessions[0].is_last_attached);
             assert_eq!(sessions[0].last_activity, 0);
+            assert_eq!(sessions[0].linger_secs, 0);
         }
         other => panic!("expected SessionInfo, got {other:?}"),
     }
@@ -614,6 +633,7 @@ fn session_info_u32_id_roundtrip() {
             agent_forwarding_active: false,
             is_last_attached: false,
             last_activity: 1700000050,
+            linger_secs: 0,
         }],
     };
     codec.encode(original.clone(), &mut buf).unwrap();
@@ -685,6 +705,7 @@ fn session_info_preserves_newline_in_name() {
             agent_forwarding_active: false,
             is_last_attached: false,
             last_activity: 0,
+            linger_secs: 0,
         }],
     };
     codec.encode(original.clone(), &mut buf).unwrap();

@@ -84,7 +84,7 @@ See **[USAGE.md](USAGE.md)** for every command and flag, configuration, escape s
 ## Features
 
 - **Self-healing connections** -- heartbeat detection, automatic tunnel respawn, transparent reconnect
-- **Persistent sessions** -- shells survive disconnect, network failure, laptop sleep; `connect` reattaches or creates; multiple named sessions
+- **Persistent sessions** -- shells survive disconnect, network failure, laptop sleep; `connect` reattaches or creates; multiple named sessions; opt-in `linger` to auto-reap detached throwaway sessions after a timeout (`~K` to pin one you decide to keep)
 - **SSH agent forwarding** -- `git push`, `ssh`, and other agent-dependent commands work remotely using your local keys (opt-in via `-A`); survives reconnects without stale sockets
 - **URL open forwarding** -- `$BROWSER` requests forwarded to your local machine, with automatic OAuth callback tunneling (on by default; disable with `--no-forward-open`)
 - **Port forwarding** -- `gritty rf 8080` to quick-check a remote web server locally, `gritty lf 5432` to let the session reach local postgres (the target defaults to your attached session; name one with `gritty rf devbox:work 8080`); client-initiated only (a compromised server cannot open forwards)

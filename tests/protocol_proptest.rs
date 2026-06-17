@@ -37,7 +37,15 @@ fn arb_session_entry() -> impl Strategy<Value = SessionEntry> {
             any::<bool>(),
             any::<u64>(),
         ),
-        (arb_string(), arb_string(), arb_string(), any::<bool>(), any::<bool>(), any::<u64>()),
+        (
+            arb_string(),
+            arb_string(),
+            arb_string(),
+            any::<bool>(),
+            any::<bool>(),
+            any::<u64>(),
+            any::<u64>(),
+        ),
     )
         .prop_map(
             |(
@@ -49,6 +57,7 @@ fn arb_session_entry() -> impl Strategy<Value = SessionEntry> {
                     agent_forwarding_active,
                     is_last_attached,
                     last_activity,
+                    linger_secs,
                 ),
             )| {
                 SessionEntry {
@@ -65,6 +74,7 @@ fn arb_session_entry() -> impl Strategy<Value = SessionEntry> {
                     agent_forwarding_active,
                     is_last_attached,
                     last_activity,
+                    linger_secs,
                 }
             },
         )
@@ -147,15 +157,20 @@ fn arb_frame() -> impl Strategy<Value = Frame> {
         arb_string().prop_map(|session| Frame::SendFile { session }),
         (arb_string(), arb_string())
             .prop_map(|(session, new_name)| Frame::RenameSession { session, new_name }),
+        (arb_string(), any::<u64>())
+            .prop_map(|(session, linger_secs)| Frame::SetLinger { session, linger_secs }),
         // Structured frames
-        (arb_string(), arb_string(), arb_string(), any::<u16>(), any::<u16>(), arb_string())
-            .prop_map(|(name, command, cwd, cols, rows, client_name)| Frame::NewSession {
-                name,
-                command,
-                cwd,
-                cols,
-                rows,
-                client_name,
+        (
+            arb_string(),
+            arb_string(),
+            arb_string(),
+            any::<u16>(),
+            any::<u16>(),
+            arb_string(),
+            any::<u64>(),
+        )
+            .prop_map(|(name, command, cwd, cols, rows, client_name, linger_secs)| {
+                Frame::NewSession { name, command, cwd, cols, rows, client_name, linger_secs }
             }),
         (
             arb_string(),

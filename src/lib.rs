@@ -14,6 +14,23 @@ pub mod security;
 pub mod server;
 pub mod table;
 
+/// Parse a compact duration into seconds: bare seconds (`"90"`) or a number
+/// with a unit suffix (`"90s"`, `"30m"`, `"12h"`, `"7d"`) -- what `gritty ls`
+/// prints in the Idle column is valid input here.
+pub fn parse_duration(s: &str) -> anyhow::Result<u64> {
+    let err = || anyhow::anyhow!("invalid duration: {s:?} (use e.g. 90s, 30m, 12h, 7d)");
+    let (number, multiplier) = match s.chars().last() {
+        Some('s') => (&s[..s.len() - 1], 1),
+        Some('m') => (&s[..s.len() - 1], 60),
+        Some('h') => (&s[..s.len() - 1], 3600),
+        Some('d') => (&s[..s.len() - 1], 86400),
+        Some(c) if c.is_ascii_digit() => (s, 1),
+        _ => return Err(err()),
+    };
+    let n: u64 = number.parse().map_err(|_| err())?;
+    n.checked_mul(multiplier).ok_or_else(err)
+}
+
 /// Result of a successful handshake. The `version` field carries what the
 /// server advertised, which may differ from `PROTOCOL_VERSION` -- callers
 /// that need session-level compatibility must verify via

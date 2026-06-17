@@ -79,6 +79,7 @@ async fn create_session(ctl_path: &std::path::Path, name: &str) -> String {
             cols: 0,
             rows: 0,
             client_name: String::new(),
+            linger_secs: 0,
         },
     )
     .await;
@@ -293,6 +294,7 @@ async fn daemon_rejects_duplicate_name() {
             cols: 0,
             rows: 0,
             client_name: String::new(),
+            linger_secs: 0,
         },
     )
     .await;
@@ -318,6 +320,7 @@ async fn daemon_rejects_name_with_tab() {
             cols: 0,
             rows: 0,
             client_name: String::new(),
+            linger_secs: 0,
         },
     )
     .await;
@@ -343,6 +346,7 @@ async fn daemon_rejects_name_with_newline() {
             cols: 0,
             rows: 0,
             client_name: String::new(),
+            linger_secs: 0,
         },
     )
     .await;
@@ -829,6 +833,7 @@ async fn list_before_session_ready() {
             cols: 0,
             rows: 0,
             client_name: String::new(),
+            linger_secs: 0,
         },
     )
     .await;
@@ -1033,6 +1038,7 @@ async fn second_attach_during_birth_window_is_rejected() {
         cols: 0,
         rows: 0,
         client_name: String::new(),
+        linger_secs: 0,
     })
     .await
     .unwrap();
@@ -1438,6 +1444,7 @@ async fn daemon_rejects_purely_numeric_name() {
             cols: 0,
             rows: 0,
             client_name: String::new(),
+            linger_secs: 0,
         },
     )
     .await;
@@ -1621,6 +1628,7 @@ async fn new_session_for_test(
             cols: 0,
             rows: 0,
             client_name: client_name.to_string(),
+            linger_secs: 0,
         })
         .await
         .unwrap();
@@ -1759,6 +1767,7 @@ async fn already_attached_error_names_current_client() {
             cols: 0,
             rows: 0,
             client_name: "laptop-a".to_string(),
+            linger_secs: 0,
         })
         .await
         .unwrap();
@@ -2080,4 +2089,170 @@ async fn probe_socket_protocol_fails_cleanly_when_no_daemon() {
         .await
         .expect("probe must not hang on a missing socket");
     assert!(result.is_err(), "probe of a nonexistent socket should fail, got {result:?}");
+}
+
+// --- linger reaper -----------------------------------------------------
+
+/// Create a session with the given `linger_secs`, then drop the creating
+/// connection so it becomes detached. Returns the wire name.
+async fn create_lingering_session(
+    ctl_path: &std::path::Path,
+    name: &str,
+    linger_secs: u64,
+) -> String {
+    let resp = control_request(
+        ctl_path,
+        Frame::NewSession {
+            name: name.to_string(),
+            command: String::new(),
+            cwd: String::new(),
+            cols: 0,
+            rows: 0,
+            client_name: String::new(),
+            linger_secs,
+        },
+    )
+    .await;
+    assert!(matches!(resp, Frame::SessionCreated { .. }), "got {resp:?}");
+    name.to_string()
+}
+
+/// Fetch the session list.
+async fn list_entries(ctl_path: &std::path::Path) -> Vec<gritty::protocol::SessionEntry> {
+    match control_request(ctl_path, Frame::ListSessions).await {
+        Frame::SessionInfo { sessions } => sessions,
+        other => panic!("expected SessionInfo, got {other:?}"),
+    }
+}
+
+/// Poll until the named session reports `attached == false`, or panic
+/// after 5s. Lets a linger test wait for the create-then-drop dance to
+/// settle before starting its expiry clock.
+async fn wait_until_detached(ctl_path: &std::path::Path, name: &str) {
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    loop {
+        let entries = list_entries(ctl_path).await;
+        if let Some(e) = entries.iter().find(|e| e.name == name)
+            && !e.attached
+        {
+            return;
+        }
+        if tokio::time::Instant::now() >= deadline {
+            panic!("session {name} never reported detached: {entries:?}");
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+}
+
+#[tokio::test]
+async fn linger_reaps_detached_session_after_expiry() {
+    let (_tmp, ctl_path) = test_ctl();
+    let ctl = ctl_path.clone();
+    let _daemon = tokio::spawn(async move { gritty::daemon::run(&ctl, None).await });
+    wait_for_daemon(&ctl_path).await;
+
+    let name = create_lingering_session(&ctl_path, "transient", 1).await;
+    wait_until_detached(&ctl_path, &name).await;
+
+    // Linger expires after 1s; the ListSessions request itself drives a
+    // daemon loop iteration, which runs reap_lingering before answering.
+    tokio::time::sleep(Duration::from_millis(1500)).await;
+    let entries = list_entries(&ctl_path).await;
+    assert!(
+        !entries.iter().any(|e| e.name == name),
+        "session should have been reaped after linger expiry: {entries:?}"
+    );
+}
+
+#[tokio::test]
+async fn linger_zero_never_reaps() {
+    let (_tmp, ctl_path) = test_ctl();
+    let ctl = ctl_path.clone();
+    let _daemon = tokio::spawn(async move { gritty::daemon::run(&ctl, None).await });
+    wait_for_daemon(&ctl_path).await;
+
+    let name = create_lingering_session(&ctl_path, "permanent", 0).await;
+    wait_until_detached(&ctl_path, &name).await;
+
+    tokio::time::sleep(Duration::from_millis(1500)).await;
+    let entries = list_entries(&ctl_path).await;
+    assert!(
+        entries.iter().any(|e| e.name == name),
+        "linger=0 session must never be reaped: {entries:?}"
+    );
+
+    kill_cleanup(&ctl_path, &name).await;
+}
+
+#[tokio::test]
+async fn linger_does_not_reap_while_attached() {
+    let (_tmp, ctl_path) = test_ctl();
+    let ctl = ctl_path.clone();
+    let _daemon = tokio::spawn(async move { gritty::daemon::run(&ctl, None).await });
+    wait_for_daemon(&ctl_path).await;
+
+    // linger=2s leaves headroom for the create->detach->reattach hop
+    // under CI load before the reaper could fire on the briefly-detached
+    // session; we then hold the attach past the linger window.
+    let name = create_lingering_session(&ctl_path, "held", 2).await;
+    let mut framed = attach_session(&ctl_path, &name).await;
+    tokio::time::sleep(Duration::from_millis(2500)).await;
+    let entries = list_entries(&ctl_path).await;
+    assert!(
+        entries.iter().any(|e| e.name == name && e.attached),
+        "attached session must survive past its linger window: {entries:?}"
+    );
+    // Keep the relay alive until we've checked.
+    let _ = framed.send(Frame::Ping).await;
+    drop(framed);
+
+    kill_cleanup(&ctl_path, &name).await;
+}
+
+#[tokio::test]
+async fn set_linger_to_never_cancels_reap() {
+    let (_tmp, ctl_path) = test_ctl();
+    let ctl = ctl_path.clone();
+    let _daemon = tokio::spawn(async move { gritty::daemon::run(&ctl, None).await });
+    wait_for_daemon(&ctl_path).await;
+
+    // linger=2s gives the SetLinger control round-trip headroom against
+    // CI scheduling before the reaper could fire.
+    let name = create_lingering_session(&ctl_path, "pinnable", 2).await;
+    // Pin via the control socket (the `~K` path goes through the session
+    // stream and is exercised by the escape-processor unit tests; here we
+    // verify the daemon-side handler updates the stored value).
+    let resp =
+        control_request(&ctl_path, Frame::SetLinger { session: name.clone(), linger_secs: 0 })
+            .await;
+    assert!(matches!(resp, Frame::Ok), "SetLinger should Ok, got {resp:?}");
+    wait_until_detached(&ctl_path, &name).await;
+
+    tokio::time::sleep(Duration::from_millis(2500)).await;
+    let entries = list_entries(&ctl_path).await;
+    let entry = entries
+        .iter()
+        .find(|e| e.name == name)
+        .unwrap_or_else(|| panic!("session reaped despite SetLinger->never: {entries:?}"));
+    assert_eq!(entry.linger_secs, 0, "SessionEntry should reflect updated linger");
+
+    kill_cleanup(&ctl_path, &name).await;
+}
+
+#[tokio::test]
+async fn set_linger_unknown_session_errors() {
+    let (_tmp, ctl_path) = test_ctl();
+    let ctl = ctl_path.clone();
+    let _daemon = tokio::spawn(async move { gritty::daemon::run(&ctl, None).await });
+    wait_for_daemon(&ctl_path).await;
+
+    let resp = control_request(
+        &ctl_path,
+        Frame::SetLinger { session: "nosuch".to_string(), linger_secs: 0 },
+    )
+    .await;
+    assert!(
+        matches!(resp, Frame::Error { code: ErrorCode::NoSuchSession, .. }),
+        "expected NoSuchSession, got {resp:?}"
+    );
 }

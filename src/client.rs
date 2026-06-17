@@ -136,6 +136,7 @@ impl SecurityLimiters {
 const ESCAPE_HELP: &[u8] = b"\r\nSupported escape sequences:\r\n\
     ~.  - detach from session\r\n\
     ~R  - force reconnect\r\n\
+    ~K  - pin session (set linger to never)\r\n\
     ~^Z - suspend client\r\n\
     ~#  - session status and RTT\r\n\
     ~?  - this message\r\n\
@@ -154,6 +155,7 @@ enum EscapeAction {
     Data(Vec<u8>),
     Detach,
     Reconnect,
+    Pin,
     Suspend,
     Status,
     Help,
@@ -215,6 +217,11 @@ impl EscapeProcessor {
                             actions.push(EscapeAction::Reconnect);
                             self.state = EscapeState::Normal;
                             return actions; // Stop processing
+                        }
+                        b'K' => {
+                            flush_pending(&mut actions, &mut data_buf);
+                            actions.push(EscapeAction::Pin);
+                            self.state = EscapeState::Normal;
                         }
                         0x1a => {
                             // Ctrl-Z
@@ -1746,6 +1753,19 @@ async fn relay(
                                         // like any other seamless reconnect.
                                         return Ok(RelayExit::Disconnected);
                                     }
+                                    EscapeAction::Pin => {
+                                        if !timed_send(
+                                            framed,
+                                            Frame::SetLinger { session: String::new(), linger_secs: 0 },
+                                            relay.last_outbound_at,
+                                        ).await {
+                                            return Ok(RelayExit::Disconnected);
+                                        }
+                                        write_stdout_async(
+                                            async_stdout,
+                                            status_msg("session pinned (linger: never)").as_bytes(),
+                                        ).await?;
+                                    }
                                     EscapeAction::Suspend => {
                                         suspend(raw_guard, nb_guard)?;
                                         // Avoid a spurious idle-timeout after returning from SIGTSTP.
@@ -3044,6 +3064,22 @@ mod tests {
         let mut ep = EscapeProcessor { state: EscapeState::Normal };
         let actions = ep.process(b"\n~R");
         assert_eq!(actions, vec![EscapeAction::Data(b"\n".to_vec()), EscapeAction::Reconnect,]);
+    }
+
+    #[test]
+    fn tilde_pin() {
+        let mut ep = EscapeProcessor { state: EscapeState::Normal };
+        let actions = ep.process(b"\n~K");
+        assert_eq!(actions, vec![EscapeAction::Data(b"\n".to_vec()), EscapeAction::Pin,]);
+    }
+
+    #[test]
+    fn tilde_pin_continues_processing() {
+        // Unlike ~. and ~R, ~K keeps processing the rest of the input
+        // buffer -- it's a non-disruptive in-band tweak, not a teardown.
+        let mut ep = EscapeProcessor::new();
+        let actions = ep.process(b"~Kabc");
+        assert_eq!(actions, vec![EscapeAction::Pin, EscapeAction::Data(b"abc".to_vec())]);
     }
 
     #[test]

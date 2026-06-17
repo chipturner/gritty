@@ -84,7 +84,7 @@ SSH tunnel supervisor state machine: **[docs/tunnel-state-machine.md](docs/tunne
 - **Reap only after the confirm delay** -- `procscan::confirm_and_reap` must wait longer than `daemon::SOCKET_CHECK_INTERVAL` so a self-healing daemon is never killed mid-recovery.
 
 ### Changing the protocol
-- Bump `PROTOCOL_VERSION` whenever frame types, encoding, or `SessionEntry` fields change (currently v22).
+- Bump `PROTOCOL_VERSION` whenever frame types, encoding, or `SessionEntry` fields change (currently v23).
 - Version mismatch is **not** a hard handshake gate -- the daemon replies `HelloAck` with its own version and only honors `KillServer` afterward, so `kill-server`/`restart` work across mismatches. Details in [docs/wire-protocol.md](docs/wire-protocol.md).
 - `Frame` enum changes require updating: encoder, decoder, protocol tests, all `match frame` in server.rs, client.rs, daemon.rs, main.rs.
 - `server::run()` / `client::run()` / `ClientConn::Active` signatures are documented in [docs/internals.md](docs/internals.md) -- they are shared by the daemon and tests; update both.

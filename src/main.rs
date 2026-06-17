@@ -148,6 +148,12 @@ enum Command {
         /// free `N`).
         #[arg(short = 'n', long = "new", conflicts_with_all = ["pick", "no_pick"])]
         new_session: bool,
+
+        /// How long the session survives with no client attached before
+        /// the server reaps it (e.g. `30m`, `1h`, `never`). Overrides the
+        /// `linger` / `linger-unnamed` config.
+        #[arg(long, value_name = "DURATION")]
+        linger: Option<String>,
     },
     /// Tail a session's output (read-only, like tail -f)
     #[command(display_order = 2, visible_alias = "t")]
@@ -805,6 +811,7 @@ async fn run(cli: Cli, config: gritty::config::ConfigFile) -> anyhow::Result<()>
             pick,
             no_pick,
             new_session,
+            linger,
         } => {
             let (host, session) = split_optional_target(&config, target.as_deref());
             let auto_start_mode = match (&cli.ctl_socket, host.as_str()) {
@@ -836,6 +843,19 @@ async fn run(cli: Cli, config: gritty::config::ConfigFile) -> anyhow::Result<()>
                 ring_buffer_size: resolved.ring_buffer_size,
                 oauth_tunnel_idle_timeout: resolved.oauth_tunnel_idle_timeout,
                 client_name: resolved.client_name,
+                linger: resolved.linger,
+                linger_unnamed: resolved.linger_unnamed,
+            };
+            // Resolve the linger duration to send in NewSession. `--linger`
+            // wins; otherwise an omitted session name (`host` -> auto-slot)
+            // uses `linger-unnamed`, and a typed name (`host:foo`) uses
+            // `linger`. The server just stores and enforces the result.
+            let linger_from_cli = linger.is_some();
+            let linger_secs = match linger.as_deref().map(gritty::config::parse_linger) {
+                Some(Ok(secs)) => secs,
+                Some(Err(e)) => anyhow::bail!("--linger: {e}"),
+                None if session.is_none() => settings.linger_unnamed,
+                None => settings.linger,
             };
             // Prefix the user-supplied session into this client's namespace
             // (e.g. `work` -> `mylaptop/work`). Names containing `/` pass
@@ -845,7 +865,17 @@ async fn run(cli: Cli, config: gritty::config::ConfigFile) -> anyhow::Result<()>
             connect_session(
                 session,
                 command,
-                ConnectFlags { detach, no_create, force, pick, no_pick, new_session, wait },
+                ConnectFlags {
+                    detach,
+                    no_create,
+                    force,
+                    pick,
+                    no_pick,
+                    new_session,
+                    wait,
+                    linger_secs,
+                    linger_from_cli,
+                },
                 settings,
                 ctl_path,
                 auto_start_mode,

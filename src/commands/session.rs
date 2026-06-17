@@ -8,8 +8,8 @@ use super::util::{
 };
 
 /// The shared session-table column headers (see [`session_status_cols`]).
-const SESSION_TABLE_HEADERS: [&str; 10] =
-    ["ID", "Name", "Cmd", "CWD", "Client", "PTY", "PID", "Created", "Idle", "Status"];
+const SESSION_TABLE_HEADERS: [&str; 11] =
+    ["ID", "Name", "Cmd", "CWD", "Client", "PTY", "PID", "Created", "Idle", "Linger", "Status"];
 
 fn client_config(
     name: &str,
@@ -47,6 +47,16 @@ pub(crate) struct ConnectFlags {
     pub(crate) no_pick: bool,
     pub(crate) new_session: bool,
     pub(crate) wait: bool,
+    /// Resolved linger duration (seconds; 0 = never) to send in
+    /// `NewSession`. Computed in main from `--linger` / config and the
+    /// named-vs-unnamed heuristic.
+    pub(crate) linger_secs: u64,
+    /// True iff `linger_secs` came from the `--linger` CLI flag (not
+    /// just config). When attaching to an *existing* session, an
+    /// explicit flag is applied via `SetLinger` so it isn't silently
+    /// dropped; a config-derived value is not (config governs creation,
+    /// not every attach).
+    pub(crate) linger_from_cli: bool,
 }
 
 pub(crate) async fn connect_session(
@@ -61,7 +71,17 @@ pub(crate) async fn connect_session(
     use gritty::protocol::{Frame, FrameCodec};
     use tokio_util::codec::Framed;
 
-    let ConnectFlags { detach, no_create, force, pick, no_pick, new_session, wait } = flags;
+    let ConnectFlags {
+        detach,
+        no_create,
+        force,
+        pick,
+        no_pick,
+        new_session,
+        wait,
+        linger_secs,
+        linger_from_cli,
+    } = flags;
 
     // Resolve the session name. An explicit name or the interactive picker
     // can be resolved up front; -n/--new must wait until connect_or_start has
@@ -126,6 +146,12 @@ pub(crate) async fn connect_session(
             return Ok(());
         }
         Frame::AttachAck { token: _, session_id } => {
+            // The session already existed, so `linger_secs` was never sent
+            // in a NewSession. If the user passed `--linger` explicitly,
+            // apply it now so the flag isn't silently dropped.
+            if linger_from_cli {
+                framed.send(Frame::SetLinger { session: String::new(), linger_secs }).await?;
+            }
             eprintln!("\x1b[32m\u{25b8} attached {name}\x1b[0m");
             let client_span = tracing::info_span!("client", session = %name, session_id);
             let code = gritty::client::run(
@@ -175,6 +201,7 @@ pub(crate) async fn connect_session(
             cols,
             rows,
             client_name: settings.client_name.clone(),
+            linger_secs,
         })
         .await?;
 
@@ -1529,7 +1556,7 @@ pub(crate) async fn restart(
     Ok(())
 }
 
-/// The ten shared session-table columns (ID..Status) for one row. Identical
+/// The eleven shared session-table columns (ID..Status) for one row. Identical
 /// between `list_sessions` and `list_all_sessions`; the latter just prepends a
 /// Host column. Single-sourced so the "starting"/attached/heartbeat/detached
 /// status logic and column order cannot drift between the two listings.
@@ -1542,7 +1569,7 @@ fn session_status_cols(
     now: u64,
     ambient_client_name: &str,
 ) -> Vec<String> {
-    use super::util::{format_duration, format_idle};
+    use super::util::{format_duration, format_idle, format_linger};
 
     let name = if s.name.is_empty() {
         "-".to_string()
@@ -1588,6 +1615,7 @@ fn session_status_cols(
         pid,
         created,
         idle,
+        format_linger(s, now),
         status,
     ]
 }
@@ -1953,6 +1981,7 @@ mod tests {
             agent_forwarding_active: false,
             is_last_attached: false,
             last_activity: 0,
+            linger_secs: 0,
         }
     }
 
@@ -2170,13 +2199,14 @@ mod tests {
         let mut s = entry();
         s.shell_pid = 0;
         let cols = session_status_cols(&s, 100, "");
-        // id, name(-), cmd, cwd, client, pty(-), pid(-), created(-), idle(-), status
+        // id, name(-), cmd, cwd, client, pty(-), pid(-), created(-), idle(-), linger, status
         assert_eq!(cols[0], "3");
         assert_eq!(cols[1], "-"); // empty name renders as "-"
         assert_eq!(cols[5], "-"); // pty
         assert_eq!(cols[6], "-"); // pid
         assert_eq!(cols[8], "-"); // idle
-        assert_eq!(cols[9], "starting");
+        assert_eq!(cols[9], "-"); // linger (entry() has linger_secs=0)
+        assert_eq!(cols[10], "starting");
     }
 
     #[test]
@@ -2185,17 +2215,17 @@ mod tests {
         s.attached = true;
         s.last_heartbeat = 90;
         let cols = session_status_cols(&s, 100, "");
-        assert_eq!(cols[9], "attached (heartbeat 10s ago)");
+        assert_eq!(cols[10], "attached (heartbeat 10s ago)");
         assert_eq!(cols[6], "1234"); // pid
     }
 
     #[test]
     fn session_status_cols_detached_and_attached_no_heartbeat() {
         let s = entry();
-        assert_eq!(session_status_cols(&s, 100, "")[9], "detached");
+        assert_eq!(session_status_cols(&s, 100, "")[10], "detached");
         let mut s2 = entry();
         s2.attached = true;
-        assert_eq!(session_status_cols(&s2, 100, "")[9], "attached");
+        assert_eq!(session_status_cols(&s2, 100, "")[10], "attached");
     }
 
     #[test]
@@ -2204,7 +2234,18 @@ mod tests {
         // heartbeat / detach time) reports how long ago that was.
         let mut s = entry();
         s.last_heartbeat = 10000 - 7200; // 2h before now
-        assert_eq!(session_status_cols(&s, 10000, "")[9], "detached (2h ago)");
+        assert_eq!(session_status_cols(&s, 10000, "")[10], "detached (2h ago)");
+    }
+
+    #[test]
+    fn session_status_cols_linger_attached_and_detached() {
+        let mut s = entry();
+        s.linger_secs = 1800;
+        s.attached = true;
+        assert_eq!(session_status_cols(&s, 100, "")[9], "30m");
+        s.attached = false;
+        s.last_heartbeat = 100;
+        assert_eq!(session_status_cols(&s, 100 + 600, "")[9], "20m");
     }
 
     #[test]

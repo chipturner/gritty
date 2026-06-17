@@ -31,6 +31,8 @@ flowchart LR
 
 A daemon listens on a single Unix socket (`ctl.sock`). Clients send a control frame declaring intent (new session, attach, list); the daemon hands off the raw socket connection to the target session and gets out of the loop. Each session owns a PTY with a login shell that persists across disconnects. The server keeps an always-on, offset-indexed byte history of PTY output (a trailing ~1MB ring plus a monotonic stream offset) so the shell never blocks and a reconnecting client can resume the stream by absolute position. On reconnect the client reports how far it rendered and the server replays exactly the bytes it missed -- nothing already on screen is re-sent.
 
+A session lives until its shell exits, `kill-session` aborts it, the daemon shuts down, or its **linger** expires: an opt-in per-session duration after which the daemon reaps a session that has had no client attached. Reaping is the same teardown as `kill-session` -- the shell's process group gets `SIGHUP`, ssh-hangup semantics -- so anything started under `nohup`/`disown`/`setsid` survives. Linger is resolved client-side (CLI `--linger` > config `linger`/`linger-unnamed`) and sent at session creation; `~K` pins a running session to never.
+
 For remote access, `gritty tunnel-create` forwards the remote socket over SSH. All commands work identically over the tunnel. `gritty bootstrap <host>` installs gritty on the remote host by running the install script over SSH.
 
 ## Self-Healing Reconnect

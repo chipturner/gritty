@@ -64,6 +64,7 @@ const TYPE_KILL_SESSION: u8 = 0x53;
 const TYPE_KILL_SERVER: u8 = 0x54;
 const TYPE_TAIL: u8 = 0x55;
 const TYPE_RENAME_SESSION: u8 = 0x56;
+const TYPE_SET_LINGER: u8 = 0x57;
 
 // Control responses
 const TYPE_SESSION_CREATED: u8 = 0x60;
@@ -76,7 +77,7 @@ const HEADER_LEN: usize = 5; // type(1) + length(4)
 const MAX_FRAME_SIZE: usize = 1 << 20; // 1 MB
 
 /// Protocol version for handshake negotiation.
-pub const PROTOCOL_VERSION: u16 = 22;
+pub const PROTOCOL_VERSION: u16 = 23;
 
 /// Capability bit: client/server supports clipboard forwarding.
 pub const CAP_CLIPBOARD: u32 = 0x01;
@@ -188,6 +189,10 @@ pub struct SessionEntry {
     /// keystrokes). 0 = unknown (older server). Drives the `Idle` column in
     /// `gritty ls` so stale sessions are easy to spot and reap.
     pub last_activity: u64,
+    /// How long the session survives with zero attached clients before the
+    /// daemon reaps it (seconds; 0 = never). Drives the `Linger` column in
+    /// `gritty ls`.
+    pub linger_secs: u64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -368,6 +373,10 @@ pub enum Frame {
         cols: u16,
         rows: u16,
         client_name: String,
+        /// How long the session survives with zero attached clients before
+        /// the daemon reaps it (seconds; 0 = never). Resolved client-side
+        /// from `--linger` / config so the server just stores and enforces.
+        linger_secs: u64,
     },
     Attach {
         session: String,
@@ -412,6 +421,13 @@ pub enum Frame {
     RenameSession {
         session: String,
         new_name: String,
+    },
+    /// Change a session's linger duration (`~K` pin, or a future
+    /// `set-linger` command). Same teardown semantics as the value sent in
+    /// `NewSession`: 0 = never reap.
+    SetLinger {
+        session: String,
+        linger_secs: u64,
     },
     // Control responses
     SessionCreated {
@@ -521,6 +537,7 @@ fn encode_session_info(dst: &mut BytesMut, sessions: &[SessionEntry]) {
         dst.put_u8(if e.agent_forwarding_active { 1 } else { 0 });
         dst.put_u8(if e.is_last_attached { 1 } else { 0 });
         dst.put_u64(e.last_activity);
+        dst.put_u64(e.linger_secs);
     }
 }
 
@@ -539,6 +556,7 @@ fn entry_encoded_len(e: &SessionEntry) -> usize {
     + 1 // agent_forwarding_active
     + 1 // is_last_attached
     + 8 // last_activity
+    + 8 // linger_secs
 }
 
 fn decode_string(payload: BytesMut) -> Result<String, io::Error> {
@@ -780,6 +798,15 @@ fn decode_session_info(payload: BytesMut) -> Result<Option<Frame>, io::Error> {
         } else {
             0
         };
+        // New field (added after last_activity): linger_secs (8 bytes).
+        // Older servers don't send it; default to 0 (never).
+        let linger_secs = if eoff + 8 <= entry_slice.len() {
+            let v = read_u64(entry_slice, eoff);
+            eoff += 8;
+            v
+        } else {
+            0
+        };
         let _ = eoff; // remaining bytes skipped via entry_end
         sessions.push(SessionEntry {
             id,
@@ -795,6 +822,7 @@ fn decode_session_info(payload: BytesMut) -> Result<Option<Frame>, io::Error> {
             agent_forwarding_active,
             is_last_attached,
             last_activity,
+            linger_secs,
         });
         off = entry_end;
     }
@@ -1038,12 +1066,25 @@ impl Decoder for FrameCodec {
                             "new session frame truncated",
                         ));
                     }
-                    String::from_utf8(p[off..off + cn_len].to_vec())
-                        .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?
+                    let s = String::from_utf8(p[off..off + cn_len].to_vec())
+                        .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+                    off += cn_len;
+                    s
                 } else {
                     String::new()
                 };
-                Ok(Some(Frame::NewSession { name, command, cwd, cols, rows, client_name }))
+                // New field (added after client_name): linger_secs (8 bytes).
+                // Older clients don't send it; default to 0 (never reap).
+                let linger_secs = if off + 8 <= p.len() { read_u64(p, off) } else { 0 };
+                Ok(Some(Frame::NewSession {
+                    name,
+                    command,
+                    cwd,
+                    cols,
+                    rows,
+                    client_name,
+                    linger_secs,
+                }))
             }
             TYPE_ATTACH => {
                 expect_min_len(&payload, 5, "attach")?;
@@ -1133,6 +1174,20 @@ impl Decoder for FrameCodec {
                 let new_name = String::from_utf8(payload[2 + session_len..].to_vec())
                     .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
                 Ok(Some(Frame::RenameSession { session, new_name }))
+            }
+            TYPE_SET_LINGER => {
+                expect_min_len(&payload, 10, "set linger")?;
+                let session_len = read_u16(&payload, 0) as usize;
+                if 2 + session_len + 8 > payload.len() {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "set linger frame truncated",
+                    ));
+                }
+                let session = String::from_utf8(payload[2..2 + session_len].to_vec())
+                    .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+                let linger_secs = read_u64(&payload, 2 + session_len);
+                Ok(Some(Frame::SetLinger { session, linger_secs }))
             }
             TYPE_ERROR => {
                 expect_min_len(&payload, 2, "error")?;
@@ -1280,15 +1335,24 @@ impl Encoder<Frame> for FrameCodec {
                 dst.extend_from_slice(session_bytes);
                 dst.extend_from_slice(name_bytes);
             }
+            Frame::SetLinger { session, linger_secs } => {
+                let session_bytes = session.as_bytes();
+                let payload_len = 2 + session_bytes.len() + 8;
+                dst.put_u8(TYPE_SET_LINGER);
+                dst.put_u32(payload_len as u32);
+                dst.put_u16(session_bytes.len() as u16);
+                dst.extend_from_slice(session_bytes);
+                dst.put_u64(linger_secs);
+            }
 
             // Structured frames
-            Frame::NewSession { name, command, cwd, cols, rows, client_name } => {
+            Frame::NewSession { name, command, cwd, cols, rows, client_name, linger_secs } => {
                 let nb = name.as_bytes();
                 let cb = command.as_bytes();
                 let cwdb = cwd.as_bytes();
                 let cnb = client_name.as_bytes();
                 let payload_len =
-                    2 + nb.len() + 2 + cb.len() + 2 + cwdb.len() + 2 + 2 + 2 + cnb.len();
+                    2 + nb.len() + 2 + cb.len() + 2 + cwdb.len() + 2 + 2 + 2 + cnb.len() + 8;
                 dst.put_u8(TYPE_NEW_SESSION);
                 dst.put_u32(payload_len as u32);
                 dst.put_u16(nb.len() as u16);
@@ -1301,6 +1365,7 @@ impl Encoder<Frame> for FrameCodec {
                 dst.put_u16(rows);
                 dst.put_u16(cnb.len() as u16);
                 dst.extend_from_slice(cnb);
+                dst.put_u64(linger_secs);
             }
             Frame::Attach {
                 session,

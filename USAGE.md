@@ -83,6 +83,7 @@ A `[host.<name>] aliases` config entry makes alternate spellings resolve to the 
 - `--no-pick`: never show session list; always target session `0`
 - `-n` / `--new`: skip the picker and create the next free integer-slot session in your namespace (`0`, `1`, `2`, ...)
 - `--no-create`: attach only, error if session doesn't exist
+- `--linger <duration>`: how long the session survives with no client attached before the server reaps it (e.g. `30m`, `1h`, `never`); overrides the `linger`/`linger-unnamed` config (default: `never`)
 - `--no-escape`: disable escape sequence processing
 - `--no-oauth-redirect`: disable OAuth callback tunneling (part of `-O`)
 - `--oauth-timeout <seconds>`: OAuth callback accept timeout (default: 180)
@@ -155,6 +156,18 @@ gritty works out of the box with no config file. Optionally, set persistent defa
 # heartbeat-timeout = 60
 # ring-buffer-size = 1048576
 # oauth-tunnel-idle-timeout = 5
+# linger = "never"               # how long a session survives with no client
+                                  # attached before the server reaps it; applies
+                                  # to sessions you explicitly named (`host:foo`).
+                                  # Accepts e.g. "30m", "1h", "7d", or "never".
+# linger-unnamed = "never"       # same, for sessions where you omitted the name
+                                  # (`host` -> auto-numbered slot). Setting just
+                                  # this key gives throwaway shells a fuse while
+                                  # named ones stay permanent. Precedence:
+                                  # host.linger-unnamed > host.linger >
+                                  # defaults.linger-unnamed > defaults.linger --
+                                  # so `[host.prod] linger = "never"` shields prod's
+                                  # unnamed sessions too.
 # client-name = "my-laptop"      # prefix applied to session names; default: hostname.
                                   # Sessions you create are named <client-name>/<short>
                                   # on the wire so multi-laptop clients don't collide.
@@ -201,6 +214,8 @@ no-server-start = true
 
 `ring-buffer-size` and `oauth-tunnel-idle-timeout` are resolved by the daemon, which has no per-connection context -- they take effect only from `[defaults]`, not `[host.<name>]`.
 
+`linger`/`linger-unnamed` are resolved client-side and sent at session creation; they take effect from `[host.<name>]` and `[defaults]`. When a session is reaped, the shell's process group gets `SIGHUP` -- the same as closing an ssh window -- so anything started under `nohup`/`disown`/`setsid` survives.
+
 A missing config file uses built-in defaults. A malformed config file (a typo'd key or section -- keys are kebab-case) is rejected in full and the built-in defaults are used; `gritty info` and `gritty doctor` both report it as invalid.
 
 ## Escape Sequences
@@ -211,6 +226,7 @@ After a newline (or at session start), `~` enters escape mode:
 |----------|--------|
 | `~.` | Detach from session (clean exit, no auto-reconnect) |
 | `~R` | Force reconnect |
+| `~K` | Pin this session: set its linger to `never` so it's never auto-reaped |
 | `~#` | Session status, RTT, and server-side diagnostics |
 | `~^Z` | Suspend the client (SIGTSTP) |
 | `~?` | Print help |

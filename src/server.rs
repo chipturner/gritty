@@ -35,6 +35,10 @@ pub struct SessionConfig {
     pub cwd: Option<String>,
     pub initial_device_id: u64,
     pub idle_evict_timeout: Duration,
+    /// How long this session survives with zero attached clients before
+    /// the daemon reaps it (seconds; 0 = never). Stored on the session's
+    /// `SessionMetadata` so `SetLinger` can update it live.
+    pub linger_secs: u64,
 }
 
 impl Default for SessionConfig {
@@ -52,6 +56,7 @@ impl Default for SessionConfig {
             cwd: None,
             initial_device_id: 0,
             idle_evict_timeout: IDLE_EVICT_TIMEOUT,
+            linger_secs: 0,
         }
     }
 }
@@ -261,6 +266,11 @@ pub struct SessionMetadata {
     /// the Hello's `device_id` differs from this value, the attach is rejected
     /// with `OwnerChanged`.
     pub owner_device_id: AtomicU64,
+    /// How long this session survives with zero attached clients before
+    /// the daemon's linger reaper aborts it (seconds; 0 = never). Atomic
+    /// so `Frame::SetLinger` can update it live without stopping the
+    /// session task.
+    pub linger_secs: AtomicU64,
 }
 
 impl SessionMetadata {
@@ -275,10 +285,31 @@ impl SessionMetadata {
     pub fn touch_presence(&self) {
         self.last_heartbeat.store(epoch_now(), Ordering::Relaxed);
     }
+
+    /// Record a client detach. `last_heartbeat` is updated *before*
+    /// `attached` is cleared so the linger reaper -- which reads
+    /// `attached` then `last_heartbeat` from another thread -- never
+    /// observes `attached == false` paired with a stale heartbeat (which
+    /// would let a short linger fire at the instant of detach instead of
+    /// after its window). The `Release` store and the reaper's `Acquire`
+    /// load on `attached` make the heartbeat write visible across that
+    /// edge.
+    pub fn mark_detached(&self) {
+        self.touch_presence();
+        self.attached.store(false, Ordering::Release);
+    }
+
+    /// Baseline the linger clock runs from: last client presence, or
+    /// session creation if no client has ever been here (`-d` sessions,
+    /// or the birth window before the first attach lands). Shared by the
+    /// reaper and `format_linger` so the `ls` column and the daemon agree.
+    pub fn linger_baseline(last_heartbeat: u64, created_at: u64) -> u64 {
+        last_heartbeat.max(created_at)
+    }
 }
 
 /// Wall-clock seconds since the Unix epoch (0 if the clock predates 1970).
-fn epoch_now() -> u64 {
+pub(crate) fn epoch_now() -> u64 {
     std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_secs()
 }
 
@@ -1935,6 +1966,7 @@ pub async fn run(
         cwd,
         initial_device_id,
         idle_evict_timeout,
+        linger_secs,
     } = config;
     // Allocate PTY with initial window size when available
     let winsize = if initial_cols > 0 && initial_rows > 0 {
@@ -1978,6 +2010,7 @@ pub async fn run(
         wants_agent: AtomicBool::new(false),
         wants_open: AtomicBool::new(false),
         owner_device_id: AtomicU64::new(initial_device_id),
+        linger_secs: AtomicU64::new(linger_secs),
     });
 
     // Dup slave fds for shell stdio (before dropping slave)
@@ -2453,8 +2486,7 @@ pub async fn run(
         }
         if flush_failed {
             if let Some(meta) = metadata_slot.get() {
-                meta.attached.store(false, Ordering::Relaxed);
-                meta.touch_presence();
+                meta.mark_detached();
             }
             continue;
         }
@@ -2492,6 +2524,17 @@ pub async fn run(
                                 &history, &alt_screen, &scrollback, &relay, &managed,
                             );
                             let _ = send_framed_timed(&mut framed, Frame::DiagResponse { text }).await;
+                        } else if let Some(Ok(Frame::SetLinger { linger_secs, .. })) = &frame {
+                            // `~K` pin path: the attached client asked to
+                            // change this session's linger. The `session`
+                            // field is for the control-socket form
+                            // (`dispatch_control`); here the target is
+                            // implicit, so it's ignored.
+                            if let Some(meta) = relay.metadata_slot.get() {
+                                meta.linger_secs.store(*linger_secs, Ordering::Relaxed);
+                                info!(linger_secs, "linger updated via session stream");
+                            }
+                            let _ = send_framed_timed(&mut framed, Frame::Ok).await;
                         } else if let ControlFlow::Break(exit) = relay.handle_client_frame(&mut framed, frame).await? {
                             break exit;
                         }
@@ -2754,10 +2797,7 @@ pub async fn run(
         match exit {
             RelayExit::ClientGone => {
                 if let Some(meta) = metadata_slot.get() {
-                    meta.attached.store(false, Ordering::Relaxed);
-                    // Detach time is the last proof of client presence --
-                    // `ls` shows it as "detached (Xm ago)".
-                    meta.touch_presence();
+                    meta.mark_detached();
                 }
                 agent.disable();
                 tunnel.teardown();

@@ -276,21 +276,26 @@ pub(crate) fn format_idle(now: u64, last_activity: u64) -> String {
     format_duration(now.saturating_sub(last_activity))
 }
 
-/// Parse a compact duration into seconds: bare seconds ("90") or a number
-/// with one of [`format_duration`]'s unit suffixes ("90s", "30m", "12h",
-/// "7d") -- what `gritty ls` prints in the Idle column is valid input here.
-pub(crate) fn parse_duration(s: &str) -> anyhow::Result<u64> {
-    let err = || anyhow::anyhow!("invalid duration: {s:?} (use e.g. 90s, 30m, 12h, 7d)");
-    let (number, multiplier) = match s.chars().last() {
-        Some('s') => (&s[..s.len() - 1], 1),
-        Some('m') => (&s[..s.len() - 1], 60),
-        Some('h') => (&s[..s.len() - 1], 3600),
-        Some('d') => (&s[..s.len() - 1], 86400),
-        Some(c) if c.is_ascii_digit() => (s, 1),
-        _ => return Err(err()),
-    };
-    let n: u64 = number.parse().map_err(|_| err())?;
-    n.checked_mul(multiplier).ok_or_else(err)
+/// Re-export of [`gritty::parse_duration`] kept under `commands::util` so
+/// existing call sites and tests don't move.
+pub(crate) use gritty::parse_duration;
+
+/// Linger column value for `gritty ls`: `-` when the session never
+/// auto-reaps (linger == 0); the configured duration while a client is
+/// attached (clock not running); the remaining time once detached. Uses
+/// the same baseline as the daemon reaper
+/// ([`gritty::server::SessionMetadata::linger_baseline`]) so the column
+/// and the actual reap stay in lockstep.
+pub(crate) fn format_linger(s: &gritty::protocol::SessionEntry, now: u64) -> String {
+    if s.linger_secs == 0 {
+        return "-".to_string();
+    }
+    if s.attached {
+        return format_duration(s.linger_secs);
+    }
+    let last = gritty::server::SessionMetadata::linger_baseline(s.last_heartbeat, s.created_at);
+    let elapsed = now.saturating_sub(last);
+    format_duration(s.linger_secs.saturating_sub(elapsed))
 }
 
 pub(crate) fn format_timestamp(epoch_secs: u64) -> String {
@@ -1077,6 +1082,56 @@ mod tests {
         for bad in ["", "d", "7w", "1.5h", "-3m", "1h30m", "99999999999999999999d"] {
             assert!(parse_duration(bad).is_err(), "accepted: {bad:?}");
         }
+    }
+
+    fn linger_entry(
+        attached: bool,
+        last_heartbeat: u64,
+        created_at: u64,
+        linger_secs: u64,
+    ) -> gritty::protocol::SessionEntry {
+        gritty::protocol::SessionEntry {
+            id: 0,
+            name: String::new(),
+            pty_path: String::new(),
+            shell_pid: 1,
+            created_at,
+            attached,
+            last_heartbeat,
+            foreground_cmd: String::new(),
+            cwd: String::new(),
+            client_name: String::new(),
+            agent_forwarding_active: false,
+            is_last_attached: false,
+            last_activity: 0,
+            linger_secs,
+        }
+    }
+
+    #[test]
+    fn format_linger_never_is_dash() {
+        assert_eq!(format_linger(&linger_entry(false, 100, 50, 0), 200), "-");
+        assert_eq!(format_linger(&linger_entry(true, 100, 50, 0), 200), "-");
+    }
+
+    #[test]
+    fn format_linger_attached_shows_configured_duration() {
+        assert_eq!(format_linger(&linger_entry(true, 100, 50, 1800), 200), "30m");
+    }
+
+    #[test]
+    fn format_linger_detached_shows_remaining() {
+        // Detached at t=100, linger 1800s, now t=400 -> 1500s left.
+        assert_eq!(format_linger(&linger_entry(false, 100, 50, 1800), 400), "25m");
+        // Past expiry clamps to 0s.
+        assert_eq!(format_linger(&linger_entry(false, 100, 50, 1800), 100 + 3000), "0s");
+    }
+
+    #[test]
+    fn format_linger_uses_created_at_when_never_attached() {
+        // last_heartbeat == 0 (never attached, e.g. `connect -d`): clock
+        // runs from created_at, mirroring the daemon reaper.
+        assert_eq!(format_linger(&linger_entry(false, 0, 1000, 1800), 1000 + 600), "20m");
     }
 
     #[test]

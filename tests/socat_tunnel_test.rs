@@ -184,6 +184,7 @@ async fn tunnel_death_session_persists() {
             cols: 0,
             rows: 0,
             client_name: String::new(),
+            linger_secs: 0,
         })
         .await
         .unwrap();
