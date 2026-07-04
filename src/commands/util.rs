@@ -557,8 +557,66 @@ pub(crate) async fn port_forward_command(
     run_forward(&fwd_path, &label, direction, listen_port, target_port).await
 }
 
-/// Send the forward request over an attached client's forward socket and
-/// block until Ctrl-C or teardown.
+/// Why one attempt to place a forward request failed.
+enum EstablishError {
+    /// Could not reach the forward socket -- no attached client process right
+    /// now (it exited, or the session is gone).
+    Connect,
+    /// The request flowed end to end and the client/server refused it
+    /// (e.g. the listen port is busy).
+    Rejected(String),
+    /// The connection died mid-request (client disconnected while we waited).
+    Io,
+}
+
+/// One shot: connect to the forward socket, send the request header, wait for
+/// the accept/reject byte. The response read blocks while the attached client
+/// is mid-reconnect (the connect lands in its listener backlog), so a
+/// successful return means the forward is genuinely live.
+async fn establish_forward(
+    fwd_path: &Path,
+    direction: u8,
+    listen_port: u16,
+    target_port: u16,
+) -> Result<tokio::net::UnixStream, EstablishError> {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    let mut stream =
+        tokio::net::UnixStream::connect(fwd_path).await.map_err(|_| EstablishError::Connect)?;
+
+    // Write: [direction][listen_port BE][target_port BE]
+    let mut header = [0u8; 5];
+    header[0] = direction;
+    header[1..3].copy_from_slice(&listen_port.to_be_bytes());
+    header[3..5].copy_from_slice(&target_port.to_be_bytes());
+    stream.write_all(&header).await.map_err(|_| EstablishError::Io)?;
+
+    // Read response: 0x01 = success, 0x02 + message = error
+    let mut resp = [0u8; 1];
+    stream.read_exact(&mut resp).await.map_err(|_| EstablishError::Io)?;
+    match resp[0] {
+        0x01 => Ok(stream),
+        0x02 => {
+            let mut msg = Vec::new();
+            let _ = stream.read_to_end(&mut msg).await;
+            Err(EstablishError::Rejected(String::from_utf8_lossy(&msg).into_owned()))
+        }
+        other => Err(EstablishError::Rejected(format!("unexpected response: 0x{other:02x}"))),
+    }
+}
+
+/// First sleep between re-establish attempts; doubled per failure up to
+/// [`FORWARD_RETRY_MAX`]. Everything is local (the forward socket lives in
+/// the client process), so short is fine.
+const FORWARD_RETRY_INITIAL: std::time::Duration = std::time::Duration::from_millis(500);
+const FORWARD_RETRY_MAX: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// Send the forward request over an attached client's forward socket and hold
+/// it until Ctrl-C. A teardown (client disconnect, detach, takeover) does not
+/// end the forward: the request is re-placed with backoff as soon as a client
+/// is attached again, mirroring the session's own auto-reconnect. A rejection
+/// on the *first* attempt (port busy, bad target) is a hard error; later ones
+/// are printed and retried, since they can be transient across a reconnect.
 async fn run_forward(
     fwd_path: &Path,
     label: &str,
@@ -566,36 +624,10 @@ async fn run_forward(
     listen_port: u16,
     target_port: u16,
 ) -> anyhow::Result<()> {
-    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::io::AsyncReadExt;
 
-    let mut stream = tokio::net::UnixStream::connect(fwd_path).await.map_err(|_| {
-        anyhow::anyhow!(
-            "no client attached to {label} (could not connect to {}){}",
-            fwd_path.display(),
-            in_session_hint(inside_session())
-        )
-    })?;
-
-    // Write: [direction][listen_port BE][target_port BE]
-    let mut header = [0u8; 5];
-    header[0] = direction;
-    header[1..3].copy_from_slice(&listen_port.to_be_bytes());
-    header[3..5].copy_from_slice(&target_port.to_be_bytes());
-    stream.write_all(&header).await?;
-
-    // Read response: 0x01 = success, 0x02 + message = error
-    let mut resp = [0u8; 1];
-    stream.read_exact(&mut resp).await?;
-    if resp[0] == 0x02 {
-        let mut msg = Vec::new();
-        stream.read_to_end(&mut msg).await?;
-        let msg = String::from_utf8_lossy(&msg);
-        let hint = busy_port_hint(&msg, listen_port, target_port).unwrap_or_default();
-        anyhow::bail!("{msg}{hint}");
-    }
-    if resp[0] != 0x01 {
-        anyhow::bail!("unexpected response: 0x{:02x}", resp[0]);
-    }
+    let mut sigint = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::interrupt())?;
+    let mut sigterm = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
 
     let dir_str = if direction == 0 { "local" } else { "remote" };
     let port_str = if listen_port == target_port {
@@ -603,18 +635,68 @@ async fn run_forward(
     } else {
         format!("{listen_port}:{target_port}")
     };
-    eprintln!("\x1b[32m\u{25b8} {dir_str}-forward {port_str} active ({label})\x1b[0m");
 
-    // Block until SIGINT or stream EOF (teardown on disconnect)
-    let mut sigint = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::interrupt())?;
-    let mut sigterm = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
-    let mut buf = [0u8; 1];
-    tokio::select! {
-        _ = sigint.recv() => {}
-        _ = sigterm.recv() => {}
-        _ = stream.read(&mut buf) => {}
+    let mut first = true;
+    let mut delay = FORWARD_RETRY_INITIAL;
+    // The last status line printed while down, deduplicated so a long outage
+    // doesn't scroll rejection/waiting spam.
+    let mut last_status: Option<String> = None;
+
+    loop {
+        let attempt = tokio::select! {
+            _ = sigint.recv() => return Ok(()),
+            _ = sigterm.recv() => return Ok(()),
+            r = establish_forward(fwd_path, direction, listen_port, target_port) => r,
+        };
+        match attempt {
+            Ok(mut stream) => {
+                let verb = if first { "active" } else { "re-established" };
+                eprintln!("\x1b[32m\u{25b8} {dir_str}-forward {port_str} {verb} ({label})\x1b[0m");
+                first = false;
+                delay = FORWARD_RETRY_INITIAL;
+                last_status = None;
+
+                // Hold until SIGINT/SIGTERM or stream EOF (teardown).
+                let mut buf = [0u8; 1];
+                tokio::select! {
+                    _ = sigint.recv() => return Ok(()),
+                    _ = sigterm.recv() => return Ok(()),
+                    _ = stream.read(&mut buf) => {}
+                }
+                eprintln!(
+                    "\x1b[2;33m\u{25b8} {dir_str}-forward {port_str} torn down (client \
+                     disconnected?) -- re-establishing, ^C to stop\x1b[0m"
+                );
+            }
+            Err(EstablishError::Rejected(msg)) if first => {
+                let hint = busy_port_hint(&msg, listen_port, target_port).unwrap_or_default();
+                anyhow::bail!("{msg}{hint}");
+            }
+            Err(EstablishError::Connect) if first => {
+                anyhow::bail!(
+                    "no client attached to {label} (could not connect to {}){}",
+                    fwd_path.display(),
+                    in_session_hint(inside_session())
+                );
+            }
+            Err(e) => {
+                let status = match e {
+                    EstablishError::Rejected(msg) => format!("re-establish refused: {msg}"),
+                    _ => "waiting for an attached client".to_string(),
+                };
+                if last_status.as_deref() != Some(&status) {
+                    eprintln!("\x1b[2;33m\u{25b8} {status} -- retrying, ^C to stop\x1b[0m");
+                    last_status = Some(status);
+                }
+                tokio::select! {
+                    _ = sigint.recv() => return Ok(()),
+                    _ = sigterm.recv() => return Ok(()),
+                    _ = tokio::time::sleep(delay) => {}
+                }
+                delay = (delay * 2).min(FORWARD_RETRY_MAX);
+            }
+        }
     }
-    Ok(())
 }
 
 /// One daemon endpoint discovered by [`discover_daemon_probes`].
@@ -955,6 +1037,69 @@ mod tests {
     /// An empty config: parse_target falls through to a raw split.
     fn no_aliases() -> gritty::config::ConfigFile {
         gritty::config::ConfigFile::default()
+    }
+
+    // -- run_forward reconnect survival --
+
+    /// A torn-down forward (EOF on the forward socket -- client disconnect,
+    /// detach, takeover) must be re-requested automatically, not exit.
+    #[tokio::test]
+    async fn forward_reestablishes_after_teardown() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use tokio::time::{Duration, timeout};
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("fwd.sock");
+        let listener = tokio::net::UnixListener::bind(&path).unwrap();
+
+        let fwd_path = path.clone();
+        let fwd = tokio::spawn(async move { run_forward(&fwd_path, "test", 1, 9999, 8888).await });
+
+        // First request: read the header, approve, then drop the connection
+        // (what the attached client's teardown looks like from here).
+        let (mut s1, _) =
+            timeout(Duration::from_secs(10), listener.accept()).await.unwrap().unwrap();
+        let mut hdr = [0u8; 5];
+        s1.read_exact(&mut hdr).await.unwrap();
+        assert_eq!(hdr, [1, 0x27, 0x0f, 0x22, 0xb8]); // rf 9999:8888
+        s1.write_all(&[0x01]).await.unwrap();
+        drop(s1);
+
+        // The forward must come back on its own with the identical request.
+        let (mut s2, _) =
+            timeout(Duration::from_secs(10), listener.accept()).await.unwrap().unwrap();
+        let mut hdr2 = [0u8; 5];
+        s2.read_exact(&mut hdr2).await.unwrap();
+        assert_eq!(hdr2, hdr);
+        s2.write_all(&[0x01]).await.unwrap();
+
+        assert!(!fwd.is_finished(), "run_forward must keep holding the forward");
+        fwd.abort();
+    }
+
+    /// A rejection on the very first attempt (busy port, bad target) is a
+    /// hard error -- retrying would just spam the same refusal.
+    #[tokio::test]
+    async fn forward_first_rejection_is_fatal() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use tokio::time::{Duration, timeout};
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("fwd.sock");
+        let listener = tokio::net::UnixListener::bind(&path).unwrap();
+
+        let fwd_path = path.clone();
+        let fwd = tokio::spawn(async move { run_forward(&fwd_path, "test", 0, 80, 80).await });
+
+        let (mut s, _) =
+            timeout(Duration::from_secs(10), listener.accept()).await.unwrap().unwrap();
+        let mut hdr = [0u8; 5];
+        s.read_exact(&mut hdr).await.unwrap();
+        s.write_all(b"\x02permission denied").await.unwrap();
+        drop(s);
+
+        let result = timeout(Duration::from_secs(10), fwd).await.unwrap().unwrap();
+        assert!(result.unwrap_err().to_string().contains("permission denied"));
     }
 
     /// A config where `foo.bar.com` aliases the connection name `foo`.

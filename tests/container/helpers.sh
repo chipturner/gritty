@@ -108,6 +108,22 @@ wait_for_port() {
     return 1
 }
 
+# Wait until nothing is listening on a TCP port (inverse of wait_for_port).
+wait_for_port_closed() {
+    local port="${1}" timeout="${2:-10}"
+    local hex_port
+    hex_port=$(printf '%04X' "${port}")
+    local i
+    for ((i = 0; i < timeout * 10; i++)); do
+        if ! awk -v p=":${hex_port}" '$2 ~ p"$" && $4 == "0A" {found=1} END{exit !found}' /proc/net/tcp 2>/dev/null \
+            && ! awk -v p=":${hex_port}" '$2 ~ p"$" && $4 == "0A" {found=1} END{exit !found}' /proc/net/tcp6 2>/dev/null; then
+            return 0
+        fi
+        sleep 0.1
+    done
+    return 1
+}
+
 # Wait until `gritty ls <host>` exit-code is 0 (daemon reachable).
 wait_for_daemon() {
     local host="${1}" timeout="${2:-10}"

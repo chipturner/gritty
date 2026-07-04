@@ -133,7 +133,9 @@ The commands are named for where the *service* lives, which is the opposite of S
 
 `<target>` may be omitted when exactly one session is attached from this machine: `gritty rf 3000` forwards to it. With zero attached sessions the command errors (forwards need an attached `gritty connect` client -- always run `lf`/`rf` on the client machine, not inside the session); with several, it lists them and asks for an explicit target.
 
-Port forwards are client-initiated -- they communicate with the client process through a local forward socket, and the client sends `PortForwardRequest` frames to the server. A compromised server cannot initiate port forwards. Ctrl-C stops the forward. All forwarding binds to `127.0.0.1` only -- there is no bind-address option (unlike SSH's `-L`/`-R`).
+Port forwards are client-initiated -- they communicate with the client process through a local forward socket, and the client sends `PortForwardRequest` frames to the server. A compromised server cannot initiate port forwards. All forwarding binds to `127.0.0.1` only -- there is no bind-address option (unlike SSH's `-L`/`-R`).
+
+Forwards survive disconnects the way sessions do: when the attached client drops (network blip, detach, takeover), the `lf`/`rf` process re-places the forward automatically as soon as a client is attached again, retrying with backoff until then. Ctrl-C stops the forward -- that's the only thing that does. A rejection on the first attempt (e.g. the listen port is busy) is still an immediate error.
 
 These are transient, on-demand forwards -- great for quick checks during development. For always-on port forwarding, configure it on the SSH tunnel instead:
 

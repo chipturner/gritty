@@ -8,6 +8,10 @@ protocol interoperate with their neighbors.
 
 ## Unreleased
 
+- **Port forwards survive reconnect**: when the attached client drops
+  (network blip, detach, takeover), a running `lf`/`rf` re-places its
+  forward automatically once a client is attached again. Only Ctrl-C
+  stops a forward now.
 - **`--json` on `ls`, `tunnels`, `info`, and `doctor`**: machine-readable
   output for scripts and status bars. Fields are append-only.
 - **`gritty mangen <dir>`**: generate man pages (one per subcommand),

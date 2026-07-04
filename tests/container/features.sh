@@ -136,6 +136,39 @@ test_remote_forward() {
         fail "remote forward data roundtrip (client->session)" "response: '${response}' rf-output: $(cat /tmp/rf.out 2>/dev/null)"
     fi
 
+    # -- Reconnect survival: detaching the client tears the forward down; on
+    # reattach the still-running rf process must re-place it by itself.
+    tmux send-keys -t feat Enter
+    sleep 0.3
+    tmux send-keys -t feat '~.'
+    wait_for_port_closed 18766 10 || {
+        fail "rf: forward torn down on detach" "port 18766 still listening; rf output: $(cat /tmp/rf.out 2>/dev/null)"
+        return
+    }
+
+    tmux send-keys -t feat "gritty connect local:${session_id_name}" Enter
+    wait_for_session_attached local "${session_id_name}" 10 || {
+        fail "rf: session reattached" "ls=$(gritty ls local 2>&1)"
+        return
+    }
+    wait_for_port 18766 10 || {
+        fail "rf: forward re-established after reattach" "port 18766 never came back; rf output: $(cat /tmp/rf.out 2>/dev/null)"
+        return
+    }
+
+    (echo "RF_REPLY_AGAIN" | nc -l -p 19998 -q 0) &
+    cleanup_push "kill $! 2>/dev/null"
+    wait_for_port 19998 5 || {
+        fail "rf: second session-side listener bound" "port 19998 never opened"
+        return
+    }
+    response=$(echo "hello" | nc -w 2 127.0.0.1 18766 2>/dev/null) || true
+    if echo "${response}" | grep -qF "RF_REPLY_AGAIN"; then
+        pass "remote forward survives detach + reattach"
+    else
+        fail "remote forward survives detach + reattach" "response: '${response}' rf-output: $(cat /tmp/rf.out 2>/dev/null)"
+    fi
+
     gritty kill-session "local:${session_id_name}" 2>/dev/null || true
 }
 
