@@ -171,6 +171,8 @@ gritty is designed so that a compromised remote server cannot leverage the sessi
 
 Early stage. Works on Linux and macOS. Expect rough edges -- patches welcome.
 
+**Compatibility policy (pre-1.0):** any release may change the wire protocol, and mismatched sides refuse to talk rather than misbehave. This is a managed break, not a stranding: after upgrading, one `gritty refresh` restarts everything running stale code -- the local daemon, tunnel supervisors, and remote daemons -- across all your hosts, without touching live sessions on hosts that are already current. Sessions on a restarted daemon do not survive the restart, so finish what matters before refreshing. A frozen, append-only protocol is the plan for 1.0.
+
 ## License
 
 MIT OR Apache-2.0
