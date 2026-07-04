@@ -109,7 +109,7 @@ See **[USAGE.md](USAGE.md)** for every command and flag, configuration, escape s
 | No extra ports / firewall | yes | no (UDP) | no (TCP) | yes |
 | IP roaming (mobile) | reconnect | seamless | reconnect | reconnect |
 | Windows client | no | no | no | yes |
-| Maturity | 0.11.0 (new) | mature | mature | mature |
+| Maturity | pre-1.0 (new) | mature | mature | mature |
 
 **Advantages:** seamless local-tool integration -- SSH agent forwarding that survives reconnects without stale sockets, browser opens and OAuth flows that just work remotely, and port forwarding plus file transfer multiplexed over the session with no extra tunnels or tools. The client is stateless: reboot your laptop and `gritty connect` picks up where you left off.
 
