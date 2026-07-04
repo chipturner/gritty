@@ -15,7 +15,7 @@ The full command table and all flags live in [USAGE.md](USAGE.md). Session addre
 
 ## Build & Test
 
-Rust edition 2024, MSRV 1.94. Uses `just` as the task runner. Tests via `cargo-nextest` (concurrency in `.config/nextest.toml`).
+Rust edition 2024, MSRV 1.88 (let-chains; CI enforces via a pinned-toolchain `cargo check`). Uses `just` as the task runner. Tests via `cargo-nextest` (concurrency in `.config/nextest.toml`).
 
 ```bash
 just check                           # clippy + full test suite (pre-push gate)

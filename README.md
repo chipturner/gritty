@@ -36,7 +36,7 @@ laptop$ brew install chipturner/tap/gritty
 **From source:**
 
 ```
-laptop$ cargo install gritty-cli   # binary name: gritty, requires Rust 1.94+
+laptop$ cargo install gritty-cli   # binary name: gritty, requires Rust 1.88+ (use rustup if your distro Rust is older)
 ```
 
 Install on **both your laptop and the remote host**. `gritty bootstrap <destination>` can do the remote side for you over SSH.

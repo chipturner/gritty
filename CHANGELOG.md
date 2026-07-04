@@ -10,6 +10,7 @@ protocol interoperate with their neighbors.
 
 - **`gritty mangen <dir>`**: generate man pages (one per subcommand),
   mainly for packagers. `just man` writes them to `target/man`.
+- MSRV lowered from 1.94 to 1.88 (the actual floor: let-chains).
 - `gritty prune` with no filter now explains the filter choices instead
   of emitting clap's generic required-argument error.
 - Clearer help text: `-O` semantics, config-precedence note in
