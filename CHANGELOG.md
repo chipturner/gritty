@@ -8,6 +8,13 @@ protocol interoperate with their neighbors.
 
 ## Unreleased
 
+- **`gritty doctor --llm ["description"]`**: print a self-contained,
+  LLM-ready diagnostic report (architecture primer, known failure modes,
+  health checks, session/tunnel state, sanitized log excerpts) to paste
+  into a chat or pipe into an LLM CLI. gritty never calls an LLM itself.
+
+## 0.15.1 (2026-07-04) -- protocol v23 (no change)
+
 - **Port forwards survive reconnect**: when the attached client drops
   (network blip, detach, takeover), a running `lf`/`rf` re-places its
   forward automatically once a client is attached again. Only Ctrl-C

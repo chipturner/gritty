@@ -1709,7 +1709,7 @@ pub(crate) async fn list_sessions(
 // rename/remove fields.
 
 #[derive(serde::Serialize)]
-struct HostRefJson<'a> {
+pub(crate) struct HostRefJson<'a> {
     name: &'a str,
     /// SSH destination for tunneled hosts; `None` for `local`.
     destination: Option<&'a str>,
@@ -1718,7 +1718,7 @@ struct HostRefJson<'a> {
 }
 
 #[derive(serde::Serialize)]
-struct HostGroupJson<'a> {
+pub(crate) struct HostGroupJson<'a> {
     /// All host names that resolved to this daemon (aliases merge).
     hosts: Vec<HostRefJson<'a>>,
     /// Probe failure, mutually exclusive with a non-empty `sessions`.
@@ -1727,7 +1727,7 @@ struct HostGroupJson<'a> {
 }
 
 #[derive(serde::Serialize)]
-struct SessionJson<'a> {
+pub(crate) struct SessionJson<'a> {
     id: u32,
     /// Wire name -- pass back to gritty commands verbatim.
     name: String,
@@ -1749,7 +1749,7 @@ struct SessionJson<'a> {
     linger_secs: Option<u64>,
 }
 
-fn session_json<'a>(
+pub(crate) fn session_json<'a>(
     s: &'a gritty::protocol::SessionEntry,
     now: u64,
     client_name: &str,

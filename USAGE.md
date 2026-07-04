@@ -27,7 +27,7 @@ Complete command and flag reference. For an overview and quick start, see [READM
 | `gritty copy` | | Copy stdin to the client clipboard (for use inside gritty sessions) |
 | `gritty info [--json]` | | Show diagnostics (paths, server status, device id, tunnels) |
 | `gritty config` | | Open config in `$VISUAL`/`$EDITOR`/vi (creates from template if missing) |
-| `gritty doctor [--clean] [--json]` | | Show key paths and check for common issues (stale processes, orphaned daemons, orphaned sockets, config errors); `--clean` removes socket-dir files this version doesn't recognize |
+| `gritty doctor [--clean] [--json] [--llm [desc]]` | | Show key paths and check for common issues (stale processes, orphaned daemons, orphaned sockets, config errors); `--clean` removes socket-dir files this version doesn't recognize; `--llm` prints an LLM-ready diagnostic report instead (see [Debugging](#debugging)) |
 | `gritty server` | `s` | Start the server (backgrounds by default; `-f` for foreground) |
 | `gritty completions <shell>` | | Generate shell completions (bash, zsh, fish, elvish, powershell) |
 | `gritty mangen <dir>` | | Write man pages (one per subcommand) into `<dir>` -- for packagers |
@@ -272,6 +272,14 @@ laptop$ gritty doctor --json | jq '.failures'
 ## Debugging
 
 `gritty doctor` is the first stop: it prints the key paths (config file, socket dir, logs, device id) and checks for stale processes, orphaned sockets, and config errors. It also flags any file in the socket dir that this gritty version doesn't recognize -- litter from a release whose artifact set differed; `gritty doctor --clean` removes such files (never directories or sockets something is actively serving). `gritty info` prints the same paths plus live server/tunnel status.
+
+**Asking an LLM for help:** `gritty doctor --llm "describe what's going wrong"` prints a self-contained diagnostic report -- a primer on gritty's architecture and known failure modes, your description, doctor's checks, session/tunnel state, and sanitized excerpts from the daemon and tunnel logs -- formatted to paste into a chat or pipe into an LLM CLI:
+
+```
+laptop$ gritty doctor --llm "sessions to devbox drop every few minutes" | claude -p
+```
+
+gritty never contacts an LLM itself; it only produces the report. Review before sharing: it contains hostnames, paths, session and command names, and log lines. The description is optional (`gritty doctor --llm` reports general health) and `--log-lines <N>` adjusts how much of each log is included. The report covers this machine only -- for a suspect remote host, run the same command there over ssh.
 
 **Log levels:** log files (daemon, tunnel) default to `info`; client commands logging to the terminal default to `warn` so routine telemetry stays out of interactive output (`server -f` and `tunnel-create -f` keep `info` on stderr -- foreground is a diagnostic mode). `-v` enables debug logging. `RUST_LOG=gritty=trace` enables the most verbose output (protocol-level frame tracing, alt-screen state machine transitions). `RUST_LOG=gritty::server=debug,gritty=info` enables debug logging for the server module only.
 

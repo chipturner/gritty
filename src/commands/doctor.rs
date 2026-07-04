@@ -11,19 +11,30 @@ use super::util::server_request;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize)]
 #[serde(rename_all = "lowercase")]
-enum Status {
+pub(crate) enum Status {
     Ok,
     Warn,
     Fail,
 }
 
+impl Status {
+    /// Plain-text tag for renderers that can't use ANSI (the `--llm` report).
+    pub(crate) fn tag(self) -> &'static str {
+        match self {
+            Status::Ok => "ok",
+            Status::Warn => "WARN",
+            Status::Fail => "FAIL",
+        }
+    }
+}
+
 /// Also the per-check shape of `doctor --json` -- extend rather than
 /// rename/remove fields.
 #[derive(serde::Serialize)]
-struct Check {
-    status: Status,
-    message: String,
-    hint: Option<String>,
+pub(crate) struct Check {
+    pub(crate) status: Status,
+    pub(crate) message: String,
+    pub(crate) hint: Option<String>,
 }
 
 impl Check {
@@ -719,16 +730,30 @@ fn check_orphan_daemons() -> Vec<Check> {
 
 // ---- Entry point ------------------------------------------------------------
 
-pub(crate) async fn doctor(
-    ctl_socket: Option<std::path::PathBuf>,
-    clean: bool,
-    json: bool,
-) -> anyhow::Result<()> {
+/// Everything one doctor pass learned, decoupled from how it's shown. The
+/// text mode, `--json`, and the `--llm` report are renderers over this.
+pub(crate) struct DoctorReport {
+    pub(crate) paths: Vec<(&'static str, PathBuf)>,
+    pub(crate) groups: Vec<(&'static str, Vec<Check>)>,
+    pub(crate) sessions: Vec<gritty::protocol::SessionEntry>,
+    /// Directory holding the probed server's sockets and logs (follows a
+    /// `--ctl-socket` override).
+    pub(crate) server_dir: PathBuf,
+}
+
+impl DoctorReport {
+    pub(crate) fn has_failures(&self) -> bool {
+        self.groups.iter().flat_map(|(_, cs)| cs).any(|c| c.status == Status::Fail)
+    }
+}
+
+/// Run every doctor check and return the findings unrendered.
+pub(crate) async fn gather(ctl_socket: Option<&Path>, clean: bool) -> DoctorReport {
     let default_dir = super::util::canonicalize_or_raw(gritty::daemon::socket_dir());
     // The server's ctl/svc/agent sockets and log follow a --ctl-socket
     // override; tunnel connect-*.sock always live in the default dir.
-    let ctl_path = match &ctl_socket {
-        Some(p) => super::util::canonicalize_or_raw(p.clone()),
+    let ctl_path = match ctl_socket {
+        Some(p) => super::util::canonicalize_or_raw(p.to_path_buf()),
         None => default_dir.join("ctl.sock"),
     };
     let server_dir =
@@ -752,7 +777,7 @@ pub(crate) async fn doctor(
         .and_then(|f| f.to_str());
     socket_checks.extend(check_unknown_files(&default_dir, ctl_name, clean));
 
-    let groups: Vec<(&str, Vec<Check>)> = vec![
+    let groups: Vec<(&'static str, Vec<Check>)> = vec![
         ("Configuration", config_checks),
         ("Local server", server_checks),
         ("Orphaned processes", check_orphan_daemons()),
@@ -768,16 +793,25 @@ pub(crate) async fn doctor(
         &server_dir,
     );
 
+    DoctorReport { paths, groups, sessions, server_dir }
+}
+
+pub(crate) async fn doctor(
+    ctl_socket: Option<std::path::PathBuf>,
+    clean: bool,
+    json: bool,
+) -> anyhow::Result<()> {
+    let report = gather(ctl_socket.as_deref(), clean).await;
+
     if json {
-        println!("{}", serde_json::to_string_pretty(&report_json(&paths, &groups))?);
+        println!("{}", serde_json::to_string_pretty(&report_json(&report.paths, &report.groups))?);
     } else {
-        render_paths(&paths);
+        render_paths(&report.paths);
         println!();
-        render(&groups);
+        render(&report.groups);
     }
 
-    let has_failures = groups.iter().flat_map(|(_, cs)| cs).any(|c| c.status == Status::Fail);
-    if has_failures {
+    if report.has_failures() {
         std::process::exit(1);
     }
     Ok(())

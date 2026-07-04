@@ -140,6 +140,8 @@ The file lives at `~/.config/gritty/config.toml` on Linux (honors `$XDG_CONFIG_H
 
 **Sessions vanished / stray `gritty server` processes on a remote host** -- systemd wipes `/run/user/<uid>` when your last login session on a host ends, deleting the socket directory out from under the daemon. Current daemons self-heal (re-bind within seconds; sessions survive) or exit cleanly when they can't. Daemons from older releases linger as unreachable orphans: `gritty doctor` reports them and `gritty refresh` reaps them. Prevent the wipe entirely with `loginctl enable-linger` on the remote. See [USAGE.md](USAGE.md#debugging).
 
+**Anything else** -- `gritty doctor --llm "describe what's going wrong"` prints an LLM-ready diagnostic report (architecture primer, known failure modes, health checks, log excerpts) to paste into a chat or pipe into an LLM CLI. gritty never calls an LLM itself; review the report before sharing it.
+
 ## Design
 
 gritty contains zero networking code. Sessions live on Unix domain sockets; for remote access, you forward the socket over SSH -- the same SSH that already handles your keys, `.ssh/config`, bastion hosts, and MFA. No ports to open, no firewall rules, no TLS certificates, no authentication system to trust beyond the one you already use.

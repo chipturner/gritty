@@ -1,11 +1,13 @@
 mod doctor;
 mod refresh;
+mod report;
 mod session;
 mod transfer;
 mod util;
 
 pub(crate) use doctor::doctor;
 pub(crate) use refresh::refresh;
+pub(crate) use report::{DEFAULT_TAIL_LINES, llm_report};
 pub(crate) use session::*;
 pub(crate) use transfer::{receive_command, resolve_receive_output, send_command};
 pub(crate) use util::*;

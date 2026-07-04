@@ -64,7 +64,7 @@ Sixteen modules behind a lib crate (`src/lib.rs` hosts shared helpers + `FORWARD
 | `logging` | Tracing setup, SIGUSR1 log-level cycling, SIGUSR2 log reopen |
 | `naming` | Pure helpers for the client-prefixed session-name rule |
 | `client` | Raw mode, escape processor, heartbeat, auto-reconnect, forwarding relay |
-| `commands` | CLI command implementations (`session`, `util`, `doctor`, `refresh`, `transfer`) |
+| `commands` | CLI command implementations (`session`, `util`, `doctor`, `refresh`, `report`, `transfer`). `report.rs` embeds `docs/llm-primer.md` via `include_str!` -- keep that doc current, it ships in the binary |
 
 Detailed module descriptions, the on-disk state inventory (every socket/sidecar/lock file, its writer, readers, and lifecycle -- keep `doctor.rs::is_known_artifact()` in sync with it), key patterns (reconnect/replay, ownership, locking, forwarding, security gates), and core signatures: **[docs/internals.md](docs/internals.md)**.
 

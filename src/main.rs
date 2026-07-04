@@ -421,6 +421,22 @@ enum Command {
         /// Machine-readable output (paths, check groups, summary)
         #[arg(long)]
         json: bool,
+
+        /// Print an LLM-ready diagnostic report (primer, checks, state, log
+        /// excerpts) to paste into a chat or pipe into an LLM CLI; gritty
+        /// never calls an LLM itself. Optionally describe the problem.
+        #[arg(
+            long,
+            value_name = "DESCRIPTION",
+            num_args = 0..=1,
+            default_missing_value = "",
+            conflicts_with_all = ["json", "clean"],
+        )]
+        llm: Option<String>,
+
+        /// Tail length per log excerpt in the --llm report
+        #[arg(long, value_name = "N", requires = "llm")]
+        log_lines: Option<usize>,
     },
     /// Generate shell completions
     #[command(display_order = 41)]
@@ -1074,7 +1090,17 @@ async fn run(cli: Cli, config: gritty::config::ConfigFile) -> anyhow::Result<()>
         }
         Command::Info { json } => info(cli.ctl_socket, json).await,
         Command::Config => config_edit(),
-        Command::Doctor { clean, json } => doctor(cli.ctl_socket, clean, json).await,
+        Command::Doctor { clean, json, llm, log_lines } => match llm {
+            Some(description) => {
+                llm_report(
+                    cli.ctl_socket.as_deref(),
+                    &description,
+                    log_lines.unwrap_or(DEFAULT_TAIL_LINES),
+                )
+                .await
+            }
+            None => doctor(cli.ctl_socket, clean, json).await,
+        },
         Command::ProtocolVersion => {
             println!("{}", gritty::protocol::PROTOCOL_VERSION);
             Ok(())
