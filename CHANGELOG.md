@@ -6,6 +6,14 @@ when it bumps, run `gritty refresh` after upgrading (see
 everywhere in one idempotent command). Releases that don't bump the
 protocol interoperate with their neighbors.
 
+## Unreleased
+
+- `gritty prune` with no filter now explains the filter choices instead
+  of emitting clap's generic required-argument error.
+- Clearer help text: `-O` semantics, config-precedence note in
+  `connect --help`, and `lf`/`rf` help that leads with the ssh `-L`/`-R`
+  equivalence.
+
 ## 0.15.0 (2026-06-17) -- protocol v23 (refresh after upgrade)
 
 - **Linger timeout**: detached sessions are auto-reaped after a

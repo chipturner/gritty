@@ -184,7 +184,10 @@ enum Command {
         targets: Vec<String>,
     },
     /// Bulk-kill stale detached sessions (dry-run unless -y)
-    #[command(display_order = 4, group = clap::ArgGroup::new("prune_filter").required(true).multiple(true))]
+    // The filter group is validated by hand (`ensure_prune_filter`) instead of
+    // `required(true)` so a bare `gritty prune` gets a steering error rather
+    // than clap's generic required-group message.
+    #[command(display_order = 4, group = clap::ArgGroup::new("prune_filter").multiple(true))]
     Prune {
         /// Target host (defaults to `local`)
         target: Option<String>,
@@ -934,6 +937,7 @@ async fn run(cli: Cli, config: gritty::config::ConfigFile) -> anyhow::Result<()>
             kill_sessions(&targets, cli.ctl_socket.as_deref(), &config).await
         }
         Command::Prune { target, clients, idle, all, pick, yes } => {
+            ensure_prune_filter(&clients, idle.as_deref(), all, pick)?;
             let host = parse_host_or_local(&config, target.as_deref());
             let ctl_path = resolve_ctl_path(cli.ctl_socket, Some(&host))?;
             let client_name = config.resolve_session(Some(&host)).client_name;
@@ -1058,6 +1062,24 @@ async fn run(cli: Cli, config: gritty::config::ConfigFile) -> anyhow::Result<()>
     }
 }
 
+/// A bare `gritty prune` selects nothing rather than defaulting to
+/// everything; require an explicit filter and steer toward the choices.
+fn ensure_prune_filter(
+    clients: &[String],
+    idle: Option<&str>,
+    all: bool,
+    pick: bool,
+) -> anyhow::Result<()> {
+    if all || pick || idle.is_some() || !clients.is_empty() {
+        return Ok(());
+    }
+    anyhow::bail!(
+        "prune needs a filter: --all (every detached session), --idle <duration> \
+         (e.g. --idle 2h), --client <name>, or --pick (choose interactively). \
+         Dry-run by default; add -y to actually kill."
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1065,6 +1087,34 @@ mod tests {
     #[test]
     fn clap_config_is_valid() {
         Cli::command().debug_assert();
+    }
+
+    // A bare `gritty prune` must parse (no clap required-group error) so the
+    // hand-written steering error in `ensure_prune_filter` is what users see.
+    #[test]
+    fn prune_without_filters_parses_then_fails_validation() {
+        let cli = Cli::try_parse_from(["gritty", "prune"]).expect("bare prune should parse");
+        let Command::Prune { clients, idle, all, pick, .. } = cli.command else {
+            panic!("expected Prune");
+        };
+        let err = ensure_prune_filter(&clients, idle.as_deref(), all, pick)
+            .expect_err("no filter must be rejected");
+        for hint in ["--all", "--idle", "--client", "--pick"] {
+            assert!(err.to_string().contains(hint), "error should mention {hint}");
+        }
+    }
+
+    #[test]
+    fn prune_filters_pass_validation_and_combine() {
+        // Each filter alone satisfies the check.
+        assert!(ensure_prune_filter(&[], None, true, false).is_ok());
+        assert!(ensure_prune_filter(&[], None, false, true).is_ok());
+        assert!(ensure_prune_filter(&[], Some("2h"), false, false).is_ok());
+        assert!(ensure_prune_filter(&["laptop".into()], None, false, false).is_ok());
+        // --client and --idle still combine at the clap level.
+        assert!(Cli::try_parse_from(["gritty", "prune", "--client", "x", "--idle", "2h"]).is_ok());
+        // --all and --pick still conflict at the clap level.
+        assert!(Cli::try_parse_from(["gritty", "prune", "--all", "--pick"]).is_err());
     }
 
     // The top-level `gritty --help` uses a hand-written help_template with no
