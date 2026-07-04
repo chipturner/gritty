@@ -8,6 +8,8 @@ protocol interoperate with their neighbors.
 
 ## Unreleased
 
+- **`gritty mangen <dir>`**: generate man pages (one per subcommand),
+  mainly for packagers. `just man` writes them to `target/man`.
 - `gritty prune` with no filter now explains the filter choices instead
   of emitting clap's generic required-argument error.
 - Clearer help text: `-O` semantics, config-precedence note in

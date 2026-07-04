@@ -56,6 +56,7 @@ Configuration:
 Plumbing:
   server (s)             Start the server
   completions            Generate shell completions
+  mangen                 Generate man pages
   socket-path            Print the default socket path
   protocol-version       Print the protocol version
 
@@ -410,6 +411,12 @@ enum Command {
     Completions {
         /// Shell to generate completions for
         shell: clap_complete::Shell,
+    },
+    /// Generate man pages (one per subcommand, for packagers)
+    #[command(display_order = 44)]
+    Mangen {
+        /// Directory to write the man pages into (created if missing)
+        dir: PathBuf,
     },
     // -- Internal/plumbing --
     /// Print the default socket path
@@ -1057,6 +1064,12 @@ async fn run(cli: Cli, config: gritty::config::ConfigFile) -> anyhow::Result<()>
         }
         Command::Completions { shell } => {
             clap_complete::generate(shell, &mut Cli::command(), "gritty", &mut std::io::stdout());
+            Ok(())
+        }
+        Command::Mangen { dir } => {
+            std::fs::create_dir_all(&dir)?;
+            clap_mangen::generate_to(Cli::command(), &dir)?;
+            println!("man pages written to {}", dir.display());
             Ok(())
         }
     }

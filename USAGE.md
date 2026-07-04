@@ -30,6 +30,7 @@ Complete command and flag reference. For an overview and quick start, see [READM
 | `gritty doctor [--clean]` | | Show key paths and check for common issues (stale processes, orphaned daemons, orphaned sockets, config errors); `--clean` removes socket-dir files this version doesn't recognize |
 | `gritty server` | `s` | Start the server (backgrounds by default; `-f` for foreground) |
 | `gritty completions <shell>` | | Generate shell completions (bash, zsh, fish, elvish, powershell) |
+| `gritty mangen <dir>` | | Write man pages (one per subcommand) into `<dir>` -- for packagers |
 | `gritty socket-path` | `socket` | Print the default socket path |
 | `gritty protocol-version` | | Print the protocol version number |
 
@@ -251,6 +252,10 @@ laptop$ gritty completions zsh > ~/.zfunc/_gritty
 # Fish
 laptop$ gritty completions fish > ~/.config/fish/completions/gritty.fish
 ```
+
+## Man Pages
+
+`gritty mangen <dir>` writes roff man pages -- `gritty.1` plus one page per subcommand -- into `<dir>`. Intended for packagers; locally, `gritty mangen ~/.local/share/man/man1` puts them on most default `MANPATH`s.
 
 ## Debugging
 

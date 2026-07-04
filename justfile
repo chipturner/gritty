@@ -76,6 +76,10 @@ debug-session name="test":
 quicktest:
     tmux -L gritty-test start-server\; source-file quicktest.tmux
 
+# Generate man pages into target/man
+man:
+    cargo run --quiet -- mangen target/man
+
 # Test coverage summary
 coverage:
     cargo llvm-cov nextest
