@@ -164,6 +164,7 @@ gritty is designed so that a compromised remote server cannot leverage the sessi
 ## Documentation
 
 - **[USAGE.md](USAGE.md)** -- complete command and flag reference, configuration, escape sequences, shell completions, and debugging
+- **[CHANGELOG.md](CHANGELOG.md)** -- what changed per release, and whether an upgrade needs `gritty refresh`
 - **[ARCHITECTURE.md](ARCHITECTURE.md)** -- diagrams and protocol details
 - **[docs/tunnel-state-machine.md](docs/tunnel-state-machine.md)** -- SSH tunnel supervisor state machine
 

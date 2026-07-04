@@ -101,6 +101,7 @@ SSH tunnel supervisor state machine: **[docs/tunnel-state-machine.md](docs/tunne
 - Run `just check` (clippy + full test suite) before finishing work.
 - When changing code, update docs **in the same commit**. Files to check:
   - **README.md** -- overview, install, quick start, features, comparison, short config pointer, common troubleshooting, security model
+  - **CHANGELOG.md** -- user-visible changes per release; note protocol bumps ("refresh after upgrade")
   - **USAGE.md** -- full command table, all flags, `host:session` addressing, session env vars, full config reference, escape sequences, shell completions, debugging
   - **CLAUDE.md** -- module map, build/test commands, critical invariants, doc pointers
   - **ARCHITECTURE.md** -- high-level feature descriptions, diagrams
