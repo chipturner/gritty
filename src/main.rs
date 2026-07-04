@@ -39,8 +39,8 @@ Tunnels:
   bootstrap              Install gritty on a remote host
 
 Forwarding & transfer:
-  local-forward (lf)     Forward a port: session to client
-  remote-forward (rf)    Forward a port: client to session
+  local-forward (lf)     Expose a local port inside the session (like ssh -R)
+  remote-forward (rf)    Bring a session port to this machine (like ssh -L)
   send                   Send files to a paired receiver
   receive                Receive files from a paired sender
 
@@ -81,7 +81,14 @@ struct Cli {
 enum Command {
     // -- Sessions --
     /// Smart session: attach if exists, create if not
-    #[command(display_order = 0, visible_alias = "c")]
+    #[command(
+        display_order = 0,
+        visible_alias = "c",
+        after_help = "Flag defaults come from config, with precedence CLI > [host.<name>] > \
+                      [defaults] > built-in. Enable flags for on-by-default features (-O) exist \
+                      to override a config-file `false` for one invocation; --no-* flags win \
+                      over everything."
+    )]
     Connect {
         /// Target host, with optional session name (host or host:name);
         /// host defaults to `local` when omitted
@@ -107,7 +114,8 @@ enum Command {
         #[arg(short = 'A', long)]
         forward_agent: bool,
 
-        /// Forward URL open requests back to the local machine
+        /// Forward URL opens to the local machine (default: on; overrides
+        /// a config-file `forward-open = false`)
         #[arg(short = 'O', long)]
         forward_open: bool,
 
@@ -295,7 +303,11 @@ enum Command {
     /// Copy stdin to the client clipboard (for use inside gritty sessions)
     #[command(display_order = 35)]
     Copy,
-    /// Forward a port from the session to the client (listen on session, connect on client)
+    /// Make a local (client-side) port reachable inside the session (like ssh -R)
+    ///
+    /// Named for where the service lives: `gritty lf 5432` lets processes
+    /// in the session reach the postgres on your local machine. Listens in
+    /// the session, connects on the client.
     #[command(display_order = 30, visible_alias = "lf")]
     LocalForward {
         /// Target session (host[:session]); omit to use the only attached session
@@ -303,7 +315,11 @@ enum Command {
         /// Port spec: PORT or LISTEN_PORT:TARGET_PORT
         port: Option<String>,
     },
-    /// Forward a port from the client to the session (listen on client, connect on session)
+    /// Bring a remote (session-side) port to the client (like ssh -L)
+    ///
+    /// Named for where the service lives: `gritty rf 3000` lets you browse
+    /// the session's :3000 at localhost:3000 -- the common dev-server case.
+    /// Listens on the client, connects in the session.
     #[command(display_order = 31, visible_alias = "rf")]
     RemoteForward {
         /// Target session (host[:session]); omit to use the only attached session

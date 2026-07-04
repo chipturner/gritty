@@ -19,8 +19,8 @@ Complete command and flag reference. For an overview and quick start, see [READM
 | `gritty tunnel-create <destination>` | | Set up SSH tunnel to remote host |
 | `gritty tunnel-destroy <name>` | | Tear down an SSH tunnel |
 | `gritty bootstrap <destination>` | | Install gritty on a remote host |
-| `gritty local-forward [target] <port>` | `lf` | Make a local (client-side) port reachable inside the session |
-| `gritty remote-forward [target] <port>` | `rf` | Bring a remote (session-side) port to the client |
+| `gritty local-forward [target] <port>` | `lf` | Make a local (client-side) port reachable inside the session (like ssh `-R`) |
+| `gritty remote-forward [target] <port>` | `rf` | Bring a remote (session-side) port to the client (like ssh `-L`) |
 | `gritty send [files...]` | | Send files to a paired receiver |
 | `gritty receive [dir]` | | Receive files from a paired sender |
 | `gritty open <url>` | | Open a URL on the local machine (for use inside gritty sessions) |
@@ -73,9 +73,11 @@ A `[host.<name>] aliases` config entry makes alternate spellings resolve to the 
 
 ### Session options (`connect`)
 
+Flag defaults come from config, with precedence CLI > `[host.<name>]` > `[defaults]` > built-in. That's why on-by-default features still have an enable flag: it overrides a config-file `false` for one invocation.
+
 - `-A` / `--forward-agent`: forward your local SSH agent (off by default)
 - `--no-forward-agent`: never forward the agent, even if `forward-agent = true` in config
-- `-O` / `--forward-open`: forward URL opens to local machine (on by default; disable with `--no-forward-open`)
+- `-O` / `--forward-open`: forward URL opens to local machine (on by default; `-O` overrides a `forward-open = false` in config, `--no-forward-open` disables for this connect)
 - `-c <cmd>` / `--command`: run a command instead of a login shell (when creating)
 - `-d` / `--detach`: create session without attaching (background jobs)
 - `--force`: take over an already-attached session without prompting
