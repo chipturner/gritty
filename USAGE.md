@@ -7,7 +7,7 @@ Complete command and flag reference. For an overview and quick start, see [READM
 | Command | Aliases | Description |
 |---------|---------|-------------|
 | `gritty connect [host[:name]]` | `c` | Smart session: attach if exists, create if not |
-| `gritty list-sessions [host]` | `ls`, `list` | List sessions. Bare `gritty ls` shows every known host -- local + all tunnels -- grouped by daemon (tunnels reaching the same daemon are merged). With a host, lists just that host. Your own sessions are bold and sorted first; foreign sessions group by client (foreground process shown on Linux only). The `Idle` column shows time since the session's last terminal activity (output or keystrokes); detached sessions also show how long ago a client was last attached |
+| `gritty list-sessions [host] [--json]` | `ls`, `list` | List sessions. Bare `gritty ls` shows every known host -- local + all tunnels -- grouped by daemon (tunnels reaching the same daemon are merged). With a host, lists just that host. Your own sessions are bold and sorted first; foreign sessions group by client (foreground process shown on Linux only). The `Idle` column shows time since the session's last terminal activity (output or keystrokes); detached sessions also show how long ago a client was last attached |
 | `gritty tail [host:session]` | `t` | Read-only stream of session output |
 | `gritty kill-session [targets...]` | `kill` | Kill one or more sessions. Each target is `host:session`, or a bare session name/ID killed on `local` (so after `gritty ls`, `gritty kill 3 5 work` reaps by ID or name). A bare target naming a known host lists that host's sessions instead. Numeric targets match your own namespace name first, then fall back to the raw session ID |
 | `gritty prune [host]` | | Bulk-kill stale detached sessions. Select with `--client <name>` (sessions created by that client, repeatable -- e.g. a laptop you know rebooted), `--idle <duration>` (no terminal activity for at least that long: `90s`, `30m`, `12h`, `7d`), or `--all`; filters AND together. Or pick interactively with `--pick` (TUI: space marks, `a` marks all, `1`-`9` toggle, enter kills the marked set after a y/n confirm; `--client`/`--idle` narrow the candidate list). Dry run by default: prints the selection and stops; pass `-y` to kill it. Attached sessions are never touched |
@@ -15,7 +15,7 @@ Complete command and flag reference. For an overview and quick start, see [READM
 | `gritty kill-server [host]` | | Kill the server and all sessions (works across a protocol version mismatch) |
 | `gritty restart [host]` | | Kill + restart server (and tunnel, for remote hosts). One-shot upgrade recovery |
 | `gritty refresh [host]` | | Restart only processes running stale code, reap orphaned daemons, and (for remote hosts) verify protocol compatibility end to end (idempotent). No args = local + all tunnels |
-| `gritty tunnels` | `tun` | List active SSH tunnels |
+| `gritty tunnels [--json]` | `tun` | List active SSH tunnels |
 | `gritty tunnel-create <destination>` | | Set up SSH tunnel to remote host |
 | `gritty tunnel-destroy <name>` | | Tear down an SSH tunnel |
 | `gritty bootstrap <destination>` | | Install gritty on a remote host |
@@ -25,9 +25,9 @@ Complete command and flag reference. For an overview and quick start, see [READM
 | `gritty receive [dir]` | | Receive files from a paired sender |
 | `gritty open <url>` | | Open a URL on the local machine (for use inside gritty sessions) |
 | `gritty copy` | | Copy stdin to the client clipboard (for use inside gritty sessions) |
-| `gritty info` | | Show diagnostics (paths, server status, device id, tunnels) |
+| `gritty info [--json]` | | Show diagnostics (paths, server status, device id, tunnels) |
 | `gritty config` | | Open config in `$VISUAL`/`$EDITOR`/vi (creates from template if missing) |
-| `gritty doctor [--clean]` | | Show key paths and check for common issues (stale processes, orphaned daemons, orphaned sockets, config errors); `--clean` removes socket-dir files this version doesn't recognize |
+| `gritty doctor [--clean] [--json]` | | Show key paths and check for common issues (stale processes, orphaned daemons, orphaned sockets, config errors); `--clean` removes socket-dir files this version doesn't recognize |
 | `gritty server` | `s` | Start the server (backgrounds by default; `-f` for foreground) |
 | `gritty completions <shell>` | | Generate shell completions (bash, zsh, fish, elvish, powershell) |
 | `gritty mangen <dir>` | | Write man pages (one per subcommand) into `<dir>` -- for packagers |
@@ -251,6 +251,16 @@ laptop$ gritty completions zsh > ~/.zfunc/_gritty
 
 # Fish
 laptop$ gritty completions fish > ~/.config/fish/completions/gritty.fish
+```
+
+## Scripting (`--json`)
+
+`ls`, `tunnels`, `info`, and `doctor` accept `--json` for machine-readable output -- status bars, prompts, and scripts should parse this instead of the human tables. `gritty ls --json` emits an array of host groups, each with `hosts` (name, destination, tunnel_status), an `error` (probe failure) or a `sessions` array (`id`, `name` = wire name to pass back to gritty, `display_name` = prefix-elided form shown in tables, `attached`, `idle_secs`, `foreground_cmd`, `cwd`, ...). Fields are append-only: new keys may appear, existing ones won't be renamed or removed.
+
+```
+laptop$ gritty ls --json | jq -r '.[].sessions[] | select(.attached | not) | .name'
+laptop$ gritty tunnels --json | jq -r '.[] | select(.status != "healthy") | .name'
+laptop$ gritty doctor --json | jq '.failures'
 ```
 
 ## Man Pages

@@ -9,13 +9,17 @@ use super::util::server_request;
 
 // ---- Status / Check types ---------------------------------------------------
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "lowercase")]
 enum Status {
     Ok,
     Warn,
     Fail,
 }
 
+/// Also the per-check shape of `doctor --json` -- extend rather than
+/// rename/remove fields.
+#[derive(serde::Serialize)]
 struct Check {
     status: Status,
     message: String,
@@ -718,6 +722,7 @@ fn check_orphan_daemons() -> Vec<Check> {
 pub(crate) async fn doctor(
     ctl_socket: Option<std::path::PathBuf>,
     clean: bool,
+    json: bool,
 ) -> anyhow::Result<()> {
     let default_dir = super::util::canonicalize_or_raw(gritty::daemon::socket_dir());
     // The server's ctl/svc/agent sockets and log follow a --ctl-socket
@@ -762,15 +767,36 @@ pub(crate) async fn doctor(
         &ctl_path,
         &server_dir,
     );
-    render_paths(&paths);
-    println!();
-    render(&groups);
+
+    if json {
+        println!("{}", serde_json::to_string_pretty(&report_json(&paths, &groups))?);
+    } else {
+        render_paths(&paths);
+        println!();
+        render(&groups);
+    }
 
     let has_failures = groups.iter().flat_map(|(_, cs)| cs).any(|c| c.status == Status::Fail);
     if has_failures {
         std::process::exit(1);
     }
     Ok(())
+}
+
+/// `doctor --json` output contract -- extend rather than rename/remove fields.
+fn report_json(paths: &[(&str, PathBuf)], groups: &[(&str, Vec<Check>)]) -> serde_json::Value {
+    let count =
+        |status| groups.iter().flat_map(|(_, cs)| cs).filter(|c| c.status == status).count();
+    serde_json::json!({
+        "paths": paths.iter().map(|(label, path)| {
+            serde_json::json!({ "label": label, "path": path, "exists": path.exists() })
+        }).collect::<Vec<_>>(),
+        "groups": groups.iter().map(|(name, checks)| {
+            serde_json::json!({ "name": name, "checks": checks })
+        }).collect::<Vec<_>>(),
+        "warnings": count(Status::Warn),
+        "failures": count(Status::Fail),
+    })
 }
 
 // ---- Tests ------------------------------------------------------------------

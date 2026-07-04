@@ -121,13 +121,13 @@ wait_for_daemon() {
     return 1
 }
 
-# Wait for a named session to appear in `gritty ls <host>`. Uses an exact-name
-# column match (awk on column 2) so `test1` doesn't match `test10`.
+# Wait for a named session to appear in `gritty ls <host>`. Exact-name match
+# (via --json) so `test1` doesn't match `test10`.
 wait_for_session() {
     local host="${1}" name="${2}" timeout="${3:-10}"
     local i
     for ((i = 0; i < timeout * 10; i++)); do
-        if gritty ls "${host}" 2>/dev/null | awk 'NR>1 {print $2}' | grep -qFx "${name}"; then
+        if session_exists "${host}" "${name}"; then
             return 0
         fi
         sleep 0.1
@@ -140,7 +140,7 @@ wait_for_session_gone() {
     local host="${1}" name="${2}" timeout="${3:-10}"
     local i
     for ((i = 0; i < timeout * 10; i++)); do
-        if ! gritty ls "${host}" 2>/dev/null | awk 'NR>1 {print $2}' | grep -qFx "${name}"; then
+        if ! session_exists "${host}" "${name}"; then
             return 0
         fi
         sleep 0.1
@@ -148,11 +148,14 @@ wait_for_session_gone() {
     return 1
 }
 
-# Strict column-aware session match. Returns 0 if a session with the exact name
-# exists in `gritty ls <host>`.
+# Strict session match via `gritty ls --json` (also exercises the JSON output
+# contract). Returns 0 if a session with the exact display name exists on
+# <host>; pass `attached` as $3 to additionally require an attached client.
 session_exists() {
-    local host="${1}" name="${2}"
-    gritty ls "${host}" 2>/dev/null | awk 'NR>1 {print $2}' | grep -qFx "${name}"
+    local host="${1}" name="${2}" state="${3:-any}"
+    gritty ls "${host}" --json 2>/dev/null | jq -e --arg n "${name}" --arg s "${state}" \
+        'any(.[].sessions[]; .display_name == $n and ($s != "attached" or .attached))' \
+        >/dev/null
 }
 
 # Wait until a process is dead: gone from /proc, or lingering as a zombie.
@@ -175,13 +178,12 @@ wait_for_process_dead() {
 
 # Wait until a session is in the "attached" state in `gritty ls`. Useful before
 # probing per-session resources (fwd-*.sock) that only appear once a client has
-# finished its Attach handshake. The status may carry a heartbeat suffix
-# ("attached (heartbeat 3s ago)"), so match the word rather than the last field.
+# finished its Attach handshake.
 wait_for_session_attached() {
     local host="${1}" name="${2}" timeout="${3:-10}"
     local i
     for ((i = 0; i < timeout * 10; i++)); do
-        if gritty ls "${host}" 2>/dev/null | awk -v n="${name}" 'NR>1 && $2 == n && / attached/' | grep -q .; then
+        if session_exists "${host}" "${name}" attached; then
             return 0
         fi
         sleep 0.1

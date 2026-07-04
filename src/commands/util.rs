@@ -795,26 +795,51 @@ fn parse_editor(editor: &str) -> (String, Vec<String>) {
     (program, parts)
 }
 
-pub(crate) async fn info(ctl_socket: Option<PathBuf>) -> anyhow::Result<()> {
-    use gritty::protocol::Frame;
+/// `info --json` output contract -- extend rather than rename/remove fields.
+#[derive(serde::Serialize)]
+struct InfoJson {
+    version: &'static str,
+    config_path: PathBuf,
+    /// `not-found`, `invalid`, or `loaded`.
+    config_state: &'static str,
+    /// Parse error when `config_state` is `invalid`.
+    config_error: Option<String>,
+    socket_dir: PathBuf,
+    ctl_socket: PathBuf,
+    /// Stringified -- may exceed JSON's safe integer range as a number.
+    device_id: String,
+    device_id_path: PathBuf,
+    /// `running`, `version-mismatch`, or `not-running`.
+    server_state: &'static str,
+    server_pid: Option<u32>,
+    /// Session count; `None` unless `server_state` is `running`.
+    sessions: Option<usize>,
+    server_log: PathBuf,
+    server_out: PathBuf,
+    tunnels: Vec<gritty::connect::TunnelInfo>,
+}
 
-    println!("gritty {}", env!("CARGO_PKG_VERSION"));
-    println!();
+pub(crate) async fn info(ctl_socket: Option<PathBuf>, json: bool) -> anyhow::Result<()> {
+    use gritty::protocol::Frame;
 
     let cfg_path = gritty::config::config_path();
     // Re-parse strictly: a config rejected by deny_unknown_fields must not be
     // reported as "loaded" -- `config` here is the default-fallback value.
-    let cfg_status = match gritty::config::config_status(&cfg_path) {
-        gritty::config::ConfigStatus::NotFound => "not found".to_string(),
-        gritty::config::ConfigStatus::Invalid(e) => format!("INVALID -- ignored: {e}"),
-        gritty::config::ConfigStatus::Valid(cfg) if cfg.host.is_empty() => "loaded".to_string(),
+    let (config_state, config_error, cfg_status) = match gritty::config::config_status(&cfg_path) {
+        gritty::config::ConfigStatus::NotFound => ("not-found", None, "not found".to_string()),
+        gritty::config::ConfigStatus::Invalid(e) => {
+            let text = format!("INVALID -- ignored: {e}");
+            ("invalid", Some(e.to_string()), text)
+        }
+        gritty::config::ConfigStatus::Valid(cfg) if cfg.host.is_empty() => {
+            ("loaded", None, "loaded".to_string())
+        }
         gritty::config::ConfigStatus::Valid(cfg) => {
             let n = cfg.host.len();
             let s = if n == 1 { "" } else { "s" };
-            format!("loaded, {n} host{s}")
+            ("loaded", None, format!("loaded, {n} host{s}"))
         }
     };
-    println!("config:         {} ({cfg_status})", cfg_path.display());
 
     // A --ctl-socket override points `info` at a specific daemon; its log/pid
     // are siblings of that socket.
@@ -825,46 +850,75 @@ pub(crate) async fn info(ctl_socket: Option<PathBuf>) -> anyhow::Result<()> {
     let socket_dir =
         ctl_path.parent().map(Path::to_path_buf).unwrap_or_else(gritty::daemon::socket_dir);
 
-    println!("socket dir:     {}", socket_dir.display());
-    println!("server socket:  {}", ctl_path.display());
-
     let device_id = gritty::get_or_create_device_id();
     let device_id_path = gritty::device_id_path();
-    println!("device id:      {device_id} ({})", device_id_path.display());
 
-    // Probe server status via server_request (which includes handshake)
     let pid_path = gritty::daemon::pid_file_path(&ctl_path);
     let pid = std::fs::read_to_string(&pid_path).ok().and_then(|s| s.trim().parse::<u32>().ok());
 
     // Probe with the version-tolerant request: a running-but-mismatched daemon
     // must report as running (with the mismatch), not "not running".
-    match server_request_any_version(&ctl_path, Frame::ListSessions).await {
-        Ok(Frame::SessionInfo { sessions }) => {
-            let n = sessions.len();
+    let (server_state, sessions) =
+        match server_request_any_version(&ctl_path, Frame::ListSessions).await {
+            Ok(Frame::SessionInfo { sessions }) => ("running", Some(sessions.len())),
+            Ok(Frame::Error { code: gritty::protocol::ErrorCode::VersionMismatch, .. }) => {
+                ("version-mismatch", None)
+            }
+            _ => ("not-running", None),
+        };
+
+    let log_path = socket_dir.join("daemon.log");
+    let out_path = socket_dir.join("daemon.out");
+    let tunnels = gritty::connect::get_tunnel_info();
+
+    if json {
+        let report = InfoJson {
+            version: env!("CARGO_PKG_VERSION"),
+            config_path: cfg_path,
+            config_state,
+            config_error,
+            socket_dir,
+            ctl_socket: ctl_path,
+            device_id: device_id.to_string(),
+            device_id_path,
+            server_state,
+            server_pid: pid,
+            sessions,
+            server_log: log_path,
+            server_out: out_path,
+            tunnels,
+        };
+        println!("{}", serde_json::to_string_pretty(&report)?);
+        return Ok(());
+    }
+
+    println!("gritty {}", env!("CARGO_PKG_VERSION"));
+    println!();
+    println!("config:         {} ({cfg_status})", cfg_path.display());
+    println!("socket dir:     {}", socket_dir.display());
+    println!("server socket:  {}", ctl_path.display());
+    println!("device id:      {device_id} ({})", device_id_path.display());
+
+    match (server_state, sessions) {
+        ("running", Some(n)) => {
             let s = if n == 1 { "" } else { "s" };
             match pid {
                 Some(p) => println!("server status:  running (pid {p}, {n} session{s})"),
                 None => println!("server status:  running ({n} session{s})"),
             }
         }
-        Ok(Frame::Error { code: gritty::protocol::ErrorCode::VersionMismatch, .. }) => {
+        ("version-mismatch", _) => {
             let pid_str = pid.map(|p| format!("pid {p}, ")).unwrap_or_default();
             println!(
                 "server status:  running ({pid_str}protocol version mismatch -- run `gritty refresh`)"
             );
         }
-        _ => {
-            println!("server status:  not running");
-        }
+        _ => println!("server status:  not running"),
     }
 
-    let log_path = socket_dir.join("daemon.log");
-    let out_path = socket_dir.join("daemon.out");
     print_path("server log:    ", &log_path);
     print_path("server output: ", &out_path);
 
-    // Tunnels
-    let tunnels = gritty::connect::get_tunnel_info();
     if !tunnels.is_empty() {
         println!();
         println!("tunnels:");

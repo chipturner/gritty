@@ -175,6 +175,10 @@ enum Command {
     ListSessions {
         /// Target host (omit to list every known host)
         target: Option<String>,
+
+        /// Machine-readable output (array of host groups with sessions)
+        #[arg(long)]
+        json: bool,
     },
     /// Kill one or more sessions
     #[command(display_order = 3, visible_alias = "kill")]
@@ -384,7 +388,11 @@ enum Command {
     },
     /// List active SSH tunnels
     #[command(display_order = 10, visible_alias = "tun")]
-    Tunnels,
+    Tunnels {
+        /// Machine-readable output
+        #[arg(long)]
+        json: bool,
+    },
     // -- Server & config --
     /// Start the server (backgrounds by default, use -f to stay in foreground)
     #[command(display_order = 40, visible_alias = "s")]
@@ -395,7 +403,11 @@ enum Command {
     },
     /// Show diagnostics (paths, server status, tunnels)
     #[command(display_order = 20)]
-    Info,
+    Info {
+        /// Machine-readable output
+        #[arg(long)]
+        json: bool,
+    },
     /// Open config file in $VISUAL/$EDITOR/vi (creates from template if missing)
     #[command(display_order = 21)]
     Config,
@@ -405,6 +417,10 @@ enum Command {
         /// Remove socket-dir files this gritty version doesn't recognize
         #[arg(long)]
         clean: bool,
+
+        /// Machine-readable output (paths, check groups, summary)
+        #[arg(long)]
+        json: bool,
     },
     /// Generate shell completions
     #[command(display_order = 41)]
@@ -922,14 +938,15 @@ async fn run(cli: Cli, config: gritty::config::ConfigFile) -> anyhow::Result<()>
             let code = tail_session(session, ctl_path).await?;
             std::process::exit(code);
         }
-        Command::ListSessions { target } => {
+        Command::ListSessions { target, json } => {
             if target.is_none() && cli.ctl_socket.is_none() {
-                list_all_sessions(&config).await
+                list_all_sessions(&config, json).await
             } else {
                 let host = target.as_deref().map(|t| parse_target(&config, t).0);
                 let ctl_path = resolve_ctl_path(cli.ctl_socket, host.as_deref())?;
                 let client_name = config.resolve_session(host.as_deref()).client_name;
-                list_sessions(ctl_path, &client_name).await
+                list_sessions(ctl_path, host.as_deref().unwrap_or("local"), &client_name, json)
+                    .await
             }
         }
         Command::KillSession { targets } => {
@@ -1051,13 +1068,13 @@ async fn run(cli: Cli, config: gritty::config::ConfigFile) -> anyhow::Result<()>
             .await
         }
         Command::TunnelDestroy { name } => gritty::connect::disconnect(&name).await,
-        Command::Tunnels => {
-            gritty::connect::list_tunnels();
+        Command::Tunnels { json } => {
+            gritty::connect::list_tunnels(json);
             Ok(())
         }
-        Command::Info => info(cli.ctl_socket).await,
+        Command::Info { json } => info(cli.ctl_socket, json).await,
         Command::Config => config_edit(),
-        Command::Doctor { clean } => doctor(cli.ctl_socket, clean).await,
+        Command::Doctor { clean, json } => doctor(cli.ctl_socket, clean, json).await,
         Command::ProtocolVersion => {
             println!("{}", gritty::protocol::PROTOCOL_VERSION);
             Ok(())

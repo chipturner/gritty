@@ -130,13 +130,15 @@ test_list_matches() {
     tmux send-keys -t sot3 '~.'
     wait_for_session "${tunnel}" "listme" 5 || true
 
+    # Compare wire names (`.name`), which are vantage-independent -- the
+    # display column elides the viewer's own client prefix.
     local remote_view
-    remote_view=$(gritty ls "${tunnel}" | awk 'NR>1 {print $2}' | sort)
+    remote_view=$(gritty ls "${tunnel}" --json | jq -r '.[].sessions[].name' | sort)
 
     # SSH to the same host (over the existing tunnel's underlying connection)
     # and inspect the local view -- they should agree on session names.
     local local_view
-    local_view=$(ssh -o BatchMode=yes localhost "$(command -v gritty) ls local" 2>/dev/null | awk 'NR>1 {print $2}' | sort)
+    local_view=$(ssh -o BatchMode=yes localhost "$(command -v gritty) ls local --json" 2>/dev/null | jq -r '.[].sessions[].name' | sort)
 
     if [ "${remote_view}" = "${local_view}" ]; then
         pass "remote ls matches local ls on same host"

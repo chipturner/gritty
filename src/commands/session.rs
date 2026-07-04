@@ -1669,20 +1669,31 @@ fn print_session_table(
     }
 }
 
-pub(crate) async fn list_sessions(ctl_path: PathBuf, client_name: &str) -> anyhow::Result<()> {
+pub(crate) async fn list_sessions(
+    ctl_path: PathBuf,
+    host: &str,
+    client_name: &str,
+    json: bool,
+) -> anyhow::Result<()> {
     use gritty::protocol::Frame;
 
     let resp = server_request(&ctl_path, Frame::ListSessions).await?;
     match resp {
         Frame::SessionInfo { sessions } => {
-            if sessions.is_empty() {
+            let now = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_secs();
+            if json {
+                let groups = vec![HostGroupJson {
+                    hosts: vec![HostRefJson { name: host, destination: None, tunnel_status: None }],
+                    error: None,
+                    sessions: sessions.iter().map(|s| session_json(s, now, client_name)).collect(),
+                }];
+                print_json(&groups);
+            } else if sessions.is_empty() {
                 println!("no active sessions");
             } else {
-                let now = std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .unwrap_or_default()
-                    .as_secs();
-
                 print_session_table(&sessions, now, client_name, "");
             }
             Ok(())
@@ -1691,6 +1702,79 @@ pub(crate) async fn list_sessions(ctl_path: PathBuf, client_name: &str) -> anyho
             anyhow::bail!("unexpected response from server: {other:?}");
         }
     }
+}
+
+// ---- `ls --json` output contract --------------------------------------------
+// Parsed by scripts (and our own container tests); extend rather than
+// rename/remove fields.
+
+#[derive(serde::Serialize)]
+struct HostRefJson<'a> {
+    name: &'a str,
+    /// SSH destination for tunneled hosts; `None` for `local`.
+    destination: Option<&'a str>,
+    /// Tunnel supervisor status (`healthy`/`reconnecting`); `None` for `local`.
+    tunnel_status: Option<&'a str>,
+}
+
+#[derive(serde::Serialize)]
+struct HostGroupJson<'a> {
+    /// All host names that resolved to this daemon (aliases merge).
+    hosts: Vec<HostRefJson<'a>>,
+    /// Probe failure, mutually exclusive with a non-empty `sessions`.
+    error: Option<&'a str>,
+    sessions: Vec<SessionJson<'a>>,
+}
+
+#[derive(serde::Serialize)]
+struct SessionJson<'a> {
+    id: u32,
+    /// Wire name -- pass back to gritty commands verbatim.
+    name: String,
+    /// Wire name with your own client prefix elided, as `gritty ls` shows it.
+    display_name: String,
+    attached: bool,
+    created_at: u64,
+    /// Epoch seconds of last terminal activity; `None` = unknown (older server).
+    last_activity: Option<u64>,
+    /// Seconds since last terminal activity; `None` = unknown.
+    idle_secs: Option<u64>,
+    foreground_cmd: &'a str,
+    cwd: &'a str,
+    shell_pid: u32,
+    client_name: &'a str,
+    agent_forwarding_active: bool,
+    is_last_attached: bool,
+    /// Seconds a detached session survives before reaping; `None` = never.
+    linger_secs: Option<u64>,
+}
+
+fn session_json<'a>(
+    s: &'a gritty::protocol::SessionEntry,
+    now: u64,
+    client_name: &str,
+) -> SessionJson<'a> {
+    let wire = session_wire_name(s);
+    SessionJson {
+        id: s.id,
+        display_name: gritty::naming::display_session_name(&wire, client_name).to_string(),
+        name: wire,
+        attached: s.attached,
+        created_at: s.created_at,
+        last_activity: (s.last_activity != 0).then_some(s.last_activity),
+        idle_secs: (s.last_activity != 0).then(|| now.saturating_sub(s.last_activity)),
+        foreground_cmd: &s.foreground_cmd,
+        cwd: &s.cwd,
+        shell_pid: s.shell_pid,
+        client_name: &s.client_name,
+        agent_forwarding_active: s.agent_forwarding_active,
+        is_last_attached: s.is_last_attached,
+        linger_secs: (s.linger_secs != 0).then_some(s.linger_secs),
+    }
+}
+
+fn print_json<T: serde::Serialize>(value: &T) {
+    println!("{}", serde_json::to_string_pretty(value).unwrap_or_else(|_| "[]".into()));
 }
 
 /// One probed daemon endpoint: its host name, tunnel display info (when
@@ -1826,7 +1910,10 @@ fn is_listable(p: &ProbedHost) -> bool {
 /// all tunnels), grouped by daemon identity, one section per daemon. Outbound
 /// connections are the tunnel sections; inbound connections show up in the
 /// local section's Client column.
-pub(crate) async fn list_all_sessions(config: &gritty::config::ConfigFile) -> anyhow::Result<()> {
+pub(crate) async fn list_all_sessions(
+    config: &gritty::config::ConfigFile,
+    json: bool,
+) -> anyhow::Result<()> {
     let probes = discover_daemon_probes();
 
     if probes.is_empty() {
@@ -1845,6 +1932,36 @@ pub(crate) async fn list_all_sessions(config: &gritty::config::ConfigFile) -> an
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default()
         .as_secs();
+
+    if json {
+        let json_groups: Vec<HostGroupJson> = groups
+            .iter()
+            .map(|group| {
+                let client_name = config.resolve_session(Some(&group.members[0].0)).client_name;
+                HostGroupJson {
+                    hosts: group
+                        .members
+                        .iter()
+                        .map(|(name, tunnel)| HostRefJson {
+                            name,
+                            destination: tunnel.as_ref().map(|(d, _)| d.as_str()),
+                            tunnel_status: tunnel.as_ref().map(|(_, s)| s.as_str()),
+                        })
+                        .collect(),
+                    error: group.result.as_ref().err().map(String::as_str),
+                    sessions: group
+                        .result
+                        .as_ref()
+                        .map(|sessions| {
+                            sessions.iter().map(|s| session_json(s, now, &client_name)).collect()
+                        })
+                        .unwrap_or_default(),
+                }
+            })
+            .collect();
+        print_json(&json_groups);
+        return Ok(());
+    }
 
     for (i, group) in groups.iter().enumerate() {
         if i > 0 {
@@ -1990,6 +2107,62 @@ mod tests {
         e.name = name.to_string();
         e.attached = attached;
         e
+    }
+
+    // -- `ls --json` output contract --
+
+    /// Scripts parse these field names; renaming or removing any is a
+    /// breaking change to the `--json` contract, not a refactor.
+    #[test]
+    fn session_json_schema_is_stable() {
+        let mut e = auto_entry("mylaptop/work", true);
+        e.last_activity = 950;
+        e.linger_secs = 60;
+        let v = serde_json::to_value(session_json(&e, 1000, "mylaptop")).unwrap();
+        assert_eq!(v["id"], 3);
+        assert_eq!(v["name"], "mylaptop/work");
+        assert_eq!(v["display_name"], "work");
+        assert_eq!(v["attached"], true);
+        assert_eq!(v["idle_secs"], 50);
+        assert_eq!(v["last_activity"], 950);
+        assert_eq!(v["foreground_cmd"], "vim");
+        assert_eq!(v["cwd"], "/home/x");
+        assert_eq!(v["shell_pid"], 1234);
+        assert_eq!(v["client_name"], "laptop");
+        assert_eq!(v["agent_forwarding_active"], false);
+        assert_eq!(v["is_last_attached"], false);
+        assert_eq!(v["linger_secs"], 60);
+        assert_eq!(v["created_at"], 0);
+    }
+
+    /// Sentinel zeros (unknown activity, linger=never) become null, and an
+    /// unnamed session's wire name is its numeric id.
+    #[test]
+    fn session_json_nulls_and_unnamed() {
+        let v = serde_json::to_value(session_json(&entry(), 1000, "mylaptop")).unwrap();
+        assert_eq!(v["name"], "3");
+        assert!(v["last_activity"].is_null());
+        assert!(v["idle_secs"].is_null());
+        assert!(v["linger_secs"].is_null());
+    }
+
+    #[test]
+    fn host_group_json_schema_is_stable() {
+        let group = HostGroupJson {
+            hosts: vec![HostRefJson {
+                name: "devbox",
+                destination: Some("user@10.0.0.5"),
+                tunnel_status: Some("healthy"),
+            }],
+            error: None,
+            sessions: vec![],
+        };
+        let v = serde_json::to_value(vec![group]).unwrap();
+        assert_eq!(v[0]["hosts"][0]["name"], "devbox");
+        assert_eq!(v[0]["hosts"][0]["destination"], "user@10.0.0.5");
+        assert_eq!(v[0]["hosts"][0]["tunnel_status"], "healthy");
+        assert!(v[0]["error"].is_null());
+        assert!(v[0]["sessions"].as_array().unwrap().is_empty());
     }
 
     // -- prune_selection (prune filter logic) --

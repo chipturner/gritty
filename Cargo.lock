@@ -447,6 +447,7 @@ dependencies = [
  "opener",
  "proptest",
  "serde",
+ "serde_json",
  "shlex 2.0.1",
  "tempfile",
  "terminal_size",

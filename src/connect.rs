@@ -2100,6 +2100,9 @@ pub async fn disconnect(name: &str) -> anyhow::Result<()> {
 // List tunnels
 // ---------------------------------------------------------------------------
 
+/// Also the `--json` output contract of `gritty tunnels` -- extend rather
+/// than rename/remove fields.
+#[derive(serde::Serialize)]
 pub struct TunnelInfo {
     pub name: String,
     pub destination: String,
@@ -2140,8 +2143,12 @@ pub fn get_tunnel_info() -> Vec<TunnelInfo> {
     infos
 }
 
-pub fn list_tunnels() {
+pub fn list_tunnels(json: bool) {
     let infos = get_tunnel_info();
+    if json {
+        println!("{}", serde_json::to_string_pretty(&infos).unwrap_or_else(|_| "[]".into()));
+        return;
+    }
     if infos.is_empty() {
         println!("no active tunnels");
         return;

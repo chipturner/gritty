@@ -1,6 +1,6 @@
 FROM debian:trixie-slim
 RUN apt-get update && apt-get install -y --no-install-recommends \
-        tmux openssh-server openssh-client netcat-openbsd \
+        tmux openssh-server openssh-client netcat-openbsd jq \
     && rm -rf /var/lib/apt/lists/*
 COPY target/debug/gritty /usr/local/bin/gritty
 COPY tests/container/helpers.sh tests/container/lifecycle.sh tests/container/ssh-tunnel.sh \

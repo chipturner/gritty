@@ -8,6 +8,8 @@ protocol interoperate with their neighbors.
 
 ## Unreleased
 
+- **`--json` on `ls`, `tunnels`, `info`, and `doctor`**: machine-readable
+  output for scripts and status bars. Fields are append-only.
 - **`gritty mangen <dir>`**: generate man pages (one per subcommand),
   mainly for packagers. `just man` writes them to `target/man`.
 - MSRV lowered from 1.94 to 1.88 (the actual floor: let-chains).
