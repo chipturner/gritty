@@ -109,16 +109,10 @@ test-container:
     docker build -t gritty-container-test -f tests/container/Dockerfile .
     docker run --rm gritty-container-test
 
-# Record demos in Docker (repeatable, no local deps beyond Docker)
-record-demos:
-    cargo build
-    docker build -t gritty-demo -f tests/container/Dockerfile.demo .
-    mkdir -p docs/demos/output
-    docker run --rm --hostname devbox -v "$(pwd)/docs/demos/output:/demos/output" gritty-demo
-
-# Record demos locally (uses your SSH config + installed tools)
-record-demos-local:
-    docs/demos/record-all.sh
+# Record demo GIFs (requires vhs: https://github.com/charmbracelet/vhs)
+demo *tapes:
+    cargo build --release
+    demo/record.sh {{ tapes }}
 
 # Clean all build artifacts
 clean:

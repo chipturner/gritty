@@ -18,4 +18,6 @@ perf.data.old
 
 docs/plans/
 docs/superpowers/
-docs/demos/output/
+
+# Recorded demo GIFs (regenerate with `just demo`)
+demo/out/

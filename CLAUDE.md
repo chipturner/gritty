@@ -30,6 +30,7 @@ just test-socat-bridge               # socat bridge tests (requires socat)
 just stress 10                       # run full suite N times, report pass/fail tally
 just coverage                        # test coverage summary
 just coverage-html                   # HTML coverage report
+just demo                            # record demo GIFs into demo/out/ (requires vhs; see demo/record.sh)
 ```
 
 ```bash
