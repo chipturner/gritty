@@ -14,6 +14,8 @@ laptop$ gritty connect devbox:work          # creates or reattaches -- one comma
 
 Sessions are persistent and self-healing. The tunnel respawns on failure, the client auto-reconnects, and buffered output bridges the gap so nothing is lost. Your local tools come with you: `git push` uses your local SSH keys, `gh auth login` opens your local browser and tunnels the OAuth callback, `gritty send`/`receive` moves files through the session without scp. It feels like a local shell that happens to be remote.
 
+![A session keeps running while detached: work continues in the background and reattaching picks up right where it left off](docs/images/persist.gif)
+
 gritty works by forwarding Unix domain sockets over SSH -- no custom protocol, no open ports, no certificates, no configuration. If you can `ssh` to a host, you can use gritty.
 
 ### Install
@@ -66,6 +68,8 @@ Detach with `~.` or just close the terminal -- the remote shell keeps running.
 laptop$ gritty send report.pdf
 devbox$ gritty receive .
 ```
+
+![gritty send offers a file from inside a session; gritty receive on the client pairs with it and the file arrives with a progress bar](docs/images/transfer.gif)
 
 Send a directory with `-r`, or pipe through `tar` for compression (either direction works):
 
