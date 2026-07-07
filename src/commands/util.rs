@@ -91,11 +91,65 @@ pub(crate) async fn connect_handshaked(
         anyhow::anyhow!("no server running (could not connect to {})", ctl_path.display())
     })?;
     let mut framed = Framed::new(stream, FrameCodec);
-    let info = gritty::handshake(&mut framed, gritty::get_or_create_device_id()).await?;
+    let info = gritty::handshake(&mut framed, gritty::get_or_create_device_id())
+        .await
+        .map_err(|e| tunnel_handshake_context(e, ctl_path))?;
     if check_version {
         gritty::require_matched_version(&info)?;
     }
     Ok((framed, info))
+}
+
+/// Add tunnel-aware context to a fresh-connect handshake failure.
+///
+/// `daemon closed connection` on a first connect through a tunnel socket
+/// means ssh accepted the local connection but couldn't open the remote side
+/// (remote daemon down, or the forward targets a stale socket path). ssh logs
+/// the real diagnostic -- `channel N: open failed: ...` -- to the tunnel's
+/// `.out` file and hands the client a bare EOF, so surface that trail here.
+/// Non-tunnel paths and other error shapes pass through untouched.
+///
+/// The original message stays first: the client reconnect loop classifies
+/// handshake errors by prefix (`client::is_terminal_handshake_err`).
+pub(crate) fn tunnel_handshake_context(err: anyhow::Error, ctl_path: &Path) -> anyhow::Error {
+    let msg = err.to_string();
+    let eofish =
+        msg.starts_with("daemon closed connection") || msg.starts_with("daemon protocol error");
+    let Some(name) = gritty::connect::ctl_socket_tunnel_name(ctl_path).filter(|_| eofish) else {
+        return err;
+    };
+    anyhow::anyhow!(
+        "{}",
+        tunnel_handshake_hint(
+            &msg,
+            name,
+            &gritty::connect::connect_out_path(name),
+            gritty::connect::last_forward_error(name).as_deref(),
+        )
+    )
+}
+
+/// Pure formatter for [`tunnel_handshake_context`], separated for testing.
+fn tunnel_handshake_hint(
+    msg: &str,
+    name: &str,
+    out_path: &Path,
+    forward_err: Option<&str>,
+) -> String {
+    let mut hint = format!(
+        "{msg}\n  \
+         the '{name}' tunnel is up, but the remote daemon looks unreachable \
+         (not running, or its socket path is stale)"
+    );
+    if let Some(line) = forward_err {
+        hint.push_str(&format!("\n  ssh reported: {line}"));
+    }
+    hint.push_str(&format!(
+        "\n  ssh output: {}\n  \
+         hint: `gritty restart {name}` restarts the remote daemon and respawns the tunnel",
+        out_path.display()
+    ));
+    hint
 }
 
 async fn server_request_inner(
@@ -1537,5 +1591,36 @@ mod tests {
     fn parse_editor_empty_falls_back_to_vi() {
         assert_eq!(parse_editor(""), ("vi".into(), Vec::new()));
         assert_eq!(parse_editor("   "), ("vi".into(), Vec::new()));
+    }
+
+    #[test]
+    fn tunnel_handshake_hint_includes_evidence() {
+        let hint = tunnel_handshake_hint(
+            "daemon closed connection",
+            "devbox",
+            Path::new("/run/g/connect-devbox.out"),
+            Some("channel 2: open failed: connect failed: No such file or directory"),
+        );
+        // Prefix preserved -- the reconnect loop classifies by starts_with.
+        assert!(hint.starts_with("daemon closed connection"), "{hint}");
+        assert!(hint.contains("connect-devbox.out"), "{hint}");
+        assert!(hint.contains("open failed"), "{hint}");
+        assert!(hint.contains("gritty restart devbox"), "{hint}");
+    }
+
+    #[test]
+    fn tunnel_handshake_context_passthrough_for_local_and_other_errors() {
+        // Local ctl socket: no tunnel context regardless of message.
+        let e = tunnel_handshake_context(
+            anyhow::anyhow!("daemon closed connection"),
+            Path::new("/run/g/ctl.sock"),
+        );
+        assert_eq!(e.to_string(), "daemon closed connection");
+        // Tunnel socket but a non-EOF error: untouched.
+        let e = tunnel_handshake_context(
+            anyhow::anyhow!("handshake rejected"),
+            Path::new("/run/g/connect-devbox.sock"),
+        );
+        assert_eq!(e.to_string(), "handshake rejected");
     }
 }

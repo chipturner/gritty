@@ -8,6 +8,23 @@ protocol interoperate with their neighbors.
 
 ## Unreleased
 
+- **Fixed: a failed remote probe could poison the tunnel's forward spec.**
+  When `gritty socket-path` failed on the remote (binary missing after an
+  upgrade, broken PATH), the probe's `ERR:` tag was mistaken for the socket
+  path and the supervisor looped respawning `ssh -L ...:ERR:` ("Bad local
+  forwarding specification") forever. The probe parser now rejects any
+  `ERR:`-tagged or non-absolute-path result, a poisoned `.remote-sock`
+  cache is discarded on read, and `spawn_tunnel` refuses to build a
+  forward from a non-absolute remote path.
+- **Clearer error when the remote daemon is unreachable through a tunnel**:
+  `daemon closed connection` on a connect through a tunnel socket now
+  explains that ssh is up but the remote daemon isn't answering, quotes the
+  most recent `channel N: open failed` line from the tunnel's `.out`, and
+  points at the file plus `gritty restart <host>`.
+- **`doctor` flags tunnels whose remote daemon is unreachable**: previously
+  an end-to-end probe failure through a healthy-looking tunnel was silently
+  ignored and the tunnel reported `healthy`; it now warns with the ssh
+  `.out` evidence.
 - **`gritty doctor --llm ["description"]`**: print a self-contained,
   LLM-ready diagnostic report (architecture primer, known failure modes,
   health checks, session/tunnel state, sanitized log excerpts) to paste

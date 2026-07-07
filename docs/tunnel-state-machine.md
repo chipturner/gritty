@@ -38,7 +38,7 @@ A tunnel named `NAME` owns these files in `socket_dir()`:
 | `connect-NAME.ssh-opts` | `run()` after socket is up               | Pre-merge CLI `-o` options (one per line), replayed on `restart` / auto-start via `tunnel_recreate_args`. Config `ssh-options` are re-resolved and not stored here. |
 | `connect-NAME.log`      | tracing subscriber                       | Supervisor's own structured logs. |
 | `connect-NAME.out`      | daemonize stderr redirection             | ssh child's stderr (forward-setup errors, etc.). |
-| `connect-NAME.remote-sock` | `run()` after post-bind probe succeeds | Cache of remote `ctl.sock` path. Survives teardown so subsequent connects can skip the Preflight `ensure_remote_ready` SSH-exec. |
+| `connect-NAME.remote-sock` | `run()` after post-bind probe succeeds | Cache of remote `ctl.sock` path. Survives teardown so subsequent connects can skip the Preflight `ensure_remote_ready` SSH-exec. A non-absolute-path entry (poison from a failed probe) is discarded on read. |
 
 Invariant: the flock held on the `.lock` *inode* is the single liveness truth.
 Everything else is advisory -- if the inode's flock is free, any other leftover
@@ -364,8 +364,13 @@ layer but nothing is listening on the far end of the forward, so the first
 client Hello hits EOF. The re-prime runs `gritty ls local || (gritty server
 && sleep 0.3)` so a rebooted host gets its daemon started before we point
 ssh at its ctl socket. If `ensure_remote_ready` itself fails (ssh auth
-problem, remote unreachable, etc.), we go back to `Backoff` -- we don't
-try to spawn ssh against a stale `remote_sock`.
+problem, remote unreachable, `gritty socket-path` broken on the remote,
+etc.), we go back to `Backoff` -- we don't try to spawn ssh against a
+stale `remote_sock`. The probe's output parser rejects `ERR:`-tagged and
+non-absolute-path results, and `spawn_tunnel` refuses to build a `-L`
+forward from a non-absolute remote path -- both guards exist because a
+poisoned `remote_sock` of `ERR:` once had this loop respawning
+`ssh -L ...:ERR:` ("Bad local forwarding specification") forever.
 
 The re-prime is **skipped** when `last_healthy` (the most recent successful
 app-layer probe, seeded from the caller's initial `ensure_remote_ready`; seeded

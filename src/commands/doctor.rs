@@ -393,18 +393,42 @@ async fn check_tunnels(socket_dir: &Path) -> Vec<Check> {
             TunnelStatus::Healthy => {
                 // Probe protocol version through tunnel socket
                 let tunnel_ctl = socket_dir.join(format!("connect-{name}.sock"));
-                let ver_note = match probe_server(&tunnel_ctl).await {
-                    Ok((v, _)) if v != PROTOCOL_VERSION => {
-                        format!(", remote protocol v{v}")
+                match probe_server(&tunnel_ctl).await {
+                    Ok((v, _)) => {
+                        let note = if v != PROTOCOL_VERSION {
+                            format!(", remote protocol v{v}")
+                        } else {
+                            format!(", protocol v{v}")
+                        };
+                        checks.push(Check::ok(format!("{name}: healthy{pid_str}{note}")));
                     }
-                    Ok((v, _)) => format!(", protocol v{v}"),
                     Err(msg) if msg.contains("version mismatch") => {
                         let msg = msg.strip_prefix("version mismatch: ").unwrap_or(&msg);
-                        format!(", {msg}")
+                        checks.push(Check::ok(format!("{name}: healthy{pid_str}, {msg}")));
                     }
-                    Err(_) => String::new(),
-                };
-                checks.push(Check::ok(format!("{name}: healthy{pid_str}{ver_note}")));
+                    Err(msg) => {
+                        // The -L listener accepts but nothing answers a Hello
+                        // through it: ssh is up, the remote daemon is down or
+                        // the forward targets a stale socket path. Every
+                        // client connect fails with an EOF while flock/socket
+                        // level checks still read "healthy" -- flag it.
+                        let mut hint = format!(
+                            "remote daemon may be down or its socket path stale\n    \
+                             \x1b[2m\u{2192} ssh output: {}",
+                            gritty::connect::connect_out_path(name).display()
+                        );
+                        if let Some(line) = gritty::connect::last_forward_error(name) {
+                            hint.push_str(&format!("\n    \u{2192} ssh reported: {line}"));
+                        }
+                        hint.push_str(&format!("\n    \u{2192} gritty restart {name}"));
+                        checks.push(
+                            Check::warn(format!(
+                                "{name}: tunnel up but remote daemon unreachable ({msg}){pid_str}"
+                            ))
+                            .with_hint(hint),
+                        );
+                    }
+                }
 
                 // Check tunnel log size
                 check_log_file(&mut checks, &gritty::connect::connect_log_path(name));

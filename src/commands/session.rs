@@ -112,7 +112,9 @@ pub(crate) async fn connect_session(
     };
 
     let mut framed = Framed::new(stream, FrameCodec);
-    let info = gritty::handshake(&mut framed, gritty::get_or_create_device_id()).await?;
+    let info = gritty::handshake(&mut framed, gritty::get_or_create_device_id())
+        .await
+        .map_err(|e| super::util::tunnel_handshake_context(e, &ctl_path))?;
     gritty::require_matched_version(&info)?;
     let server_id = info.server_id;
 
@@ -188,7 +190,9 @@ pub(crate) async fn connect_session(
     // was consumed by the failed attach
     let (stream, _) = super::util::connect_or_start(&ctl_path, &auto_start_mode, wait).await?;
     let mut framed = Framed::new(stream, FrameCodec);
-    let info = gritty::handshake(&mut framed, gritty::get_or_create_device_id()).await?;
+    let info = gritty::handshake(&mut framed, gritty::get_or_create_device_id())
+        .await
+        .map_err(|e| super::util::tunnel_handshake_context(e, &ctl_path))?;
     gritty::require_matched_version(&info)?;
     let server_id = info.server_id;
     // Get terminal size for initial PTY dimensions

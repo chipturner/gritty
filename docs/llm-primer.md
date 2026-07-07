@@ -59,6 +59,13 @@ may bump it).
   (ssh's own stderr lands in it). Common causes: ssh host unreachable, host
   key or auth prompts (the background tunnel cannot answer prompts -- plain
   `ssh <host>` must work first), remote gritty missing or too old.
+- **Tunnel up but remote daemon unreachable**: clients get
+  `daemon closed connection` on every connect while `gritty tunnels` says
+  healthy. ssh's `-L` listener accepts locally but the remote-side connect
+  fails; the diagnostic is `channel N: open failed: ...` in
+  `connect-<name>.out`. Causes: remote daemon dead, or the forward targets
+  a stale remote socket path. Doctor flags this; fix:
+  `gritty restart <host>`.
 - **Wake-from-suspend**: transient handshake EOFs and stale-looking locks
   right after the laptop wakes; gritty has grace periods for these, so
   brief noise in logs around a wake is normal. A key press forces an

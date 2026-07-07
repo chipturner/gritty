@@ -329,6 +329,13 @@ async fn spawn_tunnel(
     isolate_control_path: bool,
     connect_timeout: u64,
 ) -> anyhow::Result<Child> {
+    // Last line of defense: a non-absolute remote path spliced into the -L
+    // spec makes ssh exit instantly with "Bad local forwarding specification",
+    // which the monitor classifies as transient and respawns forever. Refuse
+    // here with a message that names the real problem instead.
+    if !remote_sock.starts_with('/') {
+        bail!("invalid remote socket path {remote_sock:?}; refusing to build ssh -L forward");
+    }
     // Clear any stale socket so SSH's bind() doesn't hit EADDRINUSE. With the
     // default isolate_control_path=true this is sufficient; when a user opts
     // back into ControlMaster mux, a master that still holds this forward will
@@ -925,13 +932,19 @@ async fn tunnel_monitor(
 // the whole `&&` chain to empty stdout and the user got the unhelpful
 // "remote host returned empty socket path" with no clue which step broke.
 //
+// A `socket-path` failure short-circuits to a lone `ERR:` line (there is no
+// path to report). The parser scans every line for the tag, so the tag being
+// first (or the leading echo lines being empty and trimmed away by
+// remote_exec) is handled either way.
+//
 // Any command before the `echo`s must redirect stdout to /dev/null so its
 // output doesn't leak into the line protocol. `gritty server` today only
 // prints to stderr, but redirecting defensively keeps the contract from
 // silently breaking if that ever changes.
 const REMOTE_ENSURE_CMD: &str = "\
-    SOCK=$(gritty socket-path) && \
-    V=$(gritty protocol-version 2>/dev/null || true) && \
+    SOCK=$(gritty socket-path) || \
+    { echo \"ERR:gritty socket-path failed on the remote (binary missing or broken? try gritty bootstrap)\"; exit 0; }; \
+    V=$(gritty protocol-version 2>/dev/null || true); \
     LS_ERR=$(gritty ls local 2>&1 >/dev/null) && \
     { echo \"$SOCK\"; echo \"$V\"; exit 0; }; \
     gritty server >/dev/null 2>&1 && sleep 0.3 && \
@@ -941,16 +954,13 @@ const REMOTE_ENSURE_CMD: &str = "\
 /// Parse the 2-or-3-line `REMOTE_ENSURE_CMD` output. Factored out so the
 /// line-protocol contract can be tested without an SSH host.
 fn parse_ensure_remote_output(output: &str) -> anyhow::Result<(String, Option<u16>)> {
-    let mut lines = output.lines();
-    let sock_path = lines.next().unwrap_or("").trim().to_string();
-    let remote_version = lines.next().and_then(|s| s.trim().parse::<u16>().ok());
-    // Third line, if present, is an error tag the remote shell emitted because
-    // the daemon couldn't be reached or started. Surface it verbatim -- it's
-    // usually the `gritty ls` error message, which already tells the user what
-    // to do (e.g. "protocol version mismatch: run `gritty restart`").
-    if let Some(err_line) = lines.next()
-        && let Some(reason) = err_line.strip_prefix("ERR:")
-    {
+    // The ERR: tag is nominally the third line, but it can arrive as the
+    // *first*: remote_exec trims the whole stdout, so when `gritty
+    // socket-path` fails the two leading empty echo lines collapse and ERR:
+    // floats to the top. Scan every line so a failure can never be mistaken
+    // for a socket path -- one poisoned parse here once looped the supervisor
+    // on `ssh -L ...:ERR:` ("Bad local forwarding specification").
+    if let Some(reason) = output.lines().find_map(|l| l.trim().strip_prefix("ERR:")) {
         let reason = reason.trim();
         if reason.is_empty() {
             bail!("remote daemon is unusable and could not be started");
@@ -960,8 +970,20 @@ fn parse_ensure_remote_output(output: &str) -> anyhow::Result<(String, Option<u1
              hint: `gritty restart <host>` kills the remote daemon and respawns the tunnel"
         );
     }
+    let mut lines = output.lines();
+    let sock_path = lines.next().unwrap_or("").trim().to_string();
+    let remote_version = lines.next().and_then(|s| s.trim().parse::<u16>().ok());
     if sock_path.is_empty() {
         bail!("remote host returned empty socket path");
+    }
+    // Anything that isn't an absolute path (shell-profile chatter on stdout,
+    // a partial line) would be spliced verbatim into the ssh -L forward spec.
+    if !sock_path.starts_with('/') {
+        bail!(
+            "remote host returned invalid socket path {sock_path:?} (expected an absolute path)\n  \
+             hint: shell startup output on stdout corrupts the probe; keep \
+             echo/motd out of non-interactive shells on the remote"
+        );
     }
     Ok((sock_path, remote_version))
 }
@@ -1121,6 +1143,39 @@ pub fn connect_out_path(connection_name: &str) -> PathBuf {
     connect_sidecar_path(connection_name, "out")
 }
 
+/// The most recent ssh forward failure in the tail of the tunnel's `.out`
+/// file, if any. When the `-L` listener accepts a client but the remote
+/// socket connect fails (daemon down, stale path), ssh logs
+/// `channel N: open failed: ...` and closes the stream -- the client only
+/// sees a bare EOF, so this line is the actual diagnostic.
+pub fn last_forward_error(connection_name: &str) -> Option<String> {
+    let text = read_file_tail(&connect_out_path(connection_name), 8192)?;
+    last_forward_error_line(&text).map(str::to_string)
+}
+
+/// Pure core of [`last_forward_error`]: the last line matching a known ssh
+/// forward-failure signature.
+fn last_forward_error_line(text: &str) -> Option<&str> {
+    text.lines().rev().map(str::trim).find(|l| {
+        l.contains("open failed")
+            || l.contains("Bad local forwarding specification")
+            || l.contains("forwarding request failed")
+    })
+}
+
+/// Read up to the last `max_bytes` of a file, lossily decoded.
+fn read_file_tail(path: &Path, max_bytes: u64) -> Option<String> {
+    use std::io::{Read, Seek, SeekFrom};
+    let mut f = std::fs::File::open(path).ok()?;
+    let len = f.metadata().ok()?.len();
+    if len > max_bytes {
+        f.seek(SeekFrom::Start(len - max_bytes)).ok()?;
+    }
+    let mut buf = Vec::new();
+    f.read_to_end(&mut buf).ok()?;
+    Some(String::from_utf8_lossy(&buf).into_owned())
+}
+
 /// Compute the local socket path for a given connection name.
 /// Public so main.rs can compute the path in the parent process after daemonize.
 pub fn connection_socket_path(connection_name: &str) -> PathBuf {
@@ -1134,9 +1189,14 @@ pub fn connection_socket_path(connection_name: &str) -> PathBuf {
 /// client uses this to distinguish a tunnel respawning (socket temporarily
 /// gone but supervisor still holding the lock) from a tunnel destroyed.
 pub fn ctl_socket_lock_path(ctl_path: &Path) -> Option<PathBuf> {
+    Some(connect_lock_path(ctl_socket_tunnel_name(ctl_path)?))
+}
+
+/// The tunnel connection name embedded in a `connect-<name>.sock` ctl path,
+/// or `None` for a plain local daemon socket / unrecognized path.
+pub fn ctl_socket_tunnel_name(ctl_path: &Path) -> Option<&str> {
     let file = ctl_path.file_name()?.to_str()?;
-    let name = file.strip_prefix("connect-")?.strip_suffix(".sock")?;
-    Some(connect_lock_path(name))
+    file.strip_prefix("connect-")?.strip_suffix(".sock")
 }
 
 /// Extract the host component from a destination string (`[user@]host[:port]`).
@@ -1831,6 +1891,17 @@ pub async fn run(opts: ConnectOpts, ready_fd: Option<OwnedFd>) -> anyhow::Result
         .ok()
         .map(|s| s.trim().to_string())
         .filter(|s| !s.is_empty());
+    // A cache entry that isn't an absolute path is poison (a since-fixed bug
+    // could cache a probe's `ERR:` line as the socket path). Discard the file
+    // and take the slow path so the value is re-derived.
+    let cached_remote_sock = cached_remote_sock.filter(|s| {
+        let valid = s.starts_with('/');
+        if !valid {
+            warn!(cached = %s, "discarding invalid cached remote socket path");
+            let _ = std::fs::remove_file(&remote_sock_cache);
+        }
+        valid
+    });
     let used_cache = cached_remote_sock.is_some();
     let (remote_sock, remote_version) = match cached_remote_sock {
         Some(sock) => {
@@ -3081,6 +3152,66 @@ mod tests {
         let (sock, ver) = parse_ensure_remote_output("/tmp/ctl.sock\n20\nsome noise").unwrap();
         assert_eq!(sock, "/tmp/ctl.sock");
         assert_eq!(ver, Some(20));
+    }
+
+    #[test]
+    fn parse_ensure_remote_err_first_line_fails() {
+        // remote_exec trims the whole stdout, so when `gritty socket-path`
+        // fails on the remote the two leading empty echo lines collapse and
+        // the ERR: line floats to the top. This must never parse as a socket
+        // path -- it once did, and the supervisor looped on
+        // `ssh -L ...:ERR:` ("Bad local forwarding specification").
+        let err = parse_ensure_remote_output("ERR:socket-path exploded").unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("socket-path exploded"), "{msg}");
+    }
+
+    #[test]
+    fn parse_ensure_remote_bare_err_fails() {
+        let err = parse_ensure_remote_output("ERR:").unwrap_err();
+        assert!(err.to_string().contains("remote daemon is unusable"), "{err}");
+    }
+
+    #[test]
+    fn parse_ensure_remote_relative_sock_fails() {
+        // Shell-profile noise on stdout must not become an ssh -L target.
+        let err = parse_ensure_remote_output("Welcome to zsh!\n20").unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("invalid socket path"), "{msg}");
+        assert!(msg.contains("Welcome to zsh!"), "{msg}");
+    }
+
+    // --- ssh .out forward-error extraction ---------------------------------
+
+    #[test]
+    fn forward_error_line_finds_most_recent() {
+        let out = "debug1: something\n\
+                   channel 2: open failed: connect failed: No such file or directory\n\
+                   debug1: more noise\n\
+                   channel 3: open failed: connect failed: Connection refused\n";
+        assert_eq!(
+            last_forward_error_line(out).unwrap(),
+            "channel 3: open failed: connect failed: Connection refused"
+        );
+    }
+
+    #[test]
+    fn forward_error_line_matches_bad_forward_spec() {
+        let out = "Bad local forwarding specification '/x/connect-h.sock:ERR:'\n";
+        assert!(last_forward_error_line(out).unwrap().starts_with("Bad local forwarding"));
+    }
+
+    #[test]
+    fn forward_error_line_none_when_clean() {
+        assert_eq!(last_forward_error_line("debug1: all good\n"), None);
+        assert_eq!(last_forward_error_line(""), None);
+    }
+
+    #[test]
+    fn tunnel_name_from_ctl_path() {
+        use std::path::Path;
+        assert_eq!(ctl_socket_tunnel_name(Path::new("/run/g/connect-devbox.sock")), Some("devbox"));
+        assert_eq!(ctl_socket_tunnel_name(Path::new("/run/g/ctl.sock")), None);
     }
 
     #[test]
