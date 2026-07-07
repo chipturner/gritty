@@ -54,6 +54,6 @@ verifying by hand.
 
 Bump `PROTOCOL_VERSION` in `src/protocol.rs` whenever frame types,
 encoding, or `SessionEntry` fields change, update the encoder/decoder and
-every `match frame` site (server.rs, client.rs, daemon.rs, main.rs), the
+every `match frame` site (server.rs, client.rs, daemon.rs), the
 protocol tests, and [docs/wire-protocol.md](docs/wire-protocol.md). Note
 the bump in CHANGELOG.md so users know to `gritty refresh`.

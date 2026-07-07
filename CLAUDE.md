@@ -47,7 +47,7 @@ just quicktest                        # manual 3-pane tmux test
 
 Single-socket: all communication (control + session relay) through one Unix domain socket per server. Hello/HelloAck version handshake, then control frame declares intent, server routes accordingly.
 
-Sixteen modules behind a lib crate (`src/lib.rs` hosts shared helpers + `FORWARDED_ENV_KEYS`) with thin binary entry (`src/main.rs`):
+Sixteen modules -- fifteen behind a lib crate (`src/lib.rs` hosts shared helpers + `FORWARDED_ENV_KEYS`) plus the binary-private `commands` -- with thin binary entry (`src/main.rs`):
 
 | Module | Responsibility |
 |--------|----------------|
@@ -77,7 +77,7 @@ SSH tunnel supervisor state machine: **[docs/tunnel-state-machine.md](docs/tunne
 ## Development Notes
 
 ### Critical invariants
-- **`security` module is load-bearing** -- never use `UnixListener::bind` or `create_dir_all` directly. Client-side connects to ctl/daemon sockets MUST go through `security::connect_verified()` (connect + `SO_PEERCRED` check).
+- **`security` module is load-bearing** -- never use `UnixListener::bind` directly, and never create socket directories outside `security::secure_create_dir_all` (plain `create_dir_all` is fine for non-socket user paths like mangen output and transfer destinations). Client-side connects to ctl/daemon sockets MUST go through `security::connect_verified()` (connect + `SO_PEERCRED` check).
 - **Reap before lookup** -- `reap_sessions()` MUST precede Attach/KillSession/ListSessions. Stale sessions cause silent failures.
 - **Channel closed check** -- before `Frame::Ok` for Attach, check `client_tx.is_closed()` (session died between reap and lookup).
 - **`Stdio::from(OwnedFd)`** -- don't reintroduce `FromRawFd` in server.rs.
@@ -88,7 +88,7 @@ SSH tunnel supervisor state machine: **[docs/tunnel-state-machine.md](docs/tunne
 ### Changing the protocol
 - Bump `PROTOCOL_VERSION` whenever frame types, encoding, or `SessionEntry` fields change (currently v23).
 - Version mismatch is **not** a hard handshake gate -- the daemon replies `HelloAck` with its own version and only honors `KillServer` afterward, so `kill-server`/`restart` work across mismatches. Details in [docs/wire-protocol.md](docs/wire-protocol.md).
-- `Frame` enum changes require updating: encoder, decoder, protocol tests, all `match frame` in server.rs, client.rs, daemon.rs, main.rs.
+- `Frame` enum changes require updating: encoder, decoder, protocol tests, all `match frame` in server.rs, client.rs, daemon.rs.
 - `server::run()` / `client::run()` / `ClientConn::Active` signatures are documented in [docs/internals.md](docs/internals.md) -- they are shared by the daemon and tests; update both.
 
 ### Testing
@@ -96,7 +96,7 @@ SSH tunnel supervisor state machine: **[docs/tunnel-state-machine.md](docs/tunne
 - **Daemon**: real socket in `tempfile::tempdir()`. `do_handshake()` + `wait_for_daemon()`.
 - **Protocol**: codec unit tests + property tests (`tests/protocol_proptest.rs`).
 - **Nextest**: e2e + daemon capped at 2 concurrent; socat/SSH serial; 2 retries for flaky tests. Per-process isolation.
-- **SSH/socat**: auto-detect availability, skip gracefully. `GRITTY_SSH_TEST=0` to force-skip.
+- **Socat**: auto-detect availability, skip gracefully. `GRITTY_SOCAT_TEST=0` to force-skip. SSH coverage lives in the container suite (`just test-container`), gated on Docker.
 
 ### Workflow
 - Run `just fmt` after making code changes.

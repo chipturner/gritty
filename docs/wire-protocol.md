@@ -10,9 +10,11 @@ Byte-level reference for the gritty wire protocol (`src/protocol.rs`).
 
 All frames are `[type: u8][length: u32 BE][payload]`. Payloads <= 1MB. `PROTOCOL_VERSION: u16` is currently **23**.
 
+`protocol.rs` also hosts the idle-evict contract: `IDLE_EVICT_TIMEOUT` (90s) and `IDLE_EVICT_SAFETY_MARGIN` (10s). The daemon evicts a client whose last heartbeat is older than `IDLE_EVICT_TIMEOUT`; `config.rs` clamps user heartbeat settings so `interval + timeout` stays under it by the safety margin. Not a wire format, but a cross-module timing contract that lives here so both sides change together.
+
 ## Frame type codes
 
-Handshake: `0x01` Hello, `0x02` HelloAck. Relay: `0x10` Data, `0x11` Resize, `0x12` Exit, `0x13` Detached, `0x14` Ping, `0x15` Pong, `0x16` Env, `0x17` DiagRequest, `0x18` DiagResponse, `0x19` ServerShutdown, `0x1A` Resume, `0x1B` Notice. Agent: `0x20` AgentForward, `0x21` AgentOpen, `0x22` AgentData, `0x23` AgentClose. URL/clipboard: `0x28` OpenForward, `0x29` OpenUrl, `0x2A` ClipboardSet, `0x2B` ClipboardGet, `0x2C` ClipboardData. Tunnel: `0x30` TunnelListen, `0x31` TunnelOpen, `0x32` TunnelData, `0x33` TunnelClose. Transfer: `0x38` SendOffer, `0x39` SendDone, `0x3A` SendCancel, `0x3B` SendFile. Port forward: `0x40` PFListen, `0x41` PFReady, `0x42` PFOpen, `0x43` PFData, `0x44` PFClose, `0x45` PFStop, `0x46` PortForwardRequest. Control: `0x50` NewSession, `0x51` Attach, `0x52` ListSessions, `0x53` KillSession, `0x54` KillServer, `0x55` Tail, `0x56` RenameSession, `0x57` SetLinger. Responses: `0x60` SessionCreated, `0x61` SessionInfo, `0x62` Ok, `0x63` Error, `0x64` AttachAck. Reserved: `0x80-0xFF`.
+Handshake: `0x01` Hello, `0x02` HelloAck. Relay: `0x10` Data, `0x11` Resize, `0x12` Exit, `0x13` Detached, `0x14` Ping, `0x15` Pong, `0x16` Env, `0x17` DiagRequest, `0x18` DiagResponse, `0x19` ServerShutdown, `0x1A` Resume, `0x1B` Notice. Agent: `0x20` AgentForward, `0x21` AgentOpen, `0x22` AgentData, `0x23` AgentClose. URL/clipboard: `0x28` OpenForward, `0x29` OpenUrl, `0x2A` ClipboardSet, `0x2B` ClipboardGet, `0x2C` ClipboardData. Tunnel: `0x30` TunnelListen, `0x31` TunnelOpen, `0x32` TunnelData, `0x33` TunnelClose. Transfer: `0x38` SendOffer, `0x39` SendDone, `0x3A` SendCancel, `0x3B` SendFile. Port forward: `0x40` PortForwardListen, `0x41` PortForwardReady, `0x42` PortForwardOpen, `0x43` PortForwardData, `0x44` PortForwardClose, `0x45` PortForwardStop, `0x46` PortForwardRequest. Control: `0x50` NewSession, `0x51` Attach, `0x52` ListSessions, `0x53` KillSession, `0x54` KillServer, `0x55` Tail, `0x56` RenameSession, `0x57` SetLinger. Responses: `0x60` SessionCreated, `0x61` SessionInfo, `0x62` Ok, `0x63` Error, `0x64` AttachAck. Reserved: `0x80-0xFF`.
 
 ## Handshake
 
@@ -20,13 +22,13 @@ Handshake: `0x01` Hello, `0x02` HelloAck. Relay: `0x10` Data, `0x11` Resize, `0x
 
 ### Version mismatch is NOT a handshake error
 
-Since v15, the daemon always replies with `HelloAck` carrying its own version even when the client's version differs, and the client decides via `require_matched_version()` whether to proceed. Under a mismatch the daemon gates the next control frame so only `KillServer` is honored (returning `Frame::Ok`); anything else gets `ErrorCode::VersionMismatch` with a message pointing at `gritty restart`. This is the recovery path for upgrading one side -- `kill-server` and `restart` both use `server_request_any_version` while every normal command uses `server_request` which bails on mismatch.
+Since v15, the daemon always replies with `HelloAck` carrying its own version even when the client's version differs, and the client decides via `require_matched_version()` whether to proceed. Under a mismatch the daemon gates the next control frame so only `KillServer` is honored (returning `Frame::Ok`); anything else gets `ErrorCode::VersionMismatch` with a message pointing at `gritty refresh`. This is the recovery path for upgrading one side -- `kill-server` and `restart` both use `server_request_any_version` while every normal command uses `server_request` which bails on mismatch.
 
 This is deliberate -- `kill-server` and `restart` need to work across a mismatched handshake so users can recover without SSH. `tunnel-create --ignore-version-mismatch` still exists for the SSH-level pre-check but its value is mostly superseded by the in-band recovery flow. `gritty refresh` is the porcelain: it reads each long-lived process's `.info` sidecar (see `runinfo`) and restarts only what is stale; `refresh local` is also what `refresh <host>` runs *on the remote* over SSH, so the remote daemon is measured against the remote's own on-disk binary (not ours), which is what works for source-built remotes where `bootstrap` doesn't apply.
 
 ## Control frames
 
-`NewSession`: `[name_len: u16][name][cmd_len: u16][cmd][cwd_len: u16][cwd][cols: u16][rows: u16][client_name_len: u16][client_name][linger_secs: u64]`. Empty cwd = `$HOME`. Zero cols/rows = default 80x24. `client_name` propagated to session metadata. `linger_secs` (0 = never) is how long the session survives with zero attached clients before the daemon reaps it -- resolved client-side from `--linger` / config so the server just stores and enforces.
+`NewSession`: `[name_len: u16][name][cmd_len: u16][cmd][cwd_len: u16][cwd][cols: u16][rows: u16][client_name_len: u16][client_name][linger_secs: u64]`. Empty cwd = `$HOME`. Zero cols/rows = no explicit winsize: the PTY is opened with `openpty(None, ...)` and keeps the kernel default until the first `Resize` frame arrives (there is no 80x24 fallback). `client_name` propagated to session metadata. `linger_secs` (0 = never) is how long the session survives with zero attached clients before the daemon reaps it -- resolved client-side from `--linger` / config so the server just stores and enforces.
 
 `SetLinger`: `[session_len: u16][session][linger_secs: u64]`. Updates a live session's linger (0 = never). Sent on the control socket by name/id, or on the session stream by `~K` (where `session` is ignored -- the target is implicit). Reaping uses the same teardown as `KillSession` (`killpg(SIGHUP)` via the `ManagedChild` drop guard).
 
@@ -54,12 +56,12 @@ This is deliberate -- `kill-server` and `restart` need to work across a mismatch
 
 `SvcRequest` (svc socket dispatch, 1-byte discriminator): `OpenUrl=1`, `Send=2`, `Receive=3`, `Clipboard=5`. Clipboard sub-protocol: `[0x01][data]` = copy (client half-closes its write side; server replies one byte -- `0x01` delivered to an attached clipboard-capable client, `0x00` dropped -- so `gritty copy` fails loudly instead of exiting 0 on a silent drop; an older server sends nothing and the client degrades to a soft warning), `[0x02]` = paste (server responds with clipboard content).
 
-File transfer manifest (svc socket, not Frame protocol): sender writes `[file_count: u32][per file: [name_len: u16][name: bytes][size: u64][mode: u32]]`. Server relays per-file headers `[name_len: u16][name: bytes][size: u64][mode: u32]` to receiver, then `size` bytes of data. Sentinel `[name_len: 0x0000]` ends transfer. `-` (stdin) spools to a temp file for size discovery.
+File transfer manifest (svc socket, not Frame protocol): sender writes `[file_count: u32][per file: [name_len: u16][name: bytes][size: u64][mode: u32]]`. Server writes a `0x01` go byte back to the sender, writes `[file_count: u32]` to the receiver, then relays per-file headers `[name_len: u16][name: bytes][size: u64][mode: u32]` to the receiver, each followed by `size` bytes of data. Sentinel `[name_len: 0x0000]` ends transfer. `-` (stdin) spools to a temp file for size discovery.
 
 ## Changing the protocol
 
 - **`PROTOCOL_VERSION`** -- bump whenever frame types, encoding, or `SessionEntry` fields change.
-- **`expect_min_len`** -- all fixed-field decoders use `expect_min_len` (not exact length checks), so trailing bytes are tolerated for forward extensibility.
-- **`Frame` enum** -- update: encoder, decoder, protocol tests, all `match frame` in server.rs, client.rs, daemon.rs, main.rs.
+- **Minimum-length checks, never exact** -- fixed-field decoders check a minimum length (most via `expect_min_len`; `RenameSession`, `Env`, and `SessionInfo` roll their own guards), so trailing bytes are tolerated for forward extensibility.
+- **`Frame` enum** -- update: encoder, decoder, protocol tests, all `match frame` in server.rs, client.rs, daemon.rs.
 - **`SessionInfo`** -- entry count `u32`. Changing `SessionEntry` fields requires updating both encoder and decoder in protocol.rs.
 - Update the wire format codes and field layouts in this document.

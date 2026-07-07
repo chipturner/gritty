@@ -27,12 +27,13 @@ Three kinds of processes cooperate:
   stdout/stderr) next to its socket.
 - **client** (`gritty connect`): attaches a terminal to a session. Sends
   heartbeats; on link loss it enters a reconnect loop with backoff and
-  re-attaches automatically. Logs to stderr only -- client-side events are
-  NOT persisted to any file.
+  re-attaches automatically. When connecting to a tunnel host, client
+  tracing (reconnects, link-down events) is routed into that tunnel's
+  `connect-<name>.log`; for local sessions the client logs to stderr only.
 - **tunnel supervisor** (`gritty tunnel-create`, one per remote host):
   keeps an `ssh -L <local.sock>:<remote ctl.sock>` process alive, respawning
   with backoff on failure. Per-tunnel sidecars in the socket dir:
-  `connect-<name>.sock/.pid/.lock/.dest/.info/.log/.out`.
+  `connect-<name>.sock/.pid/.lock/.dest/.info/.ssh-opts/.remote-sock/.log/.out`.
 
 Sessions are addressed `host:session`. Session names are silently prefixed
 with the client's name (`laptop/work`) to prevent cross-machine collisions.
@@ -79,9 +80,12 @@ current time for correlation).
   `gritty tunnel-destroy <name>` + `tunnel-create <dest>`,
   `RUST_LOG=debug gritty server -f` (foreground debug daemon), `-v` on any
   command, `kill -USR1 <daemon pid>` (cycle daemon log level live).
-- Not in this report: client-side logs (not persisted; ask the user to
-  reproduce with `gritty -v connect ... 2>client.log` if client behavior is
-  in question) and remote daemons' logs (this report is from one machine;
-  ask the user to run `gritty doctor --llm` on the remote host over ssh if
-  the remote side is suspect).
+- Client-side events for tunnel hosts land in the tunnel's
+  `connect-<name>.log`, which IS excerpted in this report -- look there for
+  reconnect/link-down evidence. Only local-session client logs are absent
+  (stderr-only; ask the user to reproduce with
+  `gritty -v connect ... 2>client.log` if local client behavior is in
+  question). Also not in this report: remote daemons' logs (this report is
+  from one machine; ask the user to run `gritty doctor --llm` on the remote
+  host over ssh if the remote side is suspect).
 - If the evidence is insufficient, say precisely what to run or paste next.

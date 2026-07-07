@@ -34,6 +34,7 @@ A tunnel named `NAME` owns these files in `socket_dir()`:
 | `connect-NAME.pid`      | `run()` immediately after lock acquired  | Target for `disconnect`'s SIGTERM. |
 | `connect-NAME.sock`     | `ssh -L` bind target                     | Client connects here to reach remote `ctl.sock`. |
 | `connect-NAME.dest`     | `run()` after socket is up               | Original destination string, for `restart` / auto-start recovery. |
+| `connect-NAME.info`     | `run()` via `runinfo`                    | Protocol version + git hash + exe of the running supervisor; the staleness signal `doctor`/`refresh` read. |
 | `connect-NAME.ssh-opts` | `run()` after socket is up               | Pre-merge CLI `-o` options (one per line), replayed on `restart` / auto-start via `tunnel_recreate_args`. Config `ssh-options` are re-resolved and not stored here. |
 | `connect-NAME.log`      | tracing subscriber                       | Supervisor's own structured logs. |
 | `connect-NAME.out`      | daemonize stderr redirection             | ssh child's stderr (forward-setup errors, etc.). |
@@ -121,17 +122,17 @@ stateDiagram-v2
         Alive --> Alive: probe_tunnel_alive ok\n(Hello / HelloAck / ListSessions,\nreset failure counter)
         Alive --> ProbeFailing: probe failed\n(counter++)
         ProbeFailing --> Alive: next probe ok
-        ProbeFailing --> KillingChild: counter >= 2\n(kill ssh, reset counter)
+        ProbeFailing --> KillingChild: counter >= 2\n(kill ssh; counter resets when the\nreplacement child is installed)
         Alive --> KillingChild: net path changed\n+ one-shot probe failed\n(macOS only; gated on uptime >= 5s)
         Alive --> ChildExited: child.wait() returned
         KillingChild --> ChildExited: child.wait() observes kill
 
-        ChildExited --> NonTransient: exit code in 1..=254\nexcluding 128..=159
-        ChildExited --> Backoff: exit code 255,\nsignal death (128..=159),\nor no code (local signal)
+        ChildExited --> NonTransient: exit code 0, or 1..=254\nexcluding 128..=159
+        ChildExited --> Backoff: exit code 255,\nsignal death (128..=159),\nor no code (local signal)\nsleep derived once from this exit:\n0s if we killed ssh ourselves,\n1s if uptime >=30s, else prior backoff
         NonTransient --> [*]: warn, monitor returns
-        Backoff --> Backoff: sleep(backoff)\nreset to 1s if child_spawned_at\nelapsed >=30s,\nelse double to <=60s
+        Backoff --> Backoff: retry failed\n(sleep, then double backoff\nto <=60s)
         Backoff --> EnsureRemoteRetry: timer fires
-        Backoff --> EnsureRemoteRetry: net path changed\n(macOS; reset backoff to 1s)
+        Backoff --> EnsureRemoteRetry: net path changed\n(macOS; cut sleep to 1s,\nnext backoff 2s)
         EnsureRemoteRetry --> Backoff: ensure_remote_ready err\n(retry from top)
         EnsureRemoteRetry --> SpawnRetry: got fresh remote_sock
         SpawnRetry --> Alive: ssh respawned\n(update child_spawned_at)
@@ -168,7 +169,7 @@ stateDiagram-v2
         KillChild --> CheckOwnership: ConnectGuard.drop\n(SIGTERM ssh)
         CheckOwnership --> CleanupFiles: LockIdentity matches path
         CheckOwnership --> ReleaseFlock: path replaced / gone\n(ghost; leave owner's files alone)
-        CleanupFiles --> ReleaseFlock: rm sock/pid/info/dest/lock\n(while flock still held)
+        CleanupFiles --> ReleaseFlock: rm sock/pid/info/dest/\nssh-opts/lock\n(while flock still held)
         ReleaseFlock --> [*]: drop Flock
     }
 
@@ -228,7 +229,7 @@ kill the remote daemon and its live sessions.
    startup surfaces as a fast, diagnosable error instead of forcing us to
    wait the full `socket_wait_deadline`.
 2. **Absent -> Starting** -- `try_acquire_lock` returned `Ok`. We own the
-   supervisor role. Clean any stale `.sock`/`.pid`/`.dest`/`.ssh-opts` (we
+   supervisor role. Clean any stale `.sock`/`.pid`/`.info`/`.dest`/`.ssh-opts` (we
    don't remove the lock we just acquired), then write the `.pid` file **immediately**
    so `disconnect` can find us during the startup window. A `LockFileBailGuard`
    is armed here too: if the fallible setup that follows (`ensure_remote_ready`,
@@ -291,13 +292,15 @@ kill the remote daemon and its live sessions.
 
 ### Supervisor loop (`tunnel_monitor`)
 
-The monitor runs a `tokio::select!` with four arms:
+The monitor runs a `tokio::select!` with five arms:
 
 - **`stop.cancelled()`** -- kill ssh child and return.
 - **`net.changed()`** (macOS only) -- OS network path changed; record
-  whether any event in the burst reported `Unsatisfied`, and arm a
-  debounced probe (`NET_PROBE_DEBOUNCE`, 500ms). Each further event resets
-  the timer. When 500ms pass with no new event: if no `Unsatisfied` was
+  whether any event in the burst reported `Unsatisfied`, and arm (or
+  reset) the debounced-probe timer (`NET_PROBE_DEBOUNCE`, 500ms). This
+  arm never probes itself -- it only schedules.
+- **Debounce timer fires** (the armed `net_probe_at` sleep) -- 500ms
+  passed with no further path event. If no `Unsatisfied` was
   seen since the last successful probe, skip -- a purely-`Satisfied` burst
   is interface-property noise, and a transient HelloAck timeout on such a
   probe would kill a working SSH (ServerAlive still covers a genuine
@@ -320,7 +323,14 @@ The monitor runs a `tokio::select!` with four arms:
   - code `255` (ssh connection error), codes `128..=159` (signal death
     from the remote side: reboot, OOM, SIGTERM during shutdown), and `None`
     (local signal-kill, typically our own `child.kill()` from the probe
-    arm) are all transient -- sleep the current `backoff`, then retry.
+    arm) are all transient -- retry. The first sleep is derived **once**
+    from this exit: zero when the supervisor killed the child itself
+    (`we_killed` -- the kill was a deliberate respawn decision, so waiting
+    would only add latency; this zero-sleep path is load-bearing), 1s when
+    the child had been up >= 30s (`HEALTHY_CHILD_THRESHOLD`), else the
+    prior `backoff`. It is *not* re-derived per retry -- a long-dead
+    child's ever-growing uptime would otherwise pin backoff at 1s and
+    hammer the remote.
 - The respawn sequence (`Backoff` sleep -> `ensure_remote_ready` ->
   `spawn_tunnel`) is an **inner loop**: a failure in either step sleeps the
   current `backoff`, doubles it (capped at 60s), and retries locally. It
@@ -358,8 +368,10 @@ problem, remote unreachable, etc.), we go back to `Backoff` -- we don't
 try to spawn ssh against a stale `remote_sock`.
 
 The re-prime is **skipped** when `last_healthy` (the most recent successful
-app-layer probe, seeded from the caller's initial `ensure_remote_ready`) is
-within `SKIP_ENSURE_REMOTE_THRESHOLD` (60s). A sub-minute network blip can't
+app-layer probe, seeded from the caller's initial `ensure_remote_ready`; seeded
+to `None` when the initial `remote_sock` is empty) is within
+`SKIP_ENSURE_REMOTE_THRESHOLD` (60s) *and* the cached `remote_sock` is
+non-empty. A sub-minute network blip can't
 plausibly have rebooted the remote, and the ~2s SSH-exec round-trip is pure
 reconnect latency on the common path. Beyond 60s we re-verify. `last_healthy`
 is a `SystemTime` (wall-clock), not `Instant`, so time spent in laptop
@@ -373,12 +385,14 @@ Two entry points into `Stopping`:
   or fell out of the main `select!` because the monitor returned (e.g.
   non-transient exit). `Drop` cancels the stop token, SIGTERMs the ssh
   child directly as a belt-and-braces (the monitor also kills on cancel),
-  then removes `.sock`, `.pid`, `.lock`, `.dest`, `.ssh-opts`. The flock is released
-  last when `_lock` drops.
+  then removes `.sock`, `.pid`, `.info`, `.dest`, `.ssh-opts`, `.lock`. The flock is
+  released last when `_lock` drops.
 - **`disconnect(name)`** (external command) -- reads `.pid`, sends SIGTERM,
   polls `is_lock_held` for up to 2s. If still held, escalates to SIGKILL
   plus `killpg` to catch any detached ssh children. Then calls
-  `cleanup_stale_files(name, true)` which removes the lock file too.
+  `cleanup_if_unheld(name)`, which acquires the flock before sweeping the
+  sidecar files and removes the lock file too (the plain
+  `cleanup_stale_files` helper never touches the lock).
 
 ## Invariants
 
@@ -392,13 +406,17 @@ These must hold; violating them has in the past caused specific, nasty bugs:
    links. `disconnect` needs the PID immediately -- before v0.11.0 the
    PID was written only after socket-up, so `disconnect` during startup
    saw "lock held but no PID" and failed.
-3. **`remote_sock` must be re-fetched on every respawn.** See above;
-   otherwise a remote reboot / upgrade leaves the tunnel pointing at a
-   dead daemon with no way to recover short of `tunnel-destroy`.
+3. **`remote_sock` must be re-fetched on respawn** unless the tunnel was
+   proven healthy within `SKIP_ENSURE_REMOTE_THRESHOLD` (see Re-priming
+   above); otherwise a remote reboot / upgrade leaves the tunnel pointing
+   at a dead daemon with no way to recover short of `tunnel-destroy`.
 4. **Non-transient exit codes must not retry.** Auth failure, host-key
    mismatch, remote config error (`ExitOnForwardFailure=yes` tripping on
-   a bad forward spec) all exit in `1..=254 \ {255, 128..=159}`. Retrying
-   these hammers the remote and buries the real error in a loop.
+   a bad forward spec) all exit in `1..=254` excluding `128..=159`.
+   Exit `0` is also classified non-transient -- a clean exit (e.g. a mux
+   client whose master closed) is not a retry signal, so the supervisor
+   warns and returns. Retrying any of these hammers the remote and buries
+   the real error in a loop.
 5. **Stderr drain must start immediately.** If ssh fills its stderr pipe
    buffer (~64KB) with forward-setup errors while we're blocked in
    `wait_for_socket`, ssh wedges and we never see the error. See
@@ -417,7 +435,12 @@ These must hold; violating them has in the past caused specific, nasty bugs:
 | Probe outer timeout                   | 3s             | `probe_tunnel_alive` | Runs inside the supervisor select; slow probe blocks everything. |
 | Probe inner (HelloAck) timeout        | 1s             | `probe_tunnel_alive` | Same. |
 | Backoff min / max                     | 1s / 60s       | `tunnel_monitor`     | Aggressive first retry (usual case: transient ssh exit 255); cap at 60s to avoid hammering. |
-| `HEALTHY_THRESHOLD`                   | 30s            | `tunnel_monitor`     | Tunnel alive this long before its next death resets backoff to 1s. |
+| `HEALTHY_CHILD_THRESHOLD`             | 30s            | `tunnel_monitor`     | Tunnel alive this long before its next death resets backoff to 1s. |
+| `NET_PROBE_DEBOUNCE`                  | 500ms          | `tunnel_monitor`     | Quiet window after a net path event before probing; `nw_path_monitor` bursts during wifi renegotiation. |
+| `SPAWN_GRACE`                         | 5s             | `tunnel_monitor`     | Net-change single-strike kill is disabled until ssh has been up this long -- an infant ssh isn't killed by its own startup race. |
+| `SUSPEND_JUMP_THRESHOLD`              | 5s             | `tunnel_monitor`     | Wall-vs-monotonic gap during a backoff sleep that indicates the process was frozen (suspend); cuts the sleep short for one attempt. |
+| `SUSPEND_POLL`                        | 2s             | `tunnel_monitor`     | Cadence of the suspend-detect ticker racing the backoff sleep. |
+| `SKIP_ENSURE_REMOTE_THRESHOLD`        | 60s            | `tunnel_monitor`     | Respawn skips the ~2s `ensure_remote_ready` re-prime when healthy within this window (wall-clock, so suspend counts). |
 | `socket_wait_deadline(ct)`            | `max(5, ct)+10`s (60s if ct==0) | `wait_for_socket` | Bounds wait-for-socket polling; leaves headroom for ProxyCommand startup and forward setup. |
 | `remote_exec` outer timeout           | 60s            | `remote_exec`        | Wall-clock ceiling on the whole ssh invocation; ServerAlive covers TCP hangs but not stuck shell profiles. |
 | `disconnect` graceful deadline        | 2s             | `disconnect`         | SIGTERM -> poll for flock release. Escalates to SIGKILL + killpg after. |

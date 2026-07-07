@@ -10,7 +10,7 @@ Complete command and flag reference. For an overview and quick start, see [READM
 | `gritty list-sessions [host] [--json]` | `ls`, `list` | List sessions. Bare `gritty ls` shows every known host -- local + all tunnels -- grouped by daemon (tunnels reaching the same daemon are merged). With a host, lists just that host. Your own sessions are bold and sorted first; foreign sessions group by client (foreground process shown on Linux only). The `Idle` column shows time since the session's last terminal activity (output or keystrokes); detached sessions also show how long ago a client was last attached |
 | `gritty tail [host:session]` | `t` | Read-only stream of session output |
 | `gritty kill-session [targets...]` | `kill` | Kill one or more sessions. Each target is `host:session`, or a bare session name/ID killed on `local` (so after `gritty ls`, `gritty kill 3 5 work` reaps by ID or name). A bare target naming a known host lists that host's sessions instead. Numeric targets match your own namespace name first, then fall back to the raw session ID |
-| `gritty prune [host]` | | Bulk-kill stale detached sessions. Select with `--client <name>` (sessions created by that client, repeatable -- e.g. a laptop you know rebooted), `--idle <duration>` (no terminal activity for at least that long: `90s`, `30m`, `12h`, `7d`), or `--all`; filters AND together. Or pick interactively with `--pick` (TUI: space marks, `a` marks all, `1`-`9` toggle, enter kills the marked set after a y/n confirm; `--client`/`--idle` narrow the candidate list). Dry run by default: prints the selection and stops; pass `-y` to kill it. Attached sessions are never touched |
+| `gritty prune [host]` | | Bulk-kill stale detached sessions. Select with `--client <name>` (sessions created by that client, repeatable -- e.g. a laptop you know rebooted) and/or `--idle <duration>` (no terminal activity for at least that long: `90s`, `30m`, `12h`, `7d`) -- the two AND together -- or `--all` (every detached session; excludes the other filters). Or pick interactively with `--pick` (TUI: space marks, `a` marks all, `1`-`9` toggle, enter kills the marked set after a y/n confirm; `--client`/`--idle` narrow the candidate list; not combinable with `--all` or `-y`). Dry run by default: prints the selection and stops; pass `-y` to kill it. Attached sessions are never touched |
 | `gritty rename <host:session> <name>` | | Rename a session |
 | `gritty kill-server [host]` | | Kill the server and all sessions (works across a protocol version mismatch) |
 | `gritty restart [host]` | | Kill + restart server (and tunnel, for remote hosts). One-shot upgrade recovery |
@@ -27,7 +27,7 @@ Complete command and flag reference. For an overview and quick start, see [READM
 | `gritty copy` | | Copy stdin to the client clipboard (for use inside gritty sessions) |
 | `gritty info [--json]` | | Show diagnostics (paths, server status, device id, tunnels) |
 | `gritty config` | | Open config in `$VISUAL`/`$EDITOR`/vi (creates from template if missing) |
-| `gritty doctor [--clean] [--json] [--llm [desc]]` | | Show key paths and check for common issues (stale processes, orphaned daemons, orphaned sockets, config errors); `--clean` removes socket-dir files this version doesn't recognize; `--llm` prints an LLM-ready diagnostic report instead (see [Debugging](#debugging)) |
+| `gritty doctor [--clean \| --json \| --llm [desc]]` | | Show key paths and check for common issues (stale processes, orphaned daemons, orphaned sockets, config errors); `--clean` removes socket-dir files this version doesn't recognize; `--llm` prints an LLM-ready diagnostic report instead (mutually exclusive with `--clean`/`--json`; `--log-lines <N>` adjusts log excerpt size -- see [Debugging](#debugging)) |
 | `gritty server` | `s` | Start the server (backgrounds by default; `-f` for foreground) |
 | `gritty completions <shell>` | | Generate shell completions (bash, zsh, fish, elvish, powershell) |
 | `gritty mangen <dir>` | | Write man pages (one per subcommand) into `<dir>` -- for packagers |
@@ -94,12 +94,17 @@ Flag defaults come from config, with precedence CLI > `[host.<name>]` > `[defaul
 
 ### Tunnel options (`tunnel-create`)
 
-- `-n <name>`: override connection name (defaults to hostname)
+- `-n <name>` / `--name`: override connection name (defaults to hostname)
 - `-o <option>` / `--ssh-option`: extra SSH options (repeatable, e.g., `-o "ProxyJump=bastion"`)
 - `--no-server-start`: don't auto-start the remote server
 - `--dry-run`: print SSH commands instead of running them
 - `-f` / `--foreground`: run in the foreground instead of backgrounding
 - `--ignore-version-mismatch`: connect even if the remote protocol version differs from local
+
+### Bootstrap options (`bootstrap`)
+
+- `--install-dir <dir>`: remote install directory (default: `~/.local/bin`)
+- `-o <option>` / `--ssh-option`: extra SSH options (repeatable)
 
 ### Send/receive options
 
@@ -119,7 +124,7 @@ laptop$ gritty receive - | tar xzf -
 
 ## Session environment
 
-**Set inside sessions:** `GRITTY_SOCK` (svc socket for `gritty open`/`send`/`receive`/port forwarding), `GRITTY_SESSION` (session ID), and `GRITTY_SESSION_NAME` (if named) are set in the shell environment. Useful for prompt customization or scripts that need to know which session they're in. `BROWSER` points at the `gritty-open` helper (URL forwarding), and `SSH_AUTH_SOCK` points at the session's agent socket.
+**Set inside sessions:** `GRITTY_SOCK` (svc socket for `gritty open`/`send`/`receive`/port forwarding), `GRITTY_SESSION` (session ID), `GRITTY_SESSION_NAME` (if named), and `GRITTY_CLIENT` (the creating client's namespace prefix) are set in the shell environment. Useful for prompt customization or scripts that need to know which session they're in. `BROWSER` points at the `gritty-open` helper (URL forwarding), and `SSH_AUTH_SOCK` points at the session's agent socket.
 
 **Agent socket without `-A`:** `SSH_AUTH_SOCK` is always exported, but the underlying socket only has a listener while an `-A` client is attached. Without agent forwarding, a tool connecting to it (e.g. `ssh-add -l`) gets "cannot connect to agent" (exit 2) -- so a login script that checks whether an agent is reachable will correctly conclude there is none and can start its own. Probe reachability (`ssh-add -l`; exit 2 means no agent) rather than mere presence of `SSH_AUTH_SOCK`.
 
