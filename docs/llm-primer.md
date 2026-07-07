@@ -71,7 +71,9 @@ may bump it).
 You will find below: the user's problem description, environment details,
 doctor's check results, current sessions and tunnels, and log excerpts
 (timestamps are the machine's local time; the report header gives the
-current time for correlation).
+current time for correlation). Log excerpts include post-mortem logs of
+tunnels that have died -- when a tunnel is the problem, its final log
+lines are usually the best evidence here.
 
 - Correlate timestamps across daemon and tunnel logs around the failure.
 - Suggest the most likely causes, ranked, each tied to specific evidence.

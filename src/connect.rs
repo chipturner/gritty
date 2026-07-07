@@ -2113,11 +2113,22 @@ pub struct TunnelInfo {
 
 /// Gather info for all live tunnels (cleans stale ones as a side effect).
 pub fn get_tunnel_info() -> Vec<TunnelInfo> {
+    gather_tunnel_info(true)
+}
+
+/// Read-only variant for diagnostic surfaces (`doctor --llm`): stale tunnels
+/// are reported (status `"stale"`) instead of garbage-collected, so gathering
+/// a report never destroys the evidence it is reporting on.
+pub fn get_tunnel_info_readonly() -> Vec<TunnelInfo> {
+    gather_tunnel_info(false)
+}
+
+fn gather_tunnel_info(gc_stale: bool) -> Vec<TunnelInfo> {
     let names = enumerate_tunnels();
     let mut infos = Vec::new();
     for name in &names {
         let status = probe_tunnel_status(name);
-        if status == TunnelStatus::Stale {
+        if status == TunnelStatus::Stale && gc_stale {
             debug!("cleaning stale tunnel: {name}");
             // Race-safe: takes the flock before touching anything. If a
             // supervisor slipped in between `probe_tunnel_status` and here,
@@ -2130,7 +2141,7 @@ pub fn get_tunnel_info() -> Vec<TunnelInfo> {
         let status_str = match status {
             TunnelStatus::Healthy => "healthy".to_string(),
             TunnelStatus::Reconnecting => "reconnecting".to_string(),
-            TunnelStatus::Stale => unreachable!(),
+            TunnelStatus::Stale => "stale".to_string(),
         };
         infos.push(TunnelInfo {
             name: name.clone(),

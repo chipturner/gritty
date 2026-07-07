@@ -12,6 +12,11 @@ protocol interoperate with their neighbors.
   LLM-ready diagnostic report (architecture primer, known failure modes,
   health checks, session/tunnel state, sanitized log excerpts) to paste
   into a chat or pipe into an LLM CLI. gritty never calls an LLM itself.
+- **`doctor --llm` includes dead tunnels' evidence**: stale tunnels appear
+  in the report's tunnel list (status `stale`) instead of being silently
+  garbage-collected while gathering, and the log excerpts cover post-mortem
+  `connect-<name>.log`/`.out` files left behind by tunnels that died --
+  previously the report omitted exactly the logs that explain a dead tunnel.
 
 ## 0.15.1 (2026-07-04) -- protocol v23 (no change)
 

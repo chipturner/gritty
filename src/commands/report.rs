@@ -24,7 +24,9 @@ pub(crate) async fn llm_report(
     tail_lines: usize,
 ) -> anyhow::Result<()> {
     let report = doctor::gather(ctl_socket, false).await;
-    let tunnels = gritty::connect::get_tunnel_info();
+    // Read-only variant: gathering a diagnostic report must not GC the stale
+    // tunnels (and their lock-file breadcrumbs) it is reporting on.
+    let tunnels = gritty::connect::get_tunnel_info_readonly();
     let now_secs = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default()
@@ -111,15 +113,7 @@ pub(crate) async fn llm_report(
 
     // -- Logs --------------------------------------------------------------
     out.push_str("## Log excerpts\n");
-    let mut logs: Vec<(String, std::path::PathBuf)> = vec![
-        ("daemon.log".into(), report.server_dir.join("daemon.log")),
-        ("daemon.out".into(), report.server_dir.join("daemon.out")),
-    ];
-    for t in &tunnels {
-        logs.push((format!("tunnel `{}` log", t.name), t.log_path.clone()));
-        logs.push((format!("tunnel `{}` output", t.name), t.log_path.with_extension("out")));
-    }
-    for (title, path) in logs {
+    for (title, path) in collect_log_sources(&report.server_dir, &tunnels) {
         out.push_str(&format!("\n### {title} ({})\n\n", path.display()));
         match read_tail(&path, READ_WINDOW_BYTES) {
             Ok((text, truncated_read)) => {
@@ -142,6 +136,49 @@ pub(crate) async fn llm_report(
 
     print!("{out}");
     Ok(())
+}
+
+/// The logs to excerpt: the daemon's, each known tunnel's log + output, plus
+/// a directory scan for `connect-*.log` files no tunnel accounts for --
+/// `.log`/`.out` deliberately survive teardown for post-mortems, and a tunnel
+/// that died is exactly the case this report is generated for.
+fn collect_log_sources(
+    server_dir: &Path,
+    tunnels: &[gritty::connect::TunnelInfo],
+) -> Vec<(String, std::path::PathBuf)> {
+    let mut logs: Vec<(String, std::path::PathBuf)> = vec![
+        ("daemon.log".into(), server_dir.join("daemon.log")),
+        ("daemon.out".into(), server_dir.join("daemon.out")),
+    ];
+    for t in tunnels {
+        logs.push((format!("tunnel `{}` log", t.name), t.log_path.clone()));
+        logs.push((format!("tunnel `{}` output", t.name), t.log_path.with_extension("out")));
+    }
+    let covered: std::collections::HashSet<_> =
+        tunnels.iter().map(|t| t.log_path.clone()).collect();
+    let mut orphaned: Vec<String> = std::fs::read_dir(server_dir)
+        .into_iter()
+        .flatten()
+        .filter_map(|e| e.ok())
+        .filter_map(|e| {
+            let file = e.file_name().to_string_lossy().into_owned();
+            let name = file.strip_prefix("connect-")?.strip_suffix(".log")?;
+            (!covered.contains(&e.path())).then(|| name.to_string())
+        })
+        .collect();
+    orphaned.sort();
+    for name in orphaned {
+        let path = server_dir.join(format!("connect-{name}.log"));
+        logs.push((
+            format!("tunnel `{name}` log (no live supervisor -- post-mortem)"),
+            path.clone(),
+        ));
+        logs.push((
+            format!("tunnel `{name}` output (no live supervisor -- post-mortem)"),
+            path.with_extension("out"),
+        ));
+    }
+    logs
 }
 
 /// True for log lines the excerpt should keep even outside the tail window.
@@ -260,6 +297,43 @@ fn fence(text: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn collect_log_sources_includes_postmortem_tunnel_logs() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("connect-alive.log"), "x").unwrap();
+        std::fs::write(dir.path().join("connect-dead.log"), "x").unwrap();
+        std::fs::write(dir.path().join("connect-dead.out"), "x").unwrap();
+        let tunnels = vec![gritty::connect::TunnelInfo {
+            name: "alive".into(),
+            destination: "host".into(),
+            status: "healthy".into(),
+            pid: None,
+            log_path: dir.path().join("connect-alive.log"),
+        }];
+        let logs = collect_log_sources(dir.path(), &tunnels);
+        let titles: Vec<&str> = logs.iter().map(|(t, _)| t.as_str()).collect();
+        assert!(titles.contains(&"tunnel `alive` log"), "got {titles:?}");
+        assert!(
+            titles.iter().any(|t| t.contains("`dead`") && t.contains("post-mortem")),
+            "got {titles:?}"
+        );
+        // A known tunnel's log must not reappear as a post-mortem entry.
+        assert_eq!(titles.iter().filter(|t| t.contains("`alive` log")).count(), 1);
+        // The post-mortem .out sibling rides along like a live tunnel's does.
+        assert!(
+            titles.iter().any(|t| t.contains("`dead` output") && t.contains("post-mortem")),
+            "got {titles:?}"
+        );
+    }
+
+    #[test]
+    fn collect_log_sources_daemon_only_when_no_tunnels() {
+        let dir = tempfile::tempdir().unwrap();
+        let logs = collect_log_sources(dir.path(), &[]);
+        let titles: Vec<&str> = logs.iter().map(|(t, _)| t.as_str()).collect();
+        assert_eq!(titles, ["daemon.log", "daemon.out"]);
+    }
 
     #[test]
     fn sanitize_strips_csi_osc_and_controls() {

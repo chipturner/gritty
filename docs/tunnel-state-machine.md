@@ -188,7 +188,7 @@ values via `probe_tunnel_status(name) -> TunnelStatus`:
 |----------------------------------------------|-----------------|---------------------------------|
 | lock held + `.sock` connectable              | `Healthy`       | `Running.Alive`, `Running.ProbeFailing` (socket stays bound during probe; a failing probe has not yet killed the ssh child) |
 | lock held + `.sock` not connectable          | `Reconnecting`  | `Starting.Preflight`, `Starting.SpawnChild`, `Starting.WaitForSocket` (initial setup), plus `Running.KillingChild`, `Running.ChildExited`, `Running.Backoff`, `Running.EnsureRemoteRetry`, `Running.SpawnRetry` (respawn cycle) |
-| lock free                                    | `Stale`         | Supervisor absent / dead; `.sock`/`.pid` orphaned. `get_tunnel_info` GCs stale files as a side effect via `cleanup_if_unheld` (acquires the flock before touching anything, so a supervisor that races in between the probe and the GC is unaffected). |
+| lock free                                    | `Stale`         | Supervisor absent / dead; `.sock`/`.pid` orphaned. `get_tunnel_info` GCs stale files as a side effect via `cleanup_if_unheld` (acquires the flock before touching anything, so a supervisor that races in between the probe and the GC is unaffected). The read-only `get_tunnel_info_readonly` (used by `doctor --llm`) instead reports the tunnel with status `stale` and touches nothing. |
 
 The `Starting.*` row matters for the client observer: during a slow
 initial tunnel setup (cellular RTT, remote cold-start), the client sees

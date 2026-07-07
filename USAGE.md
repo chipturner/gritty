@@ -278,7 +278,7 @@ laptop$ gritty doctor --json | jq '.failures'
 
 `gritty doctor` is the first stop: it prints the key paths (config file, socket dir, logs, device id) and checks for stale processes, orphaned sockets, and config errors. It also flags any file in the socket dir that this gritty version doesn't recognize -- litter from a release whose artifact set differed; `gritty doctor --clean` removes such files (never directories or sockets something is actively serving). `gritty info` prints the same paths plus live server/tunnel status.
 
-**Asking an LLM for help:** `gritty doctor --llm "describe what's going wrong"` prints a self-contained diagnostic report -- a primer on gritty's architecture and known failure modes, your description, doctor's checks, session/tunnel state, and sanitized excerpts from the daemon and tunnel logs -- formatted to paste into a chat or pipe into an LLM CLI:
+**Asking an LLM for help:** `gritty doctor --llm "describe what's going wrong"` prints a self-contained diagnostic report -- a primer on gritty's architecture and known failure modes, your description, doctor's checks, session/tunnel state, and sanitized excerpts from the daemon and tunnel logs (including post-mortem logs left behind by dead tunnels) -- formatted to paste into a chat or pipe into an LLM CLI:
 
 ```
 laptop$ gritty doctor --llm "sessions to devbox drop every few minutes" | claude -p
