@@ -26,7 +26,7 @@ async fn timed_send(
     match tokio::time::timeout(SEND_TIMEOUT, framed.send(frame)).await {
         Ok(Ok(())) => Ok(()),
         Ok(Err(e)) => {
-            warn!("control send error: {e}");
+            warn!(error = %e, "control send error");
             Err(e)
         }
         Err(_) => {
@@ -152,9 +152,9 @@ fn reap_sessions(sessions: &mut HashMap<u32, SessionState>) {
                 }
                 Some(Err(join_err)) => {
                     if join_err.is_panic() {
-                        tracing::error!(id, "session task panicked: {join_err}");
+                        tracing::error!(id, error = %join_err, "session task panicked");
                     } else {
-                        tracing::warn!(id, "session task cancelled: {join_err}");
+                        tracing::warn!(id, error = %join_err, "session task cancelled");
                     }
                 }
                 None => tracing::warn!(id, "session task finished but join pending"),
@@ -462,7 +462,7 @@ async fn connection_handshake(
                 return;
             }
             Ok(Some(Err(e))) => {
-                warn!("frame decode error: {e}");
+                warn!(error = %e, "hello frame decode error");
                 return;
             }
             Ok(None) => return,
@@ -502,7 +502,7 @@ async fn connection_handshake(
     let frame = match tokio::time::timeout(Duration::from_secs(5), framed.next()).await {
         Ok(Some(Ok(f))) => f,
         Ok(Some(Err(e))) => {
-            warn!("frame decode error: {e}");
+            warn!(error = %e, "control frame decode error");
             return;
         }
         Ok(None) => return,
@@ -631,7 +631,7 @@ fn ensure_registration(ctl_path: &Path) {
     if registered != Some(std::process::id()) {
         warn!(path = %ctl_path.display(), "pid registration was missing/wrong; rewriting");
         if let Err(e) = write_registration(ctl_path) {
-            warn!("could not rewrite pid/.info: {e}");
+            warn!(error = %e, "could not rewrite pid/.info");
         }
     }
 }
@@ -743,7 +743,7 @@ pub async fn run_with_options(
                 match result {
                     Ok((stream, _addr)) => {
                         if let Err(e) = crate::security::verify_peer_uid(&stream) {
-                            warn!("{e}");
+                            warn!(error = %e, "rejected control connection: peer uid check failed");
                         } else {
                             let conn_id = next_conn_id;
                             next_conn_id = next_conn_id.wrapping_add(1);
@@ -757,7 +757,7 @@ pub async fn run_with_options(
                         }
                     }
                     Err(e) => {
-                        warn!("ctl accept error: {e}; retrying");
+                        warn!(error = %e, "ctl accept error; retrying");
                         tokio::time::sleep(Duration::from_millis(100)).await;
                     }
                 }
@@ -837,7 +837,7 @@ pub async fn run_with_options(
                     // The sidecars went down with the socket; restore them so
                     // doctor/refresh don't classify us as an orphan.
                     if let Err(e) = write_registration(ctl_path) {
-                        warn!("could not rewrite pid/.info after re-bind: {e}");
+                        warn!(error = %e, "could not rewrite pid/.info after re-bind");
                     }
                 }
                 SocketCheck::Lost(reason) => {

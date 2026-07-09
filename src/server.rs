@@ -626,14 +626,14 @@ fn spawn_agent_acceptor(
             let (stream, _) = match listener.accept().await {
                 Ok(conn) => conn,
                 Err(e) => {
-                    warn!("agent listener accept error: {e}; retrying");
+                    warn!(error = %e, "agent listener accept error; retrying");
                     tokio::time::sleep(Duration::from_millis(100)).await;
                     continue;
                 }
             };
 
             if let Err(e) = crate::security::verify_peer_uid(&stream) {
-                warn!("agent socket: {e}");
+                warn!(error = %e, "rejected agent connection: peer uid check failed");
                 continue;
             }
 
@@ -680,7 +680,7 @@ fn spawn_pf_tcp_acceptor(
             let (stream, _) = match listener.accept().await {
                 Ok(conn) => conn,
                 Err(e) => {
-                    warn!(forward_id, "pf tcp listener accept error: {e}; retrying");
+                    warn!(forward_id, error = %e, "pf tcp listener accept error; retrying");
                     tokio::time::sleep(Duration::from_millis(100)).await;
                     continue;
                 }
@@ -810,7 +810,7 @@ fn spawn_svc_acceptor(
             let (mut stream, _) = match listener.accept().await {
                 Ok(conn) => conn,
                 Err(e) => {
-                    warn!("svc listener accept error: {e}; retrying");
+                    warn!(error = %e, "svc listener accept error; retrying");
                     tokio::time::sleep(Duration::from_millis(100)).await;
                     continue;
                 }
@@ -822,7 +822,7 @@ fn spawn_svc_acceptor(
             match crate::security::verify_peer_uid(&stream) {
                 Ok(()) => {}
                 Err(e) if e.kind() == std::io::ErrorKind::PermissionDenied => {
-                    warn!("svc socket: {e}");
+                    warn!(error = %e, "rejected svc connection: peer uid check failed");
                     continue;
                 }
                 Err(e) => {
@@ -1424,7 +1424,7 @@ impl ServerRelay<'_> {
                                     .await;
                         }
                         Err(e) => {
-                            warn!(forward_id, listen_port, "local-forward: bind failed: {e}");
+                            warn!(forward_id, listen_port, error = %e, "local-forward: bind failed");
                             let _ =
                                 send_framed_timed(framed, Frame::PortForwardStop { forward_id })
                                     .await;
@@ -2967,7 +2967,7 @@ fn bind_agent_listener(path: &Path) -> Option<UnixListener> {
             Some(listener)
         }
         Err(e) => {
-            warn!("failed to bind agent socket at {}: {e}", path.display());
+            warn!(path = %path.display(), error = %e, "failed to bind agent socket");
             None
         }
     }

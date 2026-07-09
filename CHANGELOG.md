@@ -8,6 +8,20 @@ protocol interoperate with their neighbors.
 
 ## Unreleased
 
+- **Log failures are now structured.** `warn!`/`error!` sites carried the error by
+  interpolating it into the message text, so the single highest-value field was
+  unparseable and the message was not a stable event identity. They now emit
+  `error = %e` alongside a fixed message. Two `frame decode error` sites that
+  logged identical text from different phases are now distinguishable
+  (`hello` vs `control`), and the peer-UID rejection on the control socket --
+  previously logged as a bare `warn!("{e}")` with no message at all -- says what
+  it rejected.
+- **`doctor --llm` no longer confuses field values for log levels.** The filter
+  choosing which historical lines to include matched `WARN`/`ERROR`/`panic`
+  anywhere on the line, so a session named `ERROR`, or an invocation audit line
+  quoting either word, could consume the whole 40-line budget and push the real
+  failures out of the report. The level is now matched positionally, and raw
+  panics in `.out` files are matched on `panicked at`.
 - **Fixed: log lines from spawned tasks lost their session.** The agent, port-forward,
   svc-socket, transfer-relay, and tail tasks were started with bare `tokio::spawn`,
   which does not inherit the enclosing `session{id,name}` span. On a daemon serving

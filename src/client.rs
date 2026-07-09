@@ -1547,7 +1547,7 @@ impl ClientRelay<'_> {
                     );
                 }
                 Err(e) => {
-                    warn!(listen_port, "remote-forward: bind failed: {e}");
+                    warn!(listen_port, error = %e, "remote-forward: bind failed");
                     let _ = fwd_stream.write_all(&[0x02]).await;
                     let _ =
                         fwd_stream.write_all(format!("{FWD_ERR_BIND_PREFIX}{e}").as_bytes()).await;

@@ -686,7 +686,7 @@ async fn respawn_tunnel(
                     ms.remote_sock = sock;
                 }
                 Err(e) => {
-                    warn!("ensure_remote_ready failed on respawn: {e}");
+                    warn!(error = %e, "ensure_remote_ready failed on respawn");
                     sleep = ms.backoff;
                     continue;
                 }
@@ -706,7 +706,7 @@ async fn respawn_tunnel(
         {
             Ok(c) => return RespawnResult::NewChild(c),
             Err(e) => {
-                warn!("failed to respawn ssh tunnel: {e}");
+                warn!(error = %e, "failed to respawn ssh tunnel");
                 sleep = ms.backoff;
                 continue;
             }
@@ -883,7 +883,7 @@ async fn tunnel_monitor(
                 let status = match status {
                     Ok(s) => s,
                     Err(e) => {
-                        warn!("failed to wait on ssh tunnel: {e}");
+                        warn!(error = %e, "failed to wait on ssh tunnel");
                         return;
                     }
                 };

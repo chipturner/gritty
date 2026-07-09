@@ -182,8 +182,21 @@ fn collect_log_sources(
 }
 
 /// True for log lines the excerpt should keep even outside the tail window.
+///
+/// This predicate decides what an LLM sees of the log's history, so it matches
+/// the level *positionally* -- the second whitespace-separated token of a
+/// tracing line, right after the timestamp. A substring search over the whole
+/// line would let a session named `ERROR`, or the `cmd=` invocation audit line
+/// quoting either word, consume the 40-line budget and push the real failures
+/// out of view.
+///
+/// `daemon.out` and the tunnels' `.out` carry raw stderr rather than tracing
+/// output, so a panic there has no timestamp or level. Rust renders it as
+/// `thread '...' panicked at src/...`, which is matched anywhere on the line.
 fn is_warn_or_error(line: &str) -> bool {
-    line.contains("WARN") || line.contains("ERROR") || line.contains("panic")
+    let mut tokens = line.split_whitespace();
+    let level = tokens.next().and(tokens.next());
+    matches!(level, Some("WARN" | "ERROR")) || line.contains("panicked at")
 }
 
 /// Read up to the last `max_bytes` of a file (lossy UTF-8). Returns the text
@@ -297,6 +310,51 @@ fn fence(text: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    const TS: &str = "2026-07-09T14:09:30.566754-07:00";
+
+    #[test]
+    fn keeps_warn_and_error_lines_by_level_position() {
+        assert!(is_warn_or_error(&format!("{TS}  WARN gritty::daemon: ctl accept error")));
+        assert!(is_warn_or_error(&format!("{TS} ERROR gritty::daemon: session task panicked")));
+    }
+
+    #[test]
+    fn drops_info_debug_and_trace_lines() {
+        for level in ["INFO", "DEBUG", "TRACE"] {
+            let line = format!("{TS}  {level} gritty::server: client disconnected");
+            assert!(!is_warn_or_error(&line), "{level} should not be kept: {line}");
+        }
+    }
+
+    /// The level lives in a fixed column; the message and field values do not.
+    /// Before the positional match these lines were kept, and 40 of them would
+    /// evict the real failures from the report.
+    #[test]
+    fn does_not_mistake_field_values_for_a_level() {
+        let session_named_error =
+            format!(r#"{TS}  INFO session{{id=3 name="ERROR"}}: gritty::server: created"#);
+        assert!(!is_warn_or_error(&session_named_error));
+
+        let audit_line = format!("{TS}  INFO gritty: gritty invoked cmd=gritty connect WARN");
+        assert!(!is_warn_or_error(&audit_line));
+
+        let argv_mentioning_panic = format!("{TS}  INFO gritty: gritty invoked cmd=./repro-panic");
+        assert!(!is_warn_or_error(&argv_mentioning_panic));
+    }
+
+    /// `daemon.out` is raw stderr: no timestamp, no level.
+    #[test]
+    fn keeps_raw_panics_from_out_files() {
+        assert!(is_warn_or_error("thread 'tokio-runtime-worker' panicked at src/server.rs:12:5:"));
+    }
+
+    #[test]
+    fn tolerates_blank_and_single_token_lines() {
+        assert!(!is_warn_or_error(""));
+        assert!(!is_warn_or_error("   "));
+        assert!(!is_warn_or_error(TS));
+    }
 
     #[test]
     fn collect_log_sources_includes_postmortem_tunnel_logs() {
