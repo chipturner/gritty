@@ -722,7 +722,7 @@ fn main() {
                 None => match gritty::connect::parse_host(&destination) {
                     Ok(h) => h,
                     Err(e) => {
-                        eprintln!("error: {e}");
+                        eprintln!("error: {e:#}");
                         std::process::exit(1);
                     }
                 },
@@ -765,7 +765,7 @@ fn main() {
                     resolved.connect_timeout,
                 )
             {
-                eprintln!("error: {e}");
+                eprintln!("error: {e:#}");
                 std::process::exit(1);
             }
 
@@ -842,7 +842,10 @@ fn main() {
                 }
             };
             if let Err(e) = rt.block_on(run(cli, config)) {
-                eprintln!("error: {e}");
+                // `{e:#}` renders anyhow's full cause chain, matching
+                // `report_error`. Plain `{e}` drops every `.context()` the
+                // command layer attached.
+                eprintln!("error: {e:#}");
                 std::process::exit(1);
             }
         }

@@ -302,6 +302,10 @@ SIGUSR1 cycling is disabled when the daemon was started with `RUST_LOG` set -- t
 laptop$ kill -USR2 $(cat $(gritty socket-path | xargs dirname)/daemon.pid)
 ```
 
+The reopen happens on the daemon's next log write. If it fails (the directory is
+gone, the disk is full) the request stays pending and is retried on each
+subsequent write, so the daemon never gets stranded writing to a deleted file.
+
 **In-session diagnostics:** Press `~#` during a session to see both client-side status (RTT, uptime, bytes relayed) and server-side diagnostics (output history state + stream offset, alt-screen mode, channel counts, shell PID).
 
 **Forcing a reconnect attempt:** While the `reconnecting Ns` or `waiting for network` status line is showing, any key skips the rest of the backoff sleep and attempts immediately -- the line flips to `retrying now` when the attempt starts. This also overrides `waiting for network`, which trusts the OS path monitor and can lag reality after a wake-from-sleep; if you know the network is back, hit a key. Forced attempts never escalate the retry backoff, so tapping a key cannot delay the automatic schedule. Keys only become retry commands once the outage has been visible for a second -- anything typed during a blip too brief to show the status line is delivered to the session after it resumes. `^C` exits instead of retrying.

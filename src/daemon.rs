@@ -822,6 +822,11 @@ pub async fn run_with_options(
             LoopAction::CheckSocket => match check_socket(ctl_path, socket_identity) {
                 SocketCheck::Intact => ensure_registration(ctl_path),
                 SocketCheck::Recovered { listener: new_listener, identity } => {
+                    // Our log file went down with the socket dir. `check_socket`
+                    // has just recreated the dir, so request the reopen *before*
+                    // the first post-recovery log line -- otherwise every line
+                    // from here on appends to an unlinked inode.
+                    crate::logging::reopen_log_file();
                     warn!(
                         path = %ctl_path.display(),
                         sessions = sessions.len(),

@@ -8,6 +8,25 @@ protocol interoperate with their neighbors.
 
 ## Unreleased
 
+- **Fixed: after recovering a wiped socket dir, the daemon logged into a
+  deleted file.** The self-heal path re-bound the control socket and rewrote
+  its sidecars but never reopened `daemon.log`, so every subsequent line was
+  appended to an unlinked inode -- invisible to `doctor`, `tail`, and
+  `doctor --llm`. It now requests a reopen before the first post-recovery
+  log line.
+- **Fixed: a failed log reopen was silent and permanent.** `SIGUSR2` cleared
+  the reopen request before attempting the open, so if the open failed
+  (directory wiped, `ENOSPC`, `EACCES`) the writer kept the old file
+  descriptor forever with no error and no retry. The request now survives a
+  failed open and is retried on the next write.
+- **Fixed: log color escapes leaked into redirected stderr.** `gritty server
+  -f 2>log` and `RUST_LOG=debug gritty ls 2>log` wrote ANSI codes into the
+  file; the daemon's file logger already suppressed them. stderr is now
+  colored only when it is a terminal.
+- **Fixed: error messages dropped their context chain.** `gritty ls`, `kill`,
+  `prune`, and friends printed only the outermost error; the `.context()`
+  each command layer attached was discarded. They now render the full chain,
+  matching what `gritty server` and `tunnel-create` already did.
 - **Fixed: a failed remote probe could poison the tunnel's forward spec.**
   When `gritty socket-path` failed on the remote (binary missing after an
   upgrade, broken PATH), the probe's `ERR:` tag was mistaken for the socket

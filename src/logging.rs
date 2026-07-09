@@ -1,3 +1,4 @@
+use std::io::IsTerminal;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
@@ -65,20 +66,17 @@ pub fn current_log_level_name() -> &'static str {
     }
 }
 
-/// Path to the log file currently being written by the daemon.
-/// Stored in a global so the SIGUSR2 handler can reopen it.
-static LOG_PATH: OnceLock<PathBuf> = OnceLock::new();
-
 /// Writer that can be told to reopen its underlying file (for log rotation).
 /// The daemon's SIGUSR2 handler sets the reopen flag; the next write reopens.
 pub struct ReopenableWriter {
+    path: PathBuf,
     file: Mutex<std::fs::File>,
     reopen: AtomicBool,
 }
 
 impl ReopenableWriter {
-    fn new(file: std::fs::File) -> Self {
-        Self { file: Mutex::new(file), reopen: AtomicBool::new(false) }
+    fn new(path: PathBuf, file: std::fs::File) -> Self {
+        Self { path, file: Mutex::new(file), reopen: AtomicBool::new(false) }
     }
 
     fn request_reopen(&self) {
@@ -88,13 +86,19 @@ impl ReopenableWriter {
 
 impl std::io::Write for &ReopenableWriter {
     fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
-        if self.reopen.swap(false, Ordering::Relaxed)
-            && let Some(path) = LOG_PATH.get()
-            && let Some(new_file) = open_log_file(path)
+        let mut file = self.file.lock().unwrap();
+        // Retire the reopen request only once the new file is in hand. Clearing
+        // it first would strand us on the old fd forever whenever the open
+        // fails -- and the open failing (socket dir wiped out from under us) is
+        // precisely the case the daemon's self-heal path exists to survive.
+        // Leaving the request pending makes the next write retry.
+        if self.reopen.load(Ordering::Relaxed)
+            && let Some(new_file) = open_log_file(&self.path)
         {
-            *self.file.lock().unwrap() = new_file;
+            *file = new_file;
+            self.reopen.store(false, Ordering::Relaxed);
         }
-        self.file.lock().unwrap().write(buf)
+        file.write(buf)
     }
 
     fn flush(&mut self) -> std::io::Result<()> {
@@ -162,12 +166,9 @@ pub fn init_tracing(verbose: bool, log_path: Option<&Path>, stderr_default: &'st
         None => EnvFilter::from_default_env(),
     };
 
-    match log_path.and_then(|p| {
-        LOG_PATH.set(p.to_path_buf()).ok();
-        open_log_file(p)
-    }) {
-        Some(file) => {
-            let writer = Arc::new(ReopenableWriter::new(file));
+    match log_path.and_then(|p| open_log_file(p).map(|f| (p.to_path_buf(), f))) {
+        Some((path, file)) => {
+            let writer = Arc::new(ReopenableWriter::new(path, file));
             let _ = LOG_WRITER.set(writer.clone());
 
             let (filter_layer, reload_handle) = tracing_subscriber::reload::Layer::new(filter);
@@ -195,9 +196,13 @@ pub fn init_tracing(verbose: bool, log_path: Option<&Path>, stderr_default: &'st
                 .init();
         }
         None => {
+            // The file layer above hardcodes `with_ansi(false)`; stderr needs the
+            // same courtesy whenever it is not a terminal, or `server -f 2>log`
+            // and `RUST_LOG=debug gritty ls 2>log` bake color escapes into the log.
             tracing_subscriber::fmt()
                 .with_env_filter(filter)
                 .with_writer(std::io::stderr)
+                .with_ansi(std::io::stderr().is_terminal())
                 .with_timer(LocalTimer)
                 .init();
         }
@@ -246,6 +251,64 @@ mod tests {
         assert_eq!(&s[20..26], "789000");
         assert!(matches!(&s[26..27], "+" | "-"), "expected offset sign in {s}");
         assert_eq!(&s[29..30], ":");
+    }
+
+    /// Build a writer over `path` and return it plus a handle usable as `Write`.
+    fn writer_at(path: &Path) -> ReopenableWriter {
+        ReopenableWriter::new(path.to_path_buf(), open_log_file(path).expect("open"))
+    }
+
+    #[test]
+    fn reopen_recreates_an_unlinked_log_file() {
+        use std::io::Write;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("daemon.log");
+        let w = writer_at(&path);
+
+        (&w).write_all(b"before\n").unwrap();
+        std::fs::remove_file(&path).unwrap(); // logrotate / dir wipe
+
+        w.request_reopen();
+        (&w).write_all(b"after\n").unwrap();
+
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "after\n");
+        assert!(!w.reopen.load(Ordering::Relaxed), "flag should clear on success");
+    }
+
+    #[test]
+    fn failed_reopen_stays_pending_and_retries_on_the_next_write() {
+        use std::io::Write;
+        let dir = tempfile::tempdir().unwrap();
+        let sub = dir.path().join("gritty");
+        std::fs::create_dir(&sub).unwrap();
+        let path = sub.join("daemon.log");
+        let w = writer_at(&path);
+        (&w).write_all(b"before\n").unwrap();
+
+        // The whole socket dir vanishes: the reopen cannot succeed yet.
+        std::fs::remove_dir_all(&sub).unwrap();
+        w.request_reopen();
+        (&w).write_all(b"stranded\n").unwrap();
+        assert!(w.reopen.load(Ordering::Relaxed), "failed reopen must stay pending");
+
+        // The daemon's self-heal recreates the dir; the next write must land in
+        // a file that has a name again.
+        std::fs::create_dir(&sub).unwrap();
+        (&w).write_all(b"recovered\n").unwrap();
+
+        assert!(!w.reopen.load(Ordering::Relaxed), "flag should clear once open succeeds");
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "recovered\n");
+    }
+
+    #[test]
+    fn writes_without_a_reopen_request_append_to_the_same_file() {
+        use std::io::Write;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("daemon.log");
+        let w = writer_at(&path);
+        (&w).write_all(b"a\n").unwrap();
+        (&w).write_all(b"b\n").unwrap();
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "a\nb\n");
     }
 
     #[test]
