@@ -1111,7 +1111,7 @@ impl ClientRelay<'_> {
                             let tx = self.tunnel_event_tx.clone();
                             let timeout = self.oauth_timeout;
                             let next_id = Arc::clone(&self.tunnel.next_channel_id);
-                            self.tunnel.listener = Some(tokio::spawn(async move {
+                            self.tunnel.listener = Some(crate::spawn_traced(async move {
                                 let deadline =
                                     tokio::time::Instant::now() + Duration::from_secs(timeout);
                                 loop {
@@ -1127,7 +1127,7 @@ impl ClientRelay<'_> {
                                                 mpsc::channel::<Bytes>(crate::CHANNEL_RELAY_BUFFER);
 
                                             // Writer task: channel -> TCP
-                                            tokio::spawn(async move {
+                                            crate::spawn_traced(async move {
                                                 use tokio::io::AsyncWriteExt;
                                                 let mut writer = write_half;
                                                 while let Some(data) = writer_rx.recv().await {
@@ -1145,7 +1145,7 @@ impl ClientRelay<'_> {
                                             // Reader task: TCP -> events (spawned so we
                                             // can keep accepting new connections)
                                             let reader_tx = tx.clone();
-                                            tokio::spawn(async move {
+                                            crate::spawn_traced(async move {
                                                 use tokio::io::AsyncReadExt;
                                                 let mut read_half = read_half;
                                                 let mut buf = vec![0u8; 4096];
@@ -1491,7 +1491,7 @@ impl ClientRelay<'_> {
                     let tx = self.pf_event_tx.clone();
                     let nid = self.pf.next_channel_id.clone();
                     let fwd_id = forward_id;
-                    let handle = tokio::spawn(async move {
+                    let handle = crate::spawn_traced(async move {
                         loop {
                             let (stream, _) = match listener.accept().await {
                                 Ok(conn) => conn,
@@ -1600,7 +1600,7 @@ impl ClientRelay<'_> {
 
         // Keepalive: when the controlling process disconnects, tear down the forward.
         let pf_tx = self.pf_event_tx.clone();
-        let keepalive_handle = tokio::spawn(async move {
+        let keepalive_handle = crate::spawn_traced(async move {
             let mut buf = [0u8; 1];
             let _ = fwd_stream.read(&mut buf).await;
             let _ = pf_tx.send(ClientPortForwardEvent::ForwardStopped { forward_id });

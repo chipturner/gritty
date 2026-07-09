@@ -14,6 +14,25 @@ pub mod security;
 pub mod server;
 pub mod table;
 
+/// `tokio::spawn`, but the task inherits the caller's current tracing span.
+///
+/// Bare `tokio::spawn` does *not*: the spawned future is polled by another
+/// worker with no span entered, so every line it logs is emitted outside the
+/// `session{id,name}` / `client{session}` span its parent runs in. On a daemon
+/// serving several sessions those lines -- which include the svc-socket
+/// security events (`peer_cred unavailable`, unknown request byte) -- become
+/// unattributable.
+///
+/// Attaching `Span::current()` is never worse than the status quo: outside any
+/// span it resolves to the disabled current span and costs nothing.
+pub fn spawn_traced<F>(future: F) -> tokio::task::JoinHandle<F::Output>
+where
+    F: Future<Output: Send + 'static> + Send + 'static,
+{
+    use tracing::Instrument;
+    tokio::spawn(future.instrument(tracing::Span::current()))
+}
+
 /// Parse a compact duration into seconds: bare seconds (`"90"`) or a number
 /// with a unit suffix (`"90s"`, `"30m"`, `"12h"`, `"7d"`) -- what `gritty ls`
 /// prints in the Idle column is valid input here.
@@ -287,6 +306,37 @@ pub fn spawn_channel_relay<R, W, F, G>(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Each task reports the span it sees *at poll time*. The entered guard is
+    /// released before either handle is awaited, which is what the daemon
+    /// actually does -- the spawning future is not being polled while its child
+    /// runs. Hold the guard across the await and the child observes the parent's
+    /// span through the thread-local, and the test passes vacuously.
+    #[tokio::test]
+    async fn spawn_traced_carries_the_callers_span_and_bare_spawn_does_not() {
+        fn current_span_name() -> Option<&'static str> {
+            tracing::Span::current().metadata().map(|m| m.name())
+        }
+
+        let _guard = tracing::subscriber::set_default(
+            tracing_subscriber::FmtSubscriber::builder().with_writer(std::io::sink).finish(),
+        );
+        let span = tracing::info_span!("session", id = 7);
+
+        let traced = {
+            let _entered = span.enter();
+            assert_eq!(current_span_name(), Some("session"), "caller must be inside the span");
+            spawn_traced(async { current_span_name() })
+        };
+        // Negative control: the defect `spawn_traced` exists to prevent.
+        let bare = {
+            let _entered = span.enter();
+            tokio::spawn(async { current_span_name() })
+        };
+
+        assert_eq!(traced.await.unwrap(), Some("session"), "spawn_traced must carry the span");
+        assert_eq!(bare.await.unwrap(), None, "bare tokio::spawn drops the span");
+    }
 
     #[test]
     fn require_matched_version_accepts_same_version() {

@@ -8,7 +8,7 @@ Detailed module descriptions and the behavioral patterns that make gritty work. 
 
 ## Modules
 
-Sixteen modules -- fifteen behind a lib crate (`src/lib.rs` hosts `collect_env_vars()`, `relay_writer_channel()` + `spawn_channel_relay()`, `handshake()`, `get_or_create_device_id()`, `FORWARDED_ENV_KEYS`) plus the binary-private `commands` -- with thin binary entry (`src/main.rs`):
+Sixteen modules -- fifteen behind a lib crate (`src/lib.rs` hosts `collect_env_vars()`, `relay_writer_channel()` + `spawn_channel_relay()`, `handshake()`, `get_or_create_device_id()`, `spawn_traced()`, `FORWARDED_ENV_KEYS`) plus the binary-private `commands` -- with thin binary entry (`src/main.rs`):
 
 - **`security`** -- Socket/dir creation with 0700/0600 perms, ownership validation, symlink rejection, `SO_PEERCRED`. **All socket binding and dir creation MUST go through this module.**
 - **`config`** -- TOML config (`$XDG_CONFIG_HOME/gritty/config.toml`). `[defaults]` + `[host.<name>]`. Precedence: CLI > host > defaults > built-in. Host aliases: `canonical_host(typed)` resolves a typed host through `[host.*] aliases` to its canonical connection name (real names win: `local` and exact `[host.*]` keys never remap; an alias claimed by multiple hosts warns and stays literal; `canonical_host_quiet` for secondary resolutions that would duplicate the warning). `alias_destination(host)` returns the first alias -- the SSH-destination fallback threaded into `connect::resolve_destination` when no `.dest` sidecar exists.
@@ -66,6 +66,7 @@ Liveness and staleness are deliberately encoded more than once because each sign
 
 ## Key Patterns
 
+- **Tracing spans carry identity, not the message text**: the daemon wraps each session task in `info_span!("session", id, name)` (`daemon.rs`), each control connection in `debug_span!("conn", id)`, the tunnel supervisor in `info_span!("tunnel", name)` (`connect.rs`), and the client in `info_span!("client", session, session_id)` (`commands/session.rs`). Every line logged inside those futures is rendered `session{id=8 name="laptop/0"}: ...`, so `grep 'session{id=8'` recovers one session's whole story without each call site repeating the id. **`tokio::spawn` does not inherit a span** -- use `crate::spawn_traced` (`lib.rs`), which attaches `Span::current()`; a bare spawn silently orphans the task's lines.
 - **Connection handoff**: Daemon transfers `Framed<UnixStream>` to session task via `mpsc`. Daemon exits the data path.
 - **AsyncFd + try_io**: PTY master and stdin are raw fds in `AsyncFd`. `guard.try_io()` with would-block continuation.
 - **Deferred shell spawn**: PTY allocated early (with initial window size from `NewSession` cols/rows when > 0), shell waits for first client's `Env` frame. Forwarded env keys are the shared `FORWARDED_ENV_KEYS` allowlist in `lib.rs` -- `TERM`/`COLORTERM` plus `LANG` and the `LC_*` locale categories (mirrors SSH `SendEnv LANG LC_*`); `collect_env_vars()` and the server env allowlist both use it so they cannot drift. Spawns login shell with CWD from `NewSession` (or `$HOME` if empty). First client feeds directly into relay (no outer-loop re-wait).

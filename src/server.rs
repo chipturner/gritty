@@ -621,7 +621,7 @@ fn spawn_agent_acceptor(
     next_channel_id: Arc<AtomicU32>,
     enabled: Arc<AtomicBool>,
 ) -> tokio::task::JoinHandle<()> {
-    tokio::spawn(async move {
+    crate::spawn_traced(async move {
         loop {
             let (stream, _) = match listener.accept().await {
                 Ok(conn) => conn,
@@ -675,7 +675,7 @@ fn spawn_pf_tcp_acceptor(
     next_channel_id: Arc<AtomicU32>,
     event_tx: mpsc::UnboundedSender<PortForwardEvent>,
 ) -> tokio::task::JoinHandle<()> {
-    tokio::spawn(async move {
+    crate::spawn_traced(async move {
         loop {
             let (stream, _) = match listener.accept().await {
                 Ok(conn) => conn,
@@ -722,7 +722,7 @@ fn spawn_pf_svc_watcher(
     forward_id: u32,
     event_tx: mpsc::UnboundedSender<PortForwardEvent>,
 ) -> tokio::task::JoinHandle<()> {
-    tokio::spawn(async move {
+    crate::spawn_traced(async move {
         let mut stream = stream;
         let mut buf = [0u8; 1];
         // Block until EOF or error
@@ -805,7 +805,7 @@ fn spawn_svc_acceptor(
     clipboard_event_tx: mpsc::UnboundedSender<ClipboardEvent>,
     negotiated_caps: Arc<std::sync::atomic::AtomicU32>,
 ) -> tokio::task::JoinHandle<()> {
-    tokio::spawn(async move {
+    crate::spawn_traced(async move {
         loop {
             let (mut stream, _) = match listener.accept().await {
                 Ok(conn) => conn,
@@ -834,7 +834,7 @@ fn spawn_svc_acceptor(
             let stx = send_event_tx.clone();
             let ctx = clipboard_event_tx.clone();
             let caps = Arc::clone(&negotiated_caps);
-            tokio::spawn(async move {
+            crate::spawn_traced(async move {
                 // Read discriminator byte
                 let mut disc = [0u8; 1];
                 if stream.read_exact(&mut disc).await.is_err() {
@@ -956,7 +956,7 @@ fn spawn_transfer_relay(
     manifest: FileManifest,
     notify_tx: mpsc::UnboundedSender<Frame>,
 ) -> tokio::task::JoinHandle<()> {
-    tokio::spawn(async move {
+    crate::spawn_traced(async move {
         use tokio::io::AsyncWriteExt;
 
         let file_count = manifest.files.len() as u32;
@@ -1069,7 +1069,7 @@ fn spawn_tail(
 ) {
     let rx = tail_tx.subscribe();
     let chunks: Vec<Bytes> = history.chunks().iter().cloned().collect();
-    tokio::spawn(async move {
+    crate::spawn_traced(async move {
         for chunk in chunks {
             // Timed send: a stalled reader must not wedge the initial history
             // replay and leak this task + its Framed<UnixStream>.
@@ -2857,7 +2857,7 @@ pub async fn run(
 /// Spawns a task to read the SvcRequest discriminator and manifest/dest, then sends the event.
 fn handle_send_stream(mut stream: UnixStream, send_event_tx: &mpsc::UnboundedSender<SendEvent>) {
     let etx = send_event_tx.clone();
-    tokio::spawn(async move {
+    crate::spawn_traced(async move {
         let mut disc = [0u8; 1];
         if stream.read_exact(&mut disc).await.is_err() {
             return;

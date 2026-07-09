@@ -82,6 +82,7 @@ SSH tunnel supervisor state machine: **[docs/tunnel-state-machine.md](docs/tunne
 - **Channel closed check** -- before `Frame::Ok` for Attach, check `client_tx.is_closed()` (session died between reap and lookup).
 - **`Stdio::from(OwnedFd)`** -- don't reintroduce `FromRawFd` in server.rs.
 - **Fork before tokio** -- `daemonize()` MUST fork before creating the tokio runtime. `main()` is sync (no `#[tokio::main]`).
+- **Spawn with `spawn_traced`** -- in `server.rs`/`client.rs`, use `crate::spawn_traced` (`src/lib.rs`), never bare `tokio::spawn`. A bare spawn drops the enclosing `session{id,name}` / `client{session}` span, so the task's log lines -- including the svc-socket security events -- come out unattributable on a daemon serving several sessions.
 - **Orphans get SIGKILL, never SIGTERM** -- an orphaned daemon's SIGTERM handler runs its normal shutdown, which unlinks whatever is at its old socket path; by reap time that path may belong to a newer daemon. Same reason the daemon's own lost-socket exit path (`drain_sessions`) removes no files.
 - **Reap only after the confirm delay** -- `procscan::confirm_and_reap` must wait longer than `daemon::SOCKET_CHECK_INTERVAL` so a self-healing daemon is never killed mid-recovery.
 

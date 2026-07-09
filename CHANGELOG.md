@@ -8,6 +8,12 @@ protocol interoperate with their neighbors.
 
 ## Unreleased
 
+- **Fixed: log lines from spawned tasks lost their session.** The agent, port-forward,
+  svc-socket, transfer-relay, and tail tasks were started with bare `tokio::spawn`,
+  which does not inherit the enclosing `session{id,name}` span. On a daemon serving
+  several sessions their lines -- including the svc-socket security events
+  (`peer_cred unavailable`, unknown request byte) -- were unattributable. All
+  spawns in `server.rs` and `client.rs` now go through `spawn_traced`.
 - **Fixed: after recovering a wiped socket dir, the daemon logged into a
   deleted file.** The self-heal path re-bound the control socket and rewrote
   its sidecars but never reopened `daemon.log`, so every subsequent line was
