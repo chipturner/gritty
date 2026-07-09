@@ -4,6 +4,8 @@ use std::path::{Path, PathBuf};
 use gritty::connect::{TunnelStatus, enumerate_tunnels, probe_tunnel_status, read_pid_hint};
 use gritty::protocol::{Frame, PROTOCOL_VERSION};
 use gritty::runinfo::{RunInfo, Staleness};
+use gritty::ui;
+use gritty::ui::sgr::{DIM, RESET};
 
 use super::util::server_request;
 
@@ -77,11 +79,14 @@ fn check_staleness(info_path: &Path, label: &str, stale_hint: &str, checks: &mut
     }
 }
 
-fn status_symbol(s: Status) -> &'static str {
+/// Styled unconditionally; the `anstream` sinks below strip it when stdout is
+/// not a terminal or color is off.
+fn status_symbol(s: Status) -> String {
+    use gritty::ui::sgr::{GREEN, RED, YELLOW};
     match s {
-        Status::Ok => "\x1b[32m\u{2713}\x1b[0m",   // green ✓
-        Status::Warn => "\x1b[33m!\x1b[0m",        // yellow !
-        Status::Fail => "\x1b[31m\u{2717}\x1b[0m", // red ✗
+        Status::Ok => ui::paint(GREEN, "\u{2713}"),
+        Status::Warn => ui::paint(YELLOW, "!"),
+        Status::Fail => ui::paint(RED, "\u{2717}"),
     }
 }
 
@@ -97,9 +102,9 @@ fn render(groups: &[(&str, Vec<Check>)]) {
         first = false;
         println!("{title}");
         for c in checks {
-            println!("  {} {}", status_symbol(c.status), c.message);
+            anstream::println!("  {} {}", status_symbol(c.status), c.message);
             if let Some(hint) = &c.hint {
-                println!("    \x1b[2m\u{2192} {hint}\x1b[0m");
+                anstream::println!("    {DIM}\u{2192} {hint}{RESET}");
             }
         }
     }
@@ -150,7 +155,7 @@ fn render_paths(paths: &[(&str, PathBuf)]) {
         if path.exists() {
             println!("  {label:<width$}  {}", path.display());
         } else {
-            println!("  {label:<width$}  {} \x1b[2m(not found)\x1b[0m", path.display());
+            anstream::println!("  {label:<width$}  {} {DIM}(not found){RESET}", path.display());
         }
     }
 }
@@ -414,7 +419,7 @@ async fn check_tunnels(socket_dir: &Path) -> Vec<Check> {
                         // level checks still read "healthy" -- flag it.
                         let mut hint = format!(
                             "remote daemon may be down or its socket path stale\n    \
-                             \x1b[2m\u{2192} ssh output: {}",
+                             {DIM}\u{2192} ssh output: {}",
                             gritty::connect::connect_out_path(name).display()
                         );
                         if let Some(line) = gritty::connect::last_forward_error(name) {
@@ -438,7 +443,7 @@ async fn check_tunnels(socket_dir: &Path) -> Vec<Check> {
                 let out = gritty::connect::connect_out_path(name);
                 checks.push(Check::warn(format!("{name}: reconnecting{pid_str}")).with_hint(
                     format!(
-                        "tracing: {}\n    \x1b[2m\u{2192} ssh output: {}",
+                        "tracing: {}\n    {DIM}\u{2192} ssh output: {}",
                         log.display(),
                         out.display()
                     ),

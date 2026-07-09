@@ -8,6 +8,8 @@
 //! The slash is the natural separator -- any name containing one is taken as
 //! already-namespaced (literal); a bare name gets your client prefix prepended.
 
+use crate::ui;
+
 /// Resolve a user-supplied session name to its wire name.
 ///
 /// - Bare `-` is the "last-attached" marker and passes through unchanged.
@@ -75,7 +77,7 @@ pub fn sanitize_client_name(candidate: String) -> String {
     match validate_client_name(&candidate) {
         Ok(()) => candidate,
         Err(reason) => {
-            eprintln!("warning: client_name {candidate:?} rejected ({reason}); using \"unknown\"");
+            ui::warn(&format!("client_name {candidate:?} rejected ({reason}); using \"unknown\""));
             "unknown".to_string()
         }
     }

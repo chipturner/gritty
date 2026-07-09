@@ -47,7 +47,7 @@ just quicktest                        # manual 3-pane tmux test
 
 Single-socket: all communication (control + session relay) through one Unix domain socket per server. Hello/HelloAck version handshake, then control frame declares intent, server routes accordingly.
 
-Sixteen modules -- fifteen behind a lib crate (`src/lib.rs` hosts shared helpers + `FORWARDED_ENV_KEYS`) plus the binary-private `commands` -- with thin binary entry (`src/main.rs`):
+Seventeen modules -- sixteen behind a lib crate (`src/lib.rs` hosts shared helpers + `spawn_traced()` + `FORWARDED_ENV_KEYS`) plus the binary-private `commands` -- with thin binary entry (`src/main.rs`):
 
 | Module | Responsibility |
 |--------|----------------|
@@ -63,6 +63,7 @@ Sixteen modules -- fifteen behind a lib crate (`src/lib.rs` hosts shared helpers
 | `procscan` | Process-table scan for orphaned daemons (running but unregistered); Linux only, inert stub elsewhere |
 | `scrollback` | Last-50-lines buffer replayed for fresh viewers |
 | `table` | `print_table()` for tabular output |
+| `ui` | Everything gritty prints to a human: five `Level`s, the `sgr` palette, the marker glyph (ASCII fallback), `--color`. Formatters always style; sinks strip |
 | `logging` | Tracing setup, SIGUSR1 log-level cycling, SIGUSR2 log reopen |
 | `naming` | Pure helpers for the client-prefixed session-name rule |
 | `client` | Raw mode, escape processor, heartbeat, auto-reconnect, forwarding relay |
@@ -83,6 +84,7 @@ SSH tunnel supervisor state machine: **[docs/tunnel-state-machine.md](docs/tunne
 - **`Stdio::from(OwnedFd)`** -- don't reintroduce `FromRawFd` in server.rs.
 - **Fork before tokio** -- `daemonize()` MUST fork before creating the tokio runtime. `main()` is sync (no `#[tokio::main]`).
 - **Spawn with `spawn_traced`** -- in `server.rs`/`client.rs`, use `crate::spawn_traced` (`src/lib.rs`), never bare `tokio::spawn`. A bare spawn drops the enclosing `session{id,name}` / `client{session}` span, so the task's log lines -- including the svc-socket security events -- come out unattributable on a daemon serving several sessions.
+- **`ui` owns the palette; sinks own the strip decision** -- CLI messages go through `ui::{success,status,warn,error,detail}`; anything else that paints composes from `ui::sgr`. Print with `anstream::{println,eprintln}!` so ANSI is stripped for non-terminals and `NO_COLOR`/`--color` are honored. **Never route payload bytes through an `anstream` sink** (`receive -`, the PTY relay) -- stripping would corrupt transferred data. The picker/prune TUI and the server's PTY-injected notices are documented exceptions (see `src/ui.rs`).
 - **Orphans get SIGKILL, never SIGTERM** -- an orphaned daemon's SIGTERM handler runs its normal shutdown, which unlinks whatever is at its old socket path; by reap time that path may belong to a newer daemon. Same reason the daemon's own lost-socket exit path (`drain_sessions`) removes no files.
 - **Reap only after the confirm delay** -- `procscan::confirm_and_reap` must wait longer than `daemon::SOCKET_CHECK_INTERVAL` so a self-healing daemon is never killed mid-recovery.
 
@@ -113,4 +115,4 @@ SSH tunnel supervisor state machine: **[docs/tunnel-state-machine.md](docs/tunne
   - **docs/tunnel-state-machine.md** -- any change to `connect.rs` supervisor behavior (states, transitions, timing constants, exit-code classification, `TunnelStatus` projection, flock/client-observer contract)
 
 ### Style
-- `main()` returns `()`. Errors via `eprintln!("error: ...")`. Never `-> anyhow::Result` on `main()`.
+- `main()` returns `()`. Errors via `ui::error(...)` (renders `error: <msg>`), using `{e:#}` so anyhow's cause chain survives. Never `-> anyhow::Result` on `main()`.

@@ -1,6 +1,8 @@
 use std::path::{Path, PathBuf};
 use tracing::Instrument;
 
+use gritty::ui;
+
 use super::AutoStart;
 use super::util::{
     DaemonProbe, discover_daemon_probes, format_age, format_timestamp, resolve_session_id,
@@ -144,7 +146,7 @@ pub(crate) async fn connect_session(
     match Frame::expect_from(framed.next().await)? {
         Frame::Ok if detach => {
             // Probe succeeded (connect -d): existence confirmed, not attaching.
-            eprintln!("\x1b[32m\u{25b8} session {name} exists (not attaching, -d)\x1b[0m");
+            ui::success(&format!("session {name} exists (not attaching, -d)"));
             return Ok(());
         }
         Frame::AttachAck { token: _, session_id } => {
@@ -154,7 +156,7 @@ pub(crate) async fn connect_session(
             if linger_from_cli {
                 framed.send(Frame::SetLinger { session: String::new(), linger_secs }).await?;
             }
-            eprintln!("\x1b[32m\u{25b8} attached {name}\x1b[0m");
+            ui::success(&format!("attached {name}"));
             let client_span = tracing::info_span!("client", session = %name, session_id);
             let code = gritty::client::run(
                 framed,
@@ -178,7 +180,7 @@ pub(crate) async fn connect_session(
         }
         Frame::Error { code: gritty::protocol::ErrorCode::AlreadyAttached, message, .. } => {
             let host = host_from_ctl_path(&ctl_path);
-            eprintln!("error: {message}");
+            ui::error(&message);
             eprintln!("  gritty connect {host}:{name} --force   to take over");
             std::process::exit(1);
         }
@@ -211,7 +213,7 @@ pub(crate) async fn connect_session(
 
     match Frame::expect_from(framed.next().await)? {
         Frame::SessionCreated { id } => {
-            eprintln!("\x1b[32m\u{25b8} session {name}\x1b[0m");
+            ui::success(&format!("session {name}"));
 
             // Daemon emits SessionCreated immediately followed by AttachAck.
             // The token echoes the device_id (client ignores it -- ownership
@@ -347,9 +349,9 @@ fn suggest_name(rows: &[Row], client_name: &str) -> String {
 
 fn print_session_list(host: &str, sessions: &[gritty::protocol::SessionEntry]) {
     if sessions.len() == 1 {
-        eprintln!("error: session on {host} is already attached:");
+        ui::error(&format!("session on {host} is already attached:"));
     } else {
-        eprintln!("error: multiple sessions on {host} -- specify one:");
+        ui::error(&format!("multiple sessions on {host} -- specify one:"));
     }
     for s in sessions {
         let wire = session_wire_name(s);
@@ -991,7 +993,7 @@ async fn alert_detached_sessions(current_name: &str, ctl_path: &Path, client_nam
             gritty::naming::display_session_name(&wire, client_name).to_string()
         })
         .collect();
-    eprintln!("\x1b[2;33m\u{25b8} detached sessions: {}\x1b[0m", names.join(", "));
+    ui::status(&format!("detached sessions: {}", names.join(", ")));
 }
 
 pub(crate) async fn tail_session(target: String, ctl_path: PathBuf) -> anyhow::Result<i32> {
@@ -1009,7 +1011,7 @@ pub(crate) async fn tail_session(target: String, ctl_path: PathBuf) -> anyhow::R
 
     match Frame::expect_from(framed.next().await)? {
         Frame::Ok => {
-            eprintln!("\x1b[2;33m\u{25b8} tailing {target}\x1b[0m");
+            ui::status(&format!("tailing {target}"));
             gritty::client::tail(
                 session_id,
                 framed,
@@ -1038,7 +1040,7 @@ pub(crate) async fn rename_session(
     .await?
     {
         Frame::Ok => {
-            eprintln!("\x1b[32m\u{25b8} renamed {target} -> {new_name}\x1b[0m");
+            ui::success(&format!("renamed {target} -> {new_name}"));
             Ok(())
         }
         Frame::Error { message, .. } => anyhow::bail!("{message}"),
@@ -1097,7 +1099,7 @@ async fn kill_one(user_session: &str, client_name: &str, ctl_path: &Path) -> any
     }
     match resp {
         Frame::Ok => {
-            eprintln!("\x1b[32m\u{25b8} session {user_session} killed\x1b[0m");
+            ui::success(&format!("session {user_session} killed"));
             Ok(())
         }
         Frame::Error { message, .. } => anyhow::bail!("{message}"),
@@ -1134,7 +1136,7 @@ pub(crate) async fn kill_sessions(
             }
         };
         if let Err(e) = result {
-            eprintln!("error: {target}: {e:#}");
+            ui::error(&format!("{target}: {e:#}"));
             failed += 1;
         }
     }
@@ -1435,17 +1437,14 @@ pub(crate) async fn prune_sessions(
         match tui_mark_sessions(&host, &candidates, client_name).await {
             Some(marked) => marked,
             None => {
-                eprintln!("\x1b[2m\u{25b8} aborted -- nothing killed\x1b[0m");
+                ui::detail("aborted -- nothing killed");
                 return Ok(());
             }
         }
     } else {
         print_session_table(&candidates, now, client_name, "");
         if !yes {
-            eprintln!(
-                "\x1b[2m\u{25b8} dry run -- pass -y to kill {} session(s)\x1b[0m",
-                candidates.len()
-            );
+            ui::detail(&format!("dry run -- pass -y to kill {} session(s)", candidates.len()));
             return Ok(());
         }
         candidates
@@ -1456,18 +1455,18 @@ pub(crate) async fn prune_sessions(
         let display = gritty::naming::display_session_name(&s.name, client_name);
         match server_request(&ctl_path, Frame::KillSession { session: s.id.to_string() }).await {
             Ok(Frame::Ok) => {
-                eprintln!("\x1b[32m\u{25b8} session {display} killed\x1b[0m");
+                ui::success(&format!("session {display} killed"));
             }
             Ok(Frame::Error { message, .. }) => {
-                eprintln!("error: {display}: {message}");
+                ui::error(&format!("{display}: {message}"));
                 failed += 1;
             }
             Ok(other) => {
-                eprintln!("error: {display}: unexpected response from server: {other:?}");
+                ui::error(&format!("{display}: unexpected response from server: {other:?}"));
                 failed += 1;
             }
             Err(e) => {
-                eprintln!("error: {display}: {e:#}");
+                ui::error(&format!("{display}: {e:#}"));
                 failed += 1;
             }
         }
@@ -1486,7 +1485,7 @@ pub(crate) async fn kill_server(ctl_path: PathBuf) -> anyhow::Result<()> {
     // across a mismatched handshake.
     match super::util::server_request_any_version(&ctl_path, Frame::KillServer).await? {
         Frame::Ok => {
-            eprintln!("\x1b[32m\u{25b8} server killed\x1b[0m");
+            ui::success("server killed");
             Ok(())
         }
         Frame::Error { message, .. } => anyhow::bail!("{message}"),
@@ -1517,27 +1516,25 @@ pub(crate) async fn restart(
     // just because the daemon was already gone.
     match super::util::server_request_any_version(&ctl_path, Frame::KillServer).await {
         Ok(Frame::Ok) => {
-            eprintln!("\x1b[32m\u{25b8} server killed\x1b[0m");
+            ui::success("server killed");
         }
         Ok(Frame::Error { message, .. }) => {
-            eprintln!("\x1b[2;33m\u{25b8} kill-server: {message} (continuing)\x1b[0m");
+            ui::status(&format!("kill-server: {message} (continuing)"));
         }
         Ok(other) => {
-            eprintln!(
-                "\x1b[2;33m\u{25b8} kill-server: unexpected response {other:?} (continuing)\x1b[0m"
-            );
+            ui::status(&format!("kill-server: unexpected response {other:?} (continuing)"));
         }
         Err(_) => {
             // Connect failed -- no daemon to kill, that's fine.
-            eprintln!("\x1b[2;33m\u{25b8} no server running\x1b[0m");
+            ui::status("no server running");
         }
     }
 
     if host == "local" {
         // For local, kick off a fresh `gritty server`.
-        eprintln!("\x1b[2;33m\u{25b8} starting server...\x1b[0m");
+        ui::status("starting server...");
         super::util::auto_start(&super::util::server_auto_start_args(ctl_socket_arg.as_deref()))?;
-        eprintln!("\x1b[32m\u{25b8} server restarted\x1b[0m");
+        ui::success("server restarted");
     } else {
         // Remote: capture the original destination from the .dest sidecar
         // before disconnect wipes it. Using just `host` here would collapse
@@ -1552,10 +1549,10 @@ pub(crate) async fn restart(
         // because the ctl socket vanished when the daemon died, but
         // `disconnect` is idempotent for the "already stopped" case).
         gritty::connect::disconnect(&host).await?;
-        eprintln!("\x1b[2;33m\u{25b8} starting tunnel {host}...\x1b[0m");
+        ui::status(&format!("starting tunnel {host}..."));
         let recreate: Vec<&str> = recreate.iter().map(String::as_str).collect();
         super::util::auto_start(&recreate)?;
-        eprintln!("\x1b[32m\u{25b8} {host} restarted\x1b[0m");
+        ui::success(&format!("{host} restarted"));
     }
     Ok(())
 }
@@ -1646,29 +1643,32 @@ fn order_sessions<'a>(
 }
 
 /// Print the session table: ordered by [`order_sessions`], own-client rows in
-/// bold (only when stdout is a terminal -- scripts parsing `ls` output must
-/// not see ANSI codes), every line prefixed with `indent`.
+/// bold, every line prefixed with `indent`.
+///
+/// The bold is emitted unconditionally and stripped by the `anstream` sink when
+/// stdout is not a terminal (or `NO_COLOR` / `--color=never` says so), so
+/// scripts parsing `ls` never see it. Note it wraps the *whole* line: an escape
+/// inside a cell would be counted as width by `format_table`.
 fn print_session_table(
     sessions: &[gritty::protocol::SessionEntry],
     now: u64,
     client_name: &str,
     indent: &str,
 ) {
-    use std::io::IsTerminal;
+    use gritty::ui::sgr::{BOLD, RESET};
 
     let ordered = order_sessions(sessions, client_name);
     let rows: Vec<Vec<String>> =
         ordered.iter().map(|(s, _)| session_status_cols(s, now, client_name)).collect();
     let lines = gritty::table::format_table(&SESSION_TABLE_HEADERS, &rows);
-    let bold_ok = std::io::stdout().is_terminal();
 
     // lines[0] is the header; lines[i + 1] renders ordered[i].
-    println!("{indent}{}", lines[0]);
+    anstream::println!("{indent}{}", lines[0]);
     for (i, line) in lines[1..].iter().enumerate() {
-        if bold_ok && ordered[i].1 {
-            println!("{indent}\x1b[1m{line}\x1b[0m");
+        if ordered[i].1 {
+            anstream::println!("{indent}{BOLD}{line}{RESET}");
         } else {
-            println!("{indent}{line}");
+            anstream::println!("{indent}{line}");
         }
     }
 }
@@ -1918,6 +1918,8 @@ pub(crate) async fn list_all_sessions(
     config: &gritty::config::ConfigFile,
     json: bool,
 ) -> anyhow::Result<()> {
+    use gritty::ui::sgr::{DIM, DIM_YELLOW, RESET};
+
     let probes = discover_daemon_probes();
 
     if probes.is_empty() {
@@ -1973,11 +1975,13 @@ pub(crate) async fn list_all_sessions(
         }
         let (names, annotation) = group_header(group);
         match annotation {
-            Some(a) => println!("{names}  \x1b[2m({a})\x1b[0m"),
+            Some(a) => anstream::println!("{names}  {DIM}({a}){RESET}"),
             None => println!("{names}"),
         }
         match &group.result {
-            Ok(sessions) if sessions.is_empty() => println!("  \x1b[2m(no sessions)\x1b[0m"),
+            Ok(sessions) if sessions.is_empty() => {
+                anstream::println!("  {DIM}(no sessions){RESET}")
+            }
             Ok(sessions) => {
                 // The client_name elision applied to the NAME column uses the
                 // *resolved* client_name for this host -- a host with a
@@ -1987,7 +1991,9 @@ pub(crate) async fn list_all_sessions(
                 let client_name = config.resolve_session(Some(host)).client_name;
                 print_session_table(sessions, now, &client_name, "  ");
             }
-            Err(e) => println!("  \x1b[2;33m\u{26a0} {e}\x1b[0m"),
+            // Stays on stdout: in `--json` mode this same value is the group's
+            // `error` field, so it occupies the table's slot for that host.
+            Err(e) => anstream::println!("  {DIM_YELLOW}\u{26a0} {e}{RESET}"),
         }
     }
     Ok(())

@@ -71,6 +71,21 @@ A `[host.<name>] aliases` config entry makes alternate spellings resolve to the 
 
 - `-v` / `--verbose`: enable debug logging
 - `--ctl-socket <path>`: override the server socket path
+- `--color <auto|always|never>`: when to colorize output (default `auto`)
+
+### Color
+
+Under `auto`, gritty colorizes a stream only when that stream is a terminal --
+so `gritty ls > file` and `gritty ls | grep` get clean, escape-free text while
+your terminal still gets color. It also honors the usual conventions, in
+precedence order: `NO_COLOR` (any value) disables color, `CLICOLOR_FORCE=1`
+forces it on, `CLICOLOR=0` disables it, and `TERM=dumb` disables it.
+`--color` overrides all of them.
+
+`--color=always` keeps escapes through a pipe (`gritty ls --color=always | less -R`).
+Progress bars are a separate question: they are drawn only when stderr is a
+terminal, regardless of `--color`, since a bar repainting in place is line
+noise in a log file.
 
 ### Session options (`connect`)
 

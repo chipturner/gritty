@@ -1,6 +1,7 @@
 use crate::alt_screen::AltScreenTracker;
 use crate::net_watch::{NetWatcher, PathStatus};
 use crate::protocol::{ErrorCode, Frame, FrameCodec};
+use crate::ui;
 use bytes::Bytes;
 use futures_util::{SinkExt, StreamExt};
 use nix::sys::termios::{self, FlushArg, LocalFlags, SetArg, SpecialCharacterIndices, Termios};
@@ -483,8 +484,11 @@ fn reconnect_status_line(
 
 /// Terminal failure line: replaces the status line, then newline. Caller is
 /// responsible for leaving alt-screen first if needed.
+///
+/// `\r` and `\x1b[K` are cursor control, not styling: they erase whatever the
+/// spinner left on this row and survive `--color=never`.
 fn reconnect_err_line(text: &str) -> String {
-    format!("\r\x1b[31m\u{25b8} {text}\x1b[0m\x1b[K\r\n")
+    format!("\r{}\x1b[K\r\n", ui::terminal_body(ui::Level::Error, text))
 }
 
 /// Paint (or first-time open) the reconnect status line, but only once the
@@ -624,16 +628,20 @@ pub fn format_size(bytes: u64) -> String {
     humansize::format_size(bytes, humansize::BINARY)
 }
 
+// These interleave with whatever the session is printing, so each opens its own
+// row (`\r\n`) before painting. `ui` owns the styling and strips it when color
+// is off -- the client writes to the stdout fd directly, past any sink.
+
 fn status_msg(text: &str) -> String {
-    format!("\r\n\x1b[2;33m\u{25b8} {text}\x1b[0m\r\n")
+    format!("\r\n{}", ui::terminal_line(ui::Level::Status, text))
 }
 
 fn success_msg(text: &str) -> String {
-    format!("\r\n\x1b[32m\u{25b8} {text}\x1b[0m\r\n")
+    format!("\r\n{}", ui::terminal_line(ui::Level::Success, text))
 }
 
 fn error_msg(text: &str) -> String {
-    format!("\r\n\x1b[31m\u{25b8} {text}\x1b[0m\r\n")
+    format!("\r\n{}", ui::terminal_line(ui::Level::Error, text))
 }
 
 pub fn get_terminal_size() -> (u16, u16) {
@@ -3332,12 +3340,16 @@ mod tests {
         assert_ne!(a, c);
     }
 
+    /// `\r` and `\x1b[K` are cursor control, not styling. They must survive even
+    /// when color is stripped -- under `NO_COLOR`, `--color=never`, or a piped
+    /// stdout (as here, in the test binary) -- or the failure line stacks below
+    /// the spinner instead of replacing it.
     #[test]
     fn reconnect_err_line_repaints_in_place() {
         let err = reconnect_err_line("boom");
-        assert!(err.starts_with("\r\x1b[31m"), "{err:?}");
-        assert!(err.contains("boom"), "{err:?}");
+        assert!(err.starts_with('\r'), "{err:?}");
         assert!(err.ends_with("\x1b[K\r\n"), "{err:?}");
+        assert!(err.contains("error: boom"), "{err:?}");
     }
 
     #[test]

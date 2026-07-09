@@ -4,6 +4,7 @@ use std::path::PathBuf;
 use serde::Deserialize;
 
 use crate::protocol::{IDLE_EVICT_SAFETY_MARGIN, IDLE_EVICT_TIMEOUT};
+use crate::ui;
 
 /// Embedded default config template (from repo root config.toml).
 pub const DEFAULT_CONFIG: &str = include_str!("../config.toml");
@@ -245,14 +246,14 @@ impl ConfigFile {
             Ok(c) => c,
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Self::default(),
             Err(e) => {
-                eprintln!("warning: cannot read config {}: {e}", path.display());
+                ui::warn(&format!("cannot read config {}: {e}", path.display()));
                 return Self::default();
             }
         };
         match toml::from_str(&content) {
             Ok(c) => c,
             Err(e) => {
-                eprintln!("warning: malformed config at {}: {e}", path.display());
+                ui::warn(&format!("malformed config at {}: {e}", path.display()));
                 Self::default()
             }
         }
@@ -303,7 +304,7 @@ impl ConfigFile {
 
         if warn {
             for w in &warnings {
-                eprintln!("warning: {w}");
+                ui::warn(w);
             }
         }
 

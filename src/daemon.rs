@@ -2,6 +2,7 @@ use crate::protocol::{
     CAP_CLIPBOARD, ErrorCode, Frame, FrameCodec, PROTOCOL_VERSION, SessionEntry,
 };
 use crate::server::{self, ClientConn, SessionMetadata};
+use crate::ui;
 use futures_util::{SinkExt, StreamExt};
 use std::collections::HashMap;
 use std::os::fd::OwnedFd;
@@ -65,7 +66,7 @@ pub fn socket_dir() -> PathBuf {
         match validated_socket_dir_override(&dir) {
             Ok(path) => return path,
             Err(e) => {
-                eprintln!("error: {e}");
+                ui::error(&e);
                 std::process::exit(1);
             }
         }

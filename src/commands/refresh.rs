@@ -19,6 +19,7 @@ use std::path::{Path, PathBuf};
 use gritty::runinfo::{RunInfo, Staleness};
 
 use super::util;
+use gritty::ui;
 
 /// What `refresh` decided about a long-lived process after reading its
 /// `.info` sidecar (or noticing one is absent).
@@ -94,18 +95,16 @@ async fn refresh_local(ctl_socket: Option<PathBuf>) -> anyhow::Result<()> {
     let pid_path = ctl_path.with_file_name("daemon.pid");
 
     let verdict = assess(&info_path, || pid_file_alive(&pid_path));
-    eprintln!("\x1b[2m\u{25b8} local daemon: {verdict}\x1b[0m");
+    ui::detail(&format!("local daemon: {verdict}"));
     if verdict.needs_restart() {
         use gritty::protocol::Frame;
         match util::server_request_any_version(&ctl_path, Frame::KillServer).await {
             Ok(Frame::Ok) => {}
             Ok(Frame::Error { message, .. }) => {
-                eprintln!("\x1b[2;33m\u{25b8} kill-server: {message} (continuing)\x1b[0m");
+                ui::status(&format!("kill-server: {message} (continuing)"));
             }
             Ok(other) => {
-                eprintln!(
-                    "\x1b[2;33m\u{25b8} kill-server: unexpected response {other:?} (continuing)\x1b[0m"
-                );
+                ui::status(&format!("kill-server: unexpected response {other:?} (continuing)"));
             }
             Err(_) => {
                 // Can't reach the daemon (crashed? socket gone?). The PID check
@@ -120,7 +119,7 @@ async fn refresh_local(ctl_socket: Option<PathBuf>) -> anyhow::Result<()> {
             }
         }
         util::auto_start(&util::server_auto_start_args(ctl_socket_arg.as_deref()))?;
-        eprintln!("\x1b[32m\u{25b8} local daemon restarted\x1b[0m");
+        ui::success("local daemon restarted");
     }
 
     // Orphan reaping is independent of the registered daemon's verdict --
@@ -150,24 +149,24 @@ async fn reap_orphans() {
         return;
     }
     for s in &suspects {
-        eprintln!("\x1b[33m\u{25b8} possible orphaned daemon: {s}\x1b[0m");
+        ui::warn(&format!("possible orphaned daemon: {s}"));
     }
-    eprintln!(
-        "\x1b[2m\u{25b8} confirming ({}s grace for self-heal)...\x1b[0m",
+    ui::detail(&format!(
+        "confirming ({}s grace for self-heal)...",
         procscan::CONFIRM_DELAY.as_secs()
-    );
+    ));
     let reaped = procscan::confirm_and_reap(suspects, procscan::CONFIRM_DELAY).await;
     if reaped.is_empty() {
-        eprintln!("\x1b[32m\u{25b8} no orphans confirmed (recovered on their own)\x1b[0m");
+        ui::success("no orphans confirmed (recovered on their own)");
         return;
     }
     for (orphan, outcome) in reaped {
         match outcome {
             Ok(()) => {
-                eprintln!("\x1b[32m\u{25b8} reaped orphaned daemon pid {}\x1b[0m", orphan.pid);
+                ui::success(&format!("reaped orphaned daemon pid {}", orphan.pid));
             }
             Err(e) => {
-                eprintln!("\x1b[33m\u{25b8} could not kill orphan pid {}: {e}\x1b[0m", orphan.pid);
+                ui::warn(&format!("could not kill orphan pid {}: {e}", orphan.pid));
             }
         }
     }
@@ -181,7 +180,7 @@ async fn refresh_remote(host: &str, config: &gritty::config::ConfigFile) -> anyh
     let supervisor_verdict = assess(&info_path, || {
         gritty::connect::probe_tunnel_status(host) != gritty::connect::TunnelStatus::Stale
     });
-    eprintln!("\x1b[2m\u{25b8} {host} supervisor: {supervisor_verdict}\x1b[0m");
+    ui::detail(&format!("{host} supervisor: {supervisor_verdict}"));
 
     if supervisor_verdict == Verdict::NotRunning {
         return Ok(());
@@ -204,7 +203,7 @@ async fn refresh_remote(host: &str, config: &gritty::config::ConfigFile) -> anyh
     // remote the source of truth about its own staleness (its daemon may be
     // stale relative to its own on-disk binary regardless of ours) and works
     // for source-built remotes where `bootstrap` isn't in the picture.
-    eprintln!("\x1b[2m\u{25b8} {host}: checking remote daemon...\x1b[0m");
+    ui::detail(&format!("{host}: checking remote daemon..."));
     match gritty::connect::run_remote_gritty(
         &dest,
         &["refresh", "local"],
@@ -219,14 +218,13 @@ async fn refresh_remote(host: &str, config: &gritty::config::ConfigFile) -> anyh
             // remote binary predates `refresh` (or gritty isn't on PATH,
             // which the ssh error path already surfaces). Either way we
             // can't fix it from here.
-            eprintln!(
-                "\x1b[33m\u{25b8} {host}: remote `gritty refresh local` failed -- \
-                 remote binary may predate `refresh`; run `gritty restart {host}` \
-                 or update the remote binary\x1b[0m"
-            );
+            ui::warn(&format!(
+                "{host}: remote `gritty refresh local` failed -- remote binary may predate \
+                 `refresh`; run `gritty restart {host}` or update the remote binary"
+            ));
         }
         Err(e) => {
-            eprintln!("\x1b[33m\u{25b8} {host}: could not reach remote: {e}\x1b[0m");
+            ui::warn(&format!("{host}: could not reach remote: {e}"));
         }
     }
 
@@ -240,7 +238,7 @@ async fn refresh_remote(host: &str, config: &gritty::config::ConfigFile) -> anyh
         gritty::connect::disconnect(host).await?;
         let recreate: Vec<&str> = recreate.iter().map(String::as_str).collect();
         util::auto_start(&recreate)?;
-        eprintln!("\x1b[32m\u{25b8} {host} supervisor restarted\x1b[0m");
+        ui::success(&format!("{host} supervisor restarted"));
     }
 
     // Final end-to-end probe: Hello/HelloAck through the tunnel. The checks
@@ -253,17 +251,17 @@ async fn refresh_remote(host: &str, config: &gritty::config::ConfigFile) -> anyh
         .await
     {
         Ok(remote) if remote == local => {
-            eprintln!("\x1b[32m\u{25b8} {host}: end-to-end protocol verified (v{remote})\x1b[0m");
+            ui::success(&format!("{host}: end-to-end protocol verified (v{remote})"));
             Ok(())
         }
         Ok(remote) => anyhow::bail!("{}", remote_binary_outdated_msg(host, remote, local)),
         Err(e) => {
             // A flaky probe (slow SSH, tunnel mid-reconnect) shouldn't fail
             // refresh -- the .info-based work above already happened.
-            eprintln!(
-                "\x1b[33m\u{25b8} {host}: could not verify protocol end to end ({e}); \
-                 try `gritty connect {host}` to test the path\x1b[0m"
-            );
+            ui::warn(&format!(
+                "{host}: could not verify protocol end to end ({e}); \
+                 try `gritty connect {host}` to test the path"
+            ));
             Ok(())
         }
     }
@@ -297,12 +295,12 @@ pub(crate) async fn refresh(
             // report an aggregate at the end.
             let mut failed = 0usize;
             if let Err(e) = refresh_local(ctl_socket).await {
-                eprintln!("error: refresh local: {e}");
+                ui::error(&format!("refresh local: {e}"));
                 failed += 1;
             }
             for name in gritty::connect::enumerate_tunnels() {
                 if let Err(e) = refresh_remote(&name, config).await {
-                    eprintln!("error: refresh {name}: {e}");
+                    ui::error(&format!("refresh {name}: {e}"));
                     failed += 1;
                 }
             }

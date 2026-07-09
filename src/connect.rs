@@ -1,3 +1,4 @@
+use crate::ui;
 use anyhow::{Context, bail};
 use std::os::fd::OwnedFd;
 use std::os::unix::fs::OpenOptionsExt;
@@ -1272,7 +1273,7 @@ pub async fn bootstrap(
 ) -> anyhow::Result<()> {
     let dest = Destination::parse(dest_str)?;
 
-    eprintln!("\x1b[2m\u{25b8} installing gritty on {}...\x1b[0m", dest.ssh_dest());
+    ui::detail(&format!("installing gritty on {}...", dest.ssh_dest()));
 
     let install_cmd = format!(
         "GRITTY_INSTALL_DIR={} sh -c \"$(curl -sSfL {INSTALL_SCRIPT_URL})\"",
@@ -1800,12 +1801,10 @@ pub async fn run(opts: ConnectOpts, ready_fd: Option<OwnedFd>) -> anyhow::Result
             // the socket existed, causing connect_or_start to bail.
             if !sock_exists {
                 match pid_hint {
-                    Some(pid) => eprintln!(
-                        "\x1b[2;33m\u{25b8} tunnel {connection_name} starting (pid {pid})\x1b[0m"
-                    ),
-                    None => {
-                        eprintln!("\x1b[2;33m\u{25b8} tunnel {connection_name} starting\x1b[0m")
+                    Some(pid) => {
+                        ui::status(&format!("tunnel {connection_name} starting (pid {pid})"))
                     }
+                    None => ui::status(&format!("tunnel {connection_name} starting")),
                 }
                 // Race the socket-up wait against the peer supervisor
                 // dying during its own startup. Without this second arm,
@@ -1838,20 +1837,18 @@ pub async fn run(opts: ConnectOpts, ready_fd: Option<OwnedFd>) -> anyhow::Result
                 }
                 println!("{}", local_sock.display());
                 match pid_hint {
-                    Some(pid) => eprintln!(
-                        "\x1b[32m\u{25b8} tunnel {connection_name} ready (pid {pid})\x1b[0m"
-                    ),
-                    None => eprintln!("\x1b[32m\u{25b8} tunnel {connection_name} ready\x1b[0m"),
+                    Some(pid) => {
+                        ui::success(&format!("tunnel {connection_name} ready (pid {pid})"))
+                    }
+                    None => ui::success(&format!("tunnel {connection_name} ready")),
                 }
             } else {
                 println!("{}", local_sock.display());
                 match pid_hint {
-                    Some(pid) => eprintln!(
-                        "\x1b[32m\u{25b8} tunnel {connection_name} already running (pid {pid})\x1b[0m"
-                    ),
-                    None => eprintln!(
-                        "\x1b[32m\u{25b8} tunnel {connection_name} already running\x1b[0m"
-                    ),
+                    Some(pid) => ui::success(&format!(
+                        "tunnel {connection_name} already running (pid {pid})"
+                    )),
+                    None => ui::success(&format!("tunnel {connection_name} already running")),
                 }
             }
             signal_ready(&ready_fd);
@@ -2113,7 +2110,7 @@ pub async fn disconnect(name: &str) -> anyhow::Result<()> {
     // where a fresh `tunnel-create` could slip in between the probe and the
     // unlink and get its lock file yanked.
     if cleanup_if_unheld(name) {
-        eprintln!("\x1b[2;33m\u{25b8} tunnel {name} already stopped\x1b[0m");
+        ui::status(&format!("tunnel {name} already stopped"));
         return Ok(());
     }
 
@@ -2137,7 +2134,7 @@ pub async fn disconnect(name: &str) -> anyhow::Result<()> {
     loop {
         tokio::time::sleep(Duration::from_millis(100)).await;
         if cleanup_if_unheld(name) {
-            eprintln!("\x1b[32m\u{25b8} tunnel {name} stopped\x1b[0m");
+            ui::success(&format!("tunnel {name} stopped"));
             return Ok(());
         }
         if Instant::now() >= deadline {
@@ -2157,12 +2154,11 @@ pub async fn disconnect(name: &str) -> anyhow::Result<()> {
     // process is somehow still holding the flock (kill raced), skip rather
     // than risk yanking a lock out from under a live supervisor.
     if cleanup_if_unheld(name) {
-        eprintln!("\x1b[32m\u{25b8} tunnel {name} killed\x1b[0m");
+        ui::success(&format!("tunnel {name} killed"));
     } else {
-        eprintln!(
-            "\x1b[33m\u{25b8} tunnel {name} still holding its lock after SIGKILL; \
-             files left in place\x1b[0m"
-        );
+        ui::warn(&format!(
+            "tunnel {name} still holding its lock after SIGKILL; files left in place"
+        ));
     }
     Ok(())
 }

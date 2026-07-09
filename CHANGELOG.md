@@ -8,6 +8,20 @@ protocol interoperate with their neighbors.
 
 ## Unreleased
 
+- **`--color=auto|always|never`, and color is finally conditional.** gritty
+  colorized unconditionally: `gritty ls > file` wrote ANSI escapes into the
+  file, `NO_COLOR` and `TERM=dumb` were ignored, and the transfer progress bar
+  painted its erase-line into redirected stderr. Each stream is now colorized
+  only when it is a terminal, `NO_COLOR` / `CLICOLOR` / `CLICOLOR_FORCE` /
+  `TERM=dumb` are honored, and `--color` overrides all of it. The progress bar
+  is drawn only when stderr is a terminal (independent of `--color`).
+- **Messages have a vocabulary.** A new `ui` module names the five severities
+  gritty had been expressing as ad-hoc escape codes at ~90 call sites, and owns
+  the palette. Errors and warnings now render consistently as `error: <msg>` /
+  `warning: <msg>` wherever they come from -- previously the same severity
+  looked different depending on which code path printed it. The `▸` marker falls
+  back to `>` when the locale is not UTF-8 (an unset-locale container no longer
+  prints mojibake).
 - **Log failures are now structured.** `warn!`/`error!` sites carried the error by
   interpolating it into the message text, so the single highest-value field was
   unparseable and the message was not a stable event identity. They now emit

@@ -1,6 +1,7 @@
 use std::path::{Path, PathBuf};
 
 use super::AutoStart;
+use gritty::ui;
 
 /// Split a `host[:session]` target string on the first `:`, with no alias
 /// resolution. Only for strings whose host part is already canonical (e.g.
@@ -241,16 +242,16 @@ pub(crate) async fn connect_or_start(
         }
         Err(_) => match auto_start_mode {
             AutoStart::Server => {
-                eprintln!("\x1b[2;33m\u{25b8} starting server...\x1b[0m");
+                ui::status("starting server...");
                 // A concurrent `gritty connect` can race with us here: both
                 // spawn `gritty server`, and one child exits nonzero because
                 // the winner already bound ctl.sock. Don't bail on that
                 // failure -- drop into the retry loop so we attach to the
                 // racer's daemon if one came up.
                 if let Err(e) = auto_start(&["server"]) {
-                    eprintln!(
-                        "\x1b[2;33m\u{25b8} auto-start failed ({e}); retrying connect in case another process started one\x1b[0m"
-                    );
+                    ui::status(&format!(
+                        "auto-start failed ({e}); retrying connect in case another process started one"
+                    ));
                 }
                 true
             }
@@ -263,7 +264,7 @@ pub(crate) async fn connect_or_start(
                 // the name itself.
                 let destination =
                     gritty::connect::resolve_destination(host, config_dest.as_deref());
-                eprintln!("\x1b[2;33m\u{25b8} starting tunnel {host}...\x1b[0m");
+                ui::status(&format!("starting tunnel {host}..."));
                 // Replay any persisted CLI -o options so a reboot/respawn
                 // doesn't silently lose a ProxyJump/IdentityFile/Port.
                 let recreate = gritty::connect::tunnel_recreate_args(host, &destination);
@@ -273,9 +274,9 @@ pub(crate) async fn connect_or_start(
                 // is usually fine -- but if auto_start errors for any other
                 // reason, still try to connect before giving up.
                 if let Err(e) = auto_start(&recreate) {
-                    eprintln!(
-                        "\x1b[2;33m\u{25b8} auto-start failed ({e}); retrying connect in case another process started one\x1b[0m"
-                    );
+                    ui::status(&format!(
+                        "auto-start failed ({e}); retrying connect in case another process started one"
+                    ));
                 }
                 true
             }
@@ -295,7 +296,7 @@ pub(crate) async fn connect_or_start(
             }
             Err(_) => {
                 if wait {
-                    eprintln!("\x1b[2;33m\u{25b8} waiting for server...\x1b[0m");
+                    ui::status("waiting for server...");
                 }
                 tokio::time::sleep(std::time::Duration::from_millis(500)).await;
             }
@@ -705,7 +706,7 @@ async fn run_forward(
         match attempt {
             Ok(mut stream) => {
                 let verb = if first { "active" } else { "re-established" };
-                eprintln!("\x1b[32m\u{25b8} {dir_str}-forward {port_str} {verb} ({label})\x1b[0m");
+                ui::success(&format!("{dir_str}-forward {port_str} {verb} ({label})"));
                 first = false;
                 delay = FORWARD_RETRY_INITIAL;
                 last_status = None;
@@ -717,10 +718,10 @@ async fn run_forward(
                     _ = sigterm.recv() => return Ok(()),
                     _ = stream.read(&mut buf) => {}
                 }
-                eprintln!(
-                    "\x1b[2;33m\u{25b8} {dir_str}-forward {port_str} torn down (client \
-                     disconnected?) -- re-establishing, ^C to stop\x1b[0m"
-                );
+                ui::status(&format!(
+                    "{dir_str}-forward {port_str} torn down (client disconnected?) \
+                     -- re-establishing, ^C to stop"
+                ));
             }
             Err(EstablishError::Rejected(msg)) if first => {
                 let hint = busy_port_hint(&msg, listen_port, target_port).unwrap_or_default();
@@ -739,7 +740,7 @@ async fn run_forward(
                     _ => "waiting for an attached client".to_string(),
                 };
                 if last_status.as_deref() != Some(&status) {
-                    eprintln!("\x1b[2;33m\u{25b8} {status} -- retrying, ^C to stop\x1b[0m");
+                    ui::status(&format!("{status} -- retrying, ^C to stop"));
                     last_status = Some(status);
                 }
                 tokio::select! {
@@ -802,14 +803,14 @@ fn connect_svc_socket(context: &str) -> std::os::unix::net::UnixStream {
     let sock_path = match std::env::var("GRITTY_SOCK") {
         Ok(p) => p,
         Err(_) => {
-            eprintln!("error: GRITTY_SOCK not set (are you inside a gritty session{context}?)");
+            ui::error(&format!("GRITTY_SOCK not set (are you inside a gritty session{context}?)"));
             std::process::exit(1);
         }
     };
     match std::os::unix::net::UnixStream::connect(&sock_path) {
         Ok(s) => s,
         Err(e) => {
-            eprintln!("error: could not connect to service socket ({sock_path}): {e}");
+            ui::error(&format!("could not connect to service socket ({sock_path}): {e}"));
             std::process::exit(1);
         }
     }
@@ -821,7 +822,7 @@ pub(crate) fn clipboard_copy() {
 
     let mut data = Vec::new();
     if let Err(e) = std::io::stdin().read_to_end(&mut data) {
-        eprintln!("error: reading stdin: {e}");
+        ui::error(&format!("reading stdin: {e}"));
         std::process::exit(1);
     }
     let mut stream = connect_svc_socket("");
@@ -832,7 +833,7 @@ pub(crate) fn clipboard_copy() {
         // Half-close so the server's read_to_end sees EOF and can reply.
         .and_then(|_| stream.shutdown(std::net::Shutdown::Write))
     {
-        eprintln!("error: clipboard copy failed: {e}");
+        ui::error(&format!("clipboard copy failed: {e}"));
         std::process::exit(1);
     }
     // Read the 1-byte delivery confirmation: 0x01 = set, 0x00 = dropped (no
@@ -850,7 +851,7 @@ pub(crate) fn clipboard_copy() {
         }
         Ok(()) => {}
         Err(_) => {
-            eprintln!("warning: could not confirm clipboard was set (server may be older)");
+            ui::warn("could not confirm clipboard was set (server may be older)");
         }
     }
 }
@@ -883,14 +884,14 @@ pub(crate) fn open_url(url: &str, is_browser_shim: bool) {
                 eprintln!("  {url}");
                 // exit 0: do not break the tool that invoked $BROWSER.
             } else {
-                eprintln!("error: no client is connected with --forward-open");
+                ui::error("no client is connected with --forward-open");
                 std::process::exit(1);
             }
         }
         Ok(()) => {} // 0x01 or other = success
         Err(_) => {
             // Timeout or older server -- degrade gracefully
-            eprintln!("warning: could not confirm URL was forwarded (server may be older)");
+            ui::warn("could not confirm URL was forwarded (server may be older)");
         }
     }
 }

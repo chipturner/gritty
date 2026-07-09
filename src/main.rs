@@ -2,6 +2,7 @@ mod commands;
 
 use clap::{CommandFactory, Parser, Subcommand};
 use commands::*;
+use gritty::ui;
 use std::os::fd::{AsRawFd, OwnedFd};
 use std::path::{Path, PathBuf};
 
@@ -74,8 +75,41 @@ struct Cli {
     #[arg(short = 'v', long, global = true)]
     verbose: bool,
 
+    /// When to colorize output
+    #[arg(long, global = true, value_name = "WHEN", default_value_t = ColorWhen::Auto)]
+    color: ColorWhen,
+
     #[command(subcommand)]
     command: Command,
+}
+
+/// `--color`. `Auto` defers to the stream (is it a terminal?) and to the
+/// `NO_COLOR` / `CLICOLOR` / `CLICOLOR_FORCE` / `TERM=dumb` conventions.
+#[derive(Copy, Clone, PartialEq, Eq, clap::ValueEnum)]
+enum ColorWhen {
+    Auto,
+    Always,
+    Never,
+}
+
+impl std::fmt::Display for ColorWhen {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            ColorWhen::Auto => "auto",
+            ColorWhen::Always => "always",
+            ColorWhen::Never => "never",
+        })
+    }
+}
+
+impl From<ColorWhen> for gritty::ui::ColorChoice {
+    fn from(w: ColorWhen) -> Self {
+        match w {
+            ColorWhen::Auto => Self::Auto,
+            ColorWhen::Always => Self::Always,
+            ColorWhen::Never => Self::Never,
+        }
+    }
 }
 
 #[derive(Subcommand)]
@@ -546,18 +580,18 @@ fn daemonize(on_ready: impl FnOnce(u32), output_path: Option<&Path>) -> anyhow::
                         on_ready(u32::from_le_bytes(pid_buf));
                         std::process::exit(0);
                     }
-                    eprintln!("error: failed to start");
+                    ui::error("failed to start");
                     std::process::exit(1);
                 }
                 Ok(1) => {
                     // Error message from child -- read the rest
                     let mut msg = vec![first[0]];
                     let _ = read_file.read_to_end(&mut msg);
-                    eprintln!("{}", String::from_utf8_lossy(&msg).trim());
+                    ui::error(String::from_utf8_lossy(&msg).trim());
                     std::process::exit(1);
                 }
                 _ => {
-                    eprintln!("error: failed to start");
+                    ui::error("failed to start");
                     std::process::exit(1);
                 }
             }
@@ -630,12 +664,16 @@ fn dup_ready_fd(ready_fd: &Option<OwnedFd>) -> Option<OwnedFd> {
 }
 
 /// Write error to the readiness pipe (so the parent displays it), print to stderr, and exit.
+///
+/// The pipe carries the plain message and the parent renders it (see
+/// `daemonize`): styling belongs at the sink, and by this point the daemon's own
+/// stderr is redirected to a file or `/dev/null` anyway.
 fn report_error(error_pipe: &Option<OwnedFd>, e: &anyhow::Error) -> ! {
-    let msg = format!("error: {e:#}");
+    let msg = format!("{e:#}");
     if let Some(fd) = error_pipe {
         let _ = nix::unistd::write(fd, msg.as_bytes());
     }
-    eprintln!("{msg}");
+    ui::error(&msg);
     std::process::exit(1);
 }
 
@@ -656,6 +694,8 @@ fn main() {
     }
 
     let cli = Cli::parse();
+    // Before anything prints -- `ConfigFile::load()` already emits warnings.
+    gritty::ui::set_color_choice(cli.color.into());
     let verbose = cli.verbose;
     // Record verbosity so auto_start can forward --verbose to daemons it spawns.
     set_verbose(verbose);
@@ -666,7 +706,7 @@ fn main() {
             let ctl_path = cli.ctl_socket.unwrap_or_else(gritty::daemon::control_socket_path);
             let socket_dir = ctl_path.parent().unwrap_or(Path::new("."));
             if let Err(e) = gritty::security::secure_create_dir_all(socket_dir) {
-                eprintln!("error: {e}");
+                ui::error(&format!("{e}"));
                 std::process::exit(1);
             }
             let out_path = socket_dir.join("daemon.out");
@@ -676,12 +716,12 @@ fn main() {
                 None
             } else {
                 match daemonize(
-                    |pid| eprintln!("\x1b[32m\u{25b8} server started (pid {pid})\x1b[0m"),
+                    |pid| ui::success(&format!("server started (pid {pid})")),
                     Some(&out_path),
                 ) {
                     Ok(fd) => Some(fd),
                     Err(e) => {
-                        eprintln!("error: failed to daemonize: {e}");
+                        ui::error(&format!("failed to daemonize: {e}"));
                         std::process::exit(1);
                     }
                 }
@@ -698,7 +738,7 @@ fn main() {
             let rt = match tokio::runtime::Runtime::new() {
                 Ok(rt) => rt,
                 Err(e) => {
-                    eprintln!("error: {e}");
+                    ui::error(&format!("{e}"));
                     std::process::exit(1);
                 }
             };
@@ -722,7 +762,7 @@ fn main() {
                 None => match gritty::connect::parse_host(&destination) {
                     Ok(h) => h,
                     Err(e) => {
-                        eprintln!("error: {e:#}");
+                        ui::error(&format!("{e:#}"));
                         std::process::exit(1);
                     }
                 },
@@ -743,7 +783,7 @@ fn main() {
 
             let socket_dir = gritty::daemon::socket_dir();
             if let Err(e) = gritty::security::secure_create_dir_all(&socket_dir) {
-                eprintln!("error: {e}");
+                ui::error(&format!("{e}"));
                 std::process::exit(1);
             }
             let out_path = gritty::connect::connect_out_path(&connection_name);
@@ -765,7 +805,7 @@ fn main() {
                     resolved.connect_timeout,
                 )
             {
-                eprintln!("error: {e:#}");
+                ui::error(&format!("{e:#}"));
                 std::process::exit(1);
             }
 
@@ -777,13 +817,13 @@ fn main() {
                 match daemonize(
                     move |_pid| {
                         println!("{sock_display}");
-                        eprintln!("\x1b[32m\u{25b8} tunnel {conn_name} started\x1b[0m");
+                        ui::success(&format!("tunnel {conn_name} started"));
                     },
                     Some(&out_path),
                 ) {
                     Ok(fd) => Some(fd),
                     Err(e) => {
-                        eprintln!("error: failed to daemonize: {e}");
+                        ui::error(&format!("failed to daemonize: {e}"));
                         std::process::exit(1);
                     }
                 }
@@ -802,7 +842,7 @@ fn main() {
             let rt = match tokio::runtime::Runtime::new() {
                 Ok(rt) => rt,
                 Err(e) => {
-                    eprintln!("error: {e}");
+                    ui::error(&format!("{e}"));
                     std::process::exit(1);
                 }
             };
@@ -837,7 +877,7 @@ fn main() {
             let rt = match tokio::runtime::Runtime::new() {
                 Ok(rt) => rt,
                 Err(e) => {
-                    eprintln!("error: {e}");
+                    ui::error(&format!("{e}"));
                     std::process::exit(1);
                 }
             };
@@ -845,7 +885,7 @@ fn main() {
                 // `{e:#}` renders anyhow's full cause chain, matching
                 // `report_error`. Plain `{e}` drops every `.context()` the
                 // command layer attached.
-                eprintln!("error: {e:#}");
+                ui::error(&format!("{e:#}"));
                 std::process::exit(1);
             }
         }
@@ -993,7 +1033,7 @@ async fn run(cli: Cli, config: gritty::config::ConfigFile) -> anyhow::Result<()>
             let session = match session {
                 Some(s) => gritty::naming::resolve_session_name(&s, &client_name),
                 None => {
-                    eprintln!("error: specify session as host:session (e.g. local:mysession)");
+                    ui::error("specify session as host:session (e.g. local:mysession)");
                     std::process::exit(1);
                 }
             };
@@ -1013,7 +1053,7 @@ async fn run(cli: Cli, config: gritty::config::ConfigFile) -> anyhow::Result<()>
                 // remote daemon was already gone -- downgrade it to a
                 // warning and let the tunnel teardown decide the outcome.
                 if let Err(e) = &kill_result {
-                    eprintln!("\x1b[2;33m\u{25b8} {host}: {e}\x1b[0m");
+                    ui::status(&format!("{host}: {e}"));
                 }
                 gritty::connect::disconnect(&host).await
             }
@@ -1045,8 +1085,8 @@ async fn run(cli: Cli, config: gritty::config::ConfigFile) -> anyhow::Result<()>
             let (use_stdout, dir, auto) =
                 resolve_receive_output(stdout, dir, std::io::stdout().is_terminal());
             if auto {
-                eprintln!(
-                    "\x1b[2;33m\u{25b8} stdout is redirected; streaming data to it (pass a directory to receive files instead)\x1b[0m"
+                ui::status(
+                    "stdout is redirected; streaming data to it (pass a directory to receive files instead)",
                 );
             }
             let timeout = if no_timeout { None } else { Some(timeout) };

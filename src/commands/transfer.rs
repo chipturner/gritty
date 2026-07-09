@@ -2,6 +2,7 @@ use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 
 use super::util::{resolve_ctl_path, split_target};
+use gritty::ui;
 
 /// Sanitize a filename to its basename, rejecting ".." and empty names.
 fn sanitize_basename(name: &str) -> anyhow::Result<String> {
@@ -279,7 +280,19 @@ async fn write_send_manifest(
     Ok(())
 }
 
+/// Repaint the transfer progress bar in place.
+///
+/// Skipped entirely when stderr is not a terminal: the bar's `\x1b[2K` erase-line
+/// and carriage returns are line noise in a log file, and an `anstream` sink
+/// cannot rescue it -- the sink would strip the erase-line along with the color
+/// and leave the bar stacking one line per repaint. Color is a separate
+/// question, so `--color=never` on a terminal still gets a bar.
 fn print_progress(name: &str, transferred: u64, total: u64, last_render: &mut std::time::Instant) {
+    use gritty::ui::sgr::{DIM, GREEN, RESET};
+
+    if !ui::stderr_is_interactive() {
+        return;
+    }
     let now = std::time::Instant::now();
     if transferred < total && now.duration_since(*last_render).as_millis() < 50 {
         return;
@@ -291,8 +304,10 @@ fn print_progress(name: &str, transferred: u64, total: u64, last_render: &mut st
     let empty = bar_width - filled;
     let transferred_str = gritty::client::format_size(transferred);
     let total_str = gritty::client::format_size(total);
+    let (green, dim, reset) =
+        if ui::stderr_is_colored() { (GREEN, DIM, RESET) } else { ("", "", "") };
     eprint!(
-        "\x1b[2K\r  {name}  \x1b[32m{}\x1b[2m{}\x1b[0m  {pct}%  {transferred_str}/{total_str}",
+        "\x1b[2K\r  {name}  {green}{}{dim}{}{reset}  {pct}%  {transferred_str}/{total_str}",
         "=".repeat(filled),
         "-".repeat(empty),
     );
@@ -394,10 +409,9 @@ pub(crate) async fn send_command(
     for mut ts in tagged {
         match write_send_manifest(&mut ts.stream, &manifest).await {
             Ok(()) => live.push(ts),
-            Err(e) => eprintln!(
-                "\x1b[2;33m\u{25b8} skipping session {}: {e}\x1b[0m",
-                ts.label.as_deref().unwrap_or("?")
-            ),
+            Err(e) => {
+                ui::status(&format!("skipping session {}: {e}", ts.label.as_deref().unwrap_or("?")))
+            }
         }
     }
     if live.is_empty() {
@@ -408,7 +422,7 @@ pub(crate) async fn send_command(
     // Wait for go signal -- first stream to get paired wins. A sibling session
     // that closes before pairing is skipped (its socket reads EOF), not
     // treated as a failure of the whole transfer.
-    eprintln!("\x1b[2;33m\u{25b8} waiting for receiver...\x1b[0m");
+    ui::status("waiting for receiver...");
     let select = race_first_ready(tagged, |mut ts| {
         Box::pin(async move {
             let mut go = [0u8; 1];
@@ -430,20 +444,20 @@ pub(crate) async fn send_command(
     }
     .ok_or_else(|| anyhow::anyhow!("no receiver connected"))?;
     if let Some(ref label) = ts.label {
-        eprintln!("\x1b[32m\u{25b8} paired with session {label}\x1b[0m");
+        ui::success(&format!("paired with session {label}"));
     }
     let mut stream = ts.stream;
 
     // Stream data
     if let Some((mut temp, size)) = stdin_temp {
         let total_str = gritty::client::format_size(size);
-        eprintln!("\x1b[2;33m\u{25b8} sending stdin ({total_str})\x1b[0m");
+        ui::status(&format!("sending stdin ({total_str})"));
         tokio::io::copy(&mut temp, &mut stream).await?;
     } else {
         let total_bytes: u64 = entries.iter().map(|(_, s, _, _)| s).sum();
         let total_str = gritty::client::format_size(total_bytes);
         let s = if entries.len() == 1 { "" } else { "s" };
-        eprintln!("\x1b[2;33m\u{25b8} sending {} file{s} ({total_str})\x1b[0m", entries.len());
+        ui::status(&format!("sending {} file{s} ({total_str})", entries.len()));
 
         let mut buf = vec![0u8; 64 * 1024];
         for (name, size, _mode, path) in &entries {
@@ -466,7 +480,7 @@ pub(crate) async fn send_command(
         }
     }
 
-    eprintln!("\x1b[32m\u{25b8} done\x1b[0m");
+    ui::success("done");
     Ok(())
 }
 
@@ -567,10 +581,9 @@ pub(crate) async fn receive_command(
         .await;
         match wrote {
             Ok(()) => live.push(ts),
-            Err(e) => eprintln!(
-                "\x1b[2;33m\u{25b8} skipping session {}: {e}\x1b[0m",
-                ts.label.as_deref().unwrap_or("?")
-            ),
+            Err(e) => {
+                ui::status(&format!("skipping session {}: {e}", ts.label.as_deref().unwrap_or("?")))
+            }
         }
     }
     if live.is_empty() {
@@ -581,7 +594,7 @@ pub(crate) async fn receive_command(
     // Wait for file data -- first stream to get paired wins. A sibling session
     // that closes before pairing is skipped (its socket reads EOF), not
     // treated as a failure of the whole transfer.
-    eprintln!("\x1b[2;33m\u{25b8} waiting for sender...\x1b[0m");
+    ui::status("waiting for sender...");
     let select = race_first_ready(tagged, |mut ts| {
         Box::pin(async move {
             // Read: file_count (u32 BE). EOF here means this session never
@@ -602,7 +615,7 @@ pub(crate) async fn receive_command(
     }
     .ok_or_else(|| anyhow::anyhow!("no sender connected"))?;
     if let Some(ref label) = ts.label {
-        eprintln!("\x1b[32m\u{25b8} paired with session {label}\x1b[0m");
+        ui::success(&format!("paired with session {label}"));
     }
     let mut stream = ts.stream;
 
@@ -642,7 +655,7 @@ pub(crate) async fn receive_command(
 
         let s = if file_count == 1 { "" } else { "s" };
         if received == 0 {
-            eprintln!("\x1b[2;33m\u{25b8} receiving {file_count} file{s}\x1b[0m");
+            ui::status(&format!("receiving {file_count} file{s}"));
         }
 
         // Write file data (create parent dirs for nested paths)
@@ -674,10 +687,10 @@ pub(crate) async fn receive_command(
     }
 
     if received == 0 {
-        eprintln!("\x1b[2;33m\u{25b8} no files received\x1b[0m");
+        ui::status("no files received");
     } else {
         let s = if received == 1 { "" } else { "s" };
-        eprintln!("\x1b[32m\u{25b8} received {received} file{s}\x1b[0m");
+        ui::success(&format!("received {received} file{s}"));
     }
     Ok(())
 }

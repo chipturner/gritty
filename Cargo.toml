@@ -21,6 +21,10 @@ name = "gritty"
 path = "src/main.rs"
 
 [dependencies]
+# Already linked in via clap, so depending on it directly costs no compile time
+# and no binary size. Gives per-stream tty detection plus NO_COLOR / CLICOLOR /
+# CLICOLOR_FORCE / TERM=dumb handling, and strips ANSI on non-terminal sinks.
+anstream = "1"
 anyhow = "1"
 bytes = "1"
 clap = { version = "4", features = ["derive"] }
