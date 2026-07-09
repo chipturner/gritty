@@ -8,6 +8,10 @@ protocol interoperate with their neighbors.
 
 ## Unreleased
 
+- **Fixed: `ls` columns misaligned on CJK and emoji.** Column widths were measured
+  in bytes while the padding counted characters -- neither is a terminal column.
+  A session whose `Cmd` or `CWD` held wide characters pushed every column to its
+  right out of line. Widths are now measured and padded in display columns.
 - **`--color=auto|always|never`, and color is finally conditional.** gritty
   colorized unconditionally: `gritty ls > file` wrote ANSI escapes into the
   file, `NO_COLOR` and `TERM=dumb` were ignored, and the transfer progress bar
