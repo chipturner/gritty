@@ -77,6 +77,16 @@ SSH tunnel supervisor state machine: **[docs/tunnel-state-machine.md](docs/tunne
 
 ## Development Notes
 
+### Live daemon safety
+The daemon on this machine serves **real, attached sessions** -- and it runs from this working tree, so after any rebuild `refresh` considers it stale. Never point a mutating command (`refresh`, `restart`, `kill-server`, `prune -y`, `server`) at the real socket dir: a "harmless" `gritty refresh local` run as a smoke test has killed 7 live sessions. For manual verification, sandbox first:
+
+```bash
+export GRITTY_SOCKET_DIR=$(mktemp -d)   # every gritty invocation in this shell is now isolated
+target/debug/gritty server
+```
+
+Read-only commands (`ls`, `info`, `tunnels`, `doctor` without `--clean`, `socket-path`, `protocol-version`) are safe against the real daemon. Prefer tests over manual runs regardless.
+
 ### Critical invariants
 - **`security` module is load-bearing** -- never use `UnixListener::bind` directly, and never create socket directories outside `security::secure_create_dir_all` (plain `create_dir_all` is fine for non-socket user paths like mangen output and transfer destinations). Client-side connects to ctl/daemon sockets MUST go through `security::connect_verified()` (connect + `SO_PEERCRED` check).
 - **Reap before lookup** -- `reap_sessions()` MUST precede Attach/KillSession/ListSessions. Stale sessions cause silent failures.

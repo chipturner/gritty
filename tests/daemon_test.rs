@@ -2256,3 +2256,47 @@ async fn set_linger_unknown_session_errors() {
         "expected NoSuchSession, got {resp:?}"
     );
 }
+
+#[tokio::test]
+async fn refresh_refuses_to_kill_attached_sessions() {
+    let (tmp, ctl_path) = test_ctl();
+    let ctl = ctl_path.clone();
+    let _daemon = tokio::spawn(async move { gritty::daemon::run(&ctl, None).await });
+    wait_for_daemon(&ctl_path).await;
+
+    create_session(&ctl_path, "keepalive").await;
+    let _attached = attach_session(&ctl_path, "keepalive").await;
+
+    // Make the daemon read as stale: refresh trusts the `.info` sidecar plus
+    // a `daemon.pid` liveness probe, so plant an old build hash and this test
+    // process's own (live) pid next to the ctl socket.
+    let mut info = gritty::runinfo::RunInfo::current();
+    info.git_hash = "0000000-old".to_string();
+    info.write(&gritty::runinfo::daemon_info_path(&ctl_path)).unwrap();
+    std::fs::write(ctl_path.with_file_name("daemon.pid"), std::process::id().to_string()).unwrap();
+
+    // Without -y, refresh must refuse to restart over the attached client and
+    // must name the reason. (XDG_CONFIG_HOME points at the empty tempdir so
+    // the user's real config can't leak in.)
+    let out = tokio::process::Command::new(env!("CARGO_BIN_EXE_gritty"))
+        .args(["--ctl-socket", ctl_path.to_str().unwrap(), "refresh", "local"])
+        .env("XDG_CONFIG_HOME", tmp.path())
+        .output()
+        .await
+        .expect("failed to run gritty refresh");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(!out.status.success(), "refresh must refuse while a client is attached: {stderr}");
+    assert!(stderr.contains("attached session"), "refusal must name the reason: {stderr}");
+
+    // The daemon and its session survived.
+    let resp = control_request(&ctl_path, Frame::ListSessions).await;
+    let Frame::SessionInfo { sessions } = resp else {
+        panic!("daemon should still be serving, got {resp:?}");
+    };
+    assert!(
+        sessions.iter().any(|s| s.name == "keepalive" && s.attached),
+        "attached session must survive a refused refresh: {sessions:?}"
+    );
+
+    kill_cleanup(&ctl_path, "keepalive").await;
+}

@@ -277,6 +277,10 @@ enum Command {
     Refresh {
         /// Target host (defaults to `local` plus all active tunnels)
         target: Option<String>,
+        /// Restart a stale daemon even when clients are attached (their
+        /// sessions are killed). Without this, refresh refuses.
+        #[arg(short = 'y', long = "yes")]
+        yes: bool,
     },
     /// Rename a session
     #[command(display_order = 5)]
@@ -1062,9 +1066,9 @@ async fn run(cli: Cli, config: gritty::config::ConfigFile) -> anyhow::Result<()>
             let host = target.as_deref().map(|t| parse_target(&config, t).0);
             restart(host, cli.ctl_socket, &config).await
         }
-        Command::Refresh { target } => {
+        Command::Refresh { target, yes } => {
             let host = target.as_deref().map(|t| parse_target(&config, t).0);
-            refresh(host, cli.ctl_socket, &config).await
+            refresh(host, cli.ctl_socket, &config, yes).await
         }
         Command::SocketPath => {
             let ctl_path = cli.ctl_socket.unwrap_or_else(gritty::daemon::control_socket_path);

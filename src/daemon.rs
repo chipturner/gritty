@@ -1270,7 +1270,16 @@ async fn dispatch_control(
             false
         }
         Frame::KillServer => {
-            info!("kill-server received, shutting down");
+            // Attribute the kill: this frame destroys every session, and
+            // "who killed the daemon" has needed forensics before. Through an
+            // SSH tunnel the peer is sshd, which still tells you which door
+            // the kill came through.
+            match peer_identity(framed.get_ref()) {
+                Some((pid, cmd)) => {
+                    info!(peer_pid = pid, peer_cmd = %cmd, "kill-server received, shutting down");
+                }
+                None => info!("kill-server received, shutting down"),
+            }
             shutdown(sessions, ctl_path).await;
             let _ = timed_send(&mut framed, Frame::Ok).await;
             true
@@ -1287,6 +1296,32 @@ async fn dispatch_control(
             .await;
             false
         }
+    }
+}
+
+/// Best-effort identity (pid + cmdline) of a control-connection peer, used to
+/// attribute destructive frames in the log. Linux-only, like `procscan`
+/// (`SO_PEERCRED` pid plus `/proc/<pid>/cmdline`); returns `None` elsewhere
+/// or when the peer exited before we looked.
+fn peer_identity(stream: &tokio::net::UnixStream) -> Option<(i32, String)> {
+    #[cfg(target_os = "linux")]
+    {
+        let pid = stream.peer_cred().ok()?.pid()?;
+        let cmd = std::fs::read(format!("/proc/{pid}/cmdline"))
+            .map(|raw| {
+                raw.split(|b| *b == 0)
+                    .filter(|s| !s.is_empty())
+                    .map(|s| String::from_utf8_lossy(s).into_owned())
+                    .collect::<Vec<_>>()
+                    .join(" ")
+            })
+            .unwrap_or_default();
+        Some((pid, cmd))
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = stream;
+        None
     }
 }
 
@@ -1310,5 +1345,16 @@ mod tests {
     #[test]
     fn socket_dir_override_rejects_empty() {
         assert!(validated_socket_dir_override("").is_err());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn peer_identity_names_the_sender() {
+        // On a socketpair the peer is this very process, so the identity must
+        // be our own pid and a cmdline naming the test binary.
+        let (a, _b) = tokio::net::UnixStream::pair().unwrap();
+        let (pid, cmd) = super::peer_identity(&a).expect("peer_identity on linux");
+        assert_eq!(pid, std::process::id() as i32);
+        assert!(!cmd.is_empty(), "cmdline should be readable for a live process");
     }
 }

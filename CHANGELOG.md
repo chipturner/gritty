@@ -8,6 +8,17 @@ protocol interoperate with their neighbors.
 
 ## Unreleased
 
+- **`refresh` refuses to kill attached sessions without `-y`**: restarting a
+  stale daemon kills every session it hosts; refresh now counts attached
+  clients first and asks for `-y` instead of proceeding silently (a routine
+  `refresh local` against a rebuilt dev binary once took down 7 live
+  clients). A protocol-stale daemon can't report its sessions, so the
+  post-upgrade recovery path is unaffected. `refresh <host>` forwards `-y`
+  to the remote `gritty refresh local`; a remote binary that predates the
+  flag rejects it -- update the remote first, or use `gritty restart <host>`.
+- **The daemon logs who killed it**: `kill-server received` now records the
+  sender's pid and cmdline (Linux, via `SO_PEERCRED`), so "what nuked my
+  sessions" is answerable from `daemon.log` instead of a forensic dig.
 - **Fixed: `ls` columns misaligned on CJK and emoji.** Column widths were measured
   in bytes while the padding counted characters -- neither is a terminal column.
   A session whose `Cmd` or `CWD` held wide characters pushed every column to its

@@ -53,7 +53,10 @@ may bump it).
   `gritty refresh` (restarts only stale processes, idempotent).
 - **Stale binary (same protocol)**: a daemon/tunnel still running code from
   before a rebuild. Doctor warns "running build X but binary on disk is Y".
-  Fix: `gritty refresh`.
+  Fix: `gritty refresh`. Caution: restarting a stale daemon kills its
+  sessions; refresh refuses when clients are attached unless run with `-y`.
+  Do not recommend `-y` (or `restart`) casually -- attached sessions mean a
+  human is using them right now.
 - **Tunnel down / not recovering**: `reconnecting...` forever in the
   client. Check `gritty tunnels` and the tunnel's `connect-<name>.log`
   (ssh's own stderr lands in it). Common causes: ssh host unreachable, host

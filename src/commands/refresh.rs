@@ -13,6 +13,13 @@
 //! daemon is measured against its own on-disk binary, not ours. This makes
 //! the common post-upgrade dance a single idempotent verb that works for
 //! source-built remotes where `bootstrap` doesn't apply.
+//!
+//! Restarting a stale daemon kills its sessions, so when clients are
+//! *attached* refresh refuses unless `-y` is given (see
+//! [`restart_blocked_by`]). The count comes from `ListSessions`; when the
+//! daemon is protocol-stale that request is refused and the gate is skipped
+//! -- those sessions are unreachable anyway and refresh is the documented
+//! recovery.
 
 use std::path::{Path, PathBuf};
 
@@ -82,11 +89,33 @@ fn pid_file_alive(pid_path: &Path) -> bool {
         .is_some_and(|pid| unsafe { libc::kill(pid, 0) == 0 })
 }
 
+/// How many attached sessions the daemon reports, or `None` when it can't
+/// say -- a protocol-stale daemon only honors `KillServer`, so `ListSessions`
+/// is refused across a version boundary.
+async fn attached_session_count(ctl_path: &Path) -> Option<usize> {
+    use gritty::protocol::Frame;
+    match util::server_request_any_version(ctl_path, Frame::ListSessions).await {
+        Ok(Frame::SessionInfo { sessions }) => Some(sessions.iter().filter(|s| s.attached).count()),
+        _ => None,
+    }
+}
+
+/// The attached-session count that blocks an unconfirmed restart, if any.
+///
+/// `None` for the count means it couldn't be measured (protocol-stale
+/// daemon): proceed, because those sessions are unreachable by clients
+/// anyway and `refresh` is the documented recovery for that state. This
+/// gate exists because a routine `refresh local` against a rebuilt dev
+/// binary once killed 7 attached clients without ceremony.
+fn restart_blocked_by(attached: Option<usize>, yes: bool) -> Option<usize> {
+    attached.filter(|n| *n > 0 && !yes)
+}
+
 /// Refresh the local daemon if it's running stale code, then reap any
 /// orphaned daemons. Never auto-starts a daemon that wasn't already running
 /// -- refresh is about picking up a new binary, not about bringing services
 /// up.
-async fn refresh_local(ctl_socket: Option<PathBuf>) -> anyhow::Result<()> {
+async fn refresh_local(ctl_socket: Option<PathBuf>, yes: bool) -> anyhow::Result<()> {
     // Snapshot the override before resolve_ctl_path consumes it, so the
     // respawn below lands on the same socket.
     let ctl_socket_arg = ctl_socket.as_ref().map(|p| p.to_string_lossy().into_owned());
@@ -98,6 +127,12 @@ async fn refresh_local(ctl_socket: Option<PathBuf>) -> anyhow::Result<()> {
     ui::detail(&format!("local daemon: {verdict}"));
     if verdict.needs_restart() {
         use gritty::protocol::Frame;
+        if let Some(n) = restart_blocked_by(attached_session_count(&ctl_path).await, yes) {
+            anyhow::bail!(
+                "local daemon is stale, but restarting it would kill {n} attached session(s)\n  \
+                 rerun with -y to restart anyway, or wait for the clients to detach"
+            );
+        }
         match util::server_request_any_version(&ctl_path, Frame::KillServer).await {
             Ok(Frame::Ok) => {}
             Ok(Frame::Error { message, .. }) => {
@@ -174,7 +209,11 @@ async fn reap_orphans() {
 
 /// Refresh a remote host: its tunnel supervisor and, via `gritty refresh
 /// local` over SSH, its remote daemon.
-async fn refresh_remote(host: &str, config: &gritty::config::ConfigFile) -> anyhow::Result<()> {
+async fn refresh_remote(
+    host: &str,
+    config: &gritty::config::ConfigFile,
+    yes: bool,
+) -> anyhow::Result<()> {
     // Assess the local tunnel supervisor first (cheap, no network).
     let info_path = gritty::runinfo::connect_info_path(host);
     let supervisor_verdict = assess(&info_path, || {
@@ -203,10 +242,14 @@ async fn refresh_remote(host: &str, config: &gritty::config::ConfigFile) -> anyh
     // remote the source of truth about its own staleness (its daemon may be
     // stale relative to its own on-disk binary regardless of ours) and works
     // for source-built remotes where `bootstrap` isn't in the picture.
+    // `-y` is forwarded only when given, so a remote binary that predates the
+    // flag keeps working for the default invocation.
     ui::detail(&format!("{host}: checking remote daemon..."));
+    let remote_args: &[&str] =
+        if yes { &["refresh", "local", "-y"] } else { &["refresh", "local"] };
     match gritty::connect::run_remote_gritty(
         &dest,
-        &["refresh", "local"],
+        remote_args,
         &ssh_options,
         tun_cfg.connect_timeout,
     )
@@ -285,21 +328,22 @@ pub(crate) async fn refresh(
     host: Option<String>,
     ctl_socket: Option<PathBuf>,
     config: &gritty::config::ConfigFile,
+    yes: bool,
 ) -> anyhow::Result<()> {
     match host.as_deref() {
-        Some("local") => refresh_local(ctl_socket).await,
-        Some(name) => refresh_remote(name, config).await,
+        Some("local") => refresh_local(ctl_socket, yes).await,
+        Some(name) => refresh_remote(name, config, yes).await,
         None => {
             // Best-effort: `refresh` is documented as idempotent, so one
             // unreachable host must not abort the rest. Collect failures and
             // report an aggregate at the end.
             let mut failed = 0usize;
-            if let Err(e) = refresh_local(ctl_socket).await {
+            if let Err(e) = refresh_local(ctl_socket, yes).await {
                 ui::error(&format!("refresh local: {e}"));
                 failed += 1;
             }
             for name in gritty::connect::enumerate_tunnels() {
-                if let Err(e) = refresh_remote(&name, config).await {
+                if let Err(e) = refresh_remote(&name, config, yes).await {
                     ui::error(&format!("refresh {name}: {e}"));
                     failed += 1;
                 }
@@ -384,6 +428,30 @@ mod tests {
         assert_eq!(Verdict::NotRunning.to_string(), "not running");
         assert_eq!(Verdict::Current.to_string(), "up to date");
         assert!(Verdict::Unknown.to_string().contains("predates"));
+    }
+
+    #[test]
+    fn restart_gate_blocks_attached_sessions_without_yes() {
+        // The incident this guards: a routine `refresh local` against a
+        // rebuilt dev binary killed 7 attached clients without ceremony.
+        assert_eq!(restart_blocked_by(Some(7), false), Some(7));
+    }
+
+    #[test]
+    fn restart_gate_allows_with_yes_or_no_sessions() {
+        assert_eq!(restart_blocked_by(Some(7), true), None);
+        assert_eq!(restart_blocked_by(Some(0), false), None);
+        assert_eq!(restart_blocked_by(Some(0), true), None);
+    }
+
+    #[test]
+    fn restart_gate_allows_when_count_unavailable() {
+        // A protocol-stale daemon only honors KillServer, so ListSessions
+        // fails -- but its sessions are unreachable by clients anyway, and
+        // refresh is the documented recovery. Blocking here would wedge the
+        // upgrade path.
+        assert_eq!(restart_blocked_by(None, false), None);
+        assert_eq!(restart_blocked_by(None, true), None);
     }
 
     #[test]
