@@ -13,6 +13,7 @@ jobs:
   check:
     name: Check (${{ matrix.os }})
     runs-on: ${{ matrix.os }}
+    timeout-minutes: 20
     strategy:
       matrix:
         os: [ubuntu-latest, macos-latest]
@@ -32,7 +33,7 @@ jobs:
         run: cargo fmt --check
 
       - name: Clippy
-        run: cargo clippy -- -D warnings
+        run: cargo clippy --all-targets -- -D warnings
 
       - name: Test
         run: cargo nextest run --locked
@@ -40,6 +41,7 @@ jobs:
   socat-tunnel:
     name: Socat Tunnel Tests
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     steps:
       - uses: actions/checkout@v6
 
@@ -61,6 +63,7 @@ jobs:
   container-tests:
     name: Container Tests
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     steps:
       - uses: actions/checkout@v6
 
@@ -80,6 +83,7 @@ jobs:
   msrv:
     name: MSRV (1.88)
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     steps:
       - uses: actions/checkout@v6
       - uses: dtolnay/rust-toolchain@1.88.0
@@ -89,6 +93,7 @@ jobs:
   musl-build:
     name: Musl Release Build (${{ matrix.target }})
     runs-on: ubuntu-latest
+    timeout-minutes: 30
     strategy:
       matrix:
         target: [x86_64-unknown-linux-musl, aarch64-unknown-linux-musl]
@@ -105,8 +110,18 @@ jobs:
         with:
           target: ${{ matrix.target }}
 
+      - uses: taiki-e/install-action@nextest
+        if: matrix.target == 'x86_64-unknown-linux-musl'
+
       - name: Build
         run: cargo build --release --locked --target ${{ matrix.target }}
+
+      # Released Linux binaries are musl; run the suite against that libc.
+      # x86_64 only -- it executes natively on the runner (aarch64 would
+      # need QEMU, whose PTY timing is too flaky for this suite).
+      - name: Test (musl)
+        if: matrix.target == 'x86_64-unknown-linux-musl'
+        run: cargo nextest run --locked --target ${{ matrix.target }}
 
       - name: Verify static linkage
         run: |
@@ -123,6 +138,7 @@ jobs:
   socat-bridge:
     name: Socat Bridge Tests
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     steps:
       - uses: actions/checkout@v6
 

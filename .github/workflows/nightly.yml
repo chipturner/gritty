@@ -12,6 +12,7 @@ jobs:
   stress:
     name: Stress Test (5 runs)
     runs-on: ubuntu-latest
+    timeout-minutes: 45
     steps:
       - uses: actions/checkout@v6
 

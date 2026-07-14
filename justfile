@@ -12,7 +12,7 @@ build:
 
 # Clippy (strict) then full test suite — the pre-push gate
 check:
-    cargo clippy -- -D warnings
+    cargo clippy --all-targets -- -D warnings
     cargo nextest run
 
 # Format all source files
@@ -100,7 +100,7 @@ coverage-clean:
 cargo-upgrade *args:
     cargo-upgrade upgrade {{ args }}
     cargo update
-    cargo clippy -- -D warnings
+    cargo clippy --all-targets -- -D warnings
     cargo nextest run
 
 # Container tests: lifecycle + SSH tunnel (requires Docker; Linux only)
