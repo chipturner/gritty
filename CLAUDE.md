@@ -47,7 +47,7 @@ just quicktest                        # manual 3-pane tmux test
 
 Single-socket: all communication (control + session relay) through one Unix domain socket per server. Hello/HelloAck version handshake, then control frame declares intent, server routes accordingly.
 
-Seventeen modules -- sixteen behind a lib crate (`src/lib.rs` hosts shared helpers + `spawn_traced()` + `FORWARDED_ENV_KEYS`) plus the binary-private `commands` -- with thin binary entry (`src/main.rs`):
+Eighteen modules -- seventeen behind a lib crate (`src/lib.rs` hosts shared helpers + `spawn_traced()` + `FORWARDED_ENV_KEYS`) plus the binary-private `commands` -- with thin binary entry (`src/main.rs`):
 
 | Module | Responsibility |
 |--------|----------------|
@@ -59,6 +59,7 @@ Seventeen modules -- sixteen behind a lib crate (`src/lib.rs` hosts shared helpe
 | `connect` | Self-backgrounding SSH tunnel supervisor (implements `tunnel-create`) |
 | `net_watch` | macOS network path-change notifications (advisory; inert stub elsewhere) |
 | `alt_screen` | `AltScreenTracker`: detects alternate screen mode for smart reconnect |
+| `line_shadow` | `LineShadow`: cursor-state emulator (column + SGR, no cell contents) for the non-destructive cursor restore on `line_dirty` reconnects |
 | `runinfo` | `.info` sidecars (protocol version + git hash) so `doctor`/`refresh` detect stale processes |
 | `procscan` | Process-table scan for orphaned daemons (running but unregistered); Linux only, inert stub elsewhere |
 | `scrollback` | Last-50-lines buffer replayed for fresh viewers |

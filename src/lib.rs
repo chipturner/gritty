@@ -3,6 +3,7 @@ pub mod client;
 pub mod config;
 pub mod connect;
 pub mod daemon;
+pub mod line_shadow;
 pub mod logging;
 pub mod naming;
 pub mod net_watch;

@@ -1,4 +1,5 @@
 use crate::alt_screen::AltScreenTracker;
+use crate::line_shadow::LineShadow;
 use crate::protocol::{Frame, FrameCodec, IDLE_EVICT_TIMEOUT};
 use crate::scrollback::ScrollbackBuffer;
 use bytes::Bytes;
@@ -76,8 +77,10 @@ pub enum ClientConn {
         /// offset-based reconnect replay (see `plan_replay`).
         rendered_offset: u64,
         /// The client painted a reconnect status line, so its cursor is no
-        /// longer where `rendered_offset` left it and the current line needs a
-        /// repaint before the stream resumes.
+        /// longer where `rendered_offset` left it: it parks at column 0 of
+        /// the current line, whose content is still intact. The server
+        /// restores the cursor column and SGR state before the stream
+        /// resumes (see `History::cursor_restore`).
         line_dirty: bool,
         /// `true` for a fresh explicit `connect` (no prior stream position);
         /// `false` for an auto-reconnect. A fresh client gets scrollback
@@ -101,11 +104,6 @@ enum TailEvent {
     Exit { code: i32 },
     Shutdown,
 }
-
-/// Upper bound on the bytes `History::line_prefix` will return. Keeps the
-/// reconnect line-repaint `Notice` well under `MAX_FRAME_SIZE` even when the
-/// ring is configured larger than 1 MiB and holds a newline-free tail.
-const LINE_PREFIX_CAP: usize = 4096;
 
 /// Always-on trailing byte ring of PTY output plus a monotonic `total_out`
 /// counter. Together they let a reconnecting client resume the stream by
@@ -167,30 +165,26 @@ impl History {
         out
     }
 
-    /// Bytes of the current (in-progress) line up to `upto`: everything after
-    /// the last `\n` at or before `upto`, clamped to what's retained. Used to
-    /// repaint the cursor's line when a client's reconnect widget disturbed it.
-    ///
-    /// The result is capped at `LINE_PREFIX_CAP` bytes. A newline-free tail
-    /// (base64, `jq -c`, a `\r`-based progress bar) in a ring configured
-    /// larger than 1 MiB would otherwise produce a `Notice` frame above
-    /// `MAX_FRAME_SIZE`, which the client's decoder rejects -- and since the
-    /// rejection leaves `rendered_offset` unchanged, every reconnect would
-    /// recompute the same oversized prefix: a permanent reconnect loop. Only
-    /// the bytes nearest the cursor matter for a repaint anyway.
-    fn line_prefix(&self, upto: u64) -> Bytes {
-        let upto_idx = upto.saturating_sub(self.base()).min(self.size as u64) as usize;
-        let mut flat: Vec<u8> = Vec::with_capacity(upto_idx);
+    /// Terminal bytes that move a reconnecting client's cursor back to the
+    /// column and SGR state the stream held at absolute offset `upto`,
+    /// computed by interpreting the retained history through a `LineShadow`.
+    /// `cols` is the width the bytes were rendered at (0 = unknown). The scan
+    /// may start mid-escape when the ring has evicted earlier bytes; the
+    /// shadow tolerates that and re-anchors at the next `\r` or `\n`. Output
+    /// is bounded (one cursor move + capped SGR segments), so it can never
+    /// approach `MAX_FRAME_SIZE`.
+    fn cursor_restore(&self, upto: u64, cols: u16) -> Bytes {
+        let mut remaining = upto.saturating_sub(self.base()).min(self.size as u64) as usize;
+        let mut shadow = LineShadow::new(cols);
         for chunk in &self.chunks {
-            if flat.len() >= upto_idx {
+            if remaining == 0 {
                 break;
             }
-            let take = (upto_idx - flat.len()).min(chunk.len());
-            flat.extend_from_slice(&chunk[..take]);
+            let take = remaining.min(chunk.len());
+            shadow.scan(&chunk[..take]);
+            remaining -= take;
         }
-        let nl_start = flat.iter().rposition(|&b| b == b'\n').map_or(0, |nl| nl + 1);
-        let start = nl_start.max(flat.len().saturating_sub(LINE_PREFIX_CAP));
-        Bytes::copy_from_slice(&flat[start..])
+        Bytes::from(shadow.restore_sequence())
     }
 
     fn chunks(&self) -> &VecDeque<Bytes> {
@@ -1680,6 +1674,17 @@ fn apply_winsize(master: &tokio::io::unix::AsyncFd<std::os::fd::OwnedFd>, cols: 
     }
 }
 
+/// Current PTY width via `TIOCGWINSZ` (0 if the query fails or the size was
+/// never set). This is the width the retained history bytes were rendered
+/// at, which is what wrap emulation needs -- the reconnecting client's new
+/// width may differ.
+fn query_cols(master: &tokio::io::unix::AsyncFd<std::os::fd::OwnedFd>) -> u16 {
+    let mut ws = libc::winsize { ws_row: 0, ws_col: 0, ws_xpixel: 0, ws_ypixel: 0 };
+    // SAFETY: master is a valid PTY master fd; TIOCGWINSZ fills a winsize.
+    let rc = unsafe { libc::ioctl(master.as_raw_fd(), libc::TIOCGWINSZ, &mut ws) };
+    if rc == 0 { ws.ws_col } else { 0 }
+}
+
 /// Force a TUI to fully repaint by toggling the reported window size and
 /// signaling SIGWINCH twice. Many ncurses-based apps (htop, btop, nvim in
 /// some modes) no-op a SIGWINCH when the reported size matches their cached
@@ -1778,9 +1783,9 @@ async fn force_tui_redraw(
 /// Bring a reconnecting / attaching client back in sync with the PTY stream.
 /// Sends a `Resume` frame (the client's new authoritative offset) followed by
 /// whatever replay the `plan_replay` decision calls for. `line_dirty` means the
-/// client painted a reconnect status line, so the chrome here also repairs the
-/// cursor's line before resuming. Returns `Err` if the client socket rejects a
-/// send so the caller can re-enter the detached-drain path.
+/// client painted a reconnect status line, so the chrome here also restores the
+/// cursor's column and SGR state before resuming. Returns `Err` if the client
+/// socket rejects a send so the caller can re-enter the detached-drain path.
 #[allow(clippy::too_many_arguments)]
 async fn send_reconnect_replay(
     framed: &mut Framed<UnixStream, FrameCodec>,
@@ -1852,21 +1857,26 @@ async fn send_reconnect_replay(
             scrollback.clear();
         }
         ReplayPlan::Clean { offset } => {
+            // Compute the cursor restore before the winsize apply below: the
+            // shadow must emulate line wrapping at the width the retained
+            // bytes were rendered at, not the (possibly resized) new width.
+            let restore =
+                line_dirty.then(|| history.cursor_restore(offset, query_cols(async_master)));
             if cols > 0 && rows > 0 {
                 apply_winsize(async_master, cols, rows);
             }
             send_framed_timed(framed, Frame::Resume { offset }).await?;
-            if line_dirty {
+            if let Some(restore) = restore {
                 // The client erased its status line and moved the cursor back
-                // up onto the line where `offset` left it (see the reconnect
-                // success path in client.rs). Clear that line and repaint its
-                // prefix so the incremental `Data` below continues from the
-                // right column.
-                send_framed_timed(framed, Frame::Notice(Bytes::from_static(b"\r\x1b[K"))).await?;
-                let prefix = history.line_prefix(offset);
-                if !prefix.is_empty() {
-                    send_framed_timed(framed, Frame::Notice(prefix)).await?;
-                }
+                // up onto the line where `offset` left it -- at column 0 (see
+                // the reconnect success path in client.rs). That line's
+                // content is still intact on screen; only the cursor column
+                // and SGR state were disturbed. Restore them without touching
+                // the content: clearing and repainting from raw transcript
+                // bytes corrupts shell prompt lines, whose editing sequences
+                // (cursor-forward, delete-char, autosuggestion paints) only
+                // make sense against the cells present when first played.
+                send_framed_timed(framed, Frame::Notice(restore)).await?;
             }
             // The heart of the seamless resume: exactly the bytes produced
             // while the client was gone, nothing it has already rendered.
@@ -3084,39 +3094,47 @@ mod tests {
     }
 
     #[test]
-    fn history_line_prefix_returns_current_line() {
+    fn history_cursor_restore_tracks_current_column() {
         let mut h = History::new(1024);
-        h.push(&Bytes::from_static(b"first line\nsecond li"));
-        // Prefix up to the current total: everything after the last newline.
-        assert_eq!(&h.line_prefix(h.total())[..], b"second li");
-        // Prefix mid-first-line: no newline before it yet.
-        assert_eq!(&h.line_prefix(5)[..], b"first");
-        // Prefix exactly at a newline boundary: the line up to and including
-        // the newline, so the "current line" is empty.
-        assert_eq!(&h.line_prefix(11)[..], b"");
+        h.push(&Bytes::from_static(b"first line\r\nsecond li"));
+        // At the current total: "second li" = 9 columns (CHA is 1-based).
+        assert_eq!(&h.cursor_restore(h.total(), 80)[..], b"\x1b[10G\x1b[0m");
+        // Mid-first-line: 5 columns in.
+        assert_eq!(&h.cursor_restore(5, 80)[..], b"\x1b[6G\x1b[0m");
+        // Exactly after the newline: column 0.
+        assert_eq!(&h.cursor_restore(12, 80)[..], b"\r\x1b[0m");
     }
 
     #[test]
-    fn history_line_prefix_spans_chunk_boundaries() {
+    fn history_cursor_restore_spans_chunk_boundaries() {
+        // An SGR sequence and the line both split across pushes.
         let mut h = History::new(1024);
-        h.push(&Bytes::from_static(b"ab\ncd"));
-        h.push(&Bytes::from_static(b"ef"));
-        assert_eq!(&h.line_prefix(h.total())[..], b"cdef");
+        h.push(&Bytes::from_static(b"ab\r\ncd\x1b[3"));
+        h.push(&Bytes::from_static(b"1mef"));
+        assert_eq!(&h.cursor_restore(h.total(), 80)[..], b"\x1b[5G\x1b[0m\x1b[31m");
     }
 
     #[test]
-    fn history_line_prefix_capped_for_newline_free_tail() {
-        // A ring larger than 1 MiB with a newline-free tail must not produce
-        // a prefix that would overflow MAX_FRAME_SIZE as a single Notice.
+    fn history_cursor_restore_wraps_newline_free_tail() {
+        // A newline-free tail (base64, progress bar) wraps at the terminal
+        // width; the restore targets the on-screen column, and its size stays
+        // bounded no matter how large the ring is.
         let mut h = History::new(4 << 20);
-        h.push(&Bytes::from(vec![b'x'; 3 << 20]));
-        let prefix = h.line_prefix(h.total());
-        assert_eq!(prefix.len(), LINE_PREFIX_CAP);
-        const { assert!(LINE_PREFIX_CAP < (1 << 20), "must stay under MAX_FRAME_SIZE") };
-        // A short line is still returned whole.
-        let mut h2 = History::new(4 << 20);
-        h2.push(&Bytes::from_static(b"\nshort tail"));
-        assert_eq!(&h2.line_prefix(h2.total())[..], b"short tail");
+        h.push(&Bytes::from(vec![b'x'; (3 << 20) + 5]));
+        let restore = h.cursor_restore(h.total(), 80);
+        // (3 MiB + 5) % 80 = 53 -> CHA 54.
+        assert_eq!(&restore[..], format!("\x1b[{}G\x1b[0m", ((3 << 20) + 5) % 80 + 1).as_bytes());
+    }
+
+    #[test]
+    fn history_cursor_restore_after_eviction_reanchors() {
+        // The ring evicted the head mid-line; the scan starts at base and the
+        // shadow re-anchors at the next newline.
+        let mut h = History::new(8);
+        h.push(&Bytes::from_static(b"aaaa"));
+        h.push(&Bytes::from_static(b"b\r\ncc"));
+        assert_eq!(h.base(), 4);
+        assert_eq!(&h.cursor_restore(h.total(), 80)[..], b"\x1b[3G\x1b[0m");
     }
 
     #[test]

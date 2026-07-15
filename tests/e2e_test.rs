@@ -2813,6 +2813,82 @@ async fn reconnect_resumes_incrementally_from_offset() {
     let _ = timeout(Duration::from_secs(3), server).await;
 }
 
+/// A `line_dirty` auto-reconnect (the client painted a reconnect status line,
+/// so its cursor parked at column 0 of the current line) must restore the
+/// cursor's column and SGR state WITHOUT clearing or repainting the line --
+/// the line is still intact on the client's screen, and a raw-transcript
+/// repaint corrupts shell prompt lines (their editing sequences only make
+/// sense against the cells present when first played).
+#[tokio::test]
+async fn reconnect_line_dirty_restores_cursor_without_repaint() {
+    let (client_tx, mut framed, server, _meta) = setup_session().await;
+    wait_for_shell(&mut framed).await;
+    read_available_data(&mut framed, Duration::from_secs(1)).await;
+
+    // Leave a partial line (a prompt-like tail without newline) on screen.
+    framed.send(Frame::Data(Bytes::from("printf 'PROMPT> '\n"))).await.unwrap();
+    let seen = read_available_data(&mut framed, Duration::from_secs(1)).await;
+    assert!(
+        String::from_utf8_lossy(&seen).contains("PROMPT> "),
+        "should have rendered the partial line"
+    );
+
+    // Drain stragglers, then resume from the server's exact offset.
+    read_available_data(&mut framed, Duration::from_millis(300)).await;
+    let rendered = server_stream_offset(&mut framed).await;
+
+    drop(framed);
+    tokio::time::sleep(Duration::from_millis(300)).await;
+
+    let (server_stream, client_stream) = UnixStream::pair().unwrap();
+    client_tx
+        .send(ClientConn::Active {
+            framed: Framed::new(server_stream, FrameCodec),
+            client_name: String::new(),
+            capabilities: 0,
+            cols: 80,
+            rows: 24,
+            rendered_offset: rendered,
+            line_dirty: true,
+            is_fresh: false,
+        })
+        .unwrap();
+    let mut framed = Framed::new(client_stream, FrameCodec);
+
+    match timeout(Duration::from_secs(2), framed.next()).await {
+        Ok(Some(Ok(Frame::Resume { offset }))) => {
+            assert_eq!(offset, rendered, "clean resume should echo our offset");
+        }
+        other => panic!("expected Resume frame first, got {other:?}"),
+    }
+
+    // The frame right after Resume is the cursor-restore Notice.
+    let restore = match timeout(Duration::from_secs(2), framed.next()).await {
+        Ok(Some(Ok(Frame::Notice(bytes)))) => bytes,
+        other => panic!("expected cursor-restore Notice after Resume, got {other:?}"),
+    };
+    let restore_str = String::from_utf8_lossy(&restore).into_owned();
+    assert!(
+        !restore_str.contains("\x1b[K"),
+        "restore must not clear the line, got {restore_str:?}"
+    );
+    assert!(
+        !restore_str.contains("PROMPT>"),
+        "restore must not repaint line content, got {restore_str:?}"
+    );
+    assert!(
+        restore_str.starts_with('\r') || restore_str.starts_with("\x1b["),
+        "restore should be a cursor move, got {restore_str:?}"
+    );
+    assert!(
+        restore_str.contains("\x1b[0m"),
+        "restore should re-establish SGR state from a clean reset, got {restore_str:?}"
+    );
+
+    let _ = framed.send(Frame::Data(Bytes::from("exit\n"))).await;
+    let _ = timeout(Duration::from_secs(3), server).await;
+}
+
 #[tokio::test]
 async fn reconnect_sends_ctrl_l_on_alternate_screen() {
     let (client_tx, mut framed, server, _meta) = setup_session().await;

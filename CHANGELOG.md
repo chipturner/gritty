@@ -8,6 +8,19 @@ protocol interoperate with their neighbors.
 
 ## Unreleased
 
+- **Fixed: visual artifacts on shell prompt lines after a slow auto-reconnect.**
+  When a reconnect dragged past 1s (status line shown), the server "repaired"
+  the prompt line by clearing it and replaying the raw byte transcript since
+  the last newline -- but a shell's current line is an edited region, not
+  text: replayed cursor-forward/delete-char/autosuggestion sequences only make
+  sense against the cells that existed when first played, so the repaint left
+  gaps, ghost fragments, truncated-escape garbage, and duplicated wrapped
+  lines. The line on screen was never damaged in the first place (the status
+  line lives on the row below and is erased on success), so the server now
+  restores only what was actually disturbed: the cursor column and SGR state,
+  computed by a new `line_shadow` emulator (autowrap- and wide-char-aware)
+  over the retained output history. Nothing is cleared or repainted. No
+  protocol change.
 - **`refresh` refuses to kill attached sessions without `-y`**: restarting a
   stale daemon kills every session it hosts; refresh now counts attached
   clients first and asks for `-y` instead of proceeding silently (a routine
