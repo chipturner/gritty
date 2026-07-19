@@ -58,11 +58,27 @@ fn reject_duplicate_names<'a>(names: impl IntoIterator<Item = &'a str>) -> anyho
 /// from a plain unreachable daemon so discovery can give an actionable hint.
 enum ProbeOutcome {
     /// The daemon answered (the list may still be empty).
-    Sessions(Vec<DiscoveredSession>),
+    Sessions { server_id: u64, sessions: Vec<DiscoveredSession> },
     /// The daemon is up but speaks a different protocol version.
     VersionMismatch,
     /// The daemon could not be reached or did not answer.
     Unavailable,
+}
+
+/// Collapse probe results that reached the same daemon, keeping the first.
+///
+/// A daemon reachable through two connect sockets (two tunnel names for one
+/// host) is probed twice and reports the same ephemeral `server_id`. Keeping
+/// both copies would open two transfer streams per session -- and the
+/// duplicate sender arriving while a relay is active is what corrupted
+/// receive-first transfers in the field.
+fn dedupe_by_server_id(results: Vec<(u64, Vec<DiscoveredSession>)>) -> Vec<DiscoveredSession> {
+    let mut seen = std::collections::HashSet::new();
+    results
+        .into_iter()
+        .filter(|(id, _)| seen.insert(*id))
+        .flat_map(|(_, sessions)| sessions)
+        .collect()
 }
 
 /// Probe a single daemon for its sessions.
@@ -87,15 +103,16 @@ async fn probe_daemon_sessions(ctl_path: &Path) -> ProbeOutcome {
         return ProbeOutcome::Unavailable;
     }
     match Frame::expect_from(framed.next().await) {
-        Ok(Frame::SessionInfo { sessions }) => ProbeOutcome::Sessions(
-            sessions
+        Ok(Frame::SessionInfo { sessions }) => ProbeOutcome::Sessions {
+            server_id: info.server_id,
+            sessions: sessions
                 .into_iter()
                 .map(|s| DiscoveredSession {
                     session_id: if s.name.is_empty() { s.id.to_string() } else { s.name },
                     ctl_path: ctl_path.to_path_buf(),
                 })
                 .collect(),
-        ),
+        },
         _ => ProbeOutcome::Unavailable,
     }
 }
@@ -124,15 +141,16 @@ async fn discover_all_sessions(
         })
         .collect();
 
-    let mut results: Vec<DiscoveredSession> = Vec::new();
+    let mut probed: Vec<(u64, Vec<DiscoveredSession>)> = Vec::new();
     let mut saw_version_mismatch = false;
     for outcome in futures_util::future::join_all(futures).await {
         match outcome {
-            ProbeOutcome::Sessions(s) => results.extend(s),
+            ProbeOutcome::Sessions { server_id, sessions } => probed.push((server_id, sessions)),
             ProbeOutcome::VersionMismatch => saw_version_mismatch = true,
             ProbeOutcome::Unavailable => {}
         }
     }
+    let results = dedupe_by_server_id(probed);
 
     if results.is_empty() {
         if saw_version_mismatch {
@@ -796,6 +814,41 @@ mod tests {
         walk_dir(&root, tmp.path(), &mut entries).unwrap();
         let names: Vec<_> = entries.iter().map(|(n, _, _, _)| n.clone()).collect();
         assert_eq!(names, vec!["d/real.txt"]);
+    }
+
+    fn ds(session_id: &str, ctl_path: &str) -> DiscoveredSession {
+        DiscoveredSession { session_id: session_id.into(), ctl_path: PathBuf::from(ctl_path) }
+    }
+
+    // Regression: a daemon reachable through two tunnel sockets was probed
+    // twice, so every session got two sender connections -- the duplicate
+    // arriving mid-relay aborted receive-first transfers.
+    #[test]
+    fn dedupe_by_server_id_drops_second_route_to_same_daemon() {
+        let deduped = dedupe_by_server_id(vec![
+            (7, vec![ds("a/0", "/t/connect-fate.sock"), ds("a/1", "/t/connect-fate.sock")]),
+            (7, vec![ds("a/0", "/t/connect-fate2.sock"), ds("a/1", "/t/connect-fate2.sock")]),
+            (9, vec![ds("b/0", "/t/ctl.sock")]),
+        ]);
+        let got: Vec<_> =
+            deduped.iter().map(|d| (d.session_id.as_str(), d.ctl_path.to_str().unwrap())).collect();
+        assert_eq!(
+            got,
+            vec![
+                ("a/0", "/t/connect-fate.sock"),
+                ("a/1", "/t/connect-fate.sock"),
+                ("b/0", "/t/ctl.sock"),
+            ]
+        );
+    }
+
+    #[test]
+    fn dedupe_by_server_id_keeps_distinct_daemons() {
+        let deduped = dedupe_by_server_id(vec![
+            (1, vec![ds("a/0", "/t/ctl.sock")]),
+            (2, vec![ds("a/0", "/t/connect-other.sock")]),
+        ]);
+        assert_eq!(deduped.len(), 2);
     }
 
     #[test]

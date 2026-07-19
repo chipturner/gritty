@@ -1976,6 +1976,87 @@ async fn send_receive_receiver_first() {
     let _ = timeout(Duration::from_secs(3), server).await;
 }
 
+/// Helper: write a one-file sender manifest on a raw svc-socket stream.
+async fn write_sender_manifest(stream: &mut UnixStream, name: &str, size: u64) {
+    stream.write_all(&[gritty::protocol::SvcRequest::Send.to_byte()]).await.unwrap();
+    stream.write_all(&1u32.to_be_bytes()).await.unwrap();
+    stream.write_all(&(name.len() as u16).to_be_bytes()).await.unwrap();
+    stream.write_all(name.as_bytes()).await.unwrap();
+    stream.write_all(&size.to_be_bytes()).await.unwrap();
+    stream.write_all(&0o644u32.to_be_bytes()).await.unwrap();
+}
+
+// Regression: `gritty send` fans out one sender connection per discovered
+// session, and a daemon reachable through two tunnel sockets is discovered
+// twice -- so a session can see a second sender arrive while a relay is
+// already streaming. That duplicate must be dropped (the sending client's
+// pairing race skips a closed stream as a dead sibling), not allowed to
+// abort the in-flight transfer with "superseded by new sender".
+#[tokio::test]
+async fn duplicate_sender_does_not_abort_active_transfer() {
+    let (_client_tx, mut framed, server, _meta, svc_path) = setup_session_with_svc_path().await;
+    wait_for_shell(&mut framed).await;
+
+    for _ in 0..50 {
+        if svc_path.exists() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    assert!(svc_path.exists(), "send socket not bound");
+
+    // Receiver first -- the order that failed in the field.
+    let sp = svc_path.clone();
+    let receiver = tokio::spawn(async move { receive_files(&sp).await });
+    tokio::time::sleep(Duration::from_millis(100)).await;
+
+    // Sender #1 pairs and streams the first half, then stalls.
+    let file_data: Vec<u8> = (0..64 * 1024).map(|i| (i % 251) as u8).collect();
+    let mut s1 = UnixStream::connect(&svc_path).await.unwrap();
+    write_sender_manifest(&mut s1, "big.bin", file_data.len() as u64).await;
+    let mut go = [0u8; 1];
+    s1.read_exact(&mut go).await.unwrap();
+    assert_eq!(go[0], 0x01);
+    let half = file_data.len() / 2;
+    s1.write_all(&file_data[..half]).await.unwrap();
+
+    // The duplicate sender arrives mid-relay.
+    let mut s2 = UnixStream::connect(&svc_path).await.unwrap();
+    write_sender_manifest(&mut s2, "dup.bin", 3).await;
+    tokio::time::sleep(Duration::from_millis(200)).await;
+
+    // The paired transfer must still complete.
+    s1.write_all(&file_data[half..]).await.unwrap();
+    let files = receiver.await.unwrap();
+    assert_eq!(files.len(), 1);
+    assert_eq!(files[0].0, "big.bin");
+    assert_eq!(files[0].1, file_data);
+
+    // The duplicate's stream was dropped by the server: it reads EOF instead
+    // of a go byte.
+    let mut go2 = [0u8; 1];
+    let n = timeout(Duration::from_secs(3), s2.read(&mut go2))
+        .await
+        .expect("timed out waiting for duplicate sender EOF")
+        .expect("read error on duplicate sender stream");
+    assert_eq!(n, 0, "duplicate sender should see EOF, got byte 0x{:02x}", go2[0]);
+
+    // The active client sees a clean SendOffer + SendDone, never a cancel.
+    loop {
+        match timeout(Duration::from_secs(3), framed.next()).await {
+            Ok(Some(Ok(Frame::SendCancel { reason }))) => {
+                panic!("transfer was cancelled: {reason}");
+            }
+            Ok(Some(Ok(Frame::SendDone))) => break,
+            Ok(Some(Ok(Frame::SendOffer { .. }))) | Ok(Some(Ok(Frame::Data(_)))) => continue,
+            other => panic!("expected SendDone, got: {other:?}"),
+        }
+    }
+
+    let _ = framed.send(Frame::Data(Bytes::from("exit\n"))).await;
+    let _ = timeout(Duration::from_secs(3), server).await;
+}
+
 #[tokio::test]
 async fn send_cancel_on_sender_disconnect() {
     let (_client_tx, mut framed, server, _meta, svc_path) = setup_session_with_svc_path().await;

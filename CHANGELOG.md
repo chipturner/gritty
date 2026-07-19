@@ -8,6 +8,16 @@ protocol interoperate with their neighbors.
 
 ## Unreleased
 
+- **Fixed: receive-first transfers died with "superseded by new sender" + "early
+  eof".** `gritty send` fans out one connection per discovered session, and a
+  daemon reachable through two tunnel sockets (two connection names for one
+  host) was discovered twice -- so the receiving session saw the same sender
+  arrive twice, and the second copy aborted the relay the first had just
+  started. Send-first worked by luck: the duplicate landed before pairing,
+  where replacing a parked sender is harmless. Two fixes: an active relay now
+  always wins (a duplicate sender/receiver is dropped, and the client's
+  pairing race skips it as a dead sibling), and transfer discovery dedupes
+  daemons by the `server_id` they report in `HelloAck`. No protocol change.
 - **Fixed: visual artifacts on shell prompt lines after a slow auto-reconnect.**
   When a reconnect dragged past 1s (status line shown), the server "repaired"
   the prompt line by clearing it and replaying the raw byte transcript since

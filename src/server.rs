@@ -2912,6 +2912,26 @@ fn handle_send_event(
     state: &mut TransferState,
     notify_tx: &mpsc::UnboundedSender<Frame>,
 ) {
+    // A relay that is still running wins over any newcomer: `gritty send`
+    // fans out one connection per discovered session, so a daemon reachable
+    // through two tunnel sockets delivers the same sender twice, and the
+    // second copy used to abort the in-flight transfer ("superseded").
+    // Dropping the newcomer closes its stream, which the far client's
+    // pairing race skips as a dead sibling. A finished relay whose
+    // SendDone/SendCancel has not been observed yet is replaceable.
+    if let TransferState::Active { relay_handle } = &*state
+        && !relay_handle.is_finished()
+    {
+        match event {
+            SendEvent::SenderArrived { .. } => {
+                info!("transfer: relay active, dropping extra sender")
+            }
+            SendEvent::ReceiverArrived { .. } => {
+                info!("transfer: relay active, dropping extra receiver")
+            }
+        }
+        return;
+    }
     match event {
         SendEvent::SenderArrived { stream, manifest } => {
             let old = std::mem::replace(state, TransferState::Idle);
@@ -2929,12 +2949,6 @@ fn handle_send_event(
                     *state = TransferState::Active { relay_handle: handle };
                 }
                 _ => {
-                    if let TransferState::Active { relay_handle } = old {
-                        let _ = notify_tx.send(Frame::SendCancel {
-                            reason: "superseded by new sender".to_string(),
-                        });
-                        relay_handle.abort();
-                    }
                     info!(files = manifest.files.len(), "transfer: sender waiting for receiver");
                     *state = TransferState::WaitingForReceiver { sender_stream: stream, manifest };
                 }
@@ -2956,12 +2970,6 @@ fn handle_send_event(
                     *state = TransferState::Active { relay_handle: handle };
                 }
                 _ => {
-                    if let TransferState::Active { relay_handle } = old {
-                        let _ = notify_tx.send(Frame::SendCancel {
-                            reason: "superseded by new receiver".to_string(),
-                        });
-                        relay_handle.abort();
-                    }
                     info!("transfer: receiver waiting for sender");
                     *state = TransferState::WaitingForSender { receiver_stream: stream };
                 }
