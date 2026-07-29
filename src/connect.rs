@@ -492,6 +492,15 @@ fn respawn_sleep(prev: Duration, prior_uptime: Duration) -> Duration {
     if prior_uptime >= HEALTHY_CHILD_THRESHOLD { MIN_RESPAWN_BACKOFF } else { prev }
 }
 
+/// True when wall-clock time advanced at least [`SUSPEND_JUMP_THRESHOLD`]
+/// more than the monotonic clock over the same interval -- the process was
+/// frozen (lid close / Power Nap) for part of it. `Instant` stops during
+/// suspend (`CLOCK_UPTIME_RAW` on macOS, `CLOCK_MONOTONIC` on Linux) while
+/// `SystemTime` keeps running, so the gap between the two is suspend time.
+fn suspend_jump(mono: Duration, wall: Duration) -> bool {
+    wall > mono + SUSPEND_JUMP_THRESHOLD
+}
+
 /// Advance the respawn backoff: double it, clamped to
 /// `[MIN_RESPAWN_BACKOFF, MAX_RESPAWN_BACKOFF]`.
 ///
@@ -510,12 +519,22 @@ fn double_backoff(cur: Duration) -> Duration {
 struct ChildState {
     child: Child,
     spawned_at: Instant,
+    /// Wall-clock twin of `spawned_at`. Comparing wall vs monotonic uptime at
+    /// exit reveals a suspend that spanned the child's lifetime (see
+    /// [`suspend_jump`]) -- the in-sleep suspend detector can't observe a
+    /// suspend that ended before the backoff sleep started.
+    spawned_at_wall: std::time::SystemTime,
     probe_failures: u32,
 }
 
 impl ChildState {
     fn new(child: Child) -> Self {
-        Self { child, spawned_at: Instant::now(), probe_failures: 0 }
+        Self {
+            child,
+            spawned_at: Instant::now(),
+            spawned_at_wall: std::time::SystemTime::now(),
+            probe_failures: 0,
+        }
     }
 
     /// True once the `-L` forward has had time to bind. Gates the
@@ -542,6 +561,10 @@ struct MonitorConfig {
     connect_timeout: u64,
     lock_path: PathBuf,
     lock_identity: Option<LockIdentity>,
+    /// `connect-<name>.kick`: client-created nudge file. The respawn backoff
+    /// wait consumes it and retries immediately -- a keystroke in a
+    /// disconnected client is the user vouching that the network is back.
+    kick_path: PathBuf,
 }
 
 /// Mutable supervisor state, previously a handful of scattered `let mut`
@@ -575,21 +598,108 @@ enum RespawnResult {
     Exit,
 }
 
+/// Why one [`backoff_wait`] ended.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum WaitOutcome {
+    /// The full sleep was served.
+    Elapsed,
+    /// Wall-clock jumped past monotonic mid-wait: the process was suspended.
+    /// Retry now, but keep the climbed backoff -- a dark wake with a locked
+    /// Keychain should cost exactly one failed auth.
+    Wake,
+    /// The client's kick file appeared (and was consumed): the user is
+    /// present and typing. Retry now; keep the climb, same as `Wake`.
+    Kicked,
+    /// Network path recovered (`Unsatisfied -> Satisfied` edge). The caller
+    /// resets the sleep to `MIN_RESPAWN_BACKOFF` -- evidence the network is
+    /// back justifies restarting the climb.
+    NetRecovered,
+    /// Supervisor shutdown requested.
+    Cancelled,
+}
+
+/// Wait out one respawn backoff sleep, watching for reasons to cut it short:
+/// shutdown, a suspend/wake jump, a client kick, or a network-recovery edge.
+/// Pure network noise (a burst that stays `Satisfied`) does not interrupt.
+///
+/// `saw_unsatisfied` persists across waits within one respawn episode so an
+/// `Unsatisfied` observed during an earlier wait still arms the recovery edge.
+async fn backoff_wait(
+    sleep: Duration,
+    stop: &tokio_util::sync::CancellationToken,
+    net: &crate::net_watch::NetWatcher,
+    kick_path: &Path,
+    saw_unsatisfied: &mut bool,
+) -> WaitOutcome {
+    // Fixed deadline so net.changed() noise doesn't restart the sleep.
+    let deadline = tokio::time::Instant::now() + sleep;
+    // Anchors for suspend detection: wall-clock advances across suspend,
+    // the monotonic clock does not.
+    let wall_anchor = std::time::SystemTime::now();
+    let mono_anchor = Instant::now();
+    loop {
+        tokio::select! {
+            _ = tokio::time::sleep_until(deadline) => return WaitOutcome::Elapsed,
+            _ = tokio::time::sleep(SUSPEND_POLL) => {
+                // remove_file doubles as an atomic consume: Ok only when the
+                // kick existed and we unlinked it.
+                if std::fs::remove_file(kick_path).is_ok() {
+                    info!("client kick received during backoff; retrying now");
+                    return WaitOutcome::Kicked;
+                }
+                let wall = std::time::SystemTime::now()
+                    .duration_since(wall_anchor)
+                    .unwrap_or_default();
+                let mono = mono_anchor.elapsed();
+                if suspend_jump(mono, wall) {
+                    info!(
+                        jump_s = wall.saturating_sub(mono).as_secs(),
+                        "detected wake from suspend during backoff; retrying now"
+                    );
+                    return WaitOutcome::Wake;
+                }
+            }
+            _ = net.changed() => {
+                let status = net.status();
+                if status == crate::net_watch::PathStatus::Unsatisfied {
+                    *saw_unsatisfied = true;
+                    debug!(?status, "network path changed during backoff (no route); continuing to wait");
+                } else if *saw_unsatisfied {
+                    info!(?status, "network path recovered during backoff; retrying now");
+                    *saw_unsatisfied = false;
+                    return WaitOutcome::NetRecovered;
+                } else {
+                    debug!(?status, "network path changed during backoff (noise); ignoring");
+                }
+            }
+            _ = stop.cancelled() => return WaitOutcome::Cancelled,
+        }
+    }
+}
+
 /// Back off, then respawn the ssh child, re-running `ensure_remote_ready`
 /// unless the tunnel was recently healthy.
 ///
-/// The backoff wait is interruptible: a suspend/wake jump or a network-recovery
-/// edge cuts it short, while pure network noise does not. Returns
-/// [`RespawnResult::Exit`] if cancelled or the tunnel lock was taken over
-/// mid-wait (the caller then returns without killing -- there is no live child
-/// during the wait).
+/// The backoff wait is interruptible: a suspend/wake jump, a client kick, or a
+/// network-recovery edge cuts it short, while pure network noise does not.
+/// `woke_from_suspend` means the caller detected a suspend spanning the dead
+/// child's lifetime -- the exit is a wake artifact, so the first wait is
+/// skipped entirely (one immediate attempt) while the climb is preserved; the
+/// in-wait suspend detector can't see a suspend that ended before the wait
+/// started. Returns [`RespawnResult::Exit`] if cancelled or the tunnel lock
+/// was taken over mid-wait (the caller then returns without killing -- there
+/// is no live child during the wait).
 async fn respawn_tunnel(
     cfg: &MonitorConfig,
     stop: &tokio_util::sync::CancellationToken,
     net: &crate::net_watch::NetWatcher,
     ms: &mut MonitorState,
     died_uptime: Duration,
+    woke_from_suspend: bool,
 ) -> RespawnResult {
+    // A kick predating this respawn episode is stale -- only kicks arriving
+    // while we actually wait below may cut sleeps short.
+    let _ = std::fs::remove_file(&cfg.kick_path);
     // Apply the healthy-reset ONCE, based on how long the child that just died
     // actually ran -- re-deriving it every retry let a long-dead child's
     // ever-growing uptime pin backoff at MIN and hammer the remote at ~1s.
@@ -599,6 +709,7 @@ async fn respawn_tunnel(
     } else {
         respawn_sleep(ms.backoff, died_uptime)
     };
+    let mut skip_wait = woke_from_suspend && !sleep.is_zero();
     let mut backoff_saw_unsatisfied = false;
 
     loop {
@@ -617,47 +728,22 @@ async fn respawn_tunnel(
             return RespawnResult::Exit;
         }
         refresh_lock_mtime(&cfg.lock_path);
-        info!("respawn: sleeping {}s (backoff)", sleep.as_secs());
-        // Fixed deadline so net.changed() noise doesn't restart the sleep.
-        let deadline = tokio::time::Instant::now() + sleep;
-        // Anchors for suspend detection: wall-clock advances across suspend,
-        // the monotonic clock does not.
-        let wall_anchor = std::time::SystemTime::now();
-        let mono_anchor = Instant::now();
-        'wait: loop {
-            tokio::select! {
-                _ = tokio::time::sleep_until(deadline) => break 'wait,
-                _ = tokio::time::sleep(SUSPEND_POLL) => {
-                    let wall = std::time::SystemTime::now()
-                        .duration_since(wall_anchor)
-                        .unwrap_or_default();
-                    let mono = mono_anchor.elapsed();
-                    if wall > mono + SUSPEND_JUMP_THRESHOLD {
-                        // Cut this sleep short for one attempt; do NOT reset
-                        // the climb -- a dark wake with a locked Keychain
-                        // should cost exactly one failed auth.
-                        info!(
-                            jump_s = wall.saturating_sub(mono).as_secs(),
-                            "detected wake from suspend during backoff; retrying now"
-                        );
-                        break 'wait;
-                    }
-                }
-                _ = net.changed() => {
-                    let status = net.status();
-                    if status == crate::net_watch::PathStatus::Unsatisfied {
-                        backoff_saw_unsatisfied = true;
-                        debug!(?status, "network path changed during backoff (no route); continuing to wait");
-                    } else if backoff_saw_unsatisfied {
-                        info!(?status, "network path recovered during backoff; retrying now");
-                        backoff_saw_unsatisfied = false;
-                        sleep = MIN_RESPAWN_BACKOFF;
-                        break 'wait;
-                    } else {
-                        debug!(?status, "network path changed during backoff (noise); ignoring");
-                    }
-                }
-                _ = stop.cancelled() => return RespawnResult::Exit,
+        if skip_wait {
+            skip_wait = false;
+            info!(
+                skipped_s = sleep.as_secs(),
+                "respawn: skipping backoff (woke from suspend while ssh was up)"
+            );
+        } else {
+            info!("respawn: sleeping {}s (backoff)", sleep.as_secs());
+            match backoff_wait(sleep, stop, net, &cfg.kick_path, &mut backoff_saw_unsatisfied).await
+            {
+                WaitOutcome::Cancelled => return RespawnResult::Exit,
+                WaitOutcome::NetRecovered => sleep = MIN_RESPAWN_BACKOFF,
+                // Wake and Kicked cut the wait short but leave `sleep`
+                // untouched, so double_backoff below still advances the
+                // climb as if the full sleep had been served.
+                WaitOutcome::Elapsed | WaitOutcome::Wake | WaitOutcome::Kicked => {}
             }
         }
         ms.backoff = double_backoff(sleep);
@@ -737,6 +823,7 @@ async fn tunnel_monitor(
     connect_timeout: u64,
     lock_path: PathBuf,
     lock_identity: Option<LockIdentity>,
+    kick_path: PathBuf,
     stop: tokio_util::sync::CancellationToken,
 ) {
     let cfg = MonitorConfig {
@@ -749,6 +836,7 @@ async fn tunnel_monitor(
         connect_timeout,
         lock_path,
         lock_identity,
+        kick_path,
     };
     // `last_healthy` is seeded now because the caller's ensure_remote_ready
     // just verified the remote; SystemTime so suspend counts toward
@@ -907,7 +995,16 @@ async fn tunnel_monitor(
                 }
 
                 let died_uptime = state.uptime();
-                match respawn_tunnel(&cfg, &stop, &net, &mut ms, died_uptime).await {
+                // A wall/monotonic gap across the child's lifetime means the
+                // machine slept while ssh was nominally up: this exit is a
+                // wake artifact (ServerAlive firing on a connection that died
+                // during suspend), not a fresh failure -- respawn_tunnel
+                // skips its first backoff wait so lid-open reconnects
+                // immediately instead of sitting out a climbed 60s sleep.
+                let died_wall =
+                    state.spawned_at_wall.elapsed().unwrap_or(died_uptime);
+                let woke = suspend_jump(died_uptime, died_wall);
+                match respawn_tunnel(&cfg, &stop, &net, &mut ms, died_uptime, woke).await {
                     RespawnResult::NewChild(new_child) => {
                         info!("ssh tunnel respawned");
                         state = ChildState::new(new_child);
@@ -1033,6 +1130,11 @@ fn connect_pid_path(connection_name: &str) -> PathBuf {
 
 fn connect_lock_path(connection_name: &str) -> PathBuf {
     connect_sidecar_path(connection_name, "lock")
+}
+
+/// `connect-<name>.kick`: client-created nudge file. See [`kick_respawn`].
+fn connect_kick_path(connection_name: &str) -> PathBuf {
+    connect_sidecar_path(connection_name, "kick")
 }
 
 pub fn connect_dest_path(connection_name: &str) -> PathBuf {
@@ -1198,6 +1300,27 @@ pub fn ctl_socket_lock_path(ctl_path: &Path) -> Option<PathBuf> {
 pub fn ctl_socket_tunnel_name(ctl_path: &Path) -> Option<&str> {
     let file = ctl_path.file_name()?.to_str()?;
     file.strip_prefix("connect-")?.strip_suffix(".sock")
+}
+
+/// Ask the supervisor serving `ctl_path` to cut its respawn backoff short.
+///
+/// Best-effort and advisory: touches the `connect-<name>.kick` sidecar, which
+/// the supervisor's backoff wait polls (at `SUSPEND_POLL` cadence) and
+/// consumes -- a keystroke in a disconnected client is the user vouching that
+/// the network is back, so the supervisor shouldn't sit out up to 60s of
+/// climbed backoff. Harmless when the supervisor is healthy: a kick nobody is
+/// waiting on is discarded at the next respawn episode's entry, and cleaned
+/// up with the other sidecars on shutdown. No-op for non-tunnel ctl paths.
+pub fn kick_respawn(ctl_path: &Path) {
+    use std::os::unix::fs::OpenOptionsExt;
+    if let Some(kick) = ctl_socket_tunnel_name(ctl_path).map(connect_kick_path) {
+        let _ = std::fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .mode(0o600)
+            .open(kick);
+    }
 }
 
 /// Extract the host component from a destination string (`[user@]host[:port]`).
@@ -1553,7 +1676,7 @@ pub fn read_pid_hint(name: &str) -> Option<u32> {
 }
 
 /// Remove the non-lock sidecar files (`.sock`, `.pid`, `.info`, `.dest`,
-/// `.ssh-opts`).
+/// `.ssh-opts`, `.kick`).
 /// Callers must hold the tunnel flock -- either they just acquired it
 /// (`run()`, `cleanup_if_unheld()`) or they verified ownership via
 /// `LockIdentity::matches_path` (`ConnectGuard::drop`). The lock file itself
@@ -1565,6 +1688,7 @@ fn cleanup_stale_files(name: &str) {
     let _ = std::fs::remove_file(crate::runinfo::connect_info_path(name));
     let _ = std::fs::remove_file(connect_dest_path(name));
     let _ = std::fs::remove_file(connect_ssh_opts_path(name));
+    let _ = std::fs::remove_file(connect_kick_path(name));
 }
 
 /// Extract tunnel connection names by globbing lock files in the socket dir.
@@ -1598,6 +1722,7 @@ struct ConnectGuard {
     lock_file: PathBuf,
     dest_file: PathBuf,
     ssh_opts_file: PathBuf,
+    kick_file: PathBuf,
     _lock: Option<nix::fcntl::Flock<std::fs::File>>,
     stop: tokio_util::sync::CancellationToken,
 }
@@ -1642,6 +1767,7 @@ impl Drop for ConnectGuard {
             let _ = std::fs::remove_file(&self.info_file);
             let _ = std::fs::remove_file(&self.dest_file);
             let _ = std::fs::remove_file(&self.ssh_opts_file);
+            let _ = std::fs::remove_file(&self.kick_file);
             let _ = std::fs::remove_file(&self.lock_file);
         } else {
             warn!(
@@ -1947,6 +2073,7 @@ pub async fn run(opts: ConnectOpts, ready_fd: Option<OwnedFd>) -> anyhow::Result
         lock_file: lock_path,
         dest_file: dest_file.clone(),
         ssh_opts_file: connect_ssh_opts_path(&connection_name),
+        kick_file: connect_kick_path(&connection_name),
         _lock: Some(lock_fd),
         stop: stop.clone(),
     };
@@ -2062,6 +2189,7 @@ pub async fn run(opts: ConnectOpts, ready_fd: Option<OwnedFd>) -> anyhow::Result
             opts.connect_timeout,
             guard.lock_file.clone(),
             lock_identity,
+            connect_kick_path(&connection_name),
             stop.clone(),
         )
         .instrument(tunnel_span),
@@ -2887,6 +3015,7 @@ mod tests {
                 30,
                 PathBuf::from("/tmp/nonexistent.lock"),
                 None,
+                PathBuf::from("/tmp/nonexistent.kick"),
                 stop,
             ),
         )
@@ -2921,6 +3050,7 @@ mod tests {
                 30,
                 PathBuf::from("/tmp/nonexistent.lock"),
                 None,
+                PathBuf::from("/tmp/nonexistent.kick"),
                 stop,
             ),
         )
@@ -2957,6 +3087,7 @@ mod tests {
                 30,
                 PathBuf::from("/tmp/nonexistent.lock"),
                 None,
+                PathBuf::from("/tmp/nonexistent.kick"),
                 stop,
             ),
         )
@@ -3090,6 +3221,83 @@ mod tests {
         // to a full MIN step, not collapse to zero (the divergence that the
         // discarded next_backoff second return would have reintroduced).
         assert_eq!(double_backoff(Duration::ZERO), Duration::from_secs(2));
+    }
+
+    #[test]
+    fn suspend_jump_requires_wall_ahead_of_monotonic() {
+        let mono = Duration::from_secs(10);
+        // Clocks agree (or wall behind, post-NTP-step): no jump.
+        assert!(!suspend_jump(mono, mono));
+        assert!(!suspend_jump(mono, Duration::from_secs(8)));
+        // Gap at exactly the threshold: not yet a jump (must exceed).
+        assert!(!suspend_jump(mono, mono + SUSPEND_JUMP_THRESHOLD));
+        // Gap past the threshold: the process was frozen.
+        assert!(suspend_jump(mono, mono + SUSPEND_JUMP_THRESHOLD + Duration::from_millis(1)));
+        // A lid-close spanning a child's whole run: hours of wall, seconds of mono.
+        assert!(suspend_jump(Duration::from_secs(11), Duration::from_secs(4 * 3600)));
+    }
+
+    #[test]
+    fn kick_path_survives_dotted_tunnel_names() {
+        // Tunnel names may contain dots; the sidecar extension is whatever
+        // follows the last one.
+        let kick = connect_kick_path("fate.x.pattern.net");
+        assert_eq!(kick.file_name().unwrap().to_str().unwrap(), "connect-fate.x.pattern.net.kick");
+    }
+
+    // -----------------------------------------------------------------------
+    // backoff_wait
+    // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn backoff_wait_serves_full_sleep() {
+        let dir = tempfile::tempdir().unwrap();
+        let kick = dir.path().join("connect-t.kick");
+        let stop = tokio_util::sync::CancellationToken::new();
+        let net = crate::net_watch::NetWatcher::spawn();
+        let mut saw = false;
+        let outcome = backoff_wait(Duration::from_millis(100), &stop, &net, &kick, &mut saw).await;
+        assert_eq!(outcome, WaitOutcome::Elapsed);
+    }
+
+    #[tokio::test]
+    async fn backoff_wait_consumes_kick_and_returns_early() {
+        let dir = tempfile::tempdir().unwrap();
+        let kick = dir.path().join("connect-t.kick");
+        std::fs::write(&kick, b"").unwrap();
+        let stop = tokio_util::sync::CancellationToken::new();
+        let net = crate::net_watch::NetWatcher::spawn();
+        let mut saw = false;
+        // Kick is noticed on the SUSPEND_POLL tick (2s), well inside a 30s sleep.
+        let outcome = tokio::time::timeout(
+            Duration::from_secs(10),
+            backoff_wait(Duration::from_secs(30), &stop, &net, &kick, &mut saw),
+        )
+        .await
+        .expect("kick should cut the wait short");
+        assert_eq!(outcome, WaitOutcome::Kicked);
+        assert!(!kick.exists(), "kick file must be consumed");
+    }
+
+    #[tokio::test]
+    async fn backoff_wait_returns_on_cancellation() {
+        let dir = tempfile::tempdir().unwrap();
+        let kick = dir.path().join("connect-t.kick");
+        let stop = tokio_util::sync::CancellationToken::new();
+        let net = crate::net_watch::NetWatcher::spawn();
+        let stop_clone = stop.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            stop_clone.cancel();
+        });
+        let mut saw = false;
+        let outcome = tokio::time::timeout(
+            Duration::from_secs(5),
+            backoff_wait(Duration::from_secs(30), &stop, &net, &kick, &mut saw),
+        )
+        .await
+        .expect("cancellation should end the wait");
+        assert_eq!(outcome, WaitOutcome::Cancelled);
     }
 
     // --- ensure_remote_ready output parsing -------------------------------

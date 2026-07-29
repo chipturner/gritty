@@ -8,6 +8,22 @@ protocol interoperate with their neighbors.
 
 ## Unreleased
 
+- **Fixed: tunnels could sit out a full 60s backoff after lid-open.** The
+  supervisor's wake-from-suspend detector only watched for suspends that
+  happened *during* a backoff sleep. The common lid-open case -- ssh notices
+  its dead connection ~6s after wake and exits 255 -- started a fresh sleep
+  *after* the wake, so a backoff that had climbed to 60s across dark wakes ran
+  in full with nothing to interrupt it. The suspend check now also runs across
+  the dead ssh child's lifetime (wall-clock vs monotonic uptime): an exit that
+  follows a suspend skips the first backoff sleep for one immediate attempt,
+  keeping the climbed backoff so a dark wake with a locked Keychain still
+  costs only one failed auth. No protocol change.
+- **Pressing a key while disconnected now nudges the tunnel supervisor too.**
+  Keystrokes in the "reconnecting..." state used to force only the *client's*
+  next attempt, which went nowhere while the supervisor was mid-backoff with
+  the forward socket unbound. The client now also touches a
+  `connect-{name}.kick` file; the supervisor's backoff wait polls for it every
+  2s, consumes it, and respawns ssh immediately. No protocol change.
 - **Fixed: receive-first transfers died with "superseded by new sender" + "early
   eof".** `gritty send` fans out one connection per discovered session, and a
   daemon reachable through two tunnel sockets (two connection names for one

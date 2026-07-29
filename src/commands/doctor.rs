@@ -604,8 +604,18 @@ fn is_known_artifact(name: &str) -> bool {
     // Tunnel sidecars: connect-{name}.{ext}. Tunnel names may contain dots,
     // so the extension is whatever follows the last one.
     if let Some(rest) = name.strip_prefix("connect-") {
-        const EXTS: [&str; 9] =
-            ["sock", "pid", "info", "lock", "dest", "ssh-opts", "remote-sock", "log", "out"];
+        const EXTS: [&str; 10] = [
+            "sock",
+            "pid",
+            "info",
+            "lock",
+            "dest",
+            "ssh-opts",
+            "remote-sock",
+            "log",
+            "out",
+            "kick",
+        ];
         if rest.rsplit_once('.').is_some_and(|(_, ext)| EXTS.contains(&ext)) {
             return true;
         }

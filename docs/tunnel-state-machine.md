@@ -39,6 +39,7 @@ A tunnel named `NAME` owns these files in `socket_dir()`:
 | `connect-NAME.log`      | tracing subscriber                       | Supervisor's own structured logs. |
 | `connect-NAME.out`      | daemonize stderr redirection             | ssh child's stderr (forward-setup errors, etc.). |
 | `connect-NAME.remote-sock` | `run()` after post-bind probe succeeds | Cache of remote `ctl.sock` path. Survives teardown so subsequent connects can skip the Preflight `ensure_remote_ready` SSH-exec. A non-absolute-path entry (poison from a failed probe) is discarded on read. |
+| `connect-NAME.kick`     | Client reconnect loop (`kick_respawn`)   | Advisory respawn nudge: a keystroke in a disconnected client while the supervisor holds the lock touches this file; the supervisor's backoff wait polls for it every `SUSPEND_POLL` and, on consuming it, retries immediately. Stale kicks are discarded at respawn-episode entry. |
 
 Invariant: the flock held on the `.lock` *inode* is the single liveness truth.
 Everything else is advisory -- if the inode's flock is free, any other leftover
@@ -61,7 +62,7 @@ Three guards keep that state from becoming destructive:
    `LockIdentity { dev, ino }` from its held flock fd. On drop it compares
    that against `stat(lock_path)`: if they differ (the path was replaced or
    removed), the supervisor is a ghost and removes **nothing** -- the real
-   owner's `.sock`/`.pid`/`.info`/`.dest`/`.ssh-opts`/`.lock` all survive. When the
+   owner's `.sock`/`.pid`/`.info`/`.dest`/`.ssh-opts`/`.kick`/`.lock` all survive. When the
    identities match, it unlinks the sidecar files *while still holding the
    flock* (a racing `O_CREAT` after the unlink gets a brand-new inode and
    flocks it independently) and releases the flock last.
@@ -129,10 +130,12 @@ stateDiagram-v2
 
         ChildExited --> NonTransient: exit code 0, or 1..=254\nexcluding 128..=159
         ChildExited --> Backoff: exit code 255,\nsignal death (128..=159),\nor no code (local signal)\nsleep derived once from this exit:\n0s if we killed ssh ourselves,\n1s if uptime >=30s, else prior backoff
+        ChildExited --> EnsureRemoteRetry: transient exit +\nsuspend spanned child's run\n(wall >> monotonic uptime;\nfirst sleep skipped, climb kept)
         NonTransient --> [*]: warn, monitor returns
         Backoff --> Backoff: retry failed\n(sleep, then double backoff\nto <=60s)
         Backoff --> EnsureRemoteRetry: timer fires
         Backoff --> EnsureRemoteRetry: net path changed\n(macOS; cut sleep to 1s,\nnext backoff 2s)
+        Backoff --> EnsureRemoteRetry: client kick file\n(consume, retry now,\nclimb kept)
         EnsureRemoteRetry --> Backoff: ensure_remote_ready err\n(retry from top)
         EnsureRemoteRetry --> SpawnRetry: got fresh remote_sock
         SpawnRetry --> Alive: ssh respawned\n(update child_spawned_at)
@@ -169,7 +172,7 @@ stateDiagram-v2
         KillChild --> CheckOwnership: ConnectGuard.drop\n(SIGTERM ssh)
         CheckOwnership --> CleanupFiles: LockIdentity matches path
         CheckOwnership --> ReleaseFlock: path replaced / gone\n(ghost; leave owner's files alone)
-        CleanupFiles --> ReleaseFlock: rm sock/pid/info/dest/\nssh-opts/lock\n(while flock still held)
+        CleanupFiles --> ReleaseFlock: rm sock/pid/info/dest/\nssh-opts/kick/lock\n(while flock still held)
         ReleaseFlock --> [*]: drop Flock
     }
 
@@ -229,7 +232,7 @@ kill the remote daemon and its live sessions.
    startup surfaces as a fast, diagnosable error instead of forcing us to
    wait the full `socket_wait_deadline`.
 2. **Absent -> Starting** -- `try_acquire_lock` returned `Ok`. We own the
-   supervisor role. Clean any stale `.sock`/`.pid`/`.info`/`.dest`/`.ssh-opts` (we
+   supervisor role. Clean any stale `.sock`/`.pid`/`.info`/`.dest`/`.ssh-opts`/`.kick` (we
    don't remove the lock we just acquired), then write the `.pid` file **immediately**
    so `disconnect` can find us during the startup window. A `LockFileBailGuard`
    is armed here too: if the fallible setup that follows (`ensure_remote_ready`,
@@ -330,7 +333,14 @@ The monitor runs a `tokio::select!` with five arms:
     the child had been up >= 30s (`HEALTHY_CHILD_THRESHOLD`), else the
     prior `backoff`. It is *not* re-derived per retry -- a long-dead
     child's ever-growing uptime would otherwise pin backoff at 1s and
-    hammer the remote.
+    hammer the remote. The exit is additionally checked for a suspend
+    that spanned the child's lifetime (wall-clock uptime exceeds
+    monotonic uptime by more than `SUSPEND_JUMP_THRESHOLD`): ssh's
+    ServerAlive firing right after lid-open is a wake artifact, not a
+    fresh failure, so the first backoff wait is skipped for one
+    immediate attempt while the climb is preserved. The in-wait suspend
+    detector below cannot catch this case -- its anchors are taken after
+    the wake.
 - The respawn sequence (`Backoff` sleep -> `ensure_remote_ready` ->
   `spawn_tunnel`) is an **inner loop**: a failure in either step sleeps the
   current `backoff`, doubles it (capped at 60s), and retries locally. It
@@ -339,18 +349,29 @@ The monitor runs a `tokio::select!` with five arms:
   reset on every retry, which pinned backoff at 1s and hammered the remote
   with auth attempts during macOS dark wakes (Keychain agent refuses to
   sign while locked).
-- The `Backoff` sleep races `stop.cancelled()`, `net.changed()`, and a
-  2s suspend-detect ticker. A path-change only short-circuits on the
-  `Unsatisfied -> Satisfied` edge; pure-`Satisfied` noise (which
-  `nw_path_monitor` emits during dark wakes too) is ignored so it can't
-  defeat the climb. The suspend ticker compares wall-clock vs monotonic
-  elapsed since the sleep started; a gap > `SUSPEND_JUMP_THRESHOLD` (5s)
-  means the process was frozen -- cut this sleep short for one immediate
-  attempt, but keep `backoff` at its climbed value so a dark wake with a
-  locked Keychain costs exactly one failed auth before resuming the
-  climb. This closes the "up to 60s after lid-open" gap that the edge
-  detector alone can't, since the process can't observe the
-  `Unsatisfied` that happened while it was frozen.
+- The `Backoff` sleep (`backoff_wait`) races `stop.cancelled()`,
+  `net.changed()`, and a 2s suspend-detect ticker. A path-change only
+  short-circuits on the `Unsatisfied -> Satisfied` edge; pure-`Satisfied`
+  noise (which `nw_path_monitor` emits during dark wakes too) is ignored
+  so it can't defeat the climb. The suspend ticker compares wall-clock vs
+  monotonic elapsed since the sleep started; a gap >
+  `SUSPEND_JUMP_THRESHOLD` (5s) means the process was frozen -- cut this
+  sleep short for one immediate attempt, but keep `backoff` at its
+  climbed value so a dark wake with a locked Keychain costs exactly one
+  failed auth before resuming the climb. This closes the "up to 60s
+  after lid-open" gap that the edge detector alone can't, since the
+  process can't observe the `Unsatisfied` that happened while it was
+  frozen. (A suspend that ended *before* the sleep started is caught at
+  child exit instead -- see the `child.wait()` bullet above.)
+- The same 2s ticker polls for the client's `connect-NAME.kick` file.
+  Consuming it (an atomic `remove_file`) cuts the sleep short exactly
+  like a suspend jump: retry now, climb kept. The client touches the
+  file from its reconnect loop when the user presses a key while the
+  supervisor holds the lock -- user presence is evidence the network is
+  back that neither clock nor the path monitor can supply. A kick left
+  over from a healthy period (nobody was waiting) is discarded at the
+  entry of the next respawn episode, so it can never shorten a sleep it
+  didn't intend to.
 - Whenever a respawn succeeds, the "healthy threshold" logic
   (`spawned_at.elapsed() >= 30s` at the *next* exit) resets `backoff` back
   to 1s. That means a tunnel that dies five minutes into a stable run waits
@@ -390,7 +411,7 @@ Two entry points into `Stopping`:
   or fell out of the main `select!` because the monitor returned (e.g.
   non-transient exit). `Drop` cancels the stop token, SIGTERMs the ssh
   child directly as a belt-and-braces (the monitor also kills on cancel),
-  then removes `.sock`, `.pid`, `.info`, `.dest`, `.ssh-opts`, `.lock`. The flock is
+  then removes `.sock`, `.pid`, `.info`, `.dest`, `.ssh-opts`, `.kick`, `.lock`. The flock is
   released last when `_lock` drops.
 - **`disconnect(name)`** (external command) -- reads `.pid`, sends SIGTERM,
   polls `is_lock_held` for up to 2s. If still held, escalates to SIGKILL
@@ -443,8 +464,8 @@ These must hold; violating them has in the past caused specific, nasty bugs:
 | `HEALTHY_CHILD_THRESHOLD`             | 30s            | `tunnel_monitor`     | Tunnel alive this long before its next death resets backoff to 1s. |
 | `NET_PROBE_DEBOUNCE`                  | 500ms          | `tunnel_monitor`     | Quiet window after a net path event before probing; `nw_path_monitor` bursts during wifi renegotiation. |
 | `SPAWN_GRACE`                         | 5s             | `tunnel_monitor`     | Net-change single-strike kill is disabled until ssh has been up this long -- an infant ssh isn't killed by its own startup race. |
-| `SUSPEND_JUMP_THRESHOLD`              | 5s             | `tunnel_monitor`     | Wall-vs-monotonic gap during a backoff sleep that indicates the process was frozen (suspend); cuts the sleep short for one attempt. |
-| `SUSPEND_POLL`                        | 2s             | `tunnel_monitor`     | Cadence of the suspend-detect ticker racing the backoff sleep. |
+| `SUSPEND_JUMP_THRESHOLD`              | 5s             | `tunnel_monitor`     | Wall-vs-monotonic gap that indicates the process was frozen (suspend). Checked both during a backoff sleep (cuts the sleep short) and across the dead child's lifetime at exit (skips the first sleep entirely). |
+| `SUSPEND_POLL`                        | 2s             | `tunnel_monitor`     | Cadence of the suspend-detect ticker racing the backoff sleep; also the poll rate for the client's `.kick` file. |
 | `SKIP_ENSURE_REMOTE_THRESHOLD`        | 60s            | `tunnel_monitor`     | Respawn skips the ~2s `ensure_remote_ready` re-prime when healthy within this window (wall-clock, so suspend counts). |
 | `socket_wait_deadline(ct)`            | `max(5, ct)+10`s (60s if ct==0) | `wait_for_socket` | Bounds wait-for-socket polling; leaves headroom for ProxyCommand startup and forward setup. |
 | `remote_exec` outer timeout           | 60s            | `remote_exec`        | Wall-clock ceiling on the whole ssh invocation; ServerAlive covers TCP hangs but not stuck shell profiles. |

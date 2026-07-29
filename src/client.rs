@@ -2380,6 +2380,16 @@ pub async fn run(
                     // safe: the Attach below snapshots `chrome_shown` after
                     // this paint.)
                     if key_hint {
+                        // Our own attempt below can only succeed once the
+                        // supervisor has re-bound the socket, and the
+                        // supervisor may be sitting out up to 60s of climbed
+                        // respawn backoff. Relay the user's impatience to it:
+                        // its backoff wait polls for this kick file every 2s
+                        // and retries immediately. Best-effort and harmless
+                        // when the tunnel is actually healthy.
+                        if tunnel_supervisor_alive {
+                            crate::connect::kick_respawn(ctl_path);
+                        }
                         paint_reconnect_status(
                             &async_stdout,
                             show_chrome,
