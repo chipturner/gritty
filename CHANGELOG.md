@@ -8,6 +8,13 @@ protocol interoperate with their neighbors.
 
 ## Unreleased
 
+- **Fixed: stderr log lines no longer smear across the terminal mid-session.**
+  Tracing events that reach stderr while attached (e.g. `RUST_LOG=info` while
+  debugging a reconnect) used to staircase diagonally -- raw mode disables the
+  kernel's LF->CRLF translation -- and splice into the "reconnecting..."
+  status line, which parks the cursor mid-line. The stderr writer now erases
+  the current line and emits CRLF while the client owns the terminal. No
+  protocol change.
 - **Fixed: tunnels could sit out a full 60s backoff after lid-open.** The
   supervisor's wake-from-suspend detector only watched for suspends that
   happened *during* a backoff sleep. The common lid-open case -- ssh notices

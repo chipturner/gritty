@@ -270,6 +270,7 @@ impl EscapeProcessor {
 fn suspend(raw_guard: &RawModeGuard, nb_guard: &NonBlockGuard) -> anyhow::Result<()> {
     // Restore cooked mode and blocking stdin so the parent shell works normally
     termios::tcsetattr(raw_guard.fd, SetArg::TCSAFLUSH, &raw_guard.original)?;
+    crate::logging::set_terminal_owned(false);
     let _ = nix::fcntl::fcntl(nb_guard.fd, nix::fcntl::FcntlArg::F_SETFL(nb_guard.original_flags));
 
     nix::sys::signal::kill(nix::unistd::Pid::from_raw(0), nix::sys::signal::Signal::SIGTSTP)?;
@@ -282,6 +283,7 @@ fn suspend(raw_guard: &RawModeGuard, nb_guard: &NonBlockGuard) -> anyhow::Result
     let mut raw = raw_guard.original.clone();
     termios::cfmakeraw(&mut raw);
     termios::tcsetattr(raw_guard.fd, SetArg::TCSAFLUSH, &raw)?;
+    crate::logging::set_terminal_owned(true);
     Ok(())
 }
 
@@ -567,6 +569,7 @@ impl RawModeGuard {
         // TCSADRAIN (not TCSAFLUSH) so keystrokes typed during connection
         // setup are preserved and forwarded to the session.
         termios::tcsetattr(fd, SetArg::TCSADRAIN, &raw)?;
+        crate::logging::set_terminal_owned(true);
         Ok(Self { fd, original })
     }
 }
@@ -574,6 +577,7 @@ impl RawModeGuard {
 impl Drop for RawModeGuard {
     fn drop(&mut self) {
         let _ = termios::tcsetattr(self.fd, SetArg::TCSAFLUSH, &self.original);
+        crate::logging::set_terminal_owned(false);
     }
 }
 
@@ -592,6 +596,9 @@ impl SuppressInputGuard {
         modified.control_chars[SpecialCharacterIndices::VMIN as usize] = 1;
         modified.control_chars[SpecialCharacterIndices::VTIME as usize] = 0;
         termios::tcsetattr(fd, SetArg::TCSAFLUSH, &modified)?;
+        // OPOST stays on in tail mode, but the reconnect status line still
+        // parks the cursor mid-line -- log events must erase it first.
+        crate::logging::set_terminal_owned(true);
         Ok(Self { fd, original })
     }
 }
@@ -600,6 +607,7 @@ impl Drop for SuppressInputGuard {
     fn drop(&mut self) {
         let _ = termios::tcflush(self.fd, FlushArg::TCIFLUSH);
         let _ = termios::tcsetattr(self.fd, SetArg::TCSAFLUSH, &self.original);
+        crate::logging::set_terminal_owned(false);
     }
 }
 

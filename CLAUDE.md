@@ -65,7 +65,7 @@ Eighteen modules -- seventeen behind a lib crate (`src/lib.rs` hosts shared help
 | `scrollback` | Last-50-lines buffer replayed for fresh viewers |
 | `table` | `print_table()` for tabular output |
 | `ui` | Everything gritty prints to a human: five `Level`s, the `sgr` palette, the marker glyph (ASCII fallback), `--color`. Formatters always style; sinks strip |
-| `logging` | Tracing setup, SIGUSR1 log-level cycling, SIGUSR2 log reopen |
+| `logging` | Tracing setup, SIGUSR1 log-level cycling, SIGUSR2 log reopen, raw-mode-aware stderr writer (`set_terminal_owned`) |
 | `naming` | Pure helpers for the client-prefixed session-name rule |
 | `client` | Raw mode, escape processor, heartbeat, auto-reconnect, forwarding relay |
 | `commands` | CLI command implementations (`session`, `util`, `doctor`, `refresh`, `report`, `transfer`). `report.rs` embeds `docs/llm-primer.md` via `include_str!` -- keep that doc current, it ships in the binary |

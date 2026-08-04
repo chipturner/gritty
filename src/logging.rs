@@ -25,6 +25,68 @@ impl tracing_subscriber::fmt::time::FormatTime for LocalTimer {
     }
 }
 
+/// True while the interactive client owns the terminal -- raw-mode attach
+/// (`RawModeGuard`) or tail's input-suppressed viewer (`SuppressInputGuard`).
+/// Raw mode disables the kernel's LF->CRLF translation and the reconnect
+/// status line parks the cursor mid-line, so untreated stderr log lines
+/// staircase across the screen or splice into the spinner.
+static TERMINAL_OWNED: AtomicBool = AtomicBool::new(false);
+
+/// Record whether the interactive client currently owns the terminal.
+/// Toggled by the client's terminal guards on enter/drop and around suspend.
+pub fn set_terminal_owned(owned: bool) {
+    TERMINAL_OWNED.store(owned, Ordering::Relaxed);
+}
+
+/// Rewrite one formatted log event for a terminal the client owns: erase the
+/// current line first (the reconnect spinner may have parked the cursor
+/// mid-line) and give every bare LF a CR so raw mode does not staircase the
+/// output. LFs already preceded by a CR are left alone.
+fn owned_terminal_transform(buf: &[u8]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(buf.len() + 8);
+    out.extend_from_slice(b"\r\x1b[K");
+    let mut prev = 0u8;
+    for &b in buf {
+        if b == b'\n' && prev != b'\r' {
+            out.push(b'\r');
+        }
+        out.push(b);
+        prev = b;
+    }
+    out
+}
+
+/// Write one formatted event to `out`, applying `owned_terminal_transform`
+/// while the client owns the terminal. Split from [`TerminalAwareStderr`] so
+/// the routing decision is testable against an in-memory writer.
+fn write_event(out: &mut impl std::io::Write, buf: &[u8], owned: bool) -> std::io::Result<usize> {
+    if owned {
+        out.write_all(&owned_terminal_transform(buf))?;
+        Ok(buf.len())
+    } else {
+        out.write(buf)
+    }
+}
+
+/// Stderr writer for client commands: passes bytes through untouched until
+/// the client takes terminal ownership, then repaints defensively via
+/// [`owned_terminal_transform`]. `transform` is latched at init to "stderr is
+/// a terminal" -- a redirected stderr keeps clean `\n`-terminated lines.
+struct TerminalAwareStderr {
+    transform: bool,
+}
+
+impl std::io::Write for TerminalAwareStderr {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        let owned = self.transform && TERMINAL_OWNED.load(Ordering::Relaxed);
+        write_event(&mut std::io::stderr().lock(), buf, owned)
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        std::io::stderr().flush()
+    }
+}
+
 type ReloadFn = Box<dyn Fn(&str) + Send + Sync>;
 
 /// Type-erased handle for reloading the tracing filter at runtime.
@@ -199,10 +261,11 @@ pub fn init_tracing(verbose: bool, log_path: Option<&Path>, stderr_default: &'st
             // The file layer above hardcodes `with_ansi(false)`; stderr needs the
             // same courtesy whenever it is not a terminal, or `server -f 2>log`
             // and `RUST_LOG=debug gritty ls 2>log` bake color escapes into the log.
+            let stderr_is_terminal = std::io::stderr().is_terminal();
             tracing_subscriber::fmt()
                 .with_env_filter(filter)
-                .with_writer(std::io::stderr)
-                .with_ansi(std::io::stderr().is_terminal())
+                .with_writer(move || TerminalAwareStderr { transform: stderr_is_terminal })
+                .with_ansi(stderr_is_terminal)
                 .with_timer(LocalTimer)
                 .init();
         }
@@ -309,6 +372,51 @@ mod tests {
         (&w).write_all(b"a\n").unwrap();
         (&w).write_all(b"b\n").unwrap();
         assert_eq!(std::fs::read_to_string(&path).unwrap(), "a\nb\n");
+    }
+
+    #[test]
+    fn owned_transform_gives_bare_lf_a_cr_and_erases_the_line_first() {
+        let out = owned_terminal_transform(b"INFO link down\n");
+        assert_eq!(out, b"\r\x1b[KINFO link down\r\n");
+    }
+
+    #[test]
+    fn owned_transform_leaves_existing_crlf_alone() {
+        let out = owned_terminal_transform(b"a\r\nb\n");
+        assert_eq!(out, b"\r\x1b[Ka\r\nb\r\n");
+    }
+
+    #[test]
+    fn owned_transform_converts_every_bare_lf_in_a_multiline_event() {
+        let out = owned_terminal_transform(b"line1\nline2\n");
+        assert_eq!(out, b"\r\x1b[Kline1\r\nline2\r\n");
+    }
+
+    #[test]
+    fn write_event_passes_through_when_terminal_not_owned() {
+        let mut sink = Vec::new();
+        let n = write_event(&mut sink, b"plain\n", false).unwrap();
+        assert_eq!(n, 6);
+        assert_eq!(sink, b"plain\n");
+    }
+
+    #[test]
+    fn write_event_transforms_but_reports_original_length_when_owned() {
+        let mut sink = Vec::new();
+        let n = write_event(&mut sink, b"spun\n", true).unwrap();
+        // Claim the caller's bytes consumed, not the expanded count, so
+        // write_all in the fmt layer never re-sends a partial suffix.
+        assert_eq!(n, 5);
+        assert_eq!(sink, b"\r\x1b[Kspun\r\n");
+    }
+
+    #[test]
+    fn terminal_owned_flag_round_trips() {
+        assert!(!TERMINAL_OWNED.load(Ordering::Relaxed));
+        set_terminal_owned(true);
+        assert!(TERMINAL_OWNED.load(Ordering::Relaxed));
+        set_terminal_owned(false);
+        assert!(!TERMINAL_OWNED.load(Ordering::Relaxed));
     }
 
     #[test]
