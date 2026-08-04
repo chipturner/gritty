@@ -155,7 +155,7 @@ impl std::io::Write for &ReopenableWriter {
         // precisely the case the daemon's self-heal path exists to survive.
         // Leaving the request pending makes the next write retry.
         if self.reopen.load(Ordering::Relaxed)
-            && let Some(new_file) = open_log_file(&self.path)
+            && let Ok(new_file) = open_log_file(&self.path)
         {
             *file = new_file;
             self.reopen.store(false, Ordering::Relaxed);
@@ -178,9 +178,27 @@ pub fn reopen_log_file() {
     }
 }
 
-fn open_log_file(path: &Path) -> Option<std::fs::File> {
+fn open_log_file(path: &Path) -> std::io::Result<std::fs::File> {
     use std::os::unix::fs::OpenOptionsExt;
-    std::fs::OpenOptions::new().create(true).append(true).mode(0o600).open(path).ok()
+    std::fs::OpenOptions::new().create(true).append(true).mode(0o600).open(path)
+}
+
+/// Resolve the requested log file into an open handle, or a warning the
+/// caller must surface before falling back to stderr. A failed open must
+/// never silently reroute telemetry -- that writer swap once took a
+/// multi-machine forensic session to spot.
+fn resolve_log_destination(
+    log_path: Option<&Path>,
+) -> (Option<(PathBuf, std::fs::File)>, Option<String>) {
+    let Some(path) = log_path else {
+        return (None, None);
+    };
+    match open_log_file(path) {
+        Ok(file) => (Some((path.to_path_buf(), file)), None),
+        Err(e) => {
+            (None, Some(format!("cannot open log file {}: {e}; logging to stderr", path.display())))
+        }
+    }
 }
 
 /// Pick the default filter spec. `None` means "defer to RUST_LOG".
@@ -221,14 +239,22 @@ pub fn init_tracing(verbose: bool, log_path: Option<&Path>, stderr_default: &'st
     if !rust_log_set && verbose {
         LOG_LEVEL_INDEX.store(1, Ordering::Relaxed);
     }
-    let filter_spec = choose_filter_spec(rust_log_set, verbose, log_path.is_some(), stderr_default);
+    // Resolve the destination BEFORE choosing the filter: a failed open falls
+    // back to stderr and must take the (quieter) stderr filter with it, not
+    // drag the file's `info` default onto an interactive terminal.
+    let (destination, open_failure) = resolve_log_destination(log_path);
+    if let Some(msg) = &open_failure {
+        crate::ui::warn(msg);
+    }
+    let filter_spec =
+        choose_filter_spec(rust_log_set, verbose, destination.is_some(), stderr_default);
 
     let filter = match filter_spec {
         Some(spec) => EnvFilter::new(spec),
         None => EnvFilter::from_default_env(),
     };
 
-    match log_path.and_then(|p| open_log_file(p).map(|f| (p.to_path_buf(), f))) {
+    match destination {
         Some((path, file)) => {
             let writer = Arc::new(ReopenableWriter::new(path, file));
             let _ = LOG_WRITER.set(writer.clone());
@@ -372,6 +398,38 @@ mod tests {
         (&w).write_all(b"a\n").unwrap();
         (&w).write_all(b"b\n").unwrap();
         assert_eq!(std::fs::read_to_string(&path).unwrap(), "a\nb\n");
+    }
+
+    #[test]
+    fn resolve_log_destination_no_path_means_stderr_with_no_warning() {
+        let (dest, warning) = resolve_log_destination(None);
+        assert!(dest.is_none());
+        assert!(warning.is_none());
+    }
+
+    #[test]
+    fn resolve_log_destination_opens_the_requested_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("client.log");
+        let (dest, warning) = resolve_log_destination(Some(&path));
+        let (opened_path, _file) = dest.expect("openable path should resolve to a file");
+        assert_eq!(opened_path, path);
+        assert!(warning.is_none());
+        assert!(path.exists(), "open must create the file");
+    }
+
+    #[test]
+    fn resolve_log_destination_surfaces_a_failed_open() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("no-such-dir").join("client.log");
+        let (dest, warning) = resolve_log_destination(Some(&path));
+        assert!(dest.is_none(), "unopenable path must fall back to stderr");
+        let warning = warning.expect("fallback must not be silent");
+        assert!(
+            warning.contains(path.to_str().unwrap()),
+            "warning should name the path: {warning}"
+        );
+        assert!(warning.contains("stderr"), "warning should say where logs go now: {warning}");
     }
 
     #[test]

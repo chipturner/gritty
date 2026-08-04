@@ -14,6 +14,12 @@ protocol interoperate with their neighbors.
   Clients of the local daemon now append to `client.log` in the socket dir;
   clients of a tunnel keep appending to that tunnel's `connect-<name>.log`.
   No protocol change.
+- **A log file that fails to open now says so.** `init_tracing` used to fall
+  back to stderr silently -- keeping the file's wider `info` filter -- when
+  the log file could not be opened, which made "why is telemetry on my
+  terminal?" needlessly forensic. The fallback now prints a warning naming
+  the path and the cause, and takes the quieter stderr filter with it. No
+  protocol change.
 - **Fixed: stderr log lines no longer smear across the terminal mid-session.**
   Tracing events that reach stderr while attached (e.g. `RUST_LOG=info` while
   debugging a reconnect) used to staircase diagonally -- raw mode disables the
