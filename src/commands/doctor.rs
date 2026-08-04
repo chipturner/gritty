@@ -585,8 +585,12 @@ fn is_known_artifact(name: &str) -> bool {
     if matches!(name, "ctl.sock" | "daemon.pid" | "daemon.info" | "gritty-open") {
         return true;
     }
-    // Daemon logs, including external-rotation suffixes (daemon.log.1, .gz).
+    // Daemon and client logs, including external-rotation suffixes
+    // (daemon.log.1, client.log.gz).
     if name.starts_with("daemon.log") || name.starts_with("daemon.out") {
+        return true;
+    }
+    if name.starts_with("client.log") {
         return true;
     }
     // Per-session sockets: agent-{id}.sock / svc-{id}.sock, numeric id.
@@ -1018,6 +1022,8 @@ mod tests {
             "daemon.log",
             "daemon.out",
             "daemon.log.1", // external rotation
+            "client.log",
+            "client.log.1", // external rotation
             "gritty-open",
             "agent-7.sock",
             "svc-7.sock",

@@ -506,31 +506,50 @@ fn init_tracing(verbose: bool, log_path: Option<&Path>, stderr_default: &'static
     tracing::info!(cmd = %argv.join(" "), pid = std::process::id(), "gritty invoked");
 }
 
-/// For long-lived client commands against a tunnel host, route tracing to
-/// that tunnel's log file so client-side reconnect/link-down events land
-/// alongside the supervisor's entries instead of spraying stderr into a
-/// raw-mode terminal. One-shot commands, `local`, and explicit
-/// `--ctl-socket` keep stderr.
+/// Log file to pair with a ctl socket path: a tunnel's forward socket
+/// (`connect-{name}.sock`) shares the tunnel's own `connect-{name}.log`, so
+/// client-side reconnect events land alongside the supervisor's entries;
+/// anything else (the local daemon's `ctl.sock`, a `--ctl-socket` override)
+/// gets a `client.log` sibling.
+fn log_path_for_ctl_socket(ctl: &Path) -> PathBuf {
+    let name = ctl.file_name().map(|n| n.to_string_lossy()).unwrap_or_default();
+    match name.strip_prefix("connect-").and_then(|rest| rest.strip_suffix(".sock")) {
+        Some(tunnel) => ctl.with_file_name(format!("connect-{tunnel}.log")),
+        None => ctl.with_file_name("client.log"),
+    }
+}
+
+/// For long-lived client commands (`connect`/`tail`), route tracing to a log
+/// file next to the ctl socket the command will use, so client-side
+/// reconnect/link-down events never spray stderr into a raw-mode terminal --
+/// local sessions and `--ctl-socket` overrides included. One-shot commands
+/// keep stderr.
 fn client_log_path(
     config: &gritty::config::ConfigFile,
     cmd: &Command,
-    ctl_socket_override: bool,
+    ctl_socket: Option<&Path>,
 ) -> Option<PathBuf> {
-    if ctl_socket_override {
-        return None;
-    }
     let target = match cmd {
-        Command::Connect { target, .. } | Command::Tail { target } => target.as_deref()?,
+        Command::Connect { target, .. } | Command::Tail { target } => target.as_deref(),
         _ => return None,
     };
+    if let Some(ctl) = ctl_socket {
+        return Some(log_path_for_ctl_socket(ctl));
+    }
     // Quiet alias resolution: run() canonicalizes the same target right after
     // and owns any ambiguity warning.
-    let (host, _) = split_target(target);
-    let host = config.canonical_host_quiet(&host);
-    if host == "local" {
-        return None;
-    }
-    Some(gritty::connect::connect_log_path(&host))
+    let host = match target {
+        Some(t) => {
+            let (host, _) = split_target(t);
+            config.canonical_host_quiet(&host)
+        }
+        None => "local".to_string(),
+    };
+    let ctl = match host.as_str() {
+        "local" => gritty::daemon::control_socket_path(),
+        h => gritty::connect::connection_socket_path(h),
+    };
+    Some(log_path_for_ctl_socket(&ctl))
 }
 
 /// Apply the client-name prefix rule to the session part of a `host:session`
@@ -874,7 +893,16 @@ fn main() {
             }
         }
         _ => {
-            let log_path = client_log_path(&config, &cli.command, cli.ctl_socket.is_some());
+            let log_path = client_log_path(&config, &cli.command, cli.ctl_socket.as_deref());
+            // On a fresh machine `connect` runs before anything created the
+            // socket dir; make sure the log file has a home. Only for paths
+            // gritty owns -- a `--ctl-socket` override points wherever the
+            // user said, and its socket must already exist to be usable.
+            if cli.ctl_socket.is_none()
+                && let Some(dir) = log_path.as_deref().and_then(Path::parent)
+            {
+                let _ = gritty::security::secure_create_dir_all(dir);
+            }
             // Client commands log telemetry, not UI: keep stderr quiet (warn)
             // so e.g. `gritty ls` doesn't print its own invocation audit line.
             init_tracing(verbose, log_path.as_deref(), "gritty=warn");
@@ -1190,6 +1218,74 @@ mod tests {
     #[test]
     fn clap_config_is_valid() {
         Cli::command().debug_assert();
+    }
+
+    #[test]
+    fn ctl_socket_to_log_pairing() {
+        // A tunnel's forward socket shares the tunnel's own log file, so
+        // client reconnect events land alongside the supervisor's entries.
+        // Tunnel names may contain dots.
+        assert_eq!(
+            log_path_for_ctl_socket(Path::new("/run/gritty/connect-devbox.sock")),
+            PathBuf::from("/run/gritty/connect-devbox.log")
+        );
+        assert_eq!(
+            log_path_for_ctl_socket(Path::new("/x/connect-fate.x.pattern.net.sock")),
+            PathBuf::from("/x/connect-fate.x.pattern.net.log")
+        );
+        // Everything else -- the local daemon's ctl.sock, a sandbox override
+        // -- gets a client.log sibling.
+        assert_eq!(
+            log_path_for_ctl_socket(Path::new("/run/gritty/ctl.sock")),
+            PathBuf::from("/run/gritty/client.log")
+        );
+        assert_eq!(
+            log_path_for_ctl_socket(Path::new("/tmp/sandbox/anything.sock")),
+            PathBuf::from("/tmp/sandbox/client.log")
+        );
+    }
+
+    fn parsed(args: &[&str]) -> Command {
+        Cli::try_parse_from(args).expect("args should parse").command
+    }
+
+    #[test]
+    fn client_log_path_routes_every_interactive_attach_to_a_file() {
+        let config = gritty::config::ConfigFile::default();
+
+        // Remote target -> the tunnel's log.
+        let p = client_log_path(&config, &parsed(&["gritty", "connect", "devbox:0"]), None)
+            .expect("remote connect should file-route");
+        assert_eq!(p.file_name().unwrap(), "connect-devbox.log");
+
+        // Local attach (explicit or defaulted) -> client.log, not stderr: a
+        // WARN during a local attach corrupts a raw-mode terminal just as
+        // thoroughly as a remote one.
+        for args in [&["gritty", "connect"][..], &["gritty", "connect", "local:0"][..]] {
+            let p = client_log_path(&config, &parsed(args), None)
+                .expect("local connect should file-route");
+            assert_eq!(p.file_name().unwrap(), "client.log");
+        }
+
+        // --ctl-socket override -> log sibling of the override socket (this
+        // is exactly how a tunnel socket is addressed in testing, where
+        // is_remote is still true).
+        let p = client_log_path(
+            &config,
+            &parsed(&["gritty", "connect", "local:0"]),
+            Some(Path::new("/tmp/sb/connect-devbox.sock")),
+        )
+        .expect("ctl-socket override should file-route");
+        assert_eq!(p, PathBuf::from("/tmp/sb/connect-devbox.log"));
+
+        // tail routes like connect.
+        let p = client_log_path(&config, &parsed(&["gritty", "tail", "devbox:0"]), None)
+            .expect("tail should file-route");
+        assert_eq!(p.file_name().unwrap(), "connect-devbox.log");
+
+        // One-shot commands keep stderr.
+        assert!(client_log_path(&config, &parsed(&["gritty", "ls"]), None).is_none());
+        assert!(client_log_path(&config, &parsed(&["gritty", "doctor"]), None).is_none());
     }
 
     // A bare `gritty prune` must parse (no clap required-group error) so the

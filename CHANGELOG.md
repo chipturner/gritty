@@ -8,6 +8,12 @@ protocol interoperate with their neighbors.
 
 ## Unreleased
 
+- **`connect`/`tail` telemetry always goes to a log file now.** Local
+  attaches and `--ctl-socket` overrides used to log to stderr -- invisible
+  until a warning (or a widened `RUST_LOG`) sprayed the attached terminal.
+  Clients of the local daemon now append to `client.log` in the socket dir;
+  clients of a tunnel keep appending to that tunnel's `connect-<name>.log`.
+  No protocol change.
 - **Fixed: stderr log lines no longer smear across the terminal mid-session.**
   Tracing events that reach stderr while attached (e.g. `RUST_LOG=info` while
   debugging a reconnect) used to staircase diagonally -- raw mode disables the
