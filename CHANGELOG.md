@@ -8,6 +8,16 @@ protocol interoperate with their neighbors.
 
 ## Unreleased
 
+- **Fixed: exiting a session no longer disturbs the terminal's main screen.**
+  Every client exit path (session exit, detach, `-c` completion, tail)
+  unconditionally emitted `\x1b[?1049l` (leave alternate screen) to rescue
+  the terminal from a TUI that died mid-session. When no TUI was involved
+  that sequence is not the assumed no-op: its implied cursor restore can
+  jump the cursor to a stale position, and some terminals restore an empty
+  saved buffer -- visibly clearing your output, most noticeably after
+  `connect -c`. The client now tracks alt-screen state and emits `?1049l`
+  only when the session actually left the terminal in the alternate screen;
+  the SGR reset and cursor-show remain unconditional. No protocol change.
 - **`connect`/`tail` telemetry always goes to a log file now.** Local
   attaches and `--ctl-socket` overrides used to log to stderr -- invisible
   until a warning (or a widened `RUST_LOG`) sprayed the attached terminal.

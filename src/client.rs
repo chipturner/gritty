@@ -11,7 +11,7 @@ use std::ops::ControlFlow;
 use std::os::fd::{AsFd, AsRawFd, BorrowedFd};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::time::Duration;
 use tokio::io::unix::AsyncFd;
 use tokio::net::UnixStream;
@@ -893,11 +893,56 @@ async fn send_init_frames(
     true
 }
 
+/// The client's `AltScreenTracker` plus a shared flag mirroring its state, so
+/// `TerminalResetGuard` -- a `Drop` guard that cannot borrow the tracker --
+/// knows at exit time whether the alt screen is actually active. The gating
+/// matters: an unsolicited `\x1b[?1049l` is not a no-op on the main screen.
+/// Its implied DECRC can jump the cursor to a stale saved position, and some
+/// terminals restore an empty saved main-screen buffer -- visibly clearing
+/// the user's output at exit.
+struct AltScreenState {
+    tracker: AltScreenTracker,
+    active: Arc<AtomicBool>,
+}
+
+impl AltScreenState {
+    fn new() -> Self {
+        Self { tracker: AltScreenTracker::new(), active: Arc::new(AtomicBool::new(false)) }
+    }
+
+    fn scan(&mut self, data: &[u8]) {
+        self.tracker.scan(data);
+        self.active.store(self.tracker.in_alternate_screen(), Ordering::Relaxed);
+    }
+
+    fn in_alternate_screen(&self) -> bool {
+        self.tracker.in_alternate_screen()
+    }
+
+    /// Handle for `TerminalResetGuard`, which outlives every borrow of `self`.
+    fn shared_flag(&self) -> Arc<AtomicBool> {
+        Arc::clone(&self.active)
+    }
+
+    /// The `\x1b[?1049l` to prepend to a message that must land on the main
+    /// screen -- empty when already there. Writing the returned prefix is the
+    /// caller's obligation; the leave is recorded here so no later exit path
+    /// (notably `TerminalResetGuard`) repeats it.
+    fn leave_prefix(&mut self) -> &'static str {
+        if !self.tracker.in_alternate_screen() {
+            return "";
+        }
+        self.tracker.note_left();
+        self.active.store(false, Ordering::Relaxed);
+        "\x1b[?1049l"
+    }
+}
+
 /// `framed` is kept outside (passed to handlers) so `tokio::select!` can
 /// poll `framed.next()` independently without conflicting borrows.
 struct ClientRelay<'a> {
     async_stdout: &'a AsyncFd<std::os::fd::OwnedFd>,
-    alt_screen: &'a mut AltScreenTracker,
+    alt_screen: &'a mut AltScreenState,
     agent: &'a mut ClientAgentState,
     agent_event_tx: &'a mpsc::UnboundedSender<AgentEvent>,
     agent_socket: Option<&'a str>,
@@ -996,7 +1041,8 @@ impl ClientRelay<'_> {
                 // the alt-screen buffer and be discarded by TerminalResetGuard.
                 write_stdout_async(
                     self.async_stdout,
-                    format!("\x1b[?1049l{}", status_msg("detached")).as_bytes(),
+                    format!("{}{}", self.alt_screen.leave_prefix(), status_msg("detached"))
+                        .as_bytes(),
                 )
                 .await?;
                 return Ok(ControlFlow::Break(RelayExit::Exit(0)));
@@ -1012,11 +1058,12 @@ impl ClientRelay<'_> {
                 self.tunnel.teardown();
                 self.pf.teardown();
                 // Leave alt-screen first so the message is visible and not
-                // clobbered by RawModeGuard's Drop. No-op on main screen.
+                // clobbered by RawModeGuard's Drop.
                 write_stdout_async(
                     self.async_stdout,
                     format!(
-                        "\x1b[?1049l{}",
+                        "{}{}",
+                        self.alt_screen.leave_prefix(),
                         reconnect_err_line(
                             "server shut down -- session is gone; run `gritty connect` to start fresh"
                         )
@@ -1657,7 +1704,7 @@ async fn relay(
     hb_timeout: Duration,
     fwd_listener: &Option<tokio::net::UnixListener>,
     limiters: &mut SecurityLimiters,
-    alt_screen: &mut AltScreenTracker,
+    alt_screen: &mut AltScreenState,
     net: &NetWatcher,
     rendered_offset: &mut u64,
 ) -> anyhow::Result<RelayExit> {
@@ -1753,7 +1800,7 @@ async fn relay(
                                         // by TerminalResetGuard on exit.
                                         write_stdout_async(
                                             async_stdout,
-                                            format!("\x1b[?1049l{}", status_msg("detached")).as_bytes(),
+                                            format!("{}{}", relay.alt_screen.leave_prefix(), status_msg("detached")).as_bytes(),
                                         ).await?;
                                         return Ok(RelayExit::Exit(0));
                                     }
@@ -2032,17 +2079,31 @@ pub async fn run(
     }
     let async_stdout = AsyncFd::new(stdout_fd)?;
 
+    // Mirrors the server's alt-screen tracker so we can suppress our own
+    // reconnect chrome when a TUI is running -- those writes would otherwise
+    // land directly in the alt screen buffer and corrupt it -- and so the
+    // exit-path resets below know whether `\x1b[?1049l` is warranted.
+    let mut alt_screen = AltScreenState::new();
+
     // PTY output (vim/htop/less) may leave the alt-screen active or the cursor
     // hidden. RawModeGuard only restores termios, not in-band DEC private modes,
-    // so emit reset escapes on every exit path via Drop.
-    struct TerminalResetGuard;
+    // so emit reset escapes on every exit path via Drop. `?1049l` only when the
+    // tracker says the alt screen is live -- see `AltScreenState`.
+    struct TerminalResetGuard {
+        alt_active: Arc<AtomicBool>,
+    }
     impl Drop for TerminalResetGuard {
         fn drop(&mut self) {
-            let _ = io::stdout().write_all(b"\x1b[?1049l\x1b[0m\x1b[?25h");
+            let seq: &[u8] = if self.alt_active.load(Ordering::Relaxed) {
+                b"\x1b[?1049l\x1b[0m\x1b[?25h"
+            } else {
+                b"\x1b[0m\x1b[?25h"
+            };
+            let _ = io::stdout().write_all(seq);
             let _ = io::stdout().flush();
         }
     }
-    let _term_reset = TerminalResetGuard;
+    let _term_reset = TerminalResetGuard { alt_active: alt_screen.shared_flag() };
 
     let mut sigwinch = signal(SignalKind::window_change())?;
     // Hoisted so they stay live across the reconnect loop — tokio::signal() permanently
@@ -2095,10 +2156,6 @@ pub async fn run(
     // reconnect. Persists across reconnects so the next `Attach` can ask the
     // server to replay only what we missed.
     let mut rendered_offset: u64 = 0;
-    // Mirrors the server's alt-screen tracker so we can suppress our own
-    // reconnect chrome when a TUI is running -- those writes would otherwise
-    // land directly in the alt screen buffer and corrupt it.
-    let mut alt_screen = AltScreenTracker::new();
 
     loop {
         // Reset every reconnect: a fresh TCP/UDS connection is a fresh liveness
@@ -2360,15 +2417,15 @@ pub async fn run(
                             gone_s = socket_gone.streak(now).unwrap_or_default().as_secs_f64(),
                             "reconnect: exiting -- ctl socket gone and no supervisor past grace"
                         );
-                        // `\x1b[?1049l` leaves alt-screen first so the
-                        // error is visible on main screen -- otherwise
-                        // RawModeGuard's Drop emits it after the fact
-                        // and clobbers the message. No-op on main
-                        // screen.
+                        // Leave alt-screen first so the error is visible
+                        // on main screen -- otherwise TerminalResetGuard's
+                        // Drop emits `?1049l` after the fact and clobbers
+                        // the message.
                         write_stdout_async(
                             &async_stdout,
                             format!(
-                                "\x1b[?1049l{}",
+                                "{}{}",
+                                alt_screen.leave_prefix(),
                                 reconnect_err_line(
                                     "server socket gone -- session is unreachable; reconnect manually"
                                 )
@@ -2528,10 +2585,10 @@ pub async fn run(
                         }
                     };
 
-                    // Emit a terminal red line on stdout. `\x1b[?1049l` leaves
-                    // alt-screen first so the error is visible on main screen
-                    // -- otherwise RawModeGuard's Drop emits it after the fact
-                    // and clobbers the message. No-op on main screen. `lead`
+                    // Emit a terminal red line on stdout. Leave alt-screen
+                    // first so the error is visible on main screen --
+                    // otherwise TerminalResetGuard's Drop emits `?1049l`
+                    // after the fact and clobbers the message. `lead`
                     // opens a fresh line when no status line was ever painted,
                     // so the error doesn't overwrite the user's last output.
                     macro_rules! bail_reconnect {
@@ -2539,8 +2596,12 @@ pub async fn run(
                             let lead = if chrome_shown { "" } else { "\r\n" };
                             write_stdout_async(
                                 &async_stdout,
-                                format!("\x1b[?1049l{lead}{}", reconnect_err_line($text))
-                                    .as_bytes(),
+                                format!(
+                                    "{}{lead}{}",
+                                    alt_screen.leave_prefix(),
+                                    reconnect_err_line($text)
+                                )
+                                .as_bytes(),
                             )
                             .await?;
                             return Ok(1);
@@ -3022,11 +3083,17 @@ pub async fn tail(
         }
     };
 
-    // Reset terminal state: exit alt-screen, clear attributes, show cursor.
-    // PTY output may have left colors/bold set, cursor hidden, or alt-screen active.
+    // Reset terminal state: clear attributes, show cursor, and -- only if the
+    // tailed stream actually entered it -- exit alt-screen. An unsolicited
+    // `?1049l` is not a no-op on the main screen (see `AltScreenState`).
     {
         use tokio::io::AsyncWriteExt;
-        let _ = stdout.write_all(b"\x1b[?1049l\x1b[0m\x1b[?25h").await;
+        let seq: &[u8] = if alt_screen.in_alternate_screen() {
+            b"\x1b[?1049l\x1b[0m\x1b[?25h"
+        } else {
+            b"\x1b[0m\x1b[?25h"
+        };
+        let _ = stdout.write_all(seq).await;
     }
     Ok(code)
 }
@@ -3034,6 +3101,31 @@ pub async fn tail(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn alt_screen_state_mirrors_tracker_into_shared_flag() {
+        let mut s = AltScreenState::new();
+        let flag = s.shared_flag();
+        assert!(!flag.load(Ordering::Relaxed));
+        s.scan(b"\x1b[?1049h");
+        assert!(s.in_alternate_screen());
+        assert!(flag.load(Ordering::Relaxed));
+        s.scan(b"\x1b[?1049l");
+        assert!(!s.in_alternate_screen());
+        assert!(!flag.load(Ordering::Relaxed));
+    }
+
+    #[test]
+    fn leave_prefix_emits_rmcup_only_when_alt_is_active() {
+        let mut s = AltScreenState::new();
+        assert_eq!(s.leave_prefix(), "");
+        s.scan(b"\x1b[?1049h");
+        assert_eq!(s.leave_prefix(), "\x1b[?1049l");
+        // The synthesized leave was recorded: tracker and flag agree we're
+        // back on the main screen, so nothing re-emits rmcup.
+        assert_eq!(s.leave_prefix(), "");
+        assert!(!s.shared_flag().load(Ordering::Relaxed));
+    }
 
     #[test]
     fn normal_passthrough() {

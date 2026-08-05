@@ -119,6 +119,17 @@ impl AltScreenTracker {
         }
     }
 
+    /// Record an alt-screen leave that gritty itself wrote to the terminal
+    /// (not scanned from the PTY stream). Set directly rather than fed through
+    /// `scan`: a stream that was cut mid-CSI would swallow the synthesized
+    /// sequence's ESC as sequence garbage. Any such partial parse is discarded.
+    pub fn note_left(&mut self) {
+        self.in_alt = false;
+        self.state = ScanState::Normal;
+        self.param_len = 0;
+        self.pending_alt = false;
+    }
+
     /// Whether the param currently in `param_buf` names a tracked alt-screen
     /// mode (standard `1049`, legacy `1047` / `47`).
     fn param_is_tracked(&self) -> bool {
@@ -287,5 +298,17 @@ mod tests {
         // Tracker should have reset -- a real sequence should still work
         t.scan(b"\x1b[?1049h");
         assert!(t.in_alternate_screen());
+    }
+
+    #[test]
+    fn note_left_clears_state_and_discards_partial_sequence() {
+        let mut t = AltScreenTracker::new();
+        t.scan(b"\x1b[?1049h");
+        t.scan(b"\x1b[?10"); // stream cut mid-CSI (disconnect boundary)
+        t.note_left();
+        assert!(!t.in_alternate_screen());
+        // The partial sequence was discarded: its continuation is plain text.
+        t.scan(b"49h");
+        assert!(!t.in_alternate_screen());
     }
 }
