@@ -8,6 +8,21 @@ protocol interoperate with their neighbors.
 
 ## Unreleased
 
+- **`send` disambiguates duplicate file names instead of erroring.**
+  `gritty send docs/a/reference.md docs/b/reference.md` used to refuse
+  ("duplicate file name `reference.md`"); it now sends them as
+  `a/reference.md` and `b/reference.md` -- each colliding name grows its
+  shortest unique path suffix (uniquify style), and the receiver already
+  creates subdirectories for nested names. File-vs-directory conflicts
+  (a file `a` next to a nested `a/ref.md`) are resolved the same way. The
+  same file spelled two ways collapses to one copy (announced, and the
+  survivor keeps its short name); the error remains only for distinct
+  files that genuinely cannot be told apart, and it names the conflicting
+  paths. Names are opaque strings on the wire, so no protocol change.
+- **Fixed: `send -r .` works now.** The recursive walk emitted `./`-prefixed
+  wire names the daemon rejects, so the sender stalled and died with a
+  misleading "no receiver connected". Wire names are now normalized to
+  plain components.
 - **Fixed: exiting a session no longer disturbs the terminal's main screen.**
   Every client exit path (session exit, detach, `-c` completion, tail)
   unconditionally emitted `\x1b[?1049l` (leave alternate screen) to rescue

@@ -37,21 +37,202 @@ struct DiscoveredSession {
     ctl_path: PathBuf,
 }
 
-/// Error if any two send entries share a wire name: the receiver opens each
-/// file with `truncate(true)`, so a collision (e.g. `send a/x.txt b/x.txt`)
-/// silently overwrites an earlier file while still counting every entry as
-/// received.
-fn reject_duplicate_names<'a>(names: impl IntoIterator<Item = &'a str>) -> anyhow::Result<()> {
-    let mut seen = std::collections::HashSet::new();
-    for name in names {
-        if !seen.insert(name) {
-            anyhow::bail!(
-                "duplicate file name `{name}`: the receiver would overwrite it -- \
-                 rename a file or send them in separate transfers"
-            );
+/// One file queued for sending: (wire name, size, mode, disk path).
+type SendEntry = (String, u64, u32, PathBuf);
+
+/// Outcome of [`uniquify_wire_names`]: the final entries plus an exact record
+/// of what changed, so the sender can announce it.
+#[derive(Debug)]
+struct Uniquified {
+    entries: Vec<SendEntry>,
+    /// (disk path, new wire name) for every entry whose name changed.
+    renames: Vec<(PathBuf, String)>,
+    /// (dropped spelling, kept spelling) for arguments that turned out to be
+    /// the same file twice.
+    dropped: Vec<(PathBuf, PathBuf)>,
+}
+
+/// Directory prefixes of a wire name: `a/b/c` -> `a`, `a/b`.
+fn dir_prefixes(name: &str) -> impl Iterator<Item = &str> {
+    name.match_indices('/').map(|(i, _)| &name[..i])
+}
+
+/// True if any two names are equal, or one names a directory of another --
+/// either way the receiver cannot materialize both.
+fn names_conflict(names: &[&str]) -> bool {
+    let set: std::collections::HashSet<&str> = names.iter().copied().collect();
+    set.len() != names.len() || names.iter().any(|n| dir_prefixes(n).any(|p| set.contains(p)))
+}
+
+/// Resolve wire-name conflicts with each name's shortest unique path suffix
+/// (uniquify style): the receiver opens each file with `truncate(true)`, so
+/// equal names (e.g. `send a/x.txt b/x.txt`) would silently overwrite -- and a
+/// name that is a directory prefix of another breaks the receiver's
+/// `create_dir_all`. Prepend parent directory components until the names form
+/// a consistent tree. Two spellings of the same file collapse to one entry;
+/// distinct files with no distinguishing parent directories are an error.
+fn uniquify_wire_names(entries: Vec<SendEntry>) -> anyhow::Result<Uniquified> {
+    // Fast path: no conflicts (the overwhelmingly common case) means no
+    // per-entry scaffolding and the entries pass through untouched.
+    {
+        let names: Vec<&str> = entries.iter().map(|(n, ..)| n.as_str()).collect();
+        if !names_conflict(&names) {
+            return Ok(Uniquified { entries, renames: Vec::new(), dropped: Vec::new() });
         }
     }
-    Ok(())
+
+    struct Work {
+        entry: SendEntry,
+        orig_name: String,
+        /// Trailing run of plain components of the disk path -- the only ones
+        /// a wire name may contain (`sanitize_path` rejects `..` and absolute
+        /// paths). The wire name is always a suffix of this list: `used`
+        /// components.
+        avail: Vec<String>,
+        used: usize,
+    }
+    let mut work: Vec<Work> = entries
+        .into_iter()
+        .map(|entry| {
+            let mut avail: Vec<String> = entry
+                .3
+                .components()
+                .rev()
+                .map_while(|c| match c {
+                    std::path::Component::Normal(c) => Some(c.to_string_lossy().into_owned()),
+                    _ => None,
+                })
+                .collect();
+            avail.reverse();
+            let orig_name = entry.0.clone();
+            let used = entry.0.split('/').count();
+            debug_assert!(
+                used <= avail.len(),
+                "wire name `{}` is not a suffix of disk path `{}`",
+                entry.0,
+                entry.3.display()
+            );
+            Work { entry, orig_name, avail, used }
+        })
+        .collect();
+
+    let mut dropped: Vec<(PathBuf, PathBuf)> = Vec::new();
+    loop {
+        // Two conflict shapes, re-derived each round: entries sharing a wire
+        // name, and an entry whose wire name is a directory prefix of
+        // another's (the receiver writes file dest/a, then create_dir_all
+        // for a/ref.md fails on it). Extension can synthesize the second
+        // shape from the first, so both are checked every round.
+        let mut eq_groups: Vec<Vec<usize>> = Vec::new();
+        let mut prefix_groups: Vec<Vec<usize>> = Vec::new();
+        {
+            let mut by_name: std::collections::HashMap<&str, Vec<usize>> =
+                std::collections::HashMap::new();
+            for (i, w) in work.iter().enumerate() {
+                by_name.entry(w.entry.0.as_str()).or_default().push(i);
+            }
+            eq_groups.extend(by_name.values().filter(|g| g.len() > 1).cloned());
+            for (i, w) in work.iter().enumerate() {
+                for p in dir_prefixes(&w.entry.0) {
+                    if let Some(owners) = by_name.get(p) {
+                        let mut g = owners.clone();
+                        g.push(i);
+                        prefix_groups.push(g);
+                    }
+                }
+            }
+        }
+        if eq_groups.is_empty() && prefix_groups.is_empty() {
+            let mut renames = Vec::new();
+            let entries = work
+                .into_iter()
+                .map(|w| {
+                    if w.entry.0 != w.orig_name {
+                        renames.push((w.entry.3.clone(), w.entry.0.clone()));
+                    }
+                    w.entry
+                })
+                .collect();
+            return Ok(Uniquified { entries, renames, dropped });
+        }
+
+        let mut to_extend = std::collections::HashSet::new();
+        let mut drop = std::collections::HashSet::new();
+        for group in eq_groups {
+            // The same file spelled twice collapses before any extension, so
+            // the survivor keeps its short name. Only canonicalize-proven
+            // sameness collapses; anything else stays in the group.
+            let canon: Vec<_> =
+                group.iter().map(|&i| std::fs::canonicalize(&work[i].entry.3).ok()).collect();
+            let mut kept: Vec<usize> = Vec::new(); // positions within group
+            for (gi, &i) in group.iter().enumerate() {
+                let twin = canon[gi]
+                    .as_ref()
+                    .and_then(|c| kept.iter().copied().find(|&kg| canon[kg].as_ref() == Some(c)));
+                match twin {
+                    Some(kg) => {
+                        drop.insert(i);
+                        dropped.push((work[i].entry.3.clone(), work[group[kg]].entry.3.clone()));
+                    }
+                    None => kept.push(gi),
+                }
+            }
+            if kept.len() < 2 {
+                continue;
+            }
+            let extendable: Vec<usize> = kept
+                .iter()
+                .map(|&gi| group[gi])
+                .filter(|&i| work[i].used < work[i].avail.len())
+                .collect();
+            if extendable.is_empty() {
+                let list = kept
+                    .iter()
+                    .map(|&gi| work[group[gi]].entry.3.display().to_string())
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                anyhow::bail!(
+                    "duplicate file name `{}` ({list}): the receiver would overwrite it -- \
+                     rename a file or send them in separate transfers",
+                    work[group[kept[0]]].entry.0
+                );
+            }
+            to_extend.extend(extendable);
+        }
+        for group in prefix_groups {
+            let live: Vec<usize> = group.iter().copied().filter(|i| !drop.contains(i)).collect();
+            if live.len() < 2 {
+                continue;
+            }
+            let extendable: Vec<usize> =
+                live.iter().copied().filter(|&i| work[i].used < work[i].avail.len()).collect();
+            if extendable.is_empty() {
+                let list = live
+                    .iter()
+                    .map(|&i| format!("`{}` ({})", work[i].entry.0, work[i].entry.3.display()))
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                anyhow::bail!(
+                    "file/directory name collision: {list} -- \
+                     rename a file or send them in separate transfers"
+                );
+            }
+            to_extend.extend(extendable);
+        }
+        for i in to_extend {
+            let w = &mut work[i];
+            w.used += 1;
+            w.entry.0 = w.avail[w.avail.len() - w.used..].join("/");
+        }
+        if !drop.is_empty() {
+            work = work
+                .into_iter()
+                .enumerate()
+                .filter(|(i, _)| !drop.contains(i))
+                .map(|(_, w)| w)
+                .collect();
+        }
+    }
 }
 
 /// Result of probing one daemon -- distinguishes a protocol-version mismatch
@@ -283,7 +464,7 @@ async fn race_first_ready<S, T>(
 
 async fn write_send_manifest(
     stream: &mut tokio::net::UnixStream,
-    entries: &[(String, u64, u32, PathBuf)],
+    entries: &[SendEntry],
 ) -> anyhow::Result<()> {
     use tokio::io::AsyncWriteExt;
     let file_count = entries.len() as u32;
@@ -332,11 +513,7 @@ fn print_progress(name: &str, transferred: u64, total: u64, last_render: &mut st
 }
 
 /// Recursively walk a directory, collecting regular files with paths relative to `base`.
-fn walk_dir(
-    dir: &Path,
-    base: &Path,
-    entries: &mut Vec<(String, u64, u32, PathBuf)>,
-) -> anyhow::Result<()> {
+fn walk_dir(dir: &Path, base: &Path, entries: &mut Vec<SendEntry>) -> anyhow::Result<()> {
     for entry in std::fs::read_dir(dir).map_err(|e| anyhow::anyhow!("{}: {e}", dir.display()))? {
         let entry = entry?;
         let path = entry.path();
@@ -348,7 +525,16 @@ fn walk_dir(
             walk_dir(&path, base, entries)?;
         } else if ft.is_file() {
             let rel = path.strip_prefix(base).unwrap_or(&path);
-            let wire_name = rel.to_string_lossy().to_string();
+            // Keep only plain components: `send -r .` yields `./x`-style rel
+            // paths whose `.` the daemon's sanitize_filename rejects.
+            let wire_name = rel
+                .components()
+                .filter_map(|c| match c {
+                    std::path::Component::Normal(c) => Some(c.to_string_lossy()),
+                    _ => None,
+                })
+                .collect::<Vec<_>>()
+                .join("/");
             let meta = std::fs::metadata(&path)?;
             entries.push((wire_name, meta.len(), meta.permissions().mode(), path));
         }
@@ -385,8 +571,7 @@ pub(crate) async fn send_command(
     };
 
     // Validate files exist and collect metadata
-    // entries: (wire_name, size, mode, disk_path)
-    let mut entries: Vec<(String, u64, u32, PathBuf)> = Vec::with_capacity(files.len());
+    let mut entries: Vec<SendEntry> = Vec::with_capacity(files.len());
     for path in &files {
         let meta =
             std::fs::metadata(path).map_err(|e| anyhow::anyhow!("{}: {e}", path.display()))?;
@@ -410,7 +595,20 @@ pub(crate) async fn send_command(
     if !use_stdin && entries.is_empty() {
         anyhow::bail!("no files to send");
     }
-    reject_duplicate_names(entries.iter().map(|(n, ..)| n.as_str()))?;
+    let uniq = uniquify_wire_names(entries)?;
+    for (dup, kept) in &uniq.dropped {
+        ui::status(&format!("skipping {}: same file as {}", dup.display(), kept.display()));
+    }
+    if !uniq.renames.is_empty() {
+        let list = uniq
+            .renames
+            .iter()
+            .map(|(path, name)| format!("{} as {name}", path.display()))
+            .collect::<Vec<_>>()
+            .join(", ");
+        ui::status(&format!("duplicate names disambiguated: sending {list}"));
+    }
+    let entries = uniq.entries;
 
     let tagged =
         connect_send_sockets(ctl_socket, session, gritty::protocol::SvcRequest::Send.to_byte())
@@ -851,16 +1049,176 @@ mod tests {
         assert_eq!(deduped.len(), 2);
     }
 
-    #[test]
-    fn reject_duplicate_names_allows_distinct() {
-        assert!(reject_duplicate_names(["a.txt", "b.txt", "dir/a.txt"]).is_ok());
+    fn entry(name: &str, path: impl Into<PathBuf>) -> SendEntry {
+        (name.to_string(), 0, 0o644, path.into())
+    }
+
+    fn wire_names(entries: &[SendEntry]) -> Vec<&str> {
+        entries.iter().map(|(n, ..)| n.as_str()).collect()
     }
 
     #[test]
-    fn reject_duplicate_names_rejects_collision() {
-        // `send a/README.md b/README.md` -- both reduce to README.md.
-        let err = reject_duplicate_names(["README.md", "README.md"]).unwrap_err();
-        assert!(err.to_string().contains("duplicate file name"), "{err}");
+    fn uniquify_leaves_distinct_names_alone() {
+        let out = uniquify_wire_names(vec![
+            entry("a.txt", "x/a.txt"),
+            entry("b.txt", "x/b.txt"),
+            entry("dir/a.txt", "p/dir/a.txt"),
+        ])
+        .unwrap();
+        assert_eq!(wire_names(&out.entries), ["a.txt", "b.txt", "dir/a.txt"]);
+        assert!(out.renames.is_empty() && out.dropped.is_empty());
+    }
+
+    #[test]
+    fn uniquify_prefixes_parent_dir_on_collision() {
+        // `send docs/a/reference.md docs/b/reference.md`
+        let out = uniquify_wire_names(vec![
+            entry("reference.md", "docs/a/reference.md"),
+            entry("reference.md", "docs/b/reference.md"),
+        ])
+        .unwrap();
+        assert_eq!(wire_names(&out.entries), ["a/reference.md", "b/reference.md"]);
+    }
+
+    #[test]
+    fn uniquify_reports_exact_renames() {
+        let out = uniquify_wire_names(vec![
+            entry("reference.md", "docs/a/reference.md"),
+            entry("reference.md", "docs/b/reference.md"),
+        ])
+        .unwrap();
+        let renames: Vec<(String, String)> =
+            out.renames.iter().map(|(p, n)| (p.display().to_string(), n.clone())).collect();
+        assert_eq!(
+            renames,
+            [
+                ("docs/a/reference.md".to_string(), "a/reference.md".to_string()),
+                ("docs/b/reference.md".to_string(), "b/reference.md".to_string()),
+            ]
+        );
+    }
+
+    #[test]
+    fn uniquify_extends_until_names_diverge() {
+        // One parent level is not enough: the shared x/ must be walked past.
+        let out =
+            uniquify_wire_names(vec![entry("ref.md", "a/x/ref.md"), entry("ref.md", "b/x/ref.md")])
+                .unwrap();
+        assert_eq!(wire_names(&out.entries), ["a/x/ref.md", "b/x/ref.md"]);
+    }
+
+    #[test]
+    fn uniquify_keeps_exhausted_name_when_sibling_extends() {
+        // `send ref.md a/ref.md` -- the bare name has no parents to add.
+        let out = uniquify_wire_names(vec![entry("ref.md", "ref.md"), entry("ref.md", "a/ref.md")])
+            .unwrap();
+        assert_eq!(wire_names(&out.entries), ["ref.md", "a/ref.md"]);
+    }
+
+    #[test]
+    fn uniquify_disambiguates_recursive_walks() {
+        // `send -r x/data y/data` -- both walks emit data/f.txt.
+        let out = uniquify_wire_names(vec![
+            entry("data/f.txt", "x/data/f.txt"),
+            entry("data/f.txt", "y/data/f.txt"),
+        ])
+        .unwrap();
+        assert_eq!(wire_names(&out.entries), ["x/data/f.txt", "y/data/f.txt"]);
+    }
+
+    #[test]
+    fn uniquify_dedupe_keeps_the_short_name() {
+        // `send docs/notes.txt docs/notes.txt` must arrive as notes.txt --
+        // the survivor must not grow a docs/ prefix on its way out.
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::create_dir(tmp.path().join("docs")).unwrap();
+        let p = tmp.path().join("docs/notes.txt");
+        std::fs::write(&p, "x").unwrap();
+        let out =
+            uniquify_wire_names(vec![entry("notes.txt", &p), entry("notes.txt", &p)]).unwrap();
+        assert_eq!(wire_names(&out.entries), ["notes.txt"]);
+        assert!(out.renames.is_empty());
+        assert_eq!(out.dropped.len(), 1);
+    }
+
+    #[test]
+    fn uniquify_dedupes_rel_and_abs_spellings_of_one_file() {
+        // nextest runs one process per test, so chdir is safe here.
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(tmp.path().join("f.txt"), "x").unwrap();
+        std::env::set_current_dir(tmp.path()).unwrap();
+        let out = uniquify_wire_names(vec![
+            entry("f.txt", "f.txt"),
+            entry("f.txt", tmp.path().join("f.txt")),
+        ])
+        .unwrap();
+        assert_eq!(wire_names(&out.entries), ["f.txt"]);
+        assert_eq!(out.dropped.len(), 1);
+    }
+
+    #[test]
+    fn uniquify_resolves_file_vs_directory_prefix() {
+        // `a` (a plain file) and `a/ref.md` cannot both materialize at the
+        // receiver: writing dest/a then create_dir_all(dest/a) fails.
+        let out =
+            uniquify_wire_names(vec![entry("a", "notes/a"), entry("a/ref.md", "docs/a/ref.md")])
+                .unwrap();
+        assert_eq!(wire_names(&out.entries), ["notes/a", "docs/a/ref.md"]);
+    }
+
+    #[test]
+    fn uniquify_resolves_synthesized_directory_prefix_conflicts() {
+        // `send notes/a docs/a/ref.md docs/b/ref.md`: disambiguation invents
+        // a/ref.md, which collides with the plain file `a` as a directory.
+        let out = uniquify_wire_names(vec![
+            entry("a", "notes/a"),
+            entry("ref.md", "docs/a/ref.md"),
+            entry("ref.md", "docs/b/ref.md"),
+        ])
+        .unwrap();
+        assert_eq!(wire_names(&out.entries), ["notes/a", "docs/a/ref.md", "b/ref.md"]);
+    }
+
+    #[test]
+    fn uniquify_errors_on_unresolvable_prefix_conflict() {
+        let err =
+            uniquify_wire_names(vec![entry("a", "a"), entry("a/ref.md", "a/ref.md")]).unwrap_err();
+        assert!(err.to_string().contains("collision"), "{err}");
+    }
+
+    #[test]
+    fn uniquify_error_names_the_conflicting_disk_paths() {
+        // `..` cannot appear in a wire name, so neither path has usable
+        // parent components -- and neither file exists, so canonicalization
+        // cannot prove they are the same file. Refusing is the safe default,
+        // and the error must name the disk paths, not a synthesized wire name.
+        let tmp = tempfile::tempdir().unwrap();
+        let a = tmp.path().join("a/../ref.md");
+        let b = tmp.path().join("b/../ref.md");
+        let err = uniquify_wire_names(vec![entry("ref.md", &a), entry("ref.md", &b)]).unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("duplicate file name"), "{msg}");
+        assert!(msg.contains(&a.display().to_string()), "{msg}");
+        assert!(msg.contains(&b.display().to_string()), "{msg}");
+    }
+
+    #[test]
+    fn walk_dir_normalizes_dot_prefixed_names() {
+        // `send -r .` -- base becomes "" and rel paths keep their leading
+        // `./`, which the daemon's sanitize_filename rejects. nextest runs
+        // one process per test, so chdir is safe here.
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(tmp.path().join("f.txt"), "x").unwrap();
+        std::fs::create_dir(tmp.path().join("sub")).unwrap();
+        std::fs::write(tmp.path().join("sub/b.txt"), "y").unwrap();
+        std::env::set_current_dir(tmp.path()).unwrap();
+
+        let dot = PathBuf::from(".");
+        let mut entries = Vec::new();
+        walk_dir(&dot, dot.parent().unwrap(), &mut entries).unwrap();
+        let mut names = wire_names(&entries);
+        names.sort();
+        assert_eq!(names, ["f.txt", "sub/b.txt"]);
     }
 
     /// Writer that models `tokio::io::Stdout`'s hazard: bytes sit in an

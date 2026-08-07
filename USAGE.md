@@ -128,7 +128,7 @@ Flag defaults come from config, with precedence CLI > `[host.<name>]` > `[defaul
 - `-` (`send`): read data from stdin; (`receive`): write data to stdout. `receive` with no destination also auto-switches to stdout when its stdout is redirected (e.g. `gritty receive > foo` or piped); pass a directory to force file mode
 - `--timeout <seconds>`: deadline for pairing with a receiver/sender (default 300; `--no-timeout` waits indefinitely)
 
-File permissions are preserved. Directories can be sent with `-r`, or via tar for compression:
+File permissions are preserved. Files that would arrive under the same name are disambiguated with their shortest unique path suffix: `gritty send docs/a/reference.md docs/b/reference.md` arrives as `a/reference.md` and `b/reference.md` (the receiver creates the subdirectories). Sending the same file twice collapses to one copy. Directories can be sent with `-r`, or via tar for compression:
 
 ```
 laptop$ gritty send -r mydir                 # recursive (preserves directory structure)
