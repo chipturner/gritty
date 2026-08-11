@@ -47,6 +47,10 @@ protocol interoperate with their neighbors.
   sessions that is usually a different one. Doctor now prints the same
   typeable `host:name` labels `lf`/`rf` use (`devbox (session #3)` when the
   daemon can't be asked).
+- **Fixed: `send`/`receive` with stderr redirected emitted one blank line
+  per file** (the newline that ends the progress bar was printed even when
+  no bar was drawn); interactively, zero-byte files now get a completed bar
+  line like every other file instead of a bare blank line.
 - **In-session helpers.** `gritty open` in a *detached* session now fails
   immediately (and the `$BROWSER` shim prints the URL for manual opening)
   instead of waiting out a 2s timeout and then guessing "server may be

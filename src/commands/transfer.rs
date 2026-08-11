@@ -512,6 +512,20 @@ fn print_progress(name: &str, transferred: u64, total: u64, last_render: &mut st
     );
 }
 
+/// End-of-file line for the progress display: paint the completed bar (also
+/// the only line a zero-byte file ever gets, since the copy loop never runs
+/// for it) and move off the row. Interactive-only, like [`print_progress`]
+/// -- an unconditional newline here put one blank line per file into every
+/// piped/redirected stderr, where no bar was ever drawn.
+fn finish_progress(name: &str, total: u64) {
+    if !ui::stderr_is_interactive() {
+        return;
+    }
+    // transferred == total bypasses the render throttle, so any instant does.
+    print_progress(name, total, total, &mut std::time::Instant::now());
+    eprintln!();
+}
+
 /// Recursively walk a directory, collecting regular files with paths relative to `base`.
 fn walk_dir(dir: &Path, base: &Path, entries: &mut Vec<SendEntry>) -> anyhow::Result<()> {
     for entry in std::fs::read_dir(dir).map_err(|e| anyhow::anyhow!("{}: {e}", dir.display()))? {
@@ -692,7 +706,7 @@ pub(crate) async fn send_command(
                 transferred += n as u64;
                 print_progress(name, transferred, *size, &mut last_render);
             }
-            eprintln!();
+            finish_progress(name, *size);
         }
     }
 
@@ -898,7 +912,7 @@ pub(crate) async fn receive_command(
             transferred += to_read as u64;
             print_progress(&name, transferred, file_size, &mut last_render);
         }
-        eprintln!();
+        finish_progress(&name, file_size);
         received += 1;
     }
 
