@@ -26,6 +26,15 @@ protocol interoperate with their neighbors.
   `--json`) and exits 0; naming a host that is down still fails, but
   `--json` now emits the group with its `error` field rather than a bare
   message.
+- **Help cleanup.** Each command's `--help` lists `--ctl-socket`/`-v`/
+  `--color` under a separate "Global options" heading instead of shuffled
+  in with its own flags; `--ctl-socket` is rejected (usage error) by the
+  commands that never read it, instead of being silently ignored; the
+  top-level command listing shows every alias (`list`, `socket` were
+  missing) and uses the same one-line descriptions as the commands
+  themselves (a test now pins the two together); `lf`/`rf` show
+  `[TARGET] <PORT>` and keep the compact help layout; duplicated
+  `(default: …)` text is gone; `connect -c` conflicts with `--no-create`.
 - **`receive` is safe to interrupt, and both sides say who they are
   waiting for.** Files now land via a `.<name>.gritty-partial` sibling
   renamed into place when complete: a sender dying mid-file leaves the

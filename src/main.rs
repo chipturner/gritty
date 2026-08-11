@@ -11,6 +11,10 @@ fn version_string() -> &'static str {
     VERSION.get_or_init(|| format!("{} ({})", env!("CARGO_PKG_VERSION"), env!("GRITTY_GIT_HASH"),))
 }
 
+/// Heading the three global flags are listed under in every subcommand's
+/// help, so they don't interleave with the command's own options.
+const GLOBAL_HEADING: &str = "Global options";
+
 // help_template left-aligned so the string content has no spurious indentation
 #[derive(Parser)]
 #[command(
@@ -23,60 +27,68 @@ fn version_string() -> &'static str {
 {usage-heading} {usage}
 
 Sessions:
-  connect (c)            Attach or create a session
-  list-sessions (ls)     List active sessions
-  tail (t)               Read-only stream of session output
-  kill-session (kill)    Kill one or more sessions
-  prune                  Bulk-kill stale detached sessions (dry-run unless -y)
-  rename                 Rename a session
-  kill-server            Kill the server and all sessions
-  restart                Kill + restart the server (upgrade recovery)
-  refresh                Restart only stale processes (idempotent)
+  connect (c)                Attach to a session, creating it if needed
+  list-sessions (ls, list)   List sessions (every known host unless one is given)
+  tail (t)                   Stream a session's output read-only (like tail -f)
+  kill-session (kill)        Kill one or more sessions
+  prune                      Bulk-kill stale detached sessions (dry run unless -y)
+  rename                     Rename a session
+  kill-server                Kill a host's server and every session on it
+  restart                    Kill and restart a host's server and tunnel (sessions die)
+  refresh                    Restart only processes running stale code (idempotent)
 
 Tunnels:
-  tunnels (tun)          List active SSH tunnels
-  tunnel-create          Set up SSH tunnel to a remote host
-  tunnel-destroy         Tear down an SSH tunnel
-  bootstrap              Install gritty on a remote host
+  tunnels (tun)              List SSH tunnels
+  tunnel-create              Start a background SSH tunnel to a host
+  tunnel-destroy             Tear down an SSH tunnel
+  bootstrap                  Install gritty on a remote host over ssh
 
 Forwarding & transfer:
-  local-forward (lf)     Expose a local port inside the session (like ssh -R)
-  remote-forward (rf)    Bring a session port to this machine (like ssh -L)
-  send                   Send files to a paired receiver
-  receive                Receive files from a paired sender
+  local-forward (lf)         Make a local port reachable inside the session (like ssh -R)
+  remote-forward (rf)        Bring a session's port to this machine (like ssh -L)
+  send                       Send files to a paired receiver
+  receive                    Receive files from a paired sender
 
 In-session (run inside a gritty session):
-  open                   Open a URL on the local machine
-  copy                   Copy stdin to the client clipboard
+  open                       Open a URL in the local browser
+  copy                       Copy stdin to the local clipboard
 
 Configuration:
-  info                   Show diagnostics (paths, server, tunnels)
-  config                 Open config in $VISUAL/$EDITOR/vi
-  doctor                 Check for common issues
+  info                       Show paths, server status and tunnels
+  config                     Open the config file in $VISUAL/$EDITOR (created if missing)
+  doctor                     Check for stale processes, orphaned files and config errors
 
 Plumbing:
-  server (s)             Start the server
-  completions            Generate shell completions
-  mangen                 Generate man pages
-  socket-path            Print the default socket path
-  protocol-version       Print the protocol version
+  server (s)                 Start the server (backgrounds; -f stays in the foreground)
+  completions                Generate shell completions
+  mangen                     Write man pages into a directory (for packagers)
+  socket-path (socket)       Print the control socket path
+  protocol-version           Print the wire protocol version
 
 Options:
 {options}
+
 See 'gritty help <command>' for details.
 {after-help}"
 )]
 struct Cli {
-    /// Path to the server control socket (overrides default)
-    #[arg(long, global = true)]
+    /// Use the daemon at this control socket instead of the default one
+    /// (rejected by commands that don't talk to a daemon)
+    #[arg(long, global = true, value_name = "PATH", help_heading = GLOBAL_HEADING)]
     ctl_socket: Option<PathBuf>,
 
     /// Enable verbose logging
-    #[arg(short = 'v', long, global = true)]
+    #[arg(short = 'v', long, global = true, help_heading = GLOBAL_HEADING)]
     verbose: bool,
 
     /// When to colorize output
-    #[arg(long, global = true, value_name = "WHEN", default_value_t = ColorWhen::Auto)]
+    #[arg(
+        long,
+        global = true,
+        value_name = "WHEN",
+        default_value_t = ColorWhen::Auto,
+        help_heading = GLOBAL_HEADING
+    )]
     color: ColorWhen,
 
     #[command(subcommand)]
@@ -112,10 +124,10 @@ impl From<ColorWhen> for gritty::ui::ColorChoice {
     }
 }
 
-#[derive(Subcommand)]
+#[derive(Subcommand, Debug)]
 enum Command {
     // -- Sessions --
-    /// Smart session: attach if exists, create if not
+    /// Attach to a session, creating it if needed
     #[command(
         display_order = 0,
         visible_alias = "c",
@@ -129,8 +141,9 @@ enum Command {
         /// host defaults to `local` when omitted
         target: Option<String>,
 
-        /// Command to run instead of login shell
-        #[arg(short = 'c', long)]
+        /// Command to run instead of a login shell when the session is created
+        /// (warns if the session already exists)
+        #[arg(short = 'c', long, conflicts_with = "no_create")]
         command: Option<String>,
 
         /// Create the session but don't attach (for background jobs). With no
@@ -199,13 +212,13 @@ enum Command {
         #[arg(long, value_name = "DURATION")]
         linger: Option<String>,
     },
-    /// Tail a session's output (read-only, like tail -f)
+    /// Stream a session's output read-only (like tail -f)
     #[command(display_order = 2, visible_alias = "t")]
     Tail {
         /// Target host and session (host:session); host defaults to `local`
         target: Option<String>,
     },
-    /// List active sessions (no host = all known hosts: local + tunnels)
+    /// List sessions (every known host unless one is given)
     #[command(display_order = 1, visible_alias = "ls", visible_alias = "list")]
     ListSessions {
         /// Target host (omit to list every known host)
@@ -227,7 +240,7 @@ enum Command {
         /// `local` (a bare known host name lists that host's sessions instead)
         targets: Vec<String>,
     },
-    /// Bulk-kill stale detached sessions (dry-run unless -y)
+    /// Bulk-kill stale detached sessions (dry run unless -y)
     // The filter group is validated by hand (`ensure_prune_filter`) instead of
     // `required(true)` so a bare `gritty prune` gets a steering error rather
     // than clap's generic required-group message.
@@ -260,25 +273,31 @@ enum Command {
         #[arg(short = 'y', long)]
         yes: bool,
     },
-    /// Kill the server and all sessions
+    /// Kill a host's server and every session on it
     #[command(display_order = 6)]
     KillServer {
         /// Target host (defaults to `local`)
         target: Option<String>,
     },
-    /// Restart the server (and tunnel, for remote hosts). One-shot recovery
-    /// for protocol version upgrades: kills the daemon (tolerant of a
-    /// mismatched handshake), tears down the tunnel, and starts both back up.
-    #[command(display_order = 7)]
+    /// Kill and restart a host's server and tunnel (sessions die)
+    #[command(
+        display_order = 7,
+        after_help = "One-shot recovery that works even across a protocol mismatch: kills the \
+                      daemon, tears down the tunnel for remote hosts, and starts both back up. \
+                      Every session on the host dies; prefer `refresh` after an upgrade."
+    )]
     Restart {
         /// Target host (defaults to `local`)
         target: Option<String>,
     },
-    /// Restart only the processes running stale code (daemon, tunnel
-    /// supervisor, remote daemon). Idempotent: a second run is a no-op.
-    /// Use after upgrading the gritty binary to pick it up everywhere
-    /// without the scorched-earth `restart`.
-    #[command(display_order = 8)]
+    /// Restart only processes running stale code (idempotent)
+    #[command(
+        display_order = 8,
+        after_help = "Compares each long-lived process (local daemon, tunnel supervisors, remote \
+                      daemons) against the binary on disk and restarts only what is behind, so \
+                      running it twice is a no-op. Use it after upgrading; `restart` is the \
+                      scorched-earth alternative."
+    )]
     Refresh {
         /// Target host (defaults to `local` plus all active tunnels)
         target: Option<String>,
@@ -311,7 +330,7 @@ enum Command {
         #[arg(short, long)]
         recursive: bool,
 
-        /// Timeout in seconds waiting for a receiver (default: 300)
+        /// Seconds to wait for a receiver to pair
         #[arg(long, default_value_t = 300)]
         timeout: u64,
 
@@ -333,7 +352,7 @@ enum Command {
         #[arg(long, hide = true)]
         stdout: bool,
 
-        /// Timeout in seconds waiting for a sender (default: 300)
+        /// Seconds to wait for a sender to pair
         #[arg(long, default_value_t = 300)]
         timeout: u64,
 
@@ -345,41 +364,51 @@ enum Command {
         /// stdout is implied when omitted and stdout is redirected)
         dir: Option<PathBuf>,
     },
-    /// Open a URL on the local machine (for use inside gritty sessions)
+    /// Open a URL in the local browser
     #[command(display_order = 34)]
     Open {
         /// URL to open
         url: String,
     },
-    /// Copy stdin to the client clipboard (for use inside gritty sessions)
+    /// Copy stdin to the local clipboard
     #[command(display_order = 35)]
     Copy,
-    /// Make a local (client-side) port reachable inside the session (like ssh -R)
-    ///
-    /// Named for where the service lives: `gritty lf 5432` lets processes
-    /// in the session reach the postgres on your local machine. Listens in
-    /// the session, connects on the client.
-    #[command(display_order = 30, visible_alias = "lf")]
+    /// Make a local port reachable inside the session (like ssh -R)
+    // The two positionals are declared optional because the *first* one is:
+    // `lf 8080` and `lf devbox:work 8080` are both valid. util::forward_args
+    // sorts out which is which and insists on the port; the usage line shows
+    // the real grammar.
+    #[command(
+        display_order = 30,
+        visible_alias = "lf",
+        override_usage = "gritty local-forward [OPTIONS] [TARGET] <PORT>",
+        after_help = "Named for where the service lives: `gritty lf 5432` lets processes in the \
+                      session reach the postgres on your local machine. Listens in the session, \
+                      connects on the client."
+    )]
     LocalForward {
         /// Target session (host[:session]); omit to use the only attached session
         target: Option<String>,
-        /// Port spec: PORT or LISTEN_PORT:TARGET_PORT
+        /// Required. PORT (same number on both ends) or LISTEN_PORT:TARGET_PORT
         port: Option<String>,
     },
-    /// Bring a remote (session-side) port to the client (like ssh -L)
-    ///
-    /// Named for where the service lives: `gritty rf 3000` lets you browse
-    /// the session's :3000 at localhost:3000 -- the common dev-server case.
-    /// Listens on the client, connects in the session.
-    #[command(display_order = 31, visible_alias = "rf")]
+    /// Bring a session's port to this machine (like ssh -L)
+    #[command(
+        display_order = 31,
+        visible_alias = "rf",
+        override_usage = "gritty remote-forward [OPTIONS] [TARGET] <PORT>",
+        after_help = "Named for where the service lives: `gritty rf 3000` lets you browse the \
+                      session's :3000 at localhost:3000 -- the common dev-server case. Listens on \
+                      the client, connects in the session."
+    )]
     RemoteForward {
         /// Target session (host[:session]); omit to use the only attached session
         target: Option<String>,
-        /// Port spec: PORT or LISTEN_PORT:TARGET_PORT
+        /// Required. PORT (same number on both ends) or LISTEN_PORT:TARGET_PORT
         port: Option<String>,
     },
     // -- Tunnels --
-    /// Set up SSH tunnel to a remote host (backgrounds by default)
+    /// Start a background SSH tunnel to a host
     #[command(display_order = 11)]
     TunnelCreate {
         /// Remote destination ([user@]host[:port])
@@ -409,19 +438,19 @@ enum Command {
         #[arg(long)]
         ignore_version_mismatch: bool,
     },
-    /// Tear down an SSH tunnel by connection name
+    /// Tear down an SSH tunnel
     #[command(display_order = 12)]
     TunnelDestroy {
         /// Connection name (as shown in `gritty tunnels`)
         name: String,
     },
-    /// Install gritty on a remote host (downloads release via install script)
+    /// Install gritty on a remote host over ssh
     #[command(display_order = 13)]
     Bootstrap {
         /// Remote destination ([user@]host[:port])
         destination: String,
 
-        /// Remote install directory (default: ~/.local/bin)
+        /// Remote install directory
         #[arg(long, default_value = "~/.local/bin")]
         install_dir: String,
 
@@ -429,7 +458,7 @@ enum Command {
         #[arg(long = "ssh-option", short = 'o')]
         ssh_options: Vec<String>,
     },
-    /// List active SSH tunnels
+    /// List SSH tunnels
     #[command(display_order = 10, visible_alias = "tun")]
     Tunnels {
         /// Machine-readable output
@@ -437,24 +466,24 @@ enum Command {
         json: bool,
     },
     // -- Server & config --
-    /// Start the server (backgrounds by default, use -f to stay in foreground)
+    /// Start the server (backgrounds; -f stays in the foreground)
     #[command(display_order = 40, visible_alias = "s")]
     Server {
         /// Run in the foreground instead of daemonizing
         #[arg(long, short = 'f')]
         foreground: bool,
     },
-    /// Show diagnostics (paths, server status, tunnels)
+    /// Show paths, server status and tunnels
     #[command(display_order = 20)]
     Info {
         /// Machine-readable output
         #[arg(long)]
         json: bool,
     },
-    /// Open config file in $VISUAL/$EDITOR/vi (creates from template if missing)
+    /// Open the config file in $VISUAL/$EDITOR (created if missing)
     #[command(display_order = 21)]
     Config,
-    /// Check for common issues (stale processes, orphaned sockets, config errors)
+    /// Check for stale processes, orphaned files and config errors
     #[command(display_order = 22)]
     Doctor {
         /// Remove socket-dir files this gritty version doesn't recognize
@@ -487,19 +516,60 @@ enum Command {
         /// Shell to generate completions for
         shell: clap_complete::Shell,
     },
-    /// Generate man pages (one per subcommand, for packagers)
+    /// Write man pages into a directory (for packagers)
     #[command(display_order = 44)]
     Mangen {
         /// Directory to write the man pages into (created if missing)
         dir: PathBuf,
     },
     // -- Internal/plumbing --
-    /// Print the default socket path
+    /// Print the control socket path
     #[command(display_order = 42, visible_alias = "socket")]
     SocketPath,
-    /// Print the protocol version number
+    /// Print the wire protocol version
     #[command(display_order = 43)]
     ProtocolVersion,
+}
+
+impl Command {
+    /// Whether the command reads `--ctl-socket`. Everything that talks to a
+    /// daemon (or starts one) does; tunnel management, in-session helpers,
+    /// and pure output commands don't. Keep in step with `run()`.
+    fn uses_ctl_socket(&self) -> bool {
+        !matches!(
+            self,
+            Command::TunnelCreate { .. }
+                | Command::TunnelDestroy { .. }
+                | Command::Tunnels { .. }
+                | Command::Bootstrap { .. }
+                | Command::Open { .. }
+                | Command::Copy
+                | Command::Config
+                | Command::Completions { .. }
+                | Command::Mangen { .. }
+                | Command::ProtocolVersion
+        )
+    }
+
+    /// The command's CLI name (`kill-session`): the variant name in
+    /// kebab-case, which is exactly how the clap derive names subcommands
+    /// (none of ours override it -- `command_names_match_clap` checks).
+    fn name(&self) -> String {
+        let debug = format!("{self:?}");
+        let variant = debug.split(|c: char| !c.is_alphanumeric()).next().unwrap_or_default();
+        let mut out = String::new();
+        for (i, ch) in variant.chars().enumerate() {
+            if ch.is_ascii_uppercase() {
+                if i > 0 {
+                    out.push('-');
+                }
+                out.push(ch.to_ascii_lowercase());
+            } else {
+                out.push(ch);
+            }
+        }
+        out
+    }
 }
 
 fn init_tracing(verbose: bool, log_path: Option<&Path>, stderr_default: &'static str) {
@@ -732,6 +802,20 @@ fn main() {
     let cli = Cli::parse();
     // Before anything prints -- `ConfigFile::load()` already emits warnings.
     gritty::ui::set_color_choice(cli.color.into());
+    if cli.ctl_socket.is_some() && !cli.command.uses_ctl_socket() {
+        // A clap usage error (exit 2), not a runtime one: the flag is a
+        // global so it parses everywhere, but silently ignoring it here
+        // would let e.g. `tunnels --ctl-socket X` look like it inspected X.
+        Cli::command()
+            .error(
+                clap::error::ErrorKind::ArgumentConflict,
+                format!(
+                    "--ctl-socket has no effect on `{}`, which does not talk to a daemon",
+                    cli.command.name()
+                ),
+            )
+            .exit();
+    }
     let verbose = cli.verbose;
     // Record verbosity so auto_start can forward --verbose to daemons it spawns.
     set_verbose(verbose);
@@ -1259,6 +1343,31 @@ mod tests {
     }
 
     #[test]
+    fn command_names_match_clap() {
+        let registered: Vec<String> =
+            Cli::command().get_subcommands().map(|c| c.get_name().to_string()).collect();
+        for (cmd, expected) in [
+            (Command::Copy, "copy"),
+            (Command::ProtocolVersion, "protocol-version"),
+            (Command::SocketPath, "socket-path"),
+            (Command::KillSession { targets: vec!["x".into()] }, "kill-session"),
+            (Command::Tunnels { json: true }, "tunnels"),
+        ] {
+            assert_eq!(cmd.name(), expected);
+            assert!(registered.contains(&cmd.name()), "{expected} not registered: {registered:?}");
+        }
+    }
+
+    #[test]
+    fn ctl_socket_is_rejected_only_where_it_would_be_ignored() {
+        assert!(Command::KillSession { targets: vec![] }.uses_ctl_socket());
+        assert!(Command::SocketPath.uses_ctl_socket());
+        assert!(!Command::Tunnels { json: false }.uses_ctl_socket());
+        assert!(!Command::Copy.uses_ctl_socket());
+        assert!(!Command::ProtocolVersion.uses_ctl_socket());
+    }
+
+    #[test]
     fn transfer_session_target_is_prefixed_or_rejected() {
         let config = gritty::config::ConfigFile::default();
         let client = config.resolve_session(None).client_name;
@@ -1379,16 +1488,28 @@ mod tests {
     // The top-level `gritty --help` uses a hand-written help_template with no
     // {subcommands} placeholder, so it can silently drift from the Command
     // enum. Guard it: every subcommand must be named in the rendered help.
+    /// The grouped listing in `help_template` is hand-written (clap can't
+    /// group subcommands), so pin it to the enum: every subcommand must appear
+    /// with exactly its registered aliases and exactly its `about`, in the
+    /// listing's `  name (aliases)  about` shape.
     #[test]
-    fn help_template_lists_every_subcommand() {
+    fn help_template_matches_every_subcommand() {
         let help = Cli::command().render_help().to_string();
         for sub in Cli::command().get_subcommands() {
-            let name = sub.get_name();
-            assert!(
-                help.contains(name),
-                "top-level --help omits subcommand `{name}` -- help_template has \
-                 drifted from the Command enum"
-            );
+            let aliases: Vec<&str> = sub.get_visible_aliases().collect();
+            let label = if aliases.is_empty() {
+                sub.get_name().to_string()
+            } else {
+                format!("{} ({})", sub.get_name(), aliases.join(", "))
+            };
+            let about = sub.get_about().map(ToString::to_string).unwrap_or_default();
+            let listed = help.lines().any(|line| {
+                let line = line.trim_start();
+                line.starts_with(&label)
+                    && line[label.len()..].starts_with(' ')
+                    && line.trim_end().ends_with(&about)
+            });
+            assert!(listed, "help_template line for `{label}` missing or not `{label}  {about}`");
         }
     }
 }

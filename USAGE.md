@@ -70,7 +70,7 @@ A `[host.<name>] aliases` config entry makes alternate spellings resolve to the 
 ### Global options
 
 - `-v` / `--verbose`: enable debug logging
-- `--ctl-socket <path>`: override the server socket path
+- `--ctl-socket <path>`: talk to the daemon behind this control socket instead of the default one. Accepted by every command that talks to (or starts) a daemon; commands that don't (`tunnels`, `tunnel-create`/`-destroy`, `bootstrap`, `open`, `copy`, `config`, `completions`, `mangen`, `protocol-version`) reject it rather than silently ignoring it. All three global options are listed under "Global options" in each command's `--help`
 - `--color <auto|always|never>`: when to colorize output (default `auto`)
 
 ### Color
