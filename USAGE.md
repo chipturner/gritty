@@ -57,7 +57,7 @@ A `[host.<name>] aliases` config entry makes alternate spellings resolve to the 
 
 **`session`** is a name you choose so you can run several sessions per host. Rules:
 
-- Omitted: `connect` looks only at sessions in your own namespace (`<client>/*`). It attaches the sole detached one, shows a picker when the choice is ambiguous, and falls back to `<client>/0` when your namespace is empty. Auto-created sessions get the next free integer slot in your namespace (`0`, `1`, `2`, ...). Foreign-namespace and legacy unprefixed sessions are ignored -- reach those with the explicit slash-bearing form (`gritty connect host:other/name`).
+- Omitted: `connect` looks only at sessions in your own namespace (`<client>/*`). It attaches the sole detached one, shows a picker when the choice is ambiguous, and falls back to `<client>/0` when your namespace is empty (`-d` and `-n` skip all of that and create the next free slot). Auto-created sessions get the next free integer slot in your namespace (`0`, `1`, `2`, ...). Foreign-namespace and legacy unprefixed sessions are ignored -- reach those with the explicit slash-bearing form (`gritty connect host:other/name`).
 - `-`: refers to the last-attached session, e.g. `gritty connect devbox:-`. It is resolved to the real name before attaching (so messages and `~#` show that name) and never creates anything -- if nothing has been attached yet, it errors.
 - Purely numeric *wire* names are rejected by the server (they would collide with auto-assigned session IDs). Typing `0` as a short name still works -- the client prefix turns it into `<client>/0`, which contains a slash and so is not purely numeric.
 
@@ -94,8 +94,8 @@ Flag defaults come from config, with precedence CLI > `[host.<name>]` > `[defaul
 - `-A` / `--forward-agent`: forward your local SSH agent (off by default)
 - `--no-forward-agent`: never forward the agent, even if `forward-agent = true` in config
 - `-O` / `--forward-open`: forward URL opens to local machine (on by default; `-O` overrides a `forward-open = false` in config, `--no-forward-open` disables for this connect)
-- `-c <cmd>` / `--command`: run a command instead of a login shell (when creating)
-- `-d` / `--detach`: create session without attaching (background jobs). This is the only form that works without a terminal on stdin -- a scripted `connect` (stdin from a pipe or `/dev/null`) is refused up front rather than creating a session it can't attach to
+- `-c <cmd>` / `--command`: run a command instead of a login shell. Only applies when the session is created; if it already exists, connect warns that `-c` was ignored
+- `-d` / `--detach`: create the session without attaching (background jobs). With no session name it creates the next free slot, like `-n` (`--no-pick -d` pins slot `0`); on an existing session it is a no-op that says so. It returns only once the daemon lists the new session as detached, so a following command sees a consistent state. This is the only form that works without a terminal on stdin -- a scripted `connect` (stdin from a pipe or `/dev/null`) is refused up front rather than creating a session it can't attach to
 - `--force`: take over an already-attached session without prompting
 - `--pick`: always show the session picker (interactive when in a terminal). Picker keys: arrows or `1`-`9` move, enter attaches, `f` takes over an attached session, `n` creates the suggested next session, `c` creates one with a name you type, `r` renames, `x` kills (with a y/n confirm; the picker stays open, even after the last session goes), `q`/esc quits. Columns are the same as `ls`
 - `--no-pick`: never show session list; always target session `0`

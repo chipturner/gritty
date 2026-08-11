@@ -133,8 +133,9 @@ enum Command {
         #[arg(short = 'c', long)]
         command: Option<String>,
 
-        /// Create session but don't attach (for background jobs)
-        #[arg(short = 'd', long)]
+        /// Create the session but don't attach (for background jobs). With no
+        /// session name this creates the next free slot, like -n
+        #[arg(short = 'd', long, conflicts_with = "pick")]
         detach: bool,
 
         /// Attach only, error if session doesn't exist

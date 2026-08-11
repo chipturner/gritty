@@ -127,9 +127,13 @@ pub(crate) async fn connect_session(
     // Resolve the session name. An explicit name or the interactive picker
     // can be resolved up front; -n/--new must wait until connect_or_start has
     // proven the socket reachable.
+    // Unnamed `-d` means "make me a background session": it takes the next
+    // free slot like -n. (Auto-attach/picker semantics -- find something to
+    // attach to -- have nothing to offer a command that never attaches.)
+    // `--no-pick` still pins it to slot 0 for scripts that want exactly that.
     let (preliminary_name, picker_force) = match &session {
         Some(name) => (Some(name.clone()), false),
-        None if new_session => (None, false),
+        None if new_session || (detach && !no_pick) => (None, false),
         None => {
             let (n, _picked, pf) =
                 pick_session(pick, no_pick, &ctl_path, &settings.client_name).await;
@@ -137,6 +141,7 @@ pub(crate) async fn connect_session(
         }
     };
     let force = force || picker_force;
+    let command_given = command.is_some();
     let session_command = command.unwrap_or_default();
 
     let (stream, _auto_started) =
@@ -195,13 +200,26 @@ pub(crate) async fn connect_session(
         })
         .await?;
 
+    // `-c` only applies when a session is created; on an existing one it
+    // would otherwise vanish without a trace.
+    let warn_command_ignored = || {
+        if command_given {
+            ui::warn(&format!(
+                "session {shown} already exists -- -c ignored (its command is not run)"
+            ));
+        }
+    };
+
     match Frame::expect_from(framed.next().await)? {
         Frame::Ok if detach => {
             // Probe succeeded (connect -d): existence confirmed, not attaching.
-            ui::success(&format!("session {shown} exists (not attaching, -d)"));
+            // A no-op, so it reads as status rather than as an accomplishment.
+            ui::status(&format!("session {shown} exists (not attaching, -d)"));
+            warn_command_ignored();
             return Ok(());
         }
         Frame::AttachAck { token: _, session_id } => {
+            warn_command_ignored();
             // The session already existed, so `linger_secs` was never sent
             // in a NewSession. If the user passed `--linger` explicitly,
             // apply it now so the flag isn't silently dropped.
@@ -275,6 +293,13 @@ pub(crate) async fn connect_session(
             framed.send(Frame::Env { vars: gritty::collect_env_vars() }).await?;
 
             if detach {
+                // Drop our connection, then don't return until the daemon has
+                // registered the detach. Otherwise `-d` exits a few
+                // milliseconds before the session task notices our EOF, and
+                // whatever the script runs next (`connect`, `prune`, `ls`)
+                // sees the session as attached.
+                drop(framed);
+                wait_until_detached(&ctl_path, id).await;
                 return Ok(());
             }
 
@@ -300,6 +325,29 @@ pub(crate) async fn connect_session(
 /// consult for a `-` attach.
 async fn resolve_last_attached(ctl_path: &Path) -> anyhow::Result<String> {
     Ok(session_wire_name(&super::util::resolve_session(ctl_path, "-").await?))
+}
+
+/// Block until the daemon lists session `id` as detached (or it is gone).
+/// The state itself is the signal; the deadline is only a safety cap so a
+/// wedged daemon can't hang a script -- in that case `-d` degrades to the old
+/// fire-and-forget behavior.
+async fn wait_until_detached(ctl_path: &Path, id: u32) {
+    use gritty::protocol::Frame;
+
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+    loop {
+        match server_request(ctl_path, Frame::ListSessions).await {
+            Ok(Frame::SessionInfo { sessions })
+                if !sessions.iter().any(|s| s.id == id && s.attached) =>
+            {
+                return;
+            }
+            Ok(_) if std::time::Instant::now() < deadline => {
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+            _ => return,
+        }
+    }
 }
 
 /// Resolve `-n`/`--new` to the next auto-named session slot: the first free

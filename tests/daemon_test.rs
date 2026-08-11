@@ -662,6 +662,104 @@ async fn ls_dashboard_and_single_host_share_one_shape() {
     kill_cleanup(&ctl_path, "shared/x").await;
 }
 
+fn list_names(sessions: &[gritty::protocol::SessionEntry]) -> Vec<String> {
+    let mut names: Vec<String> = sessions.iter().map(|s| s.name.clone()).collect();
+    names.sort();
+    names
+}
+
+#[tokio::test]
+async fn detach_create_returns_only_once_the_session_reads_detached() {
+    let (tmp, ctl_path) = test_ctl();
+    let ctl = ctl_path.clone();
+    let _daemon = tokio::spawn(async move { gritty::daemon::run(&ctl, None).await });
+    wait_for_daemon(&ctl_path).await;
+
+    // No sleep between the two: `-d` used to exit while the daemon still
+    // counted the creating connection as attached, so anything scripted right
+    // after it (a follow-up connect, a prune, this ListSessions) saw an
+    // attached session for a few milliseconds.
+    for _ in 0..5 {
+        let out = gritty_in(tmp.path(), &["connect", "-d", "local:job"]).await;
+        assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+        let Frame::SessionInfo { sessions } = control_request(&ctl_path, Frame::ListSessions).await
+        else {
+            panic!("expected SessionInfo");
+        };
+        let job = sessions.iter().find(|s| s.name.ends_with("/job")).expect("job exists");
+        assert!(!job.attached, "-d returned while the session still read attached: {job:?}");
+        kill_cleanup(&ctl_path, &job.name).await;
+        wait_gone(&ctl_path, &job.name).await;
+    }
+}
+
+/// Wait until no session with this name is listed.
+async fn wait_gone(ctl_path: &std::path::Path, name: &str) {
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    loop {
+        if let Frame::SessionInfo { sessions } =
+            control_request(ctl_path, Frame::ListSessions).await
+            && !sessions.iter().any(|s| s.name == name)
+        {
+            return;
+        }
+        assert!(tokio::time::Instant::now() < deadline, "{name} never went away");
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+}
+
+#[tokio::test]
+async fn unnamed_detach_creates_a_new_slot_each_time() {
+    let (tmp, ctl_path) = test_ctl();
+    let ctl = ctl_path.clone();
+    let _daemon = tokio::spawn(async move { gritty::daemon::run(&ctl, None).await });
+    wait_for_daemon(&ctl_path).await;
+
+    // `-d` means "create one in the background"; picking an existing session
+    // and doing nothing (the old behavior once a slot existed) was useless.
+    let first = gritty_in(tmp.path(), &["connect", "-d"]).await;
+    let second = gritty_in(tmp.path(), &["connect", "-d"]).await;
+    assert!(first.status.success() && second.status.success());
+    assert!(String::from_utf8_lossy(&first.stderr).contains("session 0"), "{first:?}");
+    assert!(String::from_utf8_lossy(&second.stderr).contains("session 1"), "{second:?}");
+    let Frame::SessionInfo { sessions } = control_request(&ctl_path, Frame::ListSessions).await
+    else {
+        panic!("expected SessionInfo");
+    };
+    let names = list_names(&sessions);
+    assert_eq!(names.len(), 2, "{names:?}");
+    assert!(names[0].ends_with("/0") && names[1].ends_with("/1"), "{names:?}");
+    for n in &names {
+        kill_cleanup(&ctl_path, n).await;
+    }
+}
+
+#[tokio::test]
+async fn command_flag_is_never_silently_dropped() {
+    let (tmp, ctl_path) = test_ctl();
+    let ctl = ctl_path.clone();
+    let _daemon = tokio::spawn(async move { gritty::daemon::run(&ctl, None).await });
+    wait_for_daemon(&ctl_path).await;
+
+    let created = gritty_in(tmp.path(), &["connect", "-d", "local:build", "-c", "sleep 30"]).await;
+    assert!(created.status.success());
+    assert!(!String::from_utf8_lossy(&created.stderr).contains("ignored"), "{created:?}");
+
+    // Second time the session exists, so `-c` cannot take effect: say so.
+    let again = gritty_in(tmp.path(), &["connect", "-d", "local:build", "-c", "make"]).await;
+    let stderr = String::from_utf8_lossy(&again.stderr);
+    assert!(again.status.success(), "an existing session is not an error: {stderr}");
+    assert!(stderr.contains("exists"), "{stderr}");
+    assert!(stderr.contains("-c") && stderr.contains("ignored"), "must warn: {stderr}");
+
+    let Frame::SessionInfo { sessions } = control_request(&ctl_path, Frame::ListSessions).await
+    else {
+        panic!("expected SessionInfo");
+    };
+    let name = sessions[0].name.clone();
+    kill_cleanup(&ctl_path, &name).await;
+}
+
 #[tokio::test]
 async fn sessions_are_addressed_by_name_only() {
     let (tmp, ctl_path) = test_ctl();

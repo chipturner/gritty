@@ -26,6 +26,13 @@ protocol interoperate with their neighbors.
   `--json`) and exits 0; naming a host that is down still fails, but
   `--json` now emits the group with its `error` field rather than a bare
   message.
+- **`connect -d` behaves like a create command.** Unnamed `-d` creates the
+  next free slot (it used to pick an existing session and do nothing);
+  `-c` on a session that already exists now warns that the command was
+  ignored instead of silently attaching or reporting green success; and
+  `-d` waits until the daemon lists the new session as detached before
+  exiting, closing a few-millisecond window where the next command in a
+  script saw it as attached.
 - **Picker polish.** Both pickers (`connect`, `prune --pick`) now have a
   column header and show `ls`'s columns -- the connect picker gains `Idle`
   (it showed the session's age, unlabeled) and reserves the `(attached)`
