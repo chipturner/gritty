@@ -7,14 +7,17 @@ use gritty::ui;
 /// resolution. Only for strings whose host part is already canonical (e.g.
 /// rebuilt by `resolve_target_session`); everything else goes through
 /// [`parse_target`].
+///
+/// An empty host (`:work`, or an empty string) means `local`, matching the
+/// omitted-target rule -- and closing the hole where the empty string flowed
+/// on to become a tunnel named `` (`connect-.sock`, `connect-.log`).
 pub(crate) fn split_target(s: &str) -> (String, Option<String>) {
-    match s.split_once(':') {
-        Some((host, session)) if !session.is_empty() => {
-            (host.to_string(), Some(session.to_string()))
-        }
-        Some((host, _)) => (host.to_string(), None),
-        None => (s.to_string(), None),
-    }
+    let (host, session) = match s.split_once(':') {
+        Some((host, session)) => (host, Some(session).filter(|s| !s.is_empty())),
+        None => (s, None),
+    };
+    let host = if host.is_empty() { "local" } else { host };
+    (host.to_string(), session.map(str::to_string))
 }
 
 /// Parse a `host[:session]` target string: split on the first `:` and
@@ -1202,6 +1205,20 @@ mod tests {
     fn split_target_does_not_alias() {
         let (host, _) = split_target("foo.bar.com:work");
         assert_eq!(host, "foo.bar.com");
+    }
+
+    /// `:name` is the omitted-host form of `host:name`. It used to yield an
+    /// empty host, which auto-start turned into a tunnel literally named ``
+    /// (`connect-.sock`, `connect-.log`, `tunnel-create --name  `).
+    #[test]
+    fn split_target_empty_host_means_local() {
+        assert_eq!(split_target(":work"), ("local".to_string(), Some("work".to_string())));
+        assert_eq!(split_target(":"), ("local".to_string(), None));
+        assert_eq!(split_target(""), ("local".to_string(), None));
+        assert_eq!(
+            parse_target(&foo_alias(), ":work"),
+            ("local".to_string(), Some("work".to_string()))
+        );
     }
 
     #[test]

@@ -51,7 +51,7 @@ laptop$ gritty tunnel-create user@10.0.0.5 -n devbox
 laptop$ gritty connect devbox:work          # now "devbox" routes to user@10.0.0.5
 ```
 
-`local` is a reserved connection name for a server on this machine (no SSH tunnel). Omitting the host entirely targets `local`: bare `gritty connect`, `gritty tail`, `gritty prune --pick`, `gritty kill-server`, and `gritty restart` all address the local daemon. The exceptions are `gritty ls` and `gritty refresh`, where no host means every known host.
+`local` is a reserved connection name for a server on this machine (no SSH tunnel). Omitting the host targets `local`: bare `gritty connect`, `gritty tail`, `gritty prune --pick`, `gritty kill-server`, and `gritty restart` all address the local daemon, and `:work` is shorthand for `local:work` in any target (a bare word without a colon is a *host*, so `gritty connect work` means the host `work`). The exceptions are `gritty ls` and `gritty refresh`, where no host means every known host.
 
 A `[host.<name>] aliases` config entry makes alternate spellings resolve to the same connection name, so `gritty connect devbox.example.com:work` and `gritty connect devbox:work` address the same tunnel and sessions (see [Configuration](#configuration)).
 

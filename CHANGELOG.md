@@ -22,6 +22,11 @@ protocol interoperate with their neighbors.
   version-unknown case with the same verdict `refresh` acts on. Existing
   tunnels pick this up on their next `tunnel-create`/`refresh`. No
   protocol change.
+- **`:name` now means `local:name`.** An empty host part used to flow
+  through as a tunnel literally named `` -- `gritty connect :work` printed
+  `starting tunnel ...`, ran `tunnel-create --name '' ''`, and left a
+  `connect-.log` behind. It now follows the omitted-host rule and addresses
+  the local daemon, in every command that takes a target.
 - **Message fixes.** A failed auto-start / ssh / bootstrap no longer reports
   `(exit exit status: 1)`.
 - **Fixed: the "server shut down" exit line no longer erases your last line.**
