@@ -26,6 +26,14 @@ protocol interoperate with their neighbors.
   `--json`) and exits 0; naming a host that is down still fails, but
   `--json` now emits the group with its `error` field rather than a bare
   message.
+- **Picker polish.** Both pickers (`connect`, `prune --pick`) now have a
+  column header and show `ls`'s columns -- the connect picker gains `Idle`
+  (it showed the session's age, unlabeled) and reserves the `(attached)`
+  column only when something is attached; rows are styled the same way in
+  both; the hint lines list `q` and the arrow keys, and the new-session row
+  is `n)` with `n`/`c` as the two ways to create (the `+` binding is gone).
+  Killing the last session from the picker leaves you in the picker on the
+  new-session row instead of silently creating a session.
 - **Session names are shown one way everywhere.** `attached
   mylaptop/work`, picker rows, rename pre-fill, transfer pairing labels,
   `doctor`, and the suggested `gritty connect host:mylaptop/work` commands

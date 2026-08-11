@@ -466,7 +466,6 @@ struct Row {
     /// elided, exactly as `ls` shows it (foreign names stay in full).
     display: String,
     attached: bool,
-    age: String,
     idle: String,
     cmd: String,
     cwd: String,
@@ -496,7 +495,6 @@ fn build_rows(sessions: &[gritty::protocol::SessionEntry], client_name: &str) ->
                 name,
                 display,
                 attached: s.attached,
-                age: format_age(now, s.created_at),
                 idle: super::util::format_idle(now, s.last_activity),
                 cmd: s.foreground_cmd.clone(),
                 cwd: shorten_home(&s.cwd),
@@ -506,6 +504,54 @@ fn build_rows(sessions: &[gritty::protocol::SessionEntry], client_name: &str) ->
         })
         .collect()
 }
+
+/// The aligned, unstyled body of a picker: `(header, one line per row)`, in
+/// the same columns `ls` shows (Name, Idle, Cmd, Client, CWD, plus an
+/// `(attached)` column only when some row needs it) and through the same
+/// column engine, so wide characters line up. Callers prepend their own
+/// gutter (pointer, mark, hotkey) and style whole lines. Empty when there are
+/// no rows.
+fn picker_lines(rows: &[Row]) -> (String, Vec<String>) {
+    let tagged = rows.iter().any(|r| r.attached);
+    let mut headers = vec!["Name"];
+    if tagged {
+        headers.push("");
+    }
+    headers.extend(["Idle", "Cmd", "Client", "CWD"]);
+    let cells: Vec<Vec<String>> = rows
+        .iter()
+        .map(|r| {
+            let mut c = vec![r.display.clone()];
+            if tagged {
+                c.push(if r.attached { "(attached)" } else { "" }.to_string());
+            }
+            c.extend([r.idle.clone(), r.cmd.clone(), r.client.clone(), r.cwd.clone()]);
+            c
+        })
+        .collect();
+    let mut lines = gritty::table::format_table(&headers, &cells);
+    if lines.is_empty() {
+        return (String::new(), Vec::new());
+    }
+    let header = lines.remove(0);
+    (header, lines)
+}
+
+/// Style one picker body line: the cursor row in bold green, attached rows
+/// (which plain Enter would refuse) dimmed, everything else plain.
+fn style_picker_line(line: &str, at_cursor: bool, attached: bool) -> String {
+    match (at_cursor, attached) {
+        (true, _) => format!("\x1b[32;1m{line}\x1b[0m"),
+        (false, true) => format!("\x1b[2m{line}\x1b[0m"),
+        (false, false) => line.to_string(),
+    }
+}
+
+fn hotkey_label(row: &Row) -> String {
+    row.hotkey.map_or_else(|| "  ".to_string(), |c| format!("{c})"))
+}
+
+const PICKER_POINTER: &str = "\x1b[32;1m\u{25b8}\x1b[0m";
 
 /// Where the picker's cursor starts: the first *displayed* row that can be
 /// attached as-is (own sessions sort first, so that's the user's own first
@@ -624,93 +670,65 @@ async fn tui_pick_session(
                   mode: &Mode,
                   status: Option<&str>,
                   prev_total_lines: usize| {
-        // Same display form as `ls`: own prefix elided, foreign names in
-        // full (the CLIENT column carries the namespace either way).
-        let displayed: Vec<&str> = rows.iter().map(|r| r.display.as_str()).collect();
-        let name_w = displayed.iter().map(|s| s.len()).max().unwrap_or(0).max(3);
-        let tag_w = 10; // "(attached)" is 10 chars
-        let age_w = rows.iter().map(|r| r.age.len()).max().unwrap_or(0);
-        let cmd_w = rows.iter().map(|r| r.cmd.len()).max().unwrap_or(0);
-        let client_w = rows.iter().map(|r| r.client.len()).max().unwrap_or(0);
-        // header + rows + new-session + hint, plus an optional status line.
-        let total_lines = rows.len() + 3 + usize::from(status.is_some());
+        let (header, lines) = picker_lines(rows);
+        // title + column header (only with rows) + rows + new-session/input
+        // row + hint, plus an optional status line.
+        let total_lines =
+            1 + usize::from(!rows.is_empty()) + rows.len() + 1 + 1 + usize::from(status.is_some());
 
-        // If we drew before, erase old output first
         erase_picker_lines(stderr, prev_total_lines);
 
-        // Show/hide cursor based on mode
-        match mode {
-            Mode::Pick | Mode::ConfirmKill => {
-                let _ = write!(stderr, "\x1b[?25l");
-            }
-            Mode::Input { .. } => {
-                let _ = write!(stderr, "\x1b[?25h");
-            }
-        }
+        let picking = matches!(mode, Mode::Pick | Mode::ConfirmKill);
+        // The text cursor is only meaningful while editing a name.
+        let _ = write!(stderr, "{}", if picking { "\x1b[?25l" } else { "\x1b[?25h" });
 
-        // Header
         let _ = write!(stderr, "\x1b[36;1mPick a session on {host}:\x1b[0m\r\n");
-        for (i, row) in rows.iter().enumerate() {
-            let marker = if i == cursor && matches!(mode, Mode::Pick | Mode::ConfirmKill) {
-                "\x1b[32;1m\u{25b8}\x1b[0m"
-            } else {
-                " "
-            };
-            let hk = row.hotkey.map_or(String::from("  "), |c| format!("{c})"));
-            let shown = displayed[i];
-
-            if i == cursor && matches!(mode, Mode::Pick | Mode::ConfirmKill) {
-                let tag = if row.attached { "(attached)" } else { "" };
-                let _ = write!(
-                    stderr,
-                    "{marker} \x1b[2m{hk}\x1b[0m \x1b[32;1m{:<name_w$}\x1b[0m  {:<tag_w$}  \x1b[32m{:<age_w$}\x1b[0m  \x1b[32m{:<cmd_w$}\x1b[0m  \x1b[32m{:<client_w$}\x1b[0m  \x1b[32m{}\x1b[0m\r\n",
-                    shown, tag, row.age, row.cmd, row.client, row.cwd,
-                );
-            } else if row.attached {
-                let _ = write!(
-                    stderr,
-                    "{marker} \x1b[2m{hk} {:<name_w$}  {:<tag_w$}  {:<age_w$}  {:<cmd_w$}  {:<client_w$}  {}\x1b[0m\r\n",
-                    shown, "(attached)", row.age, row.cmd, row.client, row.cwd,
-                );
-            } else {
-                let _ = write!(
-                    stderr,
-                    "{marker} \x1b[2m{hk}\x1b[0m {:<name_w$}  {:<tag_w$}  {:<age_w$}  {:<cmd_w$}  {:<client_w$}  {}\r\n",
-                    shown, "", row.age, row.cmd, row.client, row.cwd,
-                );
-            }
+        if !rows.is_empty() {
+            // Gutter matches the rows' `▸ 1) ` prefix so the header aligns.
+            let _ = write!(stderr, "     \x1b[2m{header}\x1b[0m\r\n");
         }
-        // "New session" row / input line
+        for (i, (row, line)) in rows.iter().zip(&lines).enumerate() {
+            let at_cursor = picking && i == cursor;
+            let pointer = if at_cursor { PICKER_POINTER } else { " " };
+            let _ = write!(
+                stderr,
+                "{pointer} \x1b[2m{}\x1b[0m {}\r\n",
+                hotkey_label(row),
+                style_picker_line(line, at_cursor, row.attached)
+            );
+        }
+        // The new-session row doubles as the input line while naming/renaming.
         let suggested_wire = suggest_name(rows, client_name);
         let suggested = gritty::naming::display_session_name(&suggested_wire, client_name);
         match mode {
             Mode::Pick | Mode::ConfirmKill => {
-                let marker = if cursor == rows.len() { "\x1b[32;1m\u{25b8}\x1b[0m" } else { " " };
                 if cursor == rows.len() {
                     let _ = write!(
                         stderr,
-                        "{marker} \x1b[2m+)\x1b[0m \x1b[32;1mnew session \x1b[2m({suggested})\x1b[0m\r\n"
+                        "{PICKER_POINTER} \x1b[2mn)\x1b[0m \x1b[32;1mnew session \x1b[2m({suggested})\x1b[0m\r\n"
                     );
                 } else {
-                    let _ =
-                        write!(stderr, "{marker} \x1b[2m+) new session ({suggested})\x1b[0m\r\n");
+                    let _ = write!(stderr, "  \x1b[2mn) new session ({suggested})\x1b[0m\r\n");
                 }
             }
             Mode::Input { buf, cursor_pos, rename_of } => {
-                let prefix = if rename_of.is_some() { "r)" } else { "+)" };
+                let prefix = if rename_of.is_some() { "r)" } else { "c)" };
                 let (before, after) = buf.split_at(*cursor_pos);
                 let cursor_ch = after.chars().next().unwrap_or(' ');
                 let rest = if after.is_empty() { "" } else { &after[cursor_ch.len_utf8()..] };
                 let _ = write!(
                     stderr,
-                    "\x1b[32;1m\u{25b8}\x1b[0m \x1b[2m{prefix}\x1b[0m \x1b[32;1m{before}\x1b[7m{cursor_ch}\x1b[27m{rest}\x1b[0m\r\n"
+                    "{PICKER_POINTER} \x1b[2m{prefix}\x1b[0m \x1b[32;1m{before}\x1b[7m{cursor_ch}\x1b[27m{rest}\x1b[0m\r\n"
                 );
             }
         }
-        // Hint line
         let hints = match mode {
+            Mode::Pick if rows.is_empty() => {
+                "enter/n new session  c new (named)  q quit".to_string()
+            }
             Mode::Pick => {
-                "1-9 jump  enter select  f force  n new  c/+ new (named)  r rename  x kill  esc quit"
+                "\u{2191}\u{2193} move  enter/1-9 attach  f take over  n new  c new (named)  \
+                 r rename  x kill  q quit"
                     .to_string()
             }
             Mode::Input { rename_of: Some(_), .. } => "enter rename  esc back".to_string(),
@@ -782,9 +800,9 @@ async fn tui_pick_session(
                 }) => {
                     break Some((suggest_name(&rows, client_name), false));
                 }
-                // 'c' or '+' -> new session input, prompting to edit the name
+                // 'c' -> new session input, prompting to edit the name
                 Event::Key(KeyEvent {
-                    code: KeyCode::Char('c') | KeyCode::Char('+'),
+                    code: KeyCode::Char('c'),
                     modifiers: KeyModifiers::NONE,
                     ..
                 }) => {
@@ -876,17 +894,16 @@ async fn tui_pick_session(
                             status = Some(format!("kill failed: unexpected response {other:?}"));
                         }
                     }
-                    // Refresh session list
+                    // Refresh the list. Killing the last session leaves the
+                    // picker open on the new-session row -- the user asked
+                    // to kill something, not to be dropped into a fresh
+                    // shell; Enter/n creates one, q leaves.
                     if let Ok(gritty::protocol::Frame::SessionInfo { sessions: fresh }) =
                         server_request(&ctl, gritty::protocol::Frame::ListSessions).await
                     {
-                        if fresh.is_empty() {
-                            break Some((
-                                gritty::naming::resolve_session_name("0", client_name),
-                                false,
-                            ));
-                        }
                         rows = build_rows(&fresh, client_name);
+                        // Stay on a real row while any remain (== the new-session
+                        // row, index 0, once none do).
                         cursor = cursor.min(rows.len().saturating_sub(1));
                     }
                     mode = Mode::Pick;
@@ -1341,48 +1358,42 @@ async fn tui_mark_sessions(
     let _ = write!(stderr, "\x1b[?25l"); // hide cursor
     let _term_guard = PickerTermGuard;
 
+    let (header, lines) = picker_lines(&rows);
     let render = |stderr: &mut std::io::Stderr,
                   cursor: usize,
                   marked: &HashSet<u32>,
                   confirm: bool,
                   status: Option<&str>,
                   prev_total_lines: usize| {
-        let name_w = rows.iter().map(|r| r.name.len()).max().unwrap_or(0).max(3);
-        let age_w = rows.iter().map(|r| r.age.len()).max().unwrap_or(0);
-        let idle_w = rows.iter().map(|r| r.idle.len()).max().unwrap_or(0).max(4);
-        let cmd_w = rows.iter().map(|r| r.cmd.len()).max().unwrap_or(0);
-        let client_w = rows.iter().map(|r| r.client.len()).max().unwrap_or(0);
-        // header + rows + hint, plus an optional status line.
-        let total_lines = rows.len() + 2 + usize::from(status.is_some());
+        // title + column header + rows + hint, plus an optional status line.
+        let total_lines = 2 + rows.len() + 1 + usize::from(status.is_some());
 
         erase_picker_lines(stderr, prev_total_lines);
 
         let _ = write!(stderr, "\x1b[36;1mPrune sessions on {host} -- mark and kill:\x1b[0m\r\n");
-        for (i, row) in rows.iter().enumerate() {
-            let pointer = if i == cursor { "\x1b[32;1m\u{25b8}\x1b[0m" } else { " " };
+        // Gutter matches the rows' `▸ [x] 1) ` prefix so the header aligns.
+        let _ = write!(stderr, "         \x1b[2m{header}\x1b[0m\r\n");
+        for (i, (row, line)) in rows.iter().zip(&lines).enumerate() {
+            let at_cursor = i == cursor;
+            let pointer = if at_cursor { PICKER_POINTER } else { " " };
             let mark = if marked.contains(&row.id) { "\x1b[31;1m[x]\x1b[0m" } else { "[ ]" };
-            let hk = row.hotkey.map_or(String::from("  "), |c| format!("{c})"));
-            if i == cursor {
-                let _ = write!(
-                    stderr,
-                    "{pointer} {mark} \x1b[2m{hk}\x1b[0m \x1b[32;1m{:<name_w$}\x1b[0m  \x1b[32m{:<age_w$}\x1b[0m  \x1b[32m{:<idle_w$}\x1b[0m  \x1b[32m{:<cmd_w$}\x1b[0m  \x1b[32m{:<client_w$}\x1b[0m  \x1b[32m{}\x1b[0m\r\n",
-                    row.name, row.age, row.idle, row.cmd, row.client, row.cwd,
-                );
-            } else {
-                let _ = write!(
-                    stderr,
-                    "{pointer} {mark} \x1b[2m{hk}\x1b[0m {:<name_w$}  \x1b[2m{:<age_w$}  {:<idle_w$}  {:<cmd_w$}  {:<client_w$}  {}\x1b[0m\r\n",
-                    row.name, row.age, row.idle, row.cmd, row.client, row.cwd,
-                );
-            }
+            let _ = write!(
+                stderr,
+                "{pointer} {mark} \x1b[2m{}\x1b[0m {}\r\n",
+                hotkey_label(row),
+                style_picker_line(line, at_cursor, row.attached)
+            );
         }
-        let hints = if confirm {
-            format!("\x1b[31;1mkill {} session(s)? y/n\x1b[0m", marked.len())
+        if confirm {
+            let n = marked.len();
+            let s = if n == 1 { "" } else { "s" };
+            let _ = write!(stderr, "\x1b[31;1m  kill {n} session{s}? y/n\x1b[0m\r\n");
         } else {
-            "\x1b[2m  space mark  a mark all  1-9 toggle  enter kill marked  esc quit\x1b[0m"
-                .to_string()
-        };
-        let _ = write!(stderr, "{hints}\r\n");
+            let _ = write!(
+                stderr,
+                "\x1b[2m  \u{2191}\u{2193} move  space mark  a mark all  1-9 toggle  enter kill marked  q quit\x1b[0m\r\n"
+            );
+        }
         if let Some(msg) = status {
             let _ = write!(stderr, "\x1b[31m  {msg}\x1b[0m\r\n");
         }
@@ -2168,7 +2179,6 @@ mod tests {
             name: name.to_string(),
             display: name.to_string(),
             attached: false,
-            age: String::new(),
             idle: String::new(),
             cmd: String::new(),
             cwd: String::new(),
@@ -2435,6 +2445,63 @@ mod tests {
         let rows = build_rows(&sessions, "defiant");
         assert_eq!((rows[0].display.as_str(), rows[0].name.as_str()), ("a", "defiant/a"));
         assert_eq!((rows[1].display.as_str(), rows[1].name.as_str()), ("laptop2/x", "laptop2/x"));
+    }
+
+    #[test]
+    fn picker_lines_align_a_labeled_header_with_the_rows() {
+        let mut long = auto_entry("defiant/a-rather-long-name", false);
+        long.cwd = "/home/x/proj".to_string();
+        let sessions = vec![long, auto_entry("defiant/b", false)];
+        let (header, lines) = picker_lines(&build_rows(&sessions, "defiant"));
+        assert_eq!(lines.len(), 2);
+        // Every column header sits over its cells: the Idle header starts at
+        // the same offset as the idle cell of each row.
+        let idle_at = header.find("Idle").unwrap();
+        for line in &lines {
+            assert_eq!(&line[idle_at - 2..idle_at], "  ", "{line:?} vs {header:?}");
+        }
+        assert!(header.starts_with("Name"), "{header}");
+        assert!(header.ends_with("CWD"), "{header}");
+        assert!(lines[0].contains("~/proj"), "{}", lines[0]);
+        // Nothing attached: no `(attached)` column is reserved.
+        assert!(!lines[0].contains("(attached)"));
+        assert_eq!(
+            header.split_whitespace().collect::<Vec<_>>(),
+            ["Name", "Idle", "Cmd", "Client", "CWD"]
+        );
+        // Without an attached column, Idle directly follows the name column.
+        let name_w = lines.iter().map(|l| l.split("  ").next().unwrap().len()).max().unwrap();
+        assert_eq!(idle_at, name_w + 2, "{header:?}");
+    }
+
+    #[test]
+    fn picker_lines_add_the_attached_column_only_when_needed() {
+        let sessions = vec![auto_entry("defiant/a", true), auto_entry("defiant/b", false)];
+        let (header, lines) = picker_lines(&build_rows(&sessions, "defiant"));
+        assert!(lines[0].contains("(attached)"), "{}", lines[0]);
+        assert!(!lines[1].contains("(attached)"), "{}", lines[1]);
+        // The (blank-headed) tag column sits between Name and Idle and holds
+        // the column open on the untagged row too, so Idle aligns everywhere.
+        let idle_at = header.find("Idle").unwrap();
+        let tag_at = lines[0].find("(attached)").unwrap();
+        assert!(tag_at < idle_at, "{:?}", lines[0]);
+        assert_eq!(idle_at, tag_at + "(attached)".len() + 2, "{header:?} / {:?}", lines[0]);
+        for line in &lines {
+            assert_eq!(&line[idle_at - 2..idle_at], "  ", "{line:?}");
+        }
+        assert_eq!(lines[0].len(), lines[0].trim_end().len(), "last column is unpadded");
+    }
+
+    #[test]
+    fn picker_lines_empty_when_no_rows() {
+        assert_eq!(picker_lines(&[]), (String::new(), Vec::new()));
+    }
+
+    #[test]
+    fn picker_line_styles() {
+        assert_eq!(style_picker_line("x", true, true), "\x1b[32;1mx\x1b[0m");
+        assert_eq!(style_picker_line("x", false, true), "\x1b[2mx\x1b[0m");
+        assert_eq!(style_picker_line("x", false, false), "x");
     }
 
     #[test]
