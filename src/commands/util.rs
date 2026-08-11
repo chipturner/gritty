@@ -221,9 +221,16 @@ pub(crate) fn auto_start(args: &[&str]) -> anyhow::Result<()> {
     }
     let status = cmd.status()?;
     if !status.success() {
-        anyhow::bail!("failed to start `gritty {}` (exit {})", args.join(" "), status);
+        return Err(auto_start_failure(args, status));
     }
     Ok(())
+}
+
+/// `ExitStatus` already renders as `exit status: N` / `signal: N (SIGX)`,
+/// so it goes in the parentheses bare -- prefixing it with "exit" produced
+/// `(exit exit status: 1)`.
+fn auto_start_failure(args: &[&str], status: std::process::ExitStatus) -> anyhow::Error {
+    anyhow::anyhow!("failed to start `gritty {}` ({status})", args.join(" "))
 }
 
 /// Try to connect to the control socket. On failure, auto-start the
@@ -1422,6 +1429,13 @@ mod tests {
         assert!(parse_port_spec("abc").is_err());
         assert!(parse_port_spec("80:xyz").is_err());
         assert!(parse_port_spec("99999").is_err());
+    }
+
+    #[test]
+    fn auto_start_failure_does_not_double_the_word_exit() {
+        let status = std::process::Command::new("sh").args(["-c", "exit 3"]).status().unwrap();
+        let msg = auto_start_failure(&["tunnel-create", "devbox"], status).to_string();
+        assert_eq!(msg, "failed to start `gritty tunnel-create devbox` (exit status: 3)");
     }
 
     #[test]

@@ -22,6 +22,8 @@ protocol interoperate with their neighbors.
   version-unknown case with the same verdict `refresh` acts on. Existing
   tunnels pick this up on their next `tunnel-create`/`refresh`. No
   protocol change.
+- **Message fixes.** A failed auto-start / ssh / bootstrap no longer reports
+  `(exit exit status: 1)`.
 - **Fixed: the "server shut down" exit line no longer erases your last line.**
   When the daemon was killed under an attached client (or a `tail`), the
   red exit message was painted over the current row -- the sequence meant

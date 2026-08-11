@@ -229,7 +229,8 @@ async fn remote_exec(
         }
         let diag = format_ssh_diag(dest, extra_ssh_opts, foreground, connect_timeout);
         if stderr.is_empty() {
-            bail!("ssh command failed (exit {})\n  to diagnose: {diag}", output.status);
+            // ExitStatus renders as `exit status: N` / `signal: N (SIGX)`.
+            bail!("ssh command failed ({})\n  to diagnose: {diag}", output.status);
         }
         bail!("ssh command failed: {stderr}\n  to diagnose: {diag}");
     }
@@ -1441,7 +1442,7 @@ pub async fn bootstrap(
 
     let status = cmd.status().await.context("failed to run ssh")?;
     if !status.success() {
-        bail!("remote install failed (exit {status})");
+        bail!("remote install failed ({status})");
     }
 
     Ok(())
