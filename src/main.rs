@@ -222,9 +222,8 @@ enum Command {
     /// Kill one or more sessions
     #[command(display_order = 3, visible_alias = "kill")]
     KillSession {
-        /// Sessions to kill: `host:session`, or a bare name/ID resolved on
-        /// `local` (IDs and names both work; bare known host names list that
-        /// host's sessions instead)
+        /// Sessions to kill: `host:session`, or a bare session name killed on
+        /// `local` (a bare known host name lists that host's sessions instead)
         targets: Vec<String>,
     },
     /// Bulk-kill stale detached sessions (dry-run unless -y)

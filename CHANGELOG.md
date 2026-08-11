@@ -14,6 +14,13 @@ protocol interoperate with their neighbors.
   diagnostic columns are behind `ls --full`, and `--json` still carries
   every field. The session picker's CWD column shortens remote homes too
   (it only recognized the local `$HOME` before).
+- **Sessions are addressed by name only.** With the ID column gone from
+  `ls`, bare `kill 3` no longer falls back to daemon id 3 when you have no
+  session named `3` -- on hosts with auto-numbered sessions the two usually
+  disagreed, so the fallback killed the wrong session. `-` now means the
+  same thing in `tail`/`lf`/`rf` as in `connect` (the daemon's last-attached
+  session, or an error), instead of guessing the most recently heartbeated
+  one.
 - **Fixed: `/tmp` sweepers no longer strip a long-lived tunnel of its
   sidecars.** 0.15.0 taught the supervisor to keep `connect-<name>.lock`
   fresh, but `.pid`, `.info`, `.dest`, `.ssh-opts`, `.remote-sock`, `.log`

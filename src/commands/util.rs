@@ -391,32 +391,59 @@ pub(crate) fn parse_port_spec(spec: &str) -> anyhow::Result<(u16, u16)> {
     }
 }
 
-/// Resolve a session target (numeric ID, name, or `-`) to its numeric ID.
-pub(crate) async fn resolve_session_id(ctl_path: &Path, target: &str) -> anyhow::Result<u32> {
+/// The display-friendly host a ctl socket path belongs to: `connect-<host>.sock`
+/// is that tunnel, anything else (`ctl.sock`, a `--ctl-socket` override) is
+/// `local`.
+pub(crate) fn host_from_ctl_path(ctl_path: &Path) -> String {
+    ctl_path
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .and_then(|stem| stem.strip_prefix("connect-"))
+        .unwrap_or("local")
+        .to_string()
+}
+
+/// The one rule for turning a typed session target into a session, shared by
+/// every command (`connect`, `tail`, `lf`/`rf`): a wire *name* matches
+/// exactly, and `-` means the session the daemon flags as last-attached --
+/// the same rule the daemon applies to a `-` attach, so no command guesses
+/// differently (an older heartbeat-based fallback here let `tail -` pick a
+/// session `connect -` would refuse). Daemon ids are not targets.
+pub(crate) fn find_session<'a>(
+    sessions: &'a [gritty::protocol::SessionEntry],
+    target: &str,
+) -> Option<&'a gritty::protocol::SessionEntry> {
+    if target == "-" {
+        sessions.iter().find(|e| e.is_last_attached)
+    } else {
+        sessions.iter().find(|e| e.name == target)
+    }
+}
+
+/// [`find_session`] against a live daemon, with the standard errors.
+pub(crate) async fn resolve_session(
+    ctl_path: &Path,
+    target: &str,
+) -> anyhow::Result<gritty::protocol::SessionEntry> {
     use gritty::protocol::Frame;
 
-    if let Ok(id) = target.parse::<u32>() {
-        return Ok(id);
-    }
     let Frame::SessionInfo { sessions } = server_request(ctl_path, Frame::ListSessions).await?
     else {
         anyhow::bail!("unexpected response to ListSessions");
     };
-    if target == "-" {
-        if let Some(e) = sessions.iter().find(|e| e.is_last_attached) {
-            return Ok(e.id);
+    find_session(&sessions, target).cloned().ok_or_else(|| {
+        if target == "-" {
+            anyhow::anyhow!("no previously-attached session on {}", host_from_ctl_path(ctl_path))
+        } else {
+            anyhow::anyhow!("no such session: {target}")
         }
-        return sessions
-            .iter()
-            .max_by_key(|e| e.last_heartbeat)
-            .map(|e| e.id)
-            .ok_or_else(|| anyhow::anyhow!("no sessions (cannot resolve '-')"));
-    }
-    sessions
-        .iter()
-        .find(|e| e.name == target)
-        .map(|e| e.id)
-        .ok_or_else(|| anyhow::anyhow!("no such session: {target}"))
+    })
+}
+
+/// Resolve a session target (name or `-`) to its daemon id, for the frames
+/// that address sessions by id (`Tail`, forward sockets).
+pub(crate) async fn resolve_session_id(ctl_path: &Path, target: &str) -> anyhow::Result<u32> {
+    Ok(resolve_session(ctl_path, target).await?.id)
 }
 
 /// The one usage line for `lf`/`rf` errors -- single authoring point so the
@@ -1554,6 +1581,42 @@ mod tests {
         assert_eq!(live[0].session_id, 3);
         assert!(live[0].path.ends_with("fwd-devbox-3.sock"));
         assert_eq!(candidate_label(&live[0], None, "laptop"), "devbox (session #3)");
+    }
+
+    #[test]
+    fn find_session_matches_names_exactly_and_dash_only_via_the_daemon_flag() {
+        let named = |id: u32, name: &str, last: bool, heartbeat: u64| {
+            let mut e = linger_entry(false, heartbeat, 0, 0);
+            e.id = id;
+            e.name = name.to_string();
+            e.is_last_attached = last;
+            e
+        };
+        let sessions = [named(7, "laptop/7", false, 500), named(3, "laptop/work", true, 100)];
+
+        assert_eq!(find_session(&sessions, "laptop/work").map(|e| e.id), Some(3));
+        assert_eq!(find_session(&sessions, "-").map(|e| e.id), Some(3));
+        // Not a prefix/suffix match, and never a daemon id: `7` is the id of
+        // the session named `laptop/7`, but bare `7` is not a name here.
+        assert_eq!(find_session(&sessions, "work"), None);
+        assert_eq!(find_session(&sessions, "7"), None);
+        assert_eq!(find_session(&sessions, "3"), None);
+
+        // No last-attached flag: `-` has no referent, however recently
+        // something heartbeated. (This is where the old fallback guessed.)
+        let unflagged = [named(7, "laptop/7", false, 500)];
+        assert_eq!(find_session(&unflagged, "-"), None);
+    }
+
+    #[test]
+    fn host_from_ctl_path_names_the_tunnel_or_local() {
+        assert_eq!(host_from_ctl_path(Path::new("/run/g/connect-devbox.sock")), "devbox");
+        assert_eq!(
+            host_from_ctl_path(Path::new("/run/g/connect-fate.x.pattern.net.sock")),
+            "fate.x.pattern.net"
+        );
+        assert_eq!(host_from_ctl_path(Path::new("/run/g/ctl.sock")), "local");
+        assert_eq!(host_from_ctl_path(Path::new("/elsewhere/override.sock")), "local");
     }
 
     #[test]

@@ -5,8 +5,8 @@ use gritty::ui;
 
 use super::AutoStart;
 use super::util::{
-    DaemonProbe, discover_daemon_probes, format_age, format_timestamp, resolve_session_id,
-    server_request,
+    DaemonProbe, discover_daemon_probes, format_age, format_timestamp, host_from_ctl_path,
+    resolve_session_id, server_request,
 };
 
 /// Every session-table column, in [`session_status_cols`] order. This is the
@@ -294,19 +294,7 @@ pub(crate) async fn connect_session(
 /// session, using the same `is_last_attached` flag the daemon itself would
 /// consult for a `-` attach.
 async fn resolve_last_attached(ctl_path: &Path) -> anyhow::Result<String> {
-    use gritty::protocol::Frame;
-
-    let sessions = match server_request(ctl_path, Frame::ListSessions).await? {
-        Frame::SessionInfo { sessions } => sessions,
-        other => anyhow::bail!("unexpected response from server: {other:?}"),
-    };
-    last_attached_name(&sessions).ok_or_else(|| {
-        anyhow::anyhow!("no previously-attached session on {}", host_from_ctl_path(ctl_path))
-    })
-}
-
-fn last_attached_name(sessions: &[gritty::protocol::SessionEntry]) -> Option<String> {
-    sessions.iter().find(|s| s.is_last_attached).map(session_wire_name)
+    Ok(session_wire_name(&super::util::resolve_session(ctl_path, "-").await?))
 }
 
 /// Resolve `-n`/`--new` to the next auto-named session slot: the first free
@@ -1036,18 +1024,6 @@ async fn tui_pick_session(
     result
 }
 
-/// Extract a display-friendly host name from a ctl socket path.
-fn host_from_ctl_path(ctl_path: &Path) -> String {
-    // Tunnel sockets: .../connect-<host>.sock -> host is <host>
-    // Local daemon: .../ctl.sock -> host is "local"
-    let file = ctl_path.file_stem().and_then(|s| s.to_str()).unwrap_or("local");
-    if let Some(host) = file.strip_prefix("connect-") {
-        host.to_string()
-    } else {
-        "local".to_string()
-    }
-}
-
 /// After creating a new session, show a hint if there are other detached
 /// sessions the user might have forgotten about. Names are shown with our
 /// own client prefix elided.
@@ -1161,23 +1137,15 @@ fn parse_kill_target(
     KillTarget::Session { host: "local".to_string(), session: target.to_string() }
 }
 
-/// Kill one session. The input is namespace-resolved first (`3` ->
-/// `mylaptop/3`, matching `connect` semantics); when that doesn't exist and
-/// the input is purely numeric, it falls back to the raw session ID -- the ID
-/// column in `gritty ls` -- which the daemon resolves directly.
+/// Kill one session, addressed exactly as `connect` addresses it: the input is
+/// namespace-resolved (`3` -> `mylaptop/3`) and that is the only lookup. (A
+/// fallback to the raw daemon id went away with `ls`'s ID column -- names are
+/// the one addressing handle; `prune` and `--json` still see ids.)
 async fn kill_one(user_session: &str, client_name: &str, ctl_path: &Path) -> anyhow::Result<()> {
-    use gritty::protocol::{ErrorCode, Frame};
+    use gritty::protocol::Frame;
 
     let wire = gritty::naming::resolve_session_name(user_session, client_name);
-    let mut resp = server_request(ctl_path, Frame::KillSession { session: wire.clone() }).await?;
-    if matches!(resp, Frame::Error { code: ErrorCode::NoSuchSession, .. })
-        && wire != user_session
-        && user_session.parse::<u32>().is_ok()
-    {
-        resp = server_request(ctl_path, Frame::KillSession { session: user_session.to_string() })
-            .await?;
-    }
-    match resp {
+    match server_request(ctl_path, Frame::KillSession { session: wire }).await? {
         Frame::Ok => {
             ui::success(&format!("session {user_session} killed"));
             Ok(())
@@ -2413,19 +2381,22 @@ mod tests {
     }
 
     #[test]
-    fn last_attached_name_uses_the_daemon_flag_and_wire_name() {
+    fn dash_resolves_through_the_shared_finder_to_a_wire_name() {
         let mut last = auto_entry("laptop/work", false);
         last.is_last_attached = true;
         let mut unnamed_last = entry();
         unnamed_last.is_last_attached = true;
 
-        assert_eq!(last_attached_name(&[auto_entry("laptop/other", false)]), None);
+        let sessions = [auto_entry("laptop/other", true), last];
         assert_eq!(
-            last_attached_name(&[auto_entry("laptop/other", true), last]),
+            super::super::util::find_session(&sessions, "-").map(session_wire_name),
             Some("laptop/work".to_string())
         );
-        // An unnamed session is addressed by its id, like everywhere else.
-        assert_eq!(last_attached_name(&[unnamed_last]), Some("3".to_string()));
+        // An unnamed session's wire name is its id, like everywhere else.
+        assert_eq!(
+            super::super::util::find_session(&[unnamed_last], "-").map(session_wire_name),
+            Some("3".to_string())
+        );
     }
 
     #[test]
