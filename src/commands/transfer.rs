@@ -386,6 +386,26 @@ fn session_label(config: &gritty::config::ConfigFile, host: &str, wire_name: &st
     format!("{host}:{}", gritty::naming::display_session_name(wire_name, &client_name))
 }
 
+/// The "waiting" status: which sessions the offer went out to and what to
+/// run on the other end. In-session (no labels) the peer is the client side;
+/// otherwise the offer is live in every listed session at once and whichever
+/// one answers first gets the transfer.
+fn waiting_line(peer: &str, peer_command: &str, labels: &[&str]) -> String {
+    match labels {
+        [] => format!("waiting for {peer} -- run `{peer_command}` on the client side"),
+        [one] => format!("waiting for {peer} in {one} -- run `{peer_command}` there"),
+        many => format!(
+            "waiting for {peer} in {} sessions ({}) -- run `{peer_command}` in one of them",
+            many.len(),
+            many.join(", ")
+        ),
+    }
+}
+
+fn labels_of(streams: &[TaggedStream]) -> Vec<&str> {
+    streams.iter().filter_map(|t| t.label.as_deref()).collect()
+}
+
 /// Connect to service sockets for transfer. Returns one or more tagged streams.
 /// In-session or explicit --session returns one; auto-detect returns all.
 async fn connect_send_sockets(
@@ -661,7 +681,7 @@ pub(crate) async fn send_command(
     // Wait for go signal -- first stream to get paired wins. A sibling session
     // that closes before pairing is skipped (its socket reads EOF), not
     // treated as a failure of the whole transfer.
-    ui::status("waiting for receiver...");
+    ui::status(&waiting_line("receiver", "gritty receive", &labels_of(&tagged)));
     let select = race_first_ready(tagged, |mut ts| {
         Box::pin(async move {
             let mut go = [0u8; 1];
@@ -723,6 +743,32 @@ pub(crate) async fn send_command(
     Ok(())
 }
 
+/// One entry of the receive stream: `(wire name, size, mode)`, or `None` at
+/// the end-of-transfer sentinel. Shared by both receive modes so they accept
+/// and reject exactly the same inputs.
+async fn read_entry_header<R>(reader: &mut R) -> anyhow::Result<Option<(String, u64, u32)>>
+where
+    R: tokio::io::AsyncRead + Unpin,
+{
+    use tokio::io::AsyncReadExt;
+
+    let mut buf2 = [0u8; 2];
+    reader.read_exact(&mut buf2).await?;
+    let name_len = u16::from_be_bytes(buf2) as usize;
+    if name_len == 0 {
+        return Ok(None);
+    }
+    let mut name_buf = vec![0u8; name_len];
+    reader.read_exact(&mut name_buf).await?;
+    let name = sanitize_path(&String::from_utf8(name_buf)?)?;
+    let mut buf8 = [0u8; 8];
+    reader.read_exact(&mut buf8).await?;
+    let size = u64::from_be_bytes(buf8);
+    let mut buf4 = [0u8; 4];
+    reader.read_exact(&mut buf4).await?;
+    Ok(Some((name, size, u32::from_be_bytes(buf4))))
+}
+
 /// Stream the received file protocol from `reader`, writing every payload to
 /// `out`, and flush `out` before returning (returning the file count).
 ///
@@ -739,27 +785,7 @@ where
 
     let mut received = 0u32;
     let mut buf = vec![0u8; 64 * 1024];
-    loop {
-        let mut buf2 = [0u8; 2];
-        reader.read_exact(&mut buf2).await?;
-        let name_len = u16::from_be_bytes(buf2) as usize;
-        if name_len == 0 {
-            break; // sentinel
-        }
-        let mut name_buf = vec![0u8; name_len];
-        reader.read_exact(&mut name_buf).await?;
-        let name = String::from_utf8(name_buf)?;
-        // Validate even though stdout mode ignores the name, to keep the
-        // accepted/rejected inputs identical to the receive-to-dir path.
-        sanitize_path(&name)?;
-
-        let mut buf8 = [0u8; 8];
-        reader.read_exact(&mut buf8).await?;
-        let file_size = u64::from_be_bytes(buf8);
-        let mut buf4 = [0u8; 4];
-        reader.read_exact(&mut buf4).await?;
-        let _mode = u32::from_be_bytes(buf4);
-
+    while let Some((_name, file_size, _mode)) = read_entry_header(reader).await? {
         let mut remaining = file_size;
         while remaining > 0 {
             let to_read = (remaining as usize).min(buf.len());
@@ -770,6 +796,115 @@ where
         received += 1;
     }
     out.flush().await?;
+    Ok(received)
+}
+
+/// A file being received, written beside its final path and renamed into
+/// place only once complete. Dropping it uncommitted removes the partial, so
+/// an interrupted transfer leaves neither a truncated target nor a stray
+/// temporary -- and a pre-existing file at the target survives untouched
+/// until the replacement is whole.
+struct PartialFile {
+    tmp: PathBuf,
+    committed: bool,
+}
+
+impl PartialFile {
+    fn tmp_path_for(target: &Path) -> PathBuf {
+        let mut name = std::ffi::OsString::from(".");
+        name.push(target.file_name().unwrap_or_default());
+        name.push(".gritty-partial");
+        target.with_file_name(name)
+    }
+
+    async fn commit(mut self, target: &Path) -> std::io::Result<()> {
+        tokio::fs::rename(&self.tmp, target).await?;
+        self.committed = true;
+        Ok(())
+    }
+}
+
+impl Drop for PartialFile {
+    fn drop(&mut self) {
+        if !self.committed {
+            let _ = std::fs::remove_file(&self.tmp);
+        }
+    }
+}
+
+/// Receive every entry of the stream into `dest_dir` (returning the count).
+/// `file_count` is only used for the opening status line.
+async fn receive_to_dir<R>(reader: &mut R, dest_dir: &Path, file_count: u32) -> anyhow::Result<u32>
+where
+    R: tokio::io::AsyncRead + Unpin,
+{
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    let mut received = 0u32;
+    let mut buf = vec![0u8; 64 * 1024];
+    while let Some((name, file_size, mode)) = read_entry_header(reader).await? {
+        if received == 0 {
+            let s = if file_count == 1 { "" } else { "s" };
+            ui::status(&format!("receiving {file_count} file{s}"));
+        }
+        let target = dest_dir.join(&name);
+        if let Some(parent) = target.parent() {
+            tokio::fs::create_dir_all(parent)
+                .await
+                .map_err(|e| anyhow::anyhow!("{}: {e}", parent.display()))?;
+        }
+        // Expected often enough (re-sending a file you just edited) that it
+        // is information, not a warning -- but never silent.
+        if tokio::fs::symlink_metadata(&target).await.is_ok() {
+            ui::status(&format!("replacing existing {name}"));
+        }
+
+        let partial = PartialFile { tmp: PartialFile::tmp_path_for(&target), committed: false };
+        let recv_mode = if mode == 0 { 0o644 } else { mode & 0o7777 };
+        let mut file = tokio::fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .mode(recv_mode)
+            .open(&partial.tmp)
+            .await
+            .map_err(|e| anyhow::anyhow!("{}: {e}", partial.tmp.display()))?;
+        // `.mode()` only applies on create and is masked by the umask; set
+        // the sender's mode explicitly so a re-received file ends up exactly
+        // as sent.
+        file.set_permissions(std::fs::Permissions::from_mode(recv_mode)).await?;
+
+        let mut transferred = 0u64;
+        let mut last_render = std::time::Instant::now();
+        let copy = async {
+            // `read`, not `read_exact`: bytes are credited as they arrive, so
+            // the progress bar moves on slow links and an interruption
+            // reports how far it actually got.
+            while transferred < file_size {
+                let want = ((file_size - transferred) as usize).min(buf.len());
+                let n = reader.read(&mut buf[..want]).await?;
+                if n == 0 {
+                    return Err(std::io::Error::from(std::io::ErrorKind::UnexpectedEof));
+                }
+                file.write_all(&buf[..n]).await?;
+                transferred += n as u64;
+                print_progress(&name, transferred, file_size, &mut last_render);
+            }
+            file.flush().await
+        };
+        if let Err(e) = copy.await {
+            // `partial` drops here and removes the temporary.
+            anyhow::bail!(
+                "transfer of {name} interrupted after {} of {}: {e}",
+                gritty::client::format_size(transferred),
+                gritty::client::format_size(file_size)
+            );
+        }
+        drop(file);
+        partial.commit(&target).await.map_err(|e| anyhow::anyhow!("{}: {e}", target.display()))?;
+        finish_progress(&name, file_size);
+        received += 1;
+    }
     Ok(received)
 }
 
@@ -838,7 +973,7 @@ pub(crate) async fn receive_command(
     // Wait for file data -- first stream to get paired wins. A sibling session
     // that closes before pairing is skipped (its socket reads EOF), not
     // treated as a failure of the whole transfer.
-    ui::status("waiting for sender...");
+    ui::status(&waiting_line("sender", "gritty send <files>", &labels_of(&tagged)));
     let select = race_first_ready(tagged, |mut ts| {
         Box::pin(async move {
             // Read: file_count (u32 BE). EOF here means this session never
@@ -871,70 +1006,12 @@ pub(crate) async fn receive_command(
         return Ok(());
     }
 
-    // Read per-file metadata and data into the destination directory.
-    let mut received = 0u32;
-    let mut buf = vec![0u8; 64 * 1024];
-    loop {
-        // Read filename_len (u16 BE)
-        let mut buf2 = [0u8; 2];
-        stream.read_exact(&mut buf2).await?;
-        let name_len = u16::from_be_bytes(buf2) as usize;
-        if name_len == 0 {
-            break; // sentinel
-        }
-
-        // Read filename
-        let mut name_buf = vec![0u8; name_len];
-        stream.read_exact(&mut name_buf).await?;
-        let name = String::from_utf8(name_buf)?;
-        let name = sanitize_path(&name)?;
-
-        // Read file_size (u64 BE) and mode (u32 BE)
-        let mut buf8 = [0u8; 8];
-        stream.read_exact(&mut buf8).await?;
-        let file_size = u64::from_be_bytes(buf8);
-        let mut buf4 = [0u8; 4];
-        stream.read_exact(&mut buf4).await?;
-        let mode = u32::from_be_bytes(buf4);
-
-        let s = if file_count == 1 { "" } else { "s" };
-        if received == 0 {
-            ui::status(&format!("receiving {file_count} file{s}"));
-        }
-
-        // Write file data (create parent dirs for nested paths)
-        let file_path = dest_dir.join(&name);
-        if let Some(parent) = file_path.parent() {
-            tokio::fs::create_dir_all(parent).await?;
-        }
-        let recv_mode = if mode == 0 { 0o644 } else { mode & 0o7777 };
-        let mut file = tokio::fs::OpenOptions::new()
-            .write(true)
-            .create(true)
-            .truncate(true)
-            .mode(recv_mode)
-            .open(&file_path)
-            .await?;
-        let mut remaining = file_size;
-        let mut transferred = 0u64;
-        let mut last_render = std::time::Instant::now();
-        while remaining > 0 {
-            let to_read = (remaining as usize).min(buf.len());
-            stream.read_exact(&mut buf[..to_read]).await?;
-            file.write_all(&buf[..to_read]).await?;
-            remaining -= to_read as u64;
-            transferred += to_read as u64;
-            print_progress(&name, transferred, file_size, &mut last_render);
-        }
-        finish_progress(&name, file_size);
-        received += 1;
-    }
-
+    let received = receive_to_dir(&mut stream, &dest_dir, file_count).await?;
     if received == 0 {
         ui::status("no files received");
     } else {
         let s = if received == 1 { "" } else { "s" };
-        ui::success(&format!("received {received} file{s}"));
+        ui::success(&format!("received {received} file{s} into {}", dest_dir.display()));
     }
     Ok(())
 }
@@ -942,6 +1019,22 @@ pub(crate) async fn receive_command(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn waiting_line_names_where_the_offer_went() {
+        assert_eq!(
+            waiting_line("receiver", "gritty receive", &[]),
+            "waiting for receiver -- run `gritty receive` on the client side"
+        );
+        assert_eq!(
+            waiting_line("receiver", "gritty receive", &["devbox:work"]),
+            "waiting for receiver in devbox:work -- run `gritty receive` there"
+        );
+        assert_eq!(
+            waiting_line("sender", "gritty send <files>", &["devbox:work", "local:0"]),
+            "waiting for sender in 2 sessions (devbox:work, local:0) -- run `gritty send <files>` in one of them"
+        );
+    }
 
     #[test]
     fn session_label_matches_ls_display_form() {
@@ -1303,6 +1396,87 @@ mod tests {
         v.extend_from_slice(payload);
         v.extend_from_slice(&0u16.to_be_bytes()); // end sentinel
         v
+    }
+
+    /// Encode a file entry with an explicit mode and no sentinel, so streams
+    /// of several files (or truncated ones) can be assembled.
+    fn encode_entry(name: &str, payload: &[u8], mode: u32) -> Vec<u8> {
+        let mut v = Vec::new();
+        v.extend_from_slice(&(name.len() as u16).to_be_bytes());
+        v.extend_from_slice(name.as_bytes());
+        v.extend_from_slice(&(payload.len() as u64).to_be_bytes());
+        v.extend_from_slice(&mode.to_be_bytes());
+        v.extend_from_slice(payload);
+        v
+    }
+
+    fn dir_entries(dir: &Path) -> Vec<String> {
+        let mut names: Vec<String> = std::fs::read_dir(dir)
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        names.sort();
+        names
+    }
+
+    #[tokio::test]
+    async fn receive_to_dir_writes_files_and_leaves_no_temporaries() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let mut input = encode_entry("a.txt", b"aaa", 0o600);
+        input.extend(encode_entry("sub/b.sh", b"#!/bin/sh\n", 0o755));
+        input.extend_from_slice(&0u16.to_be_bytes());
+        let mut reader: &[u8] = &input;
+
+        let n = receive_to_dir(&mut reader, dir.path(), 2).await.unwrap();
+
+        assert_eq!(n, 2);
+        assert_eq!(std::fs::read(dir.path().join("a.txt")).unwrap(), b"aaa");
+        assert_eq!(std::fs::read(dir.path().join("sub/b.sh")).unwrap(), b"#!/bin/sh\n");
+        let mode =
+            |p: &str| std::fs::metadata(dir.path().join(p)).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode("a.txt"), 0o600);
+        assert_eq!(mode("sub/b.sh"), 0o755);
+        assert_eq!(dir_entries(dir.path()), ["a.txt", "sub"], "no temp files left behind");
+    }
+
+    #[tokio::test]
+    async fn receive_to_dir_replaces_an_existing_file_including_its_mode() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("a.txt");
+        std::fs::write(&target, b"old contents, longer than the new ones").unwrap();
+        std::fs::set_permissions(&target, std::fs::Permissions::from_mode(0o777)).unwrap();
+        let mut input = encode_entry("a.txt", b"new", 0o644);
+        input.extend_from_slice(&0u16.to_be_bytes());
+        let mut reader: &[u8] = &input;
+
+        receive_to_dir(&mut reader, dir.path(), 1).await.unwrap();
+
+        assert_eq!(std::fs::read(&target).unwrap(), b"new");
+        // Previously the mode was only applied on create, so a re-received
+        // file silently kept whatever mode it had.
+        assert_eq!(std::fs::metadata(&target).unwrap().permissions().mode() & 0o777, 0o644);
+        assert_eq!(dir_entries(dir.path()), ["a.txt"]);
+    }
+
+    #[tokio::test]
+    async fn interrupted_receive_keeps_the_old_file_and_names_the_casualty() {
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("big.bin");
+        std::fs::write(&target, b"previous version").unwrap();
+        // Header promises 1000 bytes; the sender dies after 10.
+        let mut input = encode_entry("big.bin", &[7u8; 1000], 0o644);
+        input.truncate(input.len() - 990);
+        let mut reader: &[u8] = &input;
+
+        let err = receive_to_dir(&mut reader, dir.path(), 1).await.unwrap_err();
+
+        let msg = format!("{err:#}");
+        assert!(msg.contains("big.bin"), "{msg}");
+        assert!(msg.contains("10 B") && msg.contains("1000 B"), "must say how far it got: {msg}");
+        assert_eq!(std::fs::read(&target).unwrap(), b"previous version", "target untouched");
+        assert_eq!(dir_entries(dir.path()), ["big.bin"], "partial removed");
     }
 
     // Regression for bug_020: a dead sibling (probe resolves None immediately)

@@ -63,7 +63,7 @@ A `[host.<name>] aliases` config entry makes alternate spellings resolve to the 
 
 **Client namespacing.** Every short name (no `/`) you type is silently scoped to your client's namespace. With `client-name = "mylaptop"` (the default is your hostname), `gritty connect devbox:work` resolves to the wire name `mylaptop/work`. Two laptops typing the same short name no longer collide -- each lands in its own session. To address a session in another client's namespace (or a deliberately-shared session), type the full slash-bearing form: `gritty connect devbox:laptop2/work` is taken literally with no prefix added. Everything gritty prints -- `ls`, the picker, `attached work`, `renamed a -> b`, transfer pairing labels, `doctor`, suggested commands -- strips your own prefix and shows foreign prefixes intact, i.e. names are always shown in the form you would type them.
 
-`connect` auto-starts the server and tunnel as needed. `send`/`receive` auto-detect the session across all active servers; use `--session host:session` to target a specific one.
+`connect` auto-starts the server and tunnel as needed. `send`/`receive` offer the transfer to every session on every active server at once (the waiting line lists them) and pair with whichever one answers first; use `--session host:session` to target a specific one.
 
 ## Options
 
@@ -128,7 +128,7 @@ Flag defaults come from config, with precedence CLI > `[host.<name>]` > `[defaul
 - `-` (`send`): read data from stdin; (`receive`): write data to stdout. `receive` with no destination also auto-switches to stdout when its stdout is redirected (e.g. `gritty receive > foo` or piped); pass a directory to force file mode
 - `--timeout <seconds>`: deadline for pairing with a receiver/sender (default 300; `--no-timeout` waits indefinitely)
 
-File permissions are preserved. Files that would arrive under the same name are disambiguated with their shortest unique path suffix: `gritty send docs/a/reference.md docs/b/reference.md` arrives as `a/reference.md` and `b/reference.md` (the receiver creates the subdirectories). Sending the same file twice collapses to one copy. Directories can be sent with `-r`, or via tar for compression:
+Files are written beside their final name (`.<name>.gritty-partial`) and renamed into place only when complete, so an interrupted transfer removes its partial and leaves any previous copy of the file untouched; a file that already exists at the destination is replaced (announced per file), permissions included. Files that would arrive under the same name are disambiguated with their shortest unique path suffix: `gritty send docs/a/reference.md docs/b/reference.md` arrives as `a/reference.md` and `b/reference.md` (the receiver creates the subdirectories). Sending the same file twice collapses to one copy. Directories can be sent with `-r`, or via tar for compression:
 
 ```
 laptop$ gritty send -r mydir                 # recursive (preserves directory structure)

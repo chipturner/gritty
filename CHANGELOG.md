@@ -26,6 +26,17 @@ protocol interoperate with their neighbors.
   `--json`) and exits 0; naming a host that is down still fails, but
   `--json` now emits the group with its `error` field rather than a bare
   message.
+- **`receive` is safe to interrupt, and both sides say who they are
+  waiting for.** Files now land via a `.<name>.gritty-partial` sibling
+  renamed into place when complete: a sender dying mid-file leaves the
+  previous copy intact and no partial behind, and the error says which file
+  and how far it got (`transfer of big.bin interrupted after 1.2 MiB of
+  40 MiB`); replacing an existing file is announced and now also applies
+  the sent permissions (before, only newly created files got them). The
+  final line names the directory. `waiting for receiver…` now lists the
+  sessions the offer went to (`waiting for receiver in 2 sessions
+  (devbox:work, local:0) -- run gritty receive in one of them`), since a
+  transfer without `--session` is offered everywhere at once.
 - **A failed first connect now says what ssh said.** The tunnel preflight
   used to discard ssh's stderr and blame "a password or host key" for
   everything (including a typo'd hostname), and `connect` then spent five
