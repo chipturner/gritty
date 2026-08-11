@@ -3,7 +3,7 @@ use std::path::{Path, PathBuf};
 
 use gritty::connect::{TunnelStatus, enumerate_tunnels, probe_tunnel_status, read_pid_hint};
 use gritty::protocol::{Frame, PROTOCOL_VERSION};
-use gritty::runinfo::{RunInfo, Staleness};
+use gritty::runinfo::Staleness;
 use gritty::ui;
 use gritty::ui::sgr::{DIM, RESET};
 
@@ -57,26 +57,29 @@ impl Check {
 
 // ---- Rendering --------------------------------------------------------------
 
-/// Read a long-lived process's `.info` sidecar and flag it if the on-disk
+/// Read a *running* process's `.info` sidecar and flag it if the on-disk
 /// binary has been replaced since the process started. This is the only way
 /// to catch a same-protocol rebuild -- the wire handshake can't see it, and
 /// for the tunnel supervisor (a pure byte proxy) no handshake ever touches
 /// its code at all.
+///
+/// Classification is delegated to [`super::refresh::assess`] so doctor
+/// reports exactly what `refresh` would act on. In particular a live process
+/// with no `.info` at all (predates the sidecar, or a `/tmp` sweeper removed
+/// it) is something `refresh` restarts, so doctor must surface it rather than
+/// stay silent -- otherwise `doctor` says "no issues" while `refresh` bounces
+/// every tunnel.
 fn check_staleness(info_path: &Path, label: &str, stale_hint: &str, checks: &mut Vec<Check>) {
-    let Ok(info) = RunInfo::read(info_path) else {
-        // No `.info` file -- process predates this feature or wrote it to a
-        // different socket dir. Not an error, just no staleness signal.
-        return;
+    use super::refresh::Verdict;
+    // Callers only reach here for a process they have just observed alive.
+    let check = match super::refresh::assess(info_path, || true) {
+        Verdict::NotRunning | Verdict::Current => return,
+        v @ Verdict::Stale(Staleness::Protocol { .. }) => Check::fail(format!("{label}: {v}")),
+        v @ (Verdict::Stale(Staleness::Build { .. }) | Verdict::Unknown) => {
+            Check::warn(format!("{label}: {v}"))
+        }
     };
-    match info.staleness_vs_current() {
-        None => {}
-        Some(s @ Staleness::Protocol { .. }) => {
-            checks.push(Check::fail(format!("{label}: {s}")).with_hint(stale_hint));
-        }
-        Some(s @ Staleness::Build { .. }) => {
-            checks.push(Check::warn(format!("{label}: {s}")).with_hint(stale_hint));
-        }
-    }
+    checks.push(check.with_hint(stale_hint));
 }
 
 /// Styled unconditionally; the `anstream` sinks below strip it when stdout is
@@ -881,6 +884,61 @@ fn report_json(paths: &[(&str, PathBuf)], groups: &[(&str, Vec<Check>)]) -> serd
 #[cfg(test)]
 mod tests {
     use super::*;
+    use gritty::runinfo::RunInfo;
+
+    // --- check_staleness: must agree with refresh's verdicts ---
+
+    fn staleness_checks(info_path: &Path) -> Vec<Check> {
+        let mut checks = Vec::new();
+        check_staleness(info_path, "devbox supervisor", "gritty refresh devbox", &mut checks);
+        checks
+    }
+
+    #[test]
+    fn staleness_silent_when_info_current() {
+        let tmp = tempfile::tempdir().unwrap();
+        let info = tmp.path().join("x.info");
+        RunInfo::current().write(&info).unwrap();
+        assert!(staleness_checks(&info).is_empty());
+    }
+
+    #[test]
+    fn staleness_warns_when_live_process_has_no_info() {
+        // refresh treats a running process with no `.info` as stale and
+        // restarts it, so doctor must not report the same state as clean --
+        // the two disagreeing is how a swept sidecar went unnoticed.
+        let tmp = tempfile::tempdir().unwrap();
+        let checks = staleness_checks(&tmp.path().join("absent.info"));
+        assert_eq!(checks.len(), 1);
+        assert_eq!(checks[0].status, Status::Warn);
+        assert!(checks[0].message.starts_with("devbox supervisor: "), "{}", checks[0].message);
+        assert_eq!(
+            checks[0].message.trim_start_matches("devbox supervisor: "),
+            super::super::refresh::Verdict::Unknown.to_string()
+        );
+        assert_eq!(checks[0].hint.as_deref(), Some("gritty refresh devbox"));
+    }
+
+    #[test]
+    fn staleness_fails_on_protocol_and_warns_on_build() {
+        let tmp = tempfile::tempdir().unwrap();
+        let info = tmp.path().join("x.info");
+
+        let mut old = RunInfo::current();
+        old.protocol = PROTOCOL_VERSION.wrapping_sub(1);
+        old.write(&info).unwrap();
+        let checks = staleness_checks(&info);
+        assert_eq!(checks.len(), 1);
+        assert_eq!(checks[0].status, Status::Fail);
+
+        let mut rebuilt = RunInfo::current();
+        rebuilt.git_hash = "old-hash".to_string();
+        rebuilt.write(&info).unwrap();
+        let checks = staleness_checks(&info);
+        assert_eq!(checks.len(), 1);
+        assert_eq!(checks[0].status, Status::Warn);
+        assert_eq!(checks[0].hint.as_deref(), Some("gritty refresh devbox"));
+    }
 
     #[test]
     fn format_size_bytes() {

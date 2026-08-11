@@ -51,9 +51,13 @@ supervisor (external `rm`, a `/tmp` sweeper, or a pre-fix racy cleanup), the
 supervisor keeps a valid flock on a deleted inode while the path reports the
 lock as free. To keep age-based `/tmp` sweepers (macOS `tmp_cleaner` runs at
 midnight; `dirhelper` uses a 3-day threshold) from being that external `rm`,
-the supervisor touches the lock file's atime/mtime via `refresh_lock_mtime` on
-every `PROBE_INTERVAL` tick and every respawn-backoff iteration -- the file is
-otherwise write-once and would age out under a multi-day supervisor. A fresh `tunnel-create` then `O_CREAT`s a new inode and becomes
+the supervisor touches the atime/mtime of the lock file -- and of every other
+write-once sidecar (`.pid`, `.info`, `.dest`, `.ssh-opts`, `.remote-sock`,
+`.log`, `.out`; `sweeper_exposed_sidecars`) -- via `refresh_mtimes` on every
+`PROBE_INTERVAL` tick and every respawn-backoff iteration; the files are
+otherwise write-once and would age out under a multi-day supervisor (losing
+`.info` alone makes `doctor` and `refresh` see a version-unknown supervisor
+that every `refresh` restarts). Once the path is gone, a fresh `tunnel-create` `O_CREAT`s a new inode and becomes
 the observable owner -- two supervisors exist concurrently, only one visible.
 
 Three guards keep that state from becoming destructive:

@@ -565,6 +565,9 @@ struct MonitorConfig {
     /// wait consumes it and retries immediately -- a keystroke in a
     /// disconnected client is the user vouching that the network is back.
     kick_path: PathBuf,
+    /// Write-once sidecars re-touched from every steady state; see
+    /// [`sweeper_exposed_sidecars`].
+    keep_fresh: Vec<PathBuf>,
 }
 
 /// Mutable supervisor state, previously a handful of scattered `let mut`
@@ -727,7 +730,7 @@ async fn respawn_tunnel(
             );
             return RespawnResult::Exit;
         }
-        refresh_lock_mtime(&cfg.lock_path);
+        refresh_mtimes(&cfg.keep_fresh);
         if skip_wait {
             skip_wait = false;
             info!(
@@ -824,6 +827,7 @@ async fn tunnel_monitor(
     lock_path: PathBuf,
     lock_identity: Option<LockIdentity>,
     kick_path: PathBuf,
+    keep_fresh: Vec<PathBuf>,
     stop: tokio_util::sync::CancellationToken,
 ) {
     let cfg = MonitorConfig {
@@ -837,6 +841,7 @@ async fn tunnel_monitor(
         lock_path,
         lock_identity,
         kick_path,
+        keep_fresh,
     };
     // `last_healthy` is seeded now because the caller's ensure_remote_ready
     // just verified the remote; SystemTime so suspend counts toward
@@ -937,7 +942,7 @@ async fn tunnel_monitor(
                     let _ = state.child.kill().await;
                     return;
                 }
-                refresh_lock_mtime(&cfg.lock_path);
+                refresh_mtimes(&cfg.keep_fresh);
                 match probe_tunnel_alive(&cfg.local_sock).await {
                     Ok(_) => {
                         if state.probe_failures > 0 {
@@ -1246,6 +1251,30 @@ pub fn connect_out_path(connection_name: &str) -> PathBuf {
     connect_sidecar_path(connection_name, "out")
 }
 
+/// Every regular file a live supervisor depends on but never rewrites while
+/// the tunnel is healthy. The socket dir usually lives under `/tmp` or
+/// `$XDG_RUNTIME_DIR`, where age-based sweepers (macOS `tmp_cleaner`,
+/// `dirhelper`, systemd-tmpfiles) unlink files nothing has touched for a
+/// few days -- so the supervisor re-touches this whole set from its steady
+/// states via [`refresh_mtimes`]. Losing `.lock` kills the tunnel; losing
+/// `.pid`/`.info` blinds `doctor`/`refresh` (a live supervisor with no
+/// `.info` is restarted by every `refresh`); losing `.dest`/`.ssh-opts` makes
+/// the next restart reconnect to the wrong place; losing `.log`/`.out`
+/// silently discards the post-mortem trail. The socket is recreated on every
+/// respawn and the kick file is transient, so neither is listed.
+fn sweeper_exposed_sidecars(connection_name: &str) -> Vec<PathBuf> {
+    vec![
+        connect_lock_path(connection_name),
+        connect_pid_path(connection_name),
+        crate::runinfo::connect_info_path(connection_name),
+        connect_dest_path(connection_name),
+        connect_ssh_opts_path(connection_name),
+        connect_remote_sock_path(connection_name),
+        connect_log_path(connection_name),
+        connect_out_path(connection_name),
+    ]
+}
+
 /// The most recent ssh forward failure in the tail of the tunnel's `.out`
 /// file, if any. When the `-L` listener accepts a client but the remote
 /// socket connect fails (daemon down, stale path), ssh logs
@@ -1518,20 +1547,24 @@ fn lock_still_owned(held: Option<LockIdentity>, path: &Path) -> bool {
     held.is_none_or(|id| id.matches_path(path))
 }
 
-/// Bump the lock file's atime+mtime to "now". The lock file is otherwise
-/// write-once (created at supervisor start, never touched again -- the
-/// flock is on the open fd, not the path), so an age-based /tmp sweeper
-/// (macOS `tmp_cleaner` at midnight, `dirhelper` at 3:35am) will eventually
-/// unlink it out from under a long-lived supervisor. Once unlinked,
-/// `is_lock_held` and `lock_still_owned` both report false and every
-/// attached client gives up after `DAEMON_GONE_GRACE`. Called from both the
-/// healthy probe tick and the respawn backoff loop so neither steady state
-/// lets the file age past the sweeper's threshold.
-fn refresh_lock_mtime(path: &Path) {
+/// Bump atime+mtime of every listed file that exists to "now" (never
+/// creating or truncating anything). These are the write-once sidecars from
+/// [`sweeper_exposed_sidecars`]: created at supervisor start and never
+/// written again -- the flock in particular lives on the open fd, not the
+/// path -- so an age-based /tmp sweeper (macOS `tmp_cleaner` at midnight,
+/// `dirhelper` at 3:35am) would otherwise unlink them out from under a
+/// long-lived supervisor. Once `.lock` is gone, `is_lock_held` and
+/// `lock_still_owned` both report false and every attached client gives up
+/// after `DAEMON_GONE_GRACE`. Called from both the healthy probe tick and the
+/// respawn backoff loop so neither steady state lets the files age past the
+/// sweeper's threshold. A second open+close does not disturb the held flock.
+fn refresh_mtimes(paths: &[PathBuf]) {
     let now = std::time::SystemTime::now();
     let times = std::fs::FileTimes::new().set_accessed(now).set_modified(now);
-    if let Ok(f) = std::fs::OpenOptions::new().write(true).open(path) {
-        let _ = f.set_times(times);
+    for path in paths {
+        if let Ok(f) = std::fs::OpenOptions::new().write(true).open(path) {
+            let _ = f.set_times(times);
+        }
     }
 }
 
@@ -2190,6 +2223,7 @@ pub async fn run(opts: ConnectOpts, ready_fd: Option<OwnedFd>) -> anyhow::Result
             guard.lock_file.clone(),
             lock_identity,
             connect_kick_path(&connection_name),
+            sweeper_exposed_sidecars(&connection_name),
             stop.clone(),
         )
         .instrument(tunnel_span),
@@ -2856,30 +2890,32 @@ mod tests {
         assert!(lock_still_owned(None, &missing));
     }
 
+    /// Age a file into /tmp-sweeper territory.
+    fn age_file(path: &Path) {
+        let old = std::time::SystemTime::now() - Duration::from_secs(7 * 24 * 60 * 60);
+        let old_times = std::fs::FileTimes::new().set_accessed(old).set_modified(old);
+        std::fs::OpenOptions::new().write(true).open(path).unwrap().set_times(old_times).unwrap();
+        let before = std::fs::metadata(path).unwrap().modified().unwrap();
+        assert!(before <= old + Duration::from_secs(1));
+    }
+
+    fn mtime_age(path: &Path) -> Duration {
+        let mtime = std::fs::metadata(path).unwrap().modified().unwrap();
+        std::time::SystemTime::now().duration_since(mtime).unwrap_or_default()
+    }
+
     #[test]
-    fn refresh_lock_mtime_bumps_timestamps_without_disturbing_flock() {
+    fn refresh_mtimes_bumps_timestamps_without_disturbing_flock() {
         let dir = tempfile::tempdir().unwrap();
         let lock_path = dir.path().join("test.lock");
 
         let held = try_acquire_lock(&lock_path).unwrap();
         assert!(is_lock_held(&lock_path));
+        age_file(&lock_path);
 
-        // Age the file into /tmp-sweeper territory.
-        let old = std::time::SystemTime::now() - Duration::from_secs(7 * 24 * 60 * 60);
-        let old_times = std::fs::FileTimes::new().set_accessed(old).set_modified(old);
-        std::fs::OpenOptions::new()
-            .write(true)
-            .open(&lock_path)
-            .unwrap()
-            .set_times(old_times)
-            .unwrap();
-        let before = std::fs::metadata(&lock_path).unwrap().modified().unwrap();
-        assert!(before <= old + Duration::from_secs(1));
+        refresh_mtimes(std::slice::from_ref(&lock_path));
 
-        refresh_lock_mtime(&lock_path);
-
-        let after = std::fs::metadata(&lock_path).unwrap().modified().unwrap();
-        let age = std::time::SystemTime::now().duration_since(after).unwrap_or_default();
+        let age = mtime_age(&lock_path);
         assert!(age < Duration::from_secs(60), "mtime should be ~now, got age {age:?}");
         // Second open+close for the touch must not have released the flock.
         assert!(is_lock_held(&lock_path), "refresh must not disturb the held flock");
@@ -2887,9 +2923,44 @@ mod tests {
     }
 
     #[test]
-    fn refresh_lock_mtime_ignores_missing_file() {
+    fn refresh_mtimes_touches_every_present_file_and_skips_missing() {
         let dir = tempfile::tempdir().unwrap();
-        refresh_lock_mtime(&dir.path().join("absent.lock"));
+        let present: Vec<PathBuf> =
+            ["a.pid", "b.info", "c.dest"].iter().map(|n| dir.path().join(n)).collect();
+        for p in &present {
+            std::fs::write(p, "x").unwrap();
+            age_file(p);
+        }
+        let mut paths = present.clone();
+        paths.insert(1, dir.path().join("absent.ssh-opts"));
+
+        refresh_mtimes(&paths);
+
+        for p in &present {
+            let age = mtime_age(p);
+            assert!(age < Duration::from_secs(60), "{}: age {age:?}", p.display());
+            assert_eq!(std::fs::read_to_string(p).unwrap(), "x", "touch must not truncate");
+        }
+        assert!(!dir.path().join("absent.ssh-opts").exists(), "touch must not create files");
+    }
+
+    #[test]
+    fn sweeper_exposed_sidecars_covers_every_write_once_file() {
+        let exts: Vec<String> = sweeper_exposed_sidecars("devbox")
+            .iter()
+            .map(|p| {
+                let name = p.file_name().unwrap().to_str().unwrap();
+                assert!(name.starts_with("connect-devbox."), "{name}");
+                name["connect-devbox.".len()..].to_string()
+            })
+            .collect();
+        for ext in ["lock", "pid", "info", "dest", "ssh-opts", "remote-sock", "log", "out"] {
+            assert!(exts.iter().any(|e| e == ext), "missing .{ext} in {exts:?}");
+        }
+        // The socket is recreated on every respawn (and sweepers skip
+        // sockets); the kick file is a transient client nudge. Neither
+        // belongs in the keep-fresh set.
+        assert!(!exts.iter().any(|e| e == "sock" || e == "kick"), "{exts:?}");
     }
 
     #[test]
@@ -3016,6 +3087,7 @@ mod tests {
                 PathBuf::from("/tmp/nonexistent.lock"),
                 None,
                 PathBuf::from("/tmp/nonexistent.kick"),
+                vec![],
                 stop,
             ),
         )
@@ -3051,6 +3123,7 @@ mod tests {
                 PathBuf::from("/tmp/nonexistent.lock"),
                 None,
                 PathBuf::from("/tmp/nonexistent.kick"),
+                vec![],
                 stop,
             ),
         )
@@ -3088,6 +3161,7 @@ mod tests {
                 PathBuf::from("/tmp/nonexistent.lock"),
                 None,
                 PathBuf::from("/tmp/nonexistent.kick"),
+                vec![],
                 stop,
             ),
         )

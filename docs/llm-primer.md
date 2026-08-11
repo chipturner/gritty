@@ -56,7 +56,11 @@ may bump it).
   Fix: `gritty refresh`. Caution: restarting a stale daemon kills its
   sessions; refresh refuses when clients are attached unless run with `-y`.
   Do not recommend `-y` (or `restart`) casually -- attached sessions mean a
-  human is using them right now.
+  human is using them right now. Doctor's "running, version unknown (no
+  .info sidecar)" is the same verdict with less information: the tunnel or
+  daemon predates the sidecar, or an age-based `/tmp` sweeper removed it
+  (supervisors started by older releases did not keep it fresh); a `-` destination
+  in `gritty tunnels` is the same sweep. `gritty refresh <host>` fixes both.
 - **Tunnel down / not recovering**: `reconnecting...` forever in the
   client. Check `gritty tunnels` and the tunnel's `connect-<name>.log`
   (ssh's own stderr lands in it). Common causes: ssh host unreachable, host

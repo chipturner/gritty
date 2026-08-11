@@ -38,10 +38,11 @@ pub(crate) enum Verdict {
     Current,
     /// Running older code than the on-disk binary. Restart required.
     Stale(Staleness),
-    /// Running, but predates the `.info` sidecar, so we can't tell what
-    /// version it is. Since the sidecar landed alongside a protocol bump,
-    /// a running process without one is definitionally behind -- treat as
-    /// stale.
+    /// Running, but has no `.info` sidecar -- it predates the sidecar, or an
+    /// age-based `/tmp` sweeper removed it -- so we can't tell what version
+    /// it is. Restarting is the only way to get back to a known state, so
+    /// treat as stale. `doctor` reports this same verdict
+    /// (`doctor.rs::check_staleness`) so the two never disagree.
     Unknown,
 }
 
@@ -51,7 +52,7 @@ impl std::fmt::Display for Verdict {
             Verdict::NotRunning => write!(f, "not running"),
             Verdict::Current => write!(f, "up to date"),
             Verdict::Stale(s) => write!(f, "{s}"),
-            Verdict::Unknown => write!(f, "running, version unknown (predates .info)"),
+            Verdict::Unknown => write!(f, "running, version unknown (no .info sidecar)"),
         }
     }
 }
@@ -75,8 +76,7 @@ pub(crate) fn assess(info_path: &Path, alive: impl FnOnce() -> bool) -> Verdict 
             None => Verdict::Current,
             Some(s) => Verdict::Stale(s),
         },
-        // Running but no `.info` sidecar: predates this feature, so it is
-        // definitionally behind the binary on disk.
+        // Running but no `.info` sidecar: unknowable version, see `Unknown`.
         Err(_) => Verdict::Unknown,
     }
 }
@@ -370,8 +370,8 @@ mod tests {
 
     #[test]
     fn assess_unknown_when_no_info_but_alive() {
-        // Process running without a `.info` sidecar predates this feature --
-        // definitionally stale, needs a restart to pick up the new binary.
+        // Process running without a `.info` sidecar (predates it, or it was
+        // swept) -- unknowable version, needs a restart to get back to one.
         let tmp = tempfile::tempdir().unwrap();
         let info = tmp.path().join("x.info");
         let v = assess(&info, || true);
@@ -427,7 +427,7 @@ mod tests {
     fn verdict_display() {
         assert_eq!(Verdict::NotRunning.to_string(), "not running");
         assert_eq!(Verdict::Current.to_string(), "up to date");
-        assert!(Verdict::Unknown.to_string().contains("predates"));
+        assert!(Verdict::Unknown.to_string().contains("no .info sidecar"));
     }
 
     #[test]

@@ -8,6 +8,20 @@ protocol interoperate with their neighbors.
 
 ## Unreleased
 
+- **Fixed: `/tmp` sweepers no longer strip a long-lived tunnel of its
+  sidecars.** 0.15.0 taught the supervisor to keep `connect-<name>.lock`
+  fresh, but `.pid`, `.info`, `.dest`, `.ssh-opts`, `.remote-sock`, `.log`
+  and `.out` were still written once and never touched again, so after a
+  few days macOS's `tmp_cleaner`/`dirhelper` removed them out from under a
+  healthy tunnel: `gritty tunnels` and `gritty ls` showed the destination
+  as `-`, `restart`/auto-start forgot the original `user@host` and `-o`
+  options, and -- because a live supervisor with no `.info` reads as
+  "version unknown" -- every `gritty refresh` restarted every tunnel while
+  `gritty doctor` insisted nothing was wrong. The supervisor now re-touches
+  the whole set on every probe tick, and `doctor` reports the
+  version-unknown case with the same verdict `refresh` acts on. Existing
+  tunnels pick this up on their next `tunnel-create`/`refresh`. No
+  protocol change.
 - **`send` disambiguates duplicate file names instead of erroring.**
   `gritty send docs/a/reference.md docs/b/reference.md` used to refuse
   ("duplicate file name `reference.md`"); it now sends them as
