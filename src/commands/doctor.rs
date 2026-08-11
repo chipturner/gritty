@@ -526,25 +526,16 @@ fn check_tunnel_residue(socket_dir: &Path) -> Vec<Check> {
 /// is attached to that host:session and serving `lf`/`rf` requests. This is
 /// the only client-side introspection surface gritty has -- the daemon knows
 /// a session is attached, but not from which machine or process.
-fn check_clients(socket_dir: &Path) -> Vec<Check> {
-    let Ok(entries) = std::fs::read_dir(socket_dir) else {
-        return Vec::new();
-    };
-
-    let mut live: Vec<(String, u32)> = entries
-        .filter_map(|e| e.ok())
-        .filter_map(|e| {
-            let name = e.file_name().to_string_lossy().to_string();
-            let (host, id) = gritty::client::parse_forward_socket_name(&name)?;
-            std::os::unix::net::UnixStream::connect(e.path())
-                .is_ok()
-                .then(|| (host.to_string(), id))
-        })
-        .collect();
-    live.sort();
-
-    live.into_iter()
-        .map(|(host, id)| Check::ok(format!("client on this machine holds {host}:{id}")))
+async fn check_clients(socket_dir: &Path, config: &gritty::config::ConfigFile) -> Vec<Check> {
+    // Same scan and the same labels as `lf`/`rf`'s "which attached session?"
+    // listing, so what doctor prints is something you can pass to a command.
+    // (The forward socket only carries the session *id*; printing `host:id`
+    // read like a target but `host:3` addresses the session *named* 3.)
+    let live = super::util::live_forward_sockets(socket_dir);
+    super::util::forward_candidate_labels(config, &live)
+        .await
+        .into_iter()
+        .map(|label| Check::ok(format!("client on this machine holds {label}")))
         .collect()
 }
 
@@ -809,7 +800,7 @@ pub(crate) async fn gather(ctl_socket: Option<&Path>, clean: bool) -> DoctorRepo
     let (server_checks, sessions) = check_local_server(&ctl_path).await;
     let mut tunnel_checks = check_tunnels(&default_dir).await;
     tunnel_checks.extend(check_tunnel_residue(&default_dir));
-    let client_checks = check_clients(&server_dir);
+    let client_checks = check_clients(&server_dir, &gritty::config::ConfigFile::load()).await;
 
     let live_ids: Vec<u32> = sessions.iter().map(|s| s.id).collect();
     let mut socket_checks = check_sockets(&server_dir, &live_ids);
@@ -1209,27 +1200,32 @@ mod tests {
 
     // --- check_clients ---
 
-    #[test]
-    fn clients_reports_connectable_fwd_sockets() {
+    #[tokio::test]
+    async fn clients_reports_connectable_fwd_sockets() {
         let dir = tempfile::tempdir().unwrap();
         // A real listener = a live client. Host names contain dots and hyphens;
-        // the session id is after the last hyphen.
+        // the session id is after the last hyphen. No daemon answers for this
+        // (made-up) host, so the label must be the explicit id form -- never
+        // `host:14`, which reads as a target for a session *named* 14.
         let _listener = std::os::unix::net::UnixListener::bind(
             dir.path().join("fwd-fate.x.pattern-net-14.sock"),
         )
         .unwrap();
-        let checks = check_clients(dir.path());
+        let checks = check_clients(dir.path(), &gritty::config::ConfigFile::default()).await;
         assert_eq!(checks.len(), 1);
         assert_eq!(checks[0].status, Status::Ok);
-        assert!(checks[0].message.contains("fate.x.pattern-net:14"));
+        assert_eq!(
+            checks[0].message,
+            "client on this machine holds fate.x.pattern-net (session #14)"
+        );
     }
 
-    #[test]
-    fn clients_skips_dead_fwd_sockets() {
+    #[tokio::test]
+    async fn clients_skips_dead_fwd_sockets() {
         let dir = tempfile::tempdir().unwrap();
         // A plain file (or a socket nobody listens on) is not a live client --
         // check_sockets reports it as orphaned instead.
         std::fs::write(dir.path().join("fwd-devbox-3.sock"), "").unwrap();
-        assert!(check_clients(dir.path()).is_empty());
+        assert!(check_clients(dir.path(), &gritty::config::ConfigFile::default()).await.is_empty());
     }
 }

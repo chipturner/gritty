@@ -478,32 +478,57 @@ pub(crate) struct ForwardCandidate {
     pub(crate) session_id: u32,
 }
 
-/// Fallback display when the daemon cannot be asked for the session name.
-fn candidate_fallback_label(c: &ForwardCandidate) -> String {
-    format!("{} (session #{})", c.host, c.session_id)
+/// Label for one candidate given its host's session list (if the daemon
+/// answered): the typeable `host:session-name` -- own client prefix elided,
+/// so it round-trips as a CLI target -- or, when the name can't be learned,
+/// the deliberately untypeable `host (session #id)`. A bare `host:id` would
+/// look like a target but resolve as a *name* (`host:3` means the session
+/// called `3`), which is exactly the confusion this avoids.
+fn candidate_label(
+    c: &ForwardCandidate,
+    sessions: Option<&[gritty::protocol::SessionEntry]>,
+    client_name: &str,
+) -> String {
+    match sessions.and_then(|s| s.iter().find(|e| e.id == c.session_id)) {
+        Some(entry) => {
+            format!("{}:{}", c.host, gritty::naming::display_session_name(&entry.name, client_name))
+        }
+        None => format!("{} (session #{})", c.host, c.session_id),
+    }
 }
 
-/// Best-effort typeable label for a candidate: `host:session-name` (own
-/// client prefix elided, so it round-trips as a CLI target) when the daemon
-/// answers, else the untypeable-but-informative `host (session #id)`.
-async fn forward_candidate_label(
+/// Best-effort typeable labels for candidates (see [`candidate_label`]),
+/// asking each distinct host's daemon once. Shared by `lf`/`rf`'s
+/// disambiguation and `doctor`'s client listing.
+pub(crate) async fn forward_candidate_labels(
     config: &gritty::config::ConfigFile,
-    c: &ForwardCandidate,
-) -> String {
-    use gritty::protocol::Frame;
+    candidates: &[ForwardCandidate],
+) -> Vec<String> {
+    use gritty::protocol::{Frame, SessionEntry};
+    use std::collections::HashMap;
 
-    let Ok(ctl_path) = resolve_ctl_path(None, Some(&c.host)) else {
-        return candidate_fallback_label(c);
-    };
-    let Ok(Frame::SessionInfo { sessions }) = server_request(&ctl_path, Frame::ListSessions).await
-    else {
-        return candidate_fallback_label(c);
-    };
-    let Some(entry) = sessions.iter().find(|e| e.id == c.session_id) else {
-        return candidate_fallback_label(c);
-    };
-    let client_name = config.resolve_session(Some(&c.host)).client_name;
-    format!("{}:{}", c.host, gritty::naming::display_session_name(&entry.name, &client_name))
+    let mut by_host: HashMap<&str, Option<Vec<SessionEntry>>> = HashMap::new();
+    for c in candidates {
+        if by_host.contains_key(c.host.as_str()) {
+            continue;
+        }
+        let sessions = match resolve_ctl_path(None, Some(&c.host)) {
+            Ok(ctl) => match server_request(&ctl, Frame::ListSessions).await {
+                Ok(Frame::SessionInfo { sessions }) => Some(sessions),
+                _ => None,
+            },
+            Err(_) => None,
+        };
+        by_host.insert(&c.host, sessions);
+    }
+    candidates
+        .iter()
+        .map(|c| {
+            let client_name = config.resolve_session(Some(&c.host)).client_name;
+            let sessions = by_host.get(c.host.as_str()).and_then(|s| s.as_deref());
+            candidate_label(c, sessions, &client_name)
+        })
+        .collect()
 }
 
 /// List the live forward sockets in `dir`, sorted by path. Liveness is probed
@@ -592,21 +617,16 @@ pub(crate) async fn port_forward_command(
             };
             ambiguous_host_guard(config, &dir, &port, alias)?;
             let mut live = live_forward_sockets(&dir);
-            match live.len() {
-                1 => {
-                    let c = live.swap_remove(0);
-                    let label = forward_candidate_label(config, &c).await;
-                    (c.path, label)
-                }
-                0 => anyhow::bail!(
+            if live.is_empty() {
+                anyhow::bail!(
                     "no attached session found (port forwards need an attached `gritty connect` client){}",
                     in_session_hint(inside_session())
-                ),
+                );
+            }
+            let mut labels = forward_candidate_labels(config, &live).await;
+            match live.len() {
+                1 => (live.swap_remove(0).path, labels.swap_remove(0)),
                 _ => {
-                    let mut labels = Vec::with_capacity(live.len());
-                    for c in &live {
-                        labels.push(forward_candidate_label(config, c).await);
-                    }
                     // Example must be typeable; fall back to a placeholder if
                     // the first label is an id-only form.
                     let example = labels.iter().find(|l| l.contains(':')).map(String::as_str);
@@ -1524,7 +1544,36 @@ mod tests {
         assert_eq!(live[0].host, "devbox");
         assert_eq!(live[0].session_id, 3);
         assert!(live[0].path.ends_with("fwd-devbox-3.sock"));
-        assert_eq!(candidate_fallback_label(&live[0]), "devbox (session #3)");
+        assert_eq!(candidate_label(&live[0], None, "laptop"), "devbox (session #3)");
+    }
+
+    #[test]
+    fn candidate_label_is_a_typeable_target_or_clearly_not_one() {
+        let c = ForwardCandidate { path: PathBuf::new(), host: "devbox".into(), session_id: 3 };
+        let named = |id: u32, name: &str| {
+            let mut e = linger_entry(true, 0, 0, 0);
+            e.id = id;
+            e.name = name.to_string();
+            e
+        };
+        let own = named(3, "laptop/work");
+        let foreign = named(3, "other/shared");
+        let unrelated = named(7, "laptop/3");
+
+        // Own prefix elided: `gritty rf devbox:work 80` works as typed.
+        assert_eq!(candidate_label(&c, Some(std::slice::from_ref(&own)), "laptop"), "devbox:work");
+        // Foreign names keep their prefix, which is also what you'd type.
+        assert_eq!(
+            candidate_label(&c, Some(std::slice::from_ref(&foreign)), "laptop"),
+            "devbox:other/shared"
+        );
+        // Id 3 unknown (only a *session named* `3` exists): never print
+        // `devbox:3`, which would address that other session.
+        assert_eq!(
+            candidate_label(&c, Some(std::slice::from_ref(&unrelated)), "laptop"),
+            "devbox (session #3)"
+        );
+        assert_eq!(candidate_label(&c, None, "laptop"), "devbox (session #3)");
     }
 
     #[test]

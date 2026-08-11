@@ -41,6 +41,12 @@ protocol interoperate with their neighbors.
   fixed: `tunnel-create <alias-spelling>` (no `-n`) announced the
   canonical name but created the tunnel's files under the spelling you
   typed, so a following `connect <name>` started a second tunnel.
+- **Fixed: `doctor`'s Clients lines named sessions by id.** `client on
+  this machine holds devbox:3` looked like a target, but `devbox:3` is how
+  you address the session *named* `3` -- on a host with auto-numbered
+  sessions that is usually a different one. Doctor now prints the same
+  typeable `host:name` labels `lf`/`rf` use (`devbox (session #3)` when the
+  daemon can't be asked).
 - **Message fixes.** A failed auto-start / ssh / bootstrap no longer reports
   `(exit exit status: 1)`. `connect host:-` says `attached <name>` (and
   `-d` says `<name> exists`) instead of a literal `-`, and can no longer
