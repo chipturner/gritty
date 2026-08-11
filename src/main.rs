@@ -780,7 +780,7 @@ fn main() {
             ignore_version_mismatch,
         } => {
             // Compute connection name before fork so parent can print socket path
-            let connection_name = match name.clone() {
+            let connection_name = match name {
                 Some(n) => n,
                 None => match gritty::connect::parse_host(&destination) {
                     Ok(h) => h,
@@ -819,6 +819,24 @@ fn main() {
             // config supplied IdentityFile / ProxyJump / etc.
             let merged_ssh_options =
                 gritty::connect::merge_ssh_options(&ssh_options, &resolved.ssh_options);
+
+            // A healthy tunnel under this name needs nothing from us: say so
+            // and stop, before paying the ssh preflight or forking. Only the
+            // Healthy state short-circuits -- a supervisor that holds the
+            // lock but whose socket is not up yet must still go through
+            // `connect::run`, which waits for the socket before exiting 0
+            // (auto-start relies on "exit 0 => connectable"). Without this
+            // the child noticed the running tunnel but reported it into the
+            // `.out` file, and the parent's ready-byte handler printed a
+            // flat "started" regardless.
+            if !foreground
+                && !dry_run
+                && gritty::connect::probe_tunnel_status(&connection_name)
+                    == gritty::connect::TunnelStatus::Healthy
+            {
+                gritty::connect::report_already_running(&connection_name, &local_sock);
+                std::process::exit(0);
+            }
 
             if !foreground
                 && !dry_run
@@ -878,7 +896,13 @@ fn main() {
                 // re-resolves config ssh-options on replay, so storing the
                 // merged set would double them.
                 cli_ssh_options: ssh_options,
-                name,
+                // The canonical (alias-resolved) name, not the raw `-n` /
+                // destination host: the parent already printed the socket
+                // path and "started" line for this name, and `connect
+                // <alias>` will look for its socket under it. Passing the
+                // raw form let the child create the tunnel under a
+                // different name than the one just announced.
+                name: connection_name,
                 dry_run,
                 foreground,
                 ignore_version_mismatch,

@@ -33,6 +33,14 @@ protocol interoperate with their neighbors.
   a lower id the cursor could land on an attached row (Enter then failed
   with "already attached"). It now starts on your first detached session
   as displayed, or on the "new session" row when everything is attached.
+- **Fixed: `tunnel-create` for a tunnel that is already up says so.** It
+  used to run the ssh preflight, fork, and print `tunnel X started` even
+  though the child had merely found the existing supervisor (its "already
+  running" line went to the `.out` file). It now reports
+  `tunnel X already running (pid N)` up front without touching ssh. Also
+  fixed: `tunnel-create <alias-spelling>` (no `-n`) announced the
+  canonical name but created the tunnel's files under the spelling you
+  typed, so a following `connect <name>` started a second tunnel.
 - **Message fixes.** A failed auto-start / ssh / bootstrap no longer reports
   `(exit exit status: 1)`.
 - **Fixed: the "server shut down" exit line no longer erases your last line.**

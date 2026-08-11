@@ -226,6 +226,20 @@ kill the remote daemon and its live sessions.
 
 ### Startup (`connect::run`)
 
+0. **Pre-fork short-circuit (`main.rs`, background mode only)** -- before
+   the ssh preflight and before daemonizing, the parent probes
+   `probe_tunnel_status(name)`. `Healthy` (lock held *and* socket
+   connectable) means there is nothing to do: it prints the same
+   socket-path line plus `tunnel NAME already running (pid N)`
+   (`report_already_running`) and exits 0. Only `Healthy` qualifies --
+   `Reconnecting` (lock held, socket down) still goes through step 1 so the
+   exit-0-implies-connectable contract holds. Rationale: after the fork the
+   child's stdout is the `.out` file, and the parent's ready-byte handler
+   can only print a fixed "started", so a duplicate `tunnel-create` used to
+   claim it started a tunnel it merely found. The parent also passes the
+   alias-canonicalized name it announced into `ConnectOpts.name` (a plain
+   `String`), so the child cannot create the tunnel under a different name
+   than the one printed.
 1. **Absent -> WaitingForPeer** -- `try_acquire_lock` returned `Err`. Another
    supervisor holds the flock. This process must not spawn a second ssh
    child: the socket path is shared and the invocation is expected to be

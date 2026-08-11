@@ -1702,15 +1702,27 @@ pub fn probe_tunnel_status(name: &str) -> TunnelStatus {
     }
 }
 
-/// Clean up files for a stale tunnel (process already dead).
-/// No signals sent — the process is confirmed dead (lockfile released).
-/// Orphaned SSH children self-terminate via ServerAliveInterval/ServerAliveCountMax.
 pub fn read_pid_hint(name: &str) -> Option<u32> {
     std::fs::read_to_string(connect_pid_path(name)).ok().and_then(|s| s.trim().parse().ok())
 }
 
+/// `tunnel-create`'s report for a tunnel that is already up: the socket path
+/// on stdout (the same line a fresh start prints, so scripts see one shape)
+/// and a success line naming the existing supervisor. Shared by the parent's
+/// pre-fork check in `main.rs` and the lock-held branch of [`run`], so the two
+/// can't drift.
+pub fn report_already_running(connection_name: &str, local_sock: &Path) {
+    println!("{}", local_sock.display());
+    match read_pid_hint(connection_name) {
+        Some(pid) => ui::success(&format!("tunnel {connection_name} already running (pid {pid})")),
+        None => ui::success(&format!("tunnel {connection_name} already running")),
+    }
+}
+
 /// Remove the non-lock sidecar files (`.sock`, `.pid`, `.info`, `.dest`,
-/// `.ssh-opts`, `.kick`).
+/// `.ssh-opts`, `.kick`) of a stale tunnel. No signals are sent -- the
+/// process is confirmed dead (lock released); orphaned ssh children
+/// self-terminate via ServerAliveInterval/ServerAliveCountMax.
 /// Callers must hold the tunnel flock -- either they just acquired it
 /// (`run()`, `cleanup_if_unheld()`) or they verified ownership via
 /// `LockIdentity::matches_path` (`ConnectGuard::drop`). The lock file itself
@@ -1873,7 +1885,9 @@ pub struct ConnectOpts {
     /// Just the CLI `-o` options (pre-merge), persisted so a restart /
     /// auto-start can replay them without double-counting config options.
     pub cli_ssh_options: Vec<String>,
-    pub name: Option<String>,
+    /// Canonical connection name, already alias-resolved by the caller --
+    /// the same name it announced on stdout, so every sidecar lands under it.
+    pub name: String,
     pub dry_run: bool,
     pub foreground: bool,
     pub ignore_version_mismatch: bool,
@@ -1887,7 +1901,7 @@ pub async fn run(opts: ConnectOpts, ready_fd: Option<OwnedFd>) -> anyhow::Result
     }
 
     let dest = Destination::parse(&opts.destination)?;
-    let connection_name = opts.name.unwrap_or_else(|| dest.host.clone());
+    let connection_name = opts.name;
     validate_connection_name(&connection_name)?;
     let local_sock = local_socket_path(&connection_name);
 
@@ -2003,13 +2017,7 @@ pub async fn run(opts: ConnectOpts, ready_fd: Option<OwnedFd>) -> anyhow::Result
                     None => ui::success(&format!("tunnel {connection_name} ready")),
                 }
             } else {
-                println!("{}", local_sock.display());
-                match pid_hint {
-                    Some(pid) => ui::success(&format!(
-                        "tunnel {connection_name} already running (pid {pid})"
-                    )),
-                    None => ui::success(&format!("tunnel {connection_name} already running")),
-                }
+                report_already_running(&connection_name, &local_sock);
             }
             signal_ready(&ready_fd);
             return Ok(0);
