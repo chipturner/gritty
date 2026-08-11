@@ -8,6 +8,12 @@ protocol interoperate with their neighbors.
 
 ## Unreleased
 
+- **`ls` fits on a normal terminal.** The table now shows `Name Cmd CWD
+  Client Idle Linger Status` (CWD home-relative); it used to run ~130
+  columns wide with ID, PTY, PID and a full timestamp on every row. Those
+  diagnostic columns are behind `ls --full`, and `--json` still carries
+  every field. The session picker's CWD column shortens remote homes too
+  (it only recognized the local `$HOME` before).
 - **Fixed: `/tmp` sweepers no longer strip a long-lived tunnel of its
   sidecars.** 0.15.0 taught the supervisor to keep `connect-<name>.lock`
   fresh, but `.pid`, `.info`, `.dest`, `.ssh-opts`, `.remote-sock`, `.log`

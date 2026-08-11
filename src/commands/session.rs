@@ -9,9 +9,38 @@ use super::util::{
     server_request,
 };
 
-/// The shared session-table column headers (see [`session_status_cols`]).
+/// Every session-table column, in [`session_status_cols`] order. This is the
+/// `--full` layout; the default table keeps only [`COMPACT_COLUMNS`].
 const SESSION_TABLE_HEADERS: [&str; 11] =
     ["ID", "Name", "Cmd", "CWD", "Client", "PTY", "PID", "Created", "Idle", "Linger", "Status"];
+
+/// Indices into [`SESSION_TABLE_HEADERS`] shown by default: what you need to
+/// pick or reap a session. ID (names are the addressing handle), PTY, PID and
+/// the absolute Created timestamp are diagnostics -- with them the table ran
+/// ~130 columns wide on a real host -- and live behind `ls --full` / `--json`.
+const COMPACT_COLUMNS: [usize; 7] = [1, 2, 3, 4, 8, 9, 10];
+
+fn table_headers(full: bool) -> Vec<&'static str> {
+    select_columns(SESSION_TABLE_HEADERS, full)
+}
+
+/// One rendered table row for `s` in the requested layout.
+fn table_row(
+    s: &gritty::protocol::SessionEntry,
+    now: u64,
+    client_name: &str,
+    full: bool,
+) -> Vec<String> {
+    select_columns(session_status_cols(s, now, client_name), full)
+}
+
+fn select_columns<T>(all: impl IntoIterator<Item = T>, full: bool) -> Vec<T> {
+    all.into_iter()
+        .enumerate()
+        .filter(|(i, _)| full || COMPACT_COLUMNS.contains(i))
+        .map(|(_, col)| col)
+        .collect()
+}
 
 fn client_config(
     name: &str,
@@ -427,7 +456,6 @@ fn build_rows(sessions: &[gritty::protocol::SessionEntry], client_name: &str) ->
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default()
         .as_secs();
-    let home = std::env::var("HOME").unwrap_or_default();
     // Sort own-namespace sessions first so the picker (and its `1`-`9` hotkeys)
     // surface your own sessions ahead of foreign/legacy ones. Stable so the
     // server's id-order survives within each group.
@@ -444,7 +472,7 @@ fn build_rows(sessions: &[gritty::protocol::SessionEntry], client_name: &str) ->
             age: format_age(now, s.created_at),
             idle: super::util::format_idle(now, s.last_activity),
             cmd: s.foreground_cmd.clone(),
-            cwd: shorten_home(&s.cwd, &home),
+            cwd: shorten_home(&s.cwd),
             client: s.client_name.clone(),
             hotkey: if i < 9 { Some((b'1' + i as u8) as char) } else { None },
         })
@@ -461,14 +489,28 @@ fn initial_cursor(rows: &[Row]) -> usize {
     rows.iter().position(|r| !r.attached).unwrap_or(rows.len())
 }
 
-fn shorten_home(path: &str, home: &str) -> String {
-    if !home.is_empty() && path.starts_with(home) {
-        let rest = &path[home.len()..];
-        if rest.is_empty() || rest.starts_with('/') {
-            return format!("~{rest}");
+/// Render a session's cwd home-relative. The daemon that reported it serves
+/// exactly one uid, so a path under *any* home-directory layout (`/home/u`,
+/// `/Users/u`, `/root`, macOS's `/var/root`) is that user's home; the local
+/// `$HOME` is deliberately not consulted, since for remote hosts it differs.
+fn shorten_home(path: &str) -> String {
+    let home_len = if let Some(rest) =
+        path.strip_prefix("/home/").or_else(|| path.strip_prefix("/Users/"))
+    {
+        // The user segment must be non-empty: `/home` alone is not a home.
+        match rest.split('/').next() {
+            Some(user) if !user.is_empty() => path.len() - rest.len() + user.len(),
+            _ => return path.to_string(),
         }
+    } else if let Some(root) = ["/var/root", "/root"].into_iter().find(|r| path.starts_with(r)) {
+        root.len()
+    } else {
+        return path.to_string();
+    };
+    match &path[home_len..] {
+        rest if rest.is_empty() || rest.starts_with('/') => format!("~{rest}"),
+        _ => path.to_string(),
     }
-    path.to_string()
 }
 
 /// Restores the terminal on drop: cursor visible, raw mode off. Shared by the
@@ -1480,7 +1522,7 @@ pub(crate) async fn prune_sessions(
             }
         }
     } else {
-        print_session_table(&candidates, now, client_name, "");
+        print_session_table(&candidates, now, client_name, false, "");
         if !yes {
             ui::detail(&format!("dry run -- pass -y to kill {} session(s)", candidates.len()));
             return Ok(());
@@ -1595,14 +1637,14 @@ pub(crate) async fn restart(
     Ok(())
 }
 
-/// The eleven shared session-table columns (ID..Status) for one row. Identical
-/// between `list_sessions` and `list_all_sessions`; the latter just prepends a
-/// Host column. Single-sourced so the "starting"/attached/heartbeat/detached
-/// status logic and column order cannot drift between the two listings.
+/// All eleven session-table columns (ID..Status) for one row, in
+/// [`SESSION_TABLE_HEADERS`] order; [`table_row`] narrows them for the default
+/// layout. Single-sourced so the "starting"/attached/heartbeat/detached status
+/// logic and column order cannot drift between `ls`, the dashboard, and prune.
 ///
 /// `ambient_client_name` elides that prefix from the displayed NAME column so
 /// your own sessions read as `work` rather than `mylaptop/work`; pass an empty
-/// string to skip elision (e.g. `--full`).
+/// string to skip elision.
 fn session_status_cols(
     s: &gritty::protocol::SessionEntry,
     now: u64,
@@ -1648,7 +1690,7 @@ fn session_status_cols(
         s.id.to_string(),
         name,
         s.foreground_cmd.clone(),
-        s.cwd.clone(),
+        shorten_home(&s.cwd),
         s.client_name.clone(),
         pty,
         pid,
@@ -1691,14 +1733,15 @@ fn print_session_table(
     sessions: &[gritty::protocol::SessionEntry],
     now: u64,
     client_name: &str,
+    full: bool,
     indent: &str,
 ) {
     use gritty::ui::sgr::{BOLD, RESET};
 
     let ordered = order_sessions(sessions, client_name);
     let rows: Vec<Vec<String>> =
-        ordered.iter().map(|(s, _)| session_status_cols(s, now, client_name)).collect();
-    let lines = gritty::table::format_table(&SESSION_TABLE_HEADERS, &rows);
+        ordered.iter().map(|(s, _)| table_row(s, now, client_name, full)).collect();
+    let lines = gritty::table::format_table(&table_headers(full), &rows);
 
     // lines[0] is the header; lines[i + 1] renders ordered[i].
     anstream::println!("{indent}{}", lines[0]);
@@ -1716,6 +1759,7 @@ pub(crate) async fn list_sessions(
     host: &str,
     client_name: &str,
     json: bool,
+    full: bool,
 ) -> anyhow::Result<()> {
     use gritty::protocol::Frame;
 
@@ -1736,7 +1780,7 @@ pub(crate) async fn list_sessions(
             } else if sessions.is_empty() {
                 println!("no active sessions");
             } else {
-                print_session_table(&sessions, now, client_name, "");
+                print_session_table(&sessions, now, client_name, full, "");
             }
             Ok(())
         }
@@ -1955,6 +1999,7 @@ fn is_listable(p: &ProbedHost) -> bool {
 pub(crate) async fn list_all_sessions(
     config: &gritty::config::ConfigFile,
     json: bool,
+    full: bool,
 ) -> anyhow::Result<()> {
     use gritty::ui::sgr::{DIM, DIM_YELLOW, RESET};
 
@@ -2027,7 +2072,7 @@ pub(crate) async fn list_all_sessions(
                 // `[defaults].client-name`) gets its own elision.
                 let host = &group.members[0].0;
                 let client_name = config.resolve_session(Some(host)).client_name;
-                print_session_table(sessions, now, &client_name, "  ");
+                print_session_table(sessions, now, &client_name, full, "  ");
             }
             // Stays on stdout: in `--json` mode this same value is the group's
             // `error` field, so it occupies the table's slot for that host.
@@ -2537,6 +2582,65 @@ mod tests {
         s.name = "laptop2/work".to_string();
         let cols = session_status_cols(&s, 100, "mylaptop");
         assert_eq!(cols[1], "laptop2/work"); // foreign prefix kept
+    }
+
+    /// Look a column up by header so tests don't encode positions.
+    fn column(row: &[String], full: bool, header: &str) -> String {
+        let headers = table_headers(full);
+        let i = headers.iter().position(|h| *h == header).unwrap_or_else(|| panic!("{header}"));
+        row[i].clone()
+    }
+
+    #[test]
+    fn compact_table_drops_diagnostic_columns() {
+        assert_eq!(
+            table_headers(false),
+            ["Name", "Cmd", "CWD", "Client", "Idle", "Linger", "Status"]
+        );
+        assert_eq!(
+            table_headers(true),
+            [
+                "ID", "Name", "Cmd", "CWD", "Client", "PTY", "PID", "Created", "Idle", "Linger",
+                "Status"
+            ]
+        );
+        let mut s = entry();
+        s.name = "mylaptop/work".to_string();
+        s.attached = true;
+        let compact = table_row(&s, 100, "mylaptop", false);
+        assert_eq!(compact.len(), table_headers(false).len());
+        assert_eq!(column(&compact, false, "Name"), "work");
+        assert_eq!(column(&compact, false, "Status"), "attached");
+        let full = table_row(&s, 100, "mylaptop", true);
+        assert_eq!(full.len(), table_headers(true).len());
+        assert_eq!(column(&full, true, "ID"), "3");
+        assert_eq!(column(&full, true, "PID"), "1234");
+        assert_eq!(column(&full, true, "Status"), "attached");
+    }
+
+    #[test]
+    fn table_cwd_is_home_relative_in_both_modes() {
+        let mut s = entry();
+        s.cwd = "/home/x/code/gritty".to_string();
+        assert_eq!(column(&table_row(&s, 100, "", false), false, "CWD"), "~/code/gritty");
+        assert_eq!(column(&table_row(&s, 100, "", true), true, "CWD"), "~/code/gritty");
+    }
+
+    #[test]
+    fn shorten_home_recognizes_any_home_dir_on_the_daemon_host() {
+        // A daemon serves exactly one uid, so a session cwd under *a* home
+        // directory is that user's home -- whichever OS layout the remote
+        // uses. The local $HOME is not consulted: remote homes differ from it.
+        assert_eq!(shorten_home("/home/chip"), "~");
+        assert_eq!(shorten_home("/home/chip/src"), "~/src");
+        assert_eq!(shorten_home("/Users/chip/src"), "~/src");
+        assert_eq!(shorten_home("/root"), "~");
+        assert_eq!(shorten_home("/root/src"), "~/src");
+        assert_eq!(shorten_home("/var/root/x"), "~/x");
+        assert_eq!(shorten_home("/homework/x"), "/homework/x");
+        assert_eq!(shorten_home("/home"), "/home");
+        assert_eq!(shorten_home("/tmp/x"), "/tmp/x");
+        assert_eq!(shorten_home(""), "");
     }
 
     // -- parse_kill_target (kill-session argument resolution) --
