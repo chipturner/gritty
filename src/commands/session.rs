@@ -430,6 +430,16 @@ fn build_rows(sessions: &[gritty::protocol::SessionEntry], client_name: &str) ->
         .collect()
 }
 
+/// Where the picker's cursor starts: the first *displayed* row that can be
+/// attached as-is (own sessions sort first, so that's the user's own first
+/// detached one), else the "new session" row at `rows.len()` -- Enter on an
+/// attached row is refused without force, so it makes a poor default.
+/// Must be computed over the displayed rows, not the server's list: the two
+/// orders differ whenever a foreign session has a lower id.
+fn initial_cursor(rows: &[Row]) -> usize {
+    rows.iter().position(|r| !r.attached).unwrap_or(rows.len())
+}
+
 fn shorten_home(path: &str, home: &str) -> String {
     if !home.is_empty() && path.starts_with(home) {
         let rest = &path[home.len()..];
@@ -484,11 +494,8 @@ async fn tui_pick_session(
 
     let mut stderr = std::io::stderr();
 
-    // Find first detached session for initial cursor position
-    let initial = sessions.iter().position(|s| !s.attached).unwrap_or(0);
-    let mut cursor = initial;
-
     let mut rows = build_rows(sessions, client_name);
+    let mut cursor = initial_cursor(&rows);
 
     enum Mode {
         Pick,
@@ -2337,6 +2344,29 @@ mod tests {
         let rows = build_rows(&sessions, "defiant");
         let names: Vec<&str> = rows.iter().map(|r| r.name.as_str()).collect();
         assert_eq!(names, vec!["defiant/b", "defiant/a", "laptop2/x", "laptop2/y"]);
+    }
+
+    #[test]
+    fn initial_cursor_follows_displayed_order_not_server_order() {
+        // Server order: a foreign detached session first, then our own
+        // attached and detached ones. build_rows displays ours first, so the
+        // cursor must land on `defiant/b` (displayed row 1) -- computing the
+        // position over the server order put it on row 0 (`defiant/a`, which
+        // is attached and can't be picked without force).
+        let sessions = vec![
+            auto_entry("laptop2/x", false),
+            auto_entry("defiant/a", true),
+            auto_entry("defiant/b", false),
+        ];
+        let rows = build_rows(&sessions, "defiant");
+        assert_eq!(rows[initial_cursor(&rows)].name, "defiant/b");
+    }
+
+    #[test]
+    fn initial_cursor_lands_on_new_session_row_when_everything_is_attached() {
+        let sessions = vec![auto_entry("defiant/a", true), auto_entry("laptop2/x", true)];
+        let rows = build_rows(&sessions, "defiant");
+        assert_eq!(initial_cursor(&rows), rows.len());
     }
 
     #[test]

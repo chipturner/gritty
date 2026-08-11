@@ -27,6 +27,12 @@ protocol interoperate with their neighbors.
   `starting tunnel ...`, ran `tunnel-create --name '' ''`, and left a
   `connect-.log` behind. It now follows the omitted-host rule and addresses
   the local daemon, in every command that takes a target.
+- **Fixed: the `connect` picker's cursor started on the wrong row.** The
+  initial position was computed over the daemon's id order but the rows are
+  displayed with your own sessions first, so whenever a foreign session had
+  a lower id the cursor could land on an attached row (Enter then failed
+  with "already attached"). It now starts on your first detached session
+  as displayed, or on the "new session" row when everything is attached.
 - **Message fixes.** A failed auto-start / ssh / bootstrap no longer reports
   `(exit exit status: 1)`.
 - **Fixed: the "server shut down" exit line no longer erases your last line.**
