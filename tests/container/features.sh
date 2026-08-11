@@ -193,27 +193,43 @@ test_force_takeover() {
         return
     }
 
-    # A second Attach on this client name without --force must be rejected
-    # with AlreadyAttached. `connect` refuses to run at all without a tty on
-    # stdin, so probe from a second pane rather than with stdin redirected;
-    # the rejected connect exits straight back to that pane's shell.
+    # A second Attach on this client name without --force gets AlreadyAttached;
+    # on a terminal that surfaces as a take-over prompt. `connect` refuses to
+    # run at all without a tty on stdin, so probe from a second pane. Decline
+    # the prompt and check the session was left alone.
     tmux split-window -t feat -d
     tmux send-keys -t feat.1 'gritty connect --no-create local:takeover' Enter
     if wait_for_text "already attached" feat.1 5; then
-        pass "takeover: second client rejected without --force"
+        tmux send-keys -t feat.1 'n' Enter
+        if wait_for_text "gritty connect local:takeover --force" feat.1 5; then
+            pass "takeover: prompt declined leaves the session alone"
+        else
+            fail "takeover: prompt declined leaves the session alone" \
+                "$(tmux capture-pane -t feat.1 -p -S - | tail -5)"
+        fi
     else
-        fail "takeover: second client rejected without --force" \
+        fail "takeover: second client is told the session is attached" \
             "$(tmux capture-pane -t feat.1 -p -S - | tail -5)"
     fi
 
-    # With --force, the steal should succeed from that same second pane.
-    tmux send-keys -t feat.1 'gritty connect --force local:takeover' Enter
+    # Answering yes at the prompt steals it (same path --force takes). Wipe
+    # the pane first so the wait below can't match the first prompt.
+    tmux send-keys -t feat.1 'clear' Enter
+    sleep 0.2
+    tmux clear-history -t feat.1
+    tmux send-keys -t feat.1 'gritty connect local:takeover' Enter
+    if wait_for_text "take it over" feat.1 5; then
+        tmux send-keys -t feat.1 'y' Enter
+    else
+        fail "takeover: prompt shown on second attempt" \
+            "$(tmux capture-pane -t feat.1 -p -S - | tail -5)"
+    fi
     sleep 2
     tmux send-keys -t feat.1 'echo TAKEOVER_B_HERE' Enter
     if wait_for_text TAKEOVER_B_HERE feat.1 5; then
-        pass "takeover: --force succeeds"
+        pass "takeover: answering yes takes the session over"
     else
-        fail "takeover: --force succeeds" "B not interactive after --force"
+        fail "takeover: answering yes takes the session over" "B not interactive after take-over"
         tmux capture-pane -t feat.1 -p -S - | tail -15
     fi
 

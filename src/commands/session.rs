@@ -170,35 +170,58 @@ pub(crate) async fn connect_session(
     // name, so suggested commands built from it stay copy-pasteable.
     let shown = gritty::naming::display_session_name(&name, &settings.client_name).to_string();
 
-    let mut framed = Framed::new(stream, FrameCodec);
-    let info = gritty::handshake(&mut framed, gritty::get_or_create_device_id())
-        .await
-        .map_err(|e| super::util::tunnel_handshake_context(e, &ctl_path))?;
-    gritty::require_matched_version(&info)?;
-    let server_id = info.server_id;
-
     // Carry current terminal size so the server can resize the PTY before
     // replaying scrollback/ring buffer on reconnect. Zero for probe-only.
     let (attach_cols, attach_rows) =
         if detach { (0, 0) } else { gritty::client::get_terminal_size() };
 
-    // Try attach first
-    framed
-        .send(Frame::Attach {
-            session: name.clone(),
-            client_name: settings.client_name.clone(),
-            force,
-            no_replay: detach,
-            cols: attach_cols,
-            rows: attach_rows,
-            attach_token: 0,
-            // Explicit connect: no prior stream position. attach_token == 0
-            // already signals "fresh viewer" to the server, so it replays
-            // scrollback context rather than an incremental resume.
-            rendered_offset: 0,
-            line_dirty: false,
-        })
-        .await?;
+    // Attach first. The first attempt rides the connection connect_or_start
+    // already opened; a take-over confirmed at the prompt retries with
+    // `force` on a fresh one (the daemon closes the connection with the
+    // AlreadyAttached error).
+    let mut force = force;
+    let mut pending_stream = Some(stream);
+    let mut holder: Option<String> = None;
+    let (mut framed, server_id, response) = loop {
+        let stream = match pending_stream.take() {
+            Some(s) => s,
+            None => super::util::connect_or_start(&ctl_path, &auto_start_mode, wait).await?.0,
+        };
+        let mut framed = Framed::new(stream, FrameCodec);
+        let info = gritty::handshake(&mut framed, gritty::get_or_create_device_id())
+            .await
+            .map_err(|e| super::util::tunnel_handshake_context(e, &ctl_path))?;
+        gritty::require_matched_version(&info)?;
+        framed
+            .send(Frame::Attach {
+                session: name.clone(),
+                client_name: settings.client_name.clone(),
+                force,
+                no_replay: detach,
+                cols: attach_cols,
+                rows: attach_rows,
+                attach_token: 0,
+                // Explicit connect: no prior stream position. attach_token == 0
+                // already signals "fresh viewer" to the server, so it replays
+                // scrollback context rather than an incremental resume.
+                rendered_offset: 0,
+                line_dirty: false,
+            })
+            .await?;
+        let response = Frame::expect_from(framed.next().await)?;
+        if matches!(
+            response,
+            Frame::Error { code: gritty::protocol::ErrorCode::AlreadyAttached, .. }
+        ) && !force
+        {
+            holder = holder_of(&ctl_path, &name).await;
+            if confirm_takeover(&shown, holder.as_deref()).await {
+                force = true;
+                continue;
+            }
+        }
+        break (framed, info.server_id, response);
+    };
 
     // `-c` only applies when a session is created; on an existing one it
     // would otherwise vanish without a trace.
@@ -210,7 +233,7 @@ pub(crate) async fn connect_session(
         }
     };
 
-    match Frame::expect_from(framed.next().await)? {
+    match response {
         Frame::Ok if detach => {
             // Probe succeeded (connect -d): existence confirmed, not attaching.
             // A no-op, so it reads as status rather than as an accomplishment.
@@ -242,9 +265,10 @@ pub(crate) async fn connect_session(
             }
             // Fall through to create
         }
-        Frame::Error { code: gritty::protocol::ErrorCode::AlreadyAttached, message, .. } => {
+        Frame::Error { code: gritty::protocol::ErrorCode::AlreadyAttached, .. } => {
+            // Declined at the prompt, or no terminal to ask on.
             let host = host_from_ctl_path(&ctl_path);
-            ui::error(&message);
+            ui::error(&attached_elsewhere(&shown, holder.as_deref()));
             eprintln!("  gritty connect {host}:{shown} --force   to take over");
             std::process::exit(1);
         }
@@ -325,6 +349,48 @@ pub(crate) async fn connect_session(
 /// consult for a `-` attach.
 async fn resolve_last_attached(ctl_path: &Path) -> anyhow::Result<String> {
     Ok(session_wire_name(&super::util::resolve_session(ctl_path, "-").await?))
+}
+
+/// Who currently holds a session, per the daemon's listing (the client name
+/// recorded at its last attach); `None` when unknown.
+async fn holder_of(ctl_path: &Path, wire_name: &str) -> Option<String> {
+    super::util::resolve_session(ctl_path, wire_name)
+        .await
+        .ok()
+        .map(|e| e.client_name)
+        .filter(|c| !c.is_empty())
+}
+
+fn attached_elsewhere(shown: &str, holder: Option<&str>) -> String {
+    match holder {
+        Some(holder) => format!("session {shown} is already attached by {holder}"),
+        None => format!("session {shown} is already attached elsewhere"),
+    }
+}
+
+/// On AlreadyAttached, ask whether to take the session over -- but only when
+/// there is a terminal to ask on; scripts get the error and the `--force`
+/// hint. Anything but an explicit yes declines.
+async fn confirm_takeover(shown: &str, holder: Option<&str>) -> bool {
+    use std::io::IsTerminal;
+
+    if !std::io::stdin().is_terminal() || !std::io::stderr().is_terminal() {
+        return false;
+    }
+    eprint!("{} -- take it over? [y/N] ", attached_elsewhere(shown, holder));
+    let answer = tokio::task::spawn_blocking(|| {
+        let mut line = String::new();
+        std::io::stdin().read_line(&mut line).map(|_| line)
+    })
+    .await
+    .ok()
+    .and_then(Result::ok)
+    .unwrap_or_default();
+    is_yes(&answer)
+}
+
+fn is_yes(answer: &str) -> bool {
+    matches!(answer.trim(), "y" | "Y" | "yes" | "YES" | "Yes")
 }
 
 /// Block until the daemon lists session `id` as detached (or it is gone).
@@ -2493,6 +2559,22 @@ mod tests {
         let rows = build_rows(&sessions, "defiant");
         assert_eq!((rows[0].display.as_str(), rows[0].name.as_str()), ("a", "defiant/a"));
         assert_eq!((rows[1].display.as_str(), rows[1].name.as_str()), ("laptop2/x", "laptop2/x"));
+    }
+
+    #[test]
+    fn takeover_wording_and_answers() {
+        assert_eq!(
+            attached_elsewhere("work", Some("laptop2")),
+            "session work is already attached by laptop2"
+        );
+        assert_eq!(attached_elsewhere("work", None), "session work is already attached elsewhere");
+        for yes in ["y", "Y", "yes\n", " Yes "] {
+            assert!(is_yes(yes), "{yes:?}");
+        }
+        // Enter alone, EOF, and anything unrecognized decline.
+        for no in ["", "\n", "n", "N", "no", "yep", "q"] {
+            assert!(!is_yes(no), "{no:?}");
+        }
     }
 
     #[test]

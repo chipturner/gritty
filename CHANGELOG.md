@@ -26,6 +26,11 @@ protocol interoperate with their neighbors.
   `--json`) and exits 0; naming a host that is down still fails, but
   `--json` now emits the group with its `error` field rather than a bare
   message.
+- **Connecting to a session someone else holds now asks.** `session work
+  is already attached by laptop2 -- take it over? [y/N]` replaces the
+  error-plus-retype-with-`--force` dance (which is what the flag's help
+  always implied); scripts and non-terminals still get the error and the
+  `--force` hint.
 - **`connect -d` behaves like a create command.** Unnamed `-d` creates the
   next free slot (it used to pick an existing session and do nothing);
   `-c` on a session that already exists now warns that the command was
