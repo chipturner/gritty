@@ -259,7 +259,10 @@ async fn probe_server(
     }
 }
 
-async fn check_local_server(ctl_path: &Path) -> (Vec<Check>, Vec<gritty::protocol::SessionEntry>) {
+async fn check_local_server(
+    ctl_path: &Path,
+    client_name: &str,
+) -> (Vec<Check>, Vec<gritty::protocol::SessionEntry>) {
     let mut checks = Vec::new();
     // Per-session sockets and the daemon log/pid are siblings of the ctl
     // socket (the daemon derives its dir from ctl_path.parent()).
@@ -305,10 +308,11 @@ async fn check_local_server(ctl_path: &Path) -> (Vec<Check>, Vec<gritty::protoco
 
             // Check per-session sockets
             for entry in &sessions {
+                // Same form as `ls`: own prefix elided, unnamed = its id.
                 let label = if entry.name.is_empty() {
-                    format!("{}", entry.id)
+                    entry.id.to_string()
                 } else {
-                    entry.name.clone()
+                    gritty::naming::display_session_name(&entry.name, client_name).to_string()
                 };
                 // svc socket is always bound at session start
                 let svc_sock = socket_dir.join(format!("svc-{}.sock", entry.id));
@@ -796,11 +800,13 @@ pub(crate) async fn gather(ctl_socket: Option<&Path>, clean: bool) -> DoctorRepo
     let server_dir =
         ctl_path.parent().map(Path::to_path_buf).unwrap_or_else(|| default_dir.clone());
 
+    let config = gritty::config::ConfigFile::load();
     let config_checks = check_config();
-    let (server_checks, sessions) = check_local_server(&ctl_path).await;
+    let (server_checks, sessions) =
+        check_local_server(&ctl_path, &config.resolve_session(None).client_name).await;
     let mut tunnel_checks = check_tunnels(&default_dir).await;
     tunnel_checks.extend(check_tunnel_residue(&default_dir));
-    let client_checks = check_clients(&server_dir, &gritty::config::ConfigFile::load()).await;
+    let client_checks = check_clients(&server_dir, &config).await;
 
     let live_ids: Vec<u32> = sessions.iter().map(|s| s.id).collect();
     let mut socket_checks = check_sockets(&server_dir, &live_ids);

@@ -1062,7 +1062,7 @@ async fn run(cli: Cli, config: gritty::config::ConfigFile) -> anyhow::Result<()>
                     unreachable!()
                 }
             };
-            let code = tail_session(session, ctl_path).await?;
+            let code = tail_session(session, ctl_path, &client_name).await?;
             std::process::exit(code);
         }
         Command::ListSessions { target, json, full } => {
@@ -1106,7 +1106,7 @@ async fn run(cli: Cli, config: gritty::config::ConfigFile) -> anyhow::Result<()>
                 }
             };
             let new_name = gritty::naming::resolve_session_name(&new_name, &client_name);
-            rename_session(session, new_name, ctl_path).await
+            rename_session(session, new_name, ctl_path, &client_name).await
         }
         Command::KillServer { target } => {
             let host = parse_host_or_local(&config, target.as_deref());
@@ -1146,7 +1146,8 @@ async fn run(cli: Cli, config: gritty::config::ConfigFile) -> anyhow::Result<()>
             }
             let timeout = if no_timeout { None } else { Some(timeout) };
             let session = resolve_target_session(&config, session)?;
-            send_command(cli.ctl_socket, session, use_stdin, timeout, recursive, files).await
+            send_command(&config, cli.ctl_socket, session, use_stdin, timeout, recursive, files)
+                .await
         }
         Command::Receive { session, stdout, timeout, no_timeout, dir } => {
             use std::io::IsTerminal;
@@ -1159,7 +1160,7 @@ async fn run(cli: Cli, config: gritty::config::ConfigFile) -> anyhow::Result<()>
             }
             let timeout = if no_timeout { None } else { Some(timeout) };
             let session = resolve_target_session(&config, session)?;
-            receive_command(cli.ctl_socket, session, use_stdout, timeout, dir).await
+            receive_command(&config, cli.ctl_socket, session, use_stdout, timeout, dir).await
         }
         Command::Open { url } => {
             open_url(&url, false);

@@ -6,7 +6,7 @@ use gritty::ui;
 use super::AutoStart;
 use super::util::{
     DaemonProbe, discover_daemon_probes, format_age, format_timestamp, host_from_ctl_path,
-    resolve_session_id, server_request,
+    server_request,
 };
 
 /// Every session-table column, in [`session_status_cols`] order. This is the
@@ -159,6 +159,11 @@ pub(crate) async fn connect_session(
         Some(n) => n,
         None => auto_new_session_name(&ctl_path, &settings.client_name).await,
     };
+    // Everything a human reads uses the same form as `ls`: own prefix
+    // elided, foreign prefixes kept. The wire `name` goes on the wire and
+    // into log spans. Typing the elided form re-prefixes to the same wire
+    // name, so suggested commands built from it stay copy-pasteable.
+    let shown = gritty::naming::display_session_name(&name, &settings.client_name).to_string();
 
     let mut framed = Framed::new(stream, FrameCodec);
     let info = gritty::handshake(&mut framed, gritty::get_or_create_device_id())
@@ -193,7 +198,7 @@ pub(crate) async fn connect_session(
     match Frame::expect_from(framed.next().await)? {
         Frame::Ok if detach => {
             // Probe succeeded (connect -d): existence confirmed, not attaching.
-            ui::success(&format!("session {name} exists (not attaching, -d)"));
+            ui::success(&format!("session {shown} exists (not attaching, -d)"));
             return Ok(());
         }
         Frame::AttachAck { token: _, session_id } => {
@@ -203,11 +208,11 @@ pub(crate) async fn connect_session(
             if linger_from_cli {
                 framed.send(Frame::SetLinger { session: String::new(), linger_secs }).await?;
             }
-            ui::success(&format!("attached {name}"));
+            ui::success(&format!("attached {shown}"));
             let client_span = tracing::info_span!("client", session = %name, session_id);
             let code = gritty::client::run(
                 framed,
-                client_config(&name, session_id, &ctl_path, &settings, server_id),
+                client_config(&shown, session_id, &ctl_path, &settings, server_id),
             )
             .instrument(client_span)
             .await?;
@@ -215,14 +220,14 @@ pub(crate) async fn connect_session(
         }
         Frame::Error { code: gritty::protocol::ErrorCode::NoSuchSession, .. } => {
             if no_create {
-                anyhow::bail!("no such session: {name}");
+                anyhow::bail!("no such session: {shown}");
             }
             // Fall through to create
         }
         Frame::Error { code: gritty::protocol::ErrorCode::AlreadyAttached, message, .. } => {
             let host = host_from_ctl_path(&ctl_path);
             ui::error(&message);
-            eprintln!("  gritty connect {host}:{name} --force   to take over");
+            eprintln!("  gritty connect {host}:{shown} --force   to take over");
             std::process::exit(1);
         }
         Frame::Error { message, .. } => anyhow::bail!("{message}"),
@@ -254,7 +259,7 @@ pub(crate) async fn connect_session(
 
     match Frame::expect_from(framed.next().await)? {
         Frame::SessionCreated { id } => {
-            ui::success(&format!("session {name}"));
+            ui::success(&format!("session {shown}"));
 
             // Daemon emits SessionCreated immediately followed by AttachAck.
             // The token echoes the device_id (client ignores it -- ownership
@@ -279,7 +284,7 @@ pub(crate) async fn connect_session(
             let client_span = tracing::info_span!("client", session = %name, session_id = id);
             let code = gritty::client::run(
                 framed,
-                client_config(&name, id, &ctl_path, &settings, server_id),
+                client_config(&shown, id, &ctl_path, &settings, server_id),
             )
             .instrument(client_span)
             .await?;
@@ -395,16 +400,42 @@ fn suggest_name(rows: &[Row], client_name: &str) -> String {
     unreachable!()
 }
 
-fn print_session_list(host: &str, sessions: &[gritty::protocol::SessionEntry]) {
-    if sessions.len() == 1 {
-        ui::error(&format!("session on {host} is already attached:"));
+/// The non-interactive stand-in for the picker: a headline plus one
+/// copy-pasteable `gritty connect` per session, in `ls`'s display form (typing
+/// the elided name re-prefixes to the same session; foreign names are shown,
+/// and typed, in full). The headline reflects why a choice is needed: every
+/// candidate is attached (needs `--force`), or there are several to choose
+/// from.
+fn session_list_lines(
+    host: &str,
+    sessions: &[gritty::protocol::SessionEntry],
+    client_name: &str,
+) -> (String, Vec<String>) {
+    let headline = if sessions.iter().all(|s| s.attached) {
+        format!("every session on {host} is already attached -- pick one to take over:")
     } else {
-        ui::error(&format!("multiple sessions on {host} -- specify one:"));
-    }
-    for s in sessions {
-        let wire = session_wire_name(s);
-        let suffix = if s.attached { "     (attached)" } else { "" };
-        eprintln!("  gritty connect {host}:{wire}{suffix}");
+        format!("multiple sessions on {host} -- specify one:")
+    };
+    let lines = sessions
+        .iter()
+        .map(|s| {
+            let wire = session_wire_name(s);
+            let shown = gritty::naming::display_session_name(&wire, client_name);
+            if s.attached {
+                format!("  gritty connect {host}:{shown} --force     (attached)")
+            } else {
+                format!("  gritty connect {host}:{shown}")
+            }
+        })
+        .collect();
+    (headline, lines)
+}
+
+fn print_session_list(host: &str, sessions: &[gritty::protocol::SessionEntry], client_name: &str) {
+    let (headline, lines) = session_list_lines(host, sessions, client_name);
+    ui::error(&headline);
+    for line in lines {
+        eprintln!("{line}");
     }
 }
 
@@ -422,14 +453,18 @@ async fn pick_or_list(
             None => std::process::exit(1),
         }
     } else {
-        print_session_list(host, sessions);
+        print_session_list(host, sessions, client_name);
         std::process::exit(1);
     }
 }
 
 struct Row {
     id: u32, // server session id -- stable across list refreshes
+    /// Wire name: what every action (attach, rename, kill) sends.
     name: String,
+    /// What the user sees and edits: `name` with the own-client prefix
+    /// elided, exactly as `ls` shows it (foreign names stay in full).
+    display: String,
     attached: bool,
     age: String,
     idle: String,
@@ -453,16 +488,21 @@ fn build_rows(sessions: &[gritty::protocol::SessionEntry], client_name: &str) ->
     ordered
         .iter()
         .enumerate()
-        .map(|(i, s)| Row {
-            id: s.id,
-            name: session_wire_name(s),
-            attached: s.attached,
-            age: format_age(now, s.created_at),
-            idle: super::util::format_idle(now, s.last_activity),
-            cmd: s.foreground_cmd.clone(),
-            cwd: shorten_home(&s.cwd),
-            client: s.client_name.clone(),
-            hotkey: if i < 9 { Some((b'1' + i as u8) as char) } else { None },
+        .map(|(i, s)| {
+            let name = session_wire_name(s);
+            let display = gritty::naming::display_session_name(&name, client_name).to_string();
+            Row {
+                id: s.id,
+                name,
+                display,
+                attached: s.attached,
+                age: format_age(now, s.created_at),
+                idle: super::util::format_idle(now, s.last_activity),
+                cmd: s.foreground_cmd.clone(),
+                cwd: shorten_home(&s.cwd),
+                client: s.client_name.clone(),
+                hotkey: if i < 9 { Some((b'1' + i as u8) as char) } else { None },
+            }
         })
         .collect()
 }
@@ -551,7 +591,7 @@ async fn tui_pick_session(
     enum Mode {
         Pick,
         Input { buf: String, cursor_pos: usize, rename_of: Option<String> },
-        ConfirmKill { name: String },
+        ConfirmKill,
     }
 
     let mut mode = Mode::Pick;
@@ -584,12 +624,9 @@ async fn tui_pick_session(
                   mode: &Mode,
                   status: Option<&str>,
                   prev_total_lines: usize| {
-        // Show the full wire name (`<client>/<suffix>`) in the picker so
-        // the namespace is visible at a glance, distinguishing your own
-        // sessions from foreign ones without scanning the CLIENT column.
-        // `gritty ls` still elides the ambient prefix (it has a separate
-        // CLIENT column doing the same job).
-        let displayed: Vec<&str> = rows.iter().map(|r| r.name.as_str()).collect();
+        // Same display form as `ls`: own prefix elided, foreign names in
+        // full (the CLIENT column carries the namespace either way).
+        let displayed: Vec<&str> = rows.iter().map(|r| r.display.as_str()).collect();
         let name_w = displayed.iter().map(|s| s.len()).max().unwrap_or(0).max(3);
         let tag_w = 10; // "(attached)" is 10 chars
         let age_w = rows.iter().map(|r| r.age.len()).max().unwrap_or(0);
@@ -603,7 +640,7 @@ async fn tui_pick_session(
 
         // Show/hide cursor based on mode
         match mode {
-            Mode::Pick | Mode::ConfirmKill { .. } => {
+            Mode::Pick | Mode::ConfirmKill => {
                 let _ = write!(stderr, "\x1b[?25l");
             }
             Mode::Input { .. } => {
@@ -614,7 +651,7 @@ async fn tui_pick_session(
         // Header
         let _ = write!(stderr, "\x1b[36;1mPick a session on {host}:\x1b[0m\r\n");
         for (i, row) in rows.iter().enumerate() {
-            let marker = if i == cursor && matches!(mode, Mode::Pick | Mode::ConfirmKill { .. }) {
+            let marker = if i == cursor && matches!(mode, Mode::Pick | Mode::ConfirmKill) {
                 "\x1b[32;1m\u{25b8}\x1b[0m"
             } else {
                 " "
@@ -622,7 +659,7 @@ async fn tui_pick_session(
             let hk = row.hotkey.map_or(String::from("  "), |c| format!("{c})"));
             let shown = displayed[i];
 
-            if i == cursor && matches!(mode, Mode::Pick | Mode::ConfirmKill { .. }) {
+            if i == cursor && matches!(mode, Mode::Pick | Mode::ConfirmKill) {
                 let tag = if row.attached { "(attached)" } else { "" };
                 let _ = write!(
                     stderr,
@@ -645,9 +682,9 @@ async fn tui_pick_session(
         }
         // "New session" row / input line
         let suggested_wire = suggest_name(rows, client_name);
-        let suggested = suggested_wire.as_str();
+        let suggested = gritty::naming::display_session_name(&suggested_wire, client_name);
         match mode {
-            Mode::Pick | Mode::ConfirmKill { .. } => {
+            Mode::Pick | Mode::ConfirmKill => {
                 let marker = if cursor == rows.len() { "\x1b[32;1m\u{25b8}\x1b[0m" } else { " " };
                 if cursor == rows.len() {
                     let _ = write!(
@@ -678,7 +715,7 @@ async fn tui_pick_session(
             }
             Mode::Input { rename_of: Some(_), .. } => "enter rename  esc back".to_string(),
             Mode::Input { .. } => "enter create  esc back".to_string(),
-            Mode::ConfirmKill { name } => format!("kill {name}? y/n"),
+            Mode::ConfirmKill => format!("kill {}? y/n", rows[cursor].display),
         };
         let _ = write!(stderr, "\x1b[2m  {hints}\x1b[0m\r\n");
         if let Some(msg) = status {
@@ -771,7 +808,7 @@ async fn tui_pick_session(
                 }) => {
                     if cursor < rows.len() {
                         status = None;
-                        mode = Mode::ConfirmKill { name: rows[cursor].name.clone() };
+                        mode = Mode::ConfirmKill;
                     }
                 }
                 // 'r' -> rename selected session
@@ -781,13 +818,17 @@ async fn tui_pick_session(
                     ..
                 }) => {
                     if cursor < rows.len() {
-                        let name = rows[cursor].name.clone();
-                        let len = name.len();
+                        // Pre-fill the display form (as `c` does); submit
+                        // re-prefixes it, so editing `work` -> `play` renames
+                        // within the namespace and a foreign `pat/work` stays
+                        // literal.
+                        let shown = rows[cursor].display.clone();
+                        let len = shown.len();
                         status = None;
                         mode = Mode::Input {
-                            buf: name.clone(),
+                            buf: shown,
                             cursor_pos: len,
-                            rename_of: Some(name),
+                            rename_of: Some(rows[cursor].name.clone()),
                         };
                     }
                 }
@@ -817,9 +858,9 @@ async fn tui_pick_session(
                 }
                 _ => continue,
             },
-            Mode::ConfirmKill { name } => match ev {
+            Mode::ConfirmKill => match ev {
                 Event::Key(KeyEvent { code: KeyCode::Char('y'), .. }) => {
-                    let kill_name = name.clone();
+                    let kill_name = rows[cursor].name.clone();
                     let ctl = ctl_path.to_path_buf();
                     match server_request(
                         &ctl,
@@ -1052,14 +1093,22 @@ async fn alert_detached_sessions(current_name: &str, ctl_path: &Path, client_nam
     ui::status(&format!("detached sessions: {}", names.join(", ")));
 }
 
-pub(crate) async fn tail_session(target: String, ctl_path: PathBuf) -> anyhow::Result<i32> {
+pub(crate) async fn tail_session(
+    target: String,
+    ctl_path: PathBuf,
+    client_name: &str,
+) -> anyhow::Result<i32> {
     use futures_util::{SinkExt, StreamExt};
     use gritty::protocol::Frame;
 
-    // Resolve the target to a numeric id before opening the tail stream so
-    // reconnect can reuse that id (the original target string may be `-`
-    // or a name that can shift while we're tailing).
-    let session_id = resolve_session_id(&ctl_path, &target).await?;
+    // Resolve the target before opening the tail stream: reconnect reuses the
+    // numeric id (the typed target may be `-`, or a name that gets renamed
+    // while we're tailing), and the status line names the session the way
+    // `ls` does rather than echoing `-`.
+    let entry = super::util::resolve_session(&ctl_path, &target).await?;
+    let session_id = entry.id;
+    let shown =
+        gritty::naming::display_session_name(&session_wire_name(&entry), client_name).to_string();
 
     let (mut framed, info) = super::util::connect_handshaked(&ctl_path, true).await?;
     let server_id = info.server_id;
@@ -1067,7 +1116,7 @@ pub(crate) async fn tail_session(target: String, ctl_path: PathBuf) -> anyhow::R
 
     match Frame::expect_from(framed.next().await)? {
         Frame::Ok => {
-            ui::status(&format!("tailing {target}"));
+            ui::status(&format!("tailing {shown} (read-only)"));
             gritty::client::tail(
                 session_id,
                 framed,
@@ -1086,9 +1135,17 @@ pub(crate) async fn rename_session(
     target: String,
     new_name: String,
     ctl_path: PathBuf,
+    client_name: &str,
 ) -> anyhow::Result<()> {
     use gritty::protocol::Frame;
 
+    // `-` is resolved here (as connect/tail do) so the confirmation names
+    // the session that was actually renamed.
+    let target = if target == "-" {
+        session_wire_name(&super::util::resolve_session(&ctl_path, "-").await?)
+    } else {
+        target
+    };
     match server_request(
         &ctl_path,
         Frame::RenameSession { session: target.clone(), new_name: new_name.clone() },
@@ -1096,7 +1153,9 @@ pub(crate) async fn rename_session(
     .await?
     {
         Frame::Ok => {
-            ui::success(&format!("renamed {target} -> {new_name}"));
+            let display =
+                |wire: &str| gritty::naming::display_session_name(wire, client_name).to_string();
+            ui::success(&format!("renamed {} -> {}", display(&target), display(&new_name)));
             Ok(())
         }
         Frame::Error { message, .. } => anyhow::bail!("{message}"),
@@ -1145,10 +1204,15 @@ async fn kill_one(user_session: &str, client_name: &str, ctl_path: &Path) -> any
     use gritty::protocol::Frame;
 
     let wire = gritty::naming::resolve_session_name(user_session, client_name);
+    let shown = gritty::naming::display_session_name(&wire, client_name).to_string();
     match server_request(ctl_path, Frame::KillSession { session: wire }).await? {
         Frame::Ok => {
-            ui::success(&format!("session {user_session} killed"));
+            ui::success(&format!("session {shown} killed"));
             Ok(())
+        }
+        // The daemon phrases this with the wire name; keep the display form.
+        Frame::Error { code: gritty::protocol::ErrorCode::NoSuchSession, .. } => {
+            anyhow::bail!("no such session: {shown}")
         }
         Frame::Error { message, .. } => anyhow::bail!("{message}"),
         other => anyhow::bail!("unexpected response from server: {other:?}"),
@@ -2102,6 +2166,7 @@ mod tests {
         Row {
             id: 0,
             name: name.to_string(),
+            display: name.to_string(),
             attached: false,
             age: String::new(),
             idle: String::new(),
@@ -2362,6 +2427,34 @@ mod tests {
         assert_eq!(rows[0].hotkey, Some('1'));
         assert_eq!(rows[1].hotkey, Some('2'));
         assert_eq!(rows[2].hotkey, Some('3'));
+    }
+
+    #[test]
+    fn build_rows_display_elides_own_prefix_but_actions_keep_the_wire_name() {
+        let sessions = vec![auto_entry("defiant/a", false), auto_entry("laptop2/x", false)];
+        let rows = build_rows(&sessions, "defiant");
+        assert_eq!((rows[0].display.as_str(), rows[0].name.as_str()), ("a", "defiant/a"));
+        assert_eq!((rows[1].display.as_str(), rows[1].name.as_str()), ("laptop2/x", "laptop2/x"));
+    }
+
+    #[test]
+    fn session_list_lines_are_typeable_and_explain_the_choice() {
+        let sessions = vec![auto_entry("defiant/a", true), auto_entry("laptop2/x", false)];
+        let (headline, lines) = session_list_lines("devbox", &sessions, "defiant");
+        assert_eq!(headline, "multiple sessions on devbox -- specify one:");
+        assert_eq!(
+            lines,
+            [
+                "  gritty connect devbox:a --force     (attached)",
+                "  gritty connect devbox:laptop2/x",
+            ]
+        );
+
+        // Only attached candidates: say so, since plain connect would fail.
+        let sessions = vec![auto_entry("defiant/a", true)];
+        let (headline, lines) = session_list_lines("devbox", &sessions, "defiant");
+        assert!(headline.contains("already attached"), "{headline}");
+        assert_eq!(lines, ["  gritty connect devbox:a --force     (attached)"]);
     }
 
     #[test]

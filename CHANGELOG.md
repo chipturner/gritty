@@ -26,6 +26,15 @@ protocol interoperate with their neighbors.
   `--json`) and exits 0; naming a host that is down still fails, but
   `--json` now emits the group with its `error` field rather than a bare
   message.
+- **Session names are shown one way everywhere.** `attached
+  mylaptop/work`, picker rows, rename pre-fill, transfer pairing labels,
+  `doctor`, and the suggested `gritty connect host:mylaptop/work` commands
+  all used the raw wire name while `ls` elided your own prefix; every
+  surface now uses `ls`'s form (`work`; foreign sessions keep their
+  prefix), which is also exactly what you type. `tail`'s status line names
+  the resolved session (not `-`) and says it is read-only; the non-tty
+  session list says when every candidate is attached and includes
+  `--force` in those lines.
 - **Sessions are addressed by name only.** With the ID column gone from
   `ls`, bare `kill 3` no longer falls back to daemon id 3 when you have no
   session named `3` -- on hosts with auto-numbered sessions the two usually

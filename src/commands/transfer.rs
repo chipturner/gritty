@@ -33,7 +33,8 @@ fn sanitize_path(name: &str) -> anyhow::Result<String> {
 }
 
 struct DiscoveredSession {
-    session_id: String,
+    /// The name to put in `SendFile` (an unnamed session's is its id).
+    wire_name: String,
     ctl_path: PathBuf,
 }
 
@@ -289,7 +290,7 @@ async fn probe_daemon_sessions(ctl_path: &Path) -> ProbeOutcome {
             sessions: sessions
                 .into_iter()
                 .map(|s| DiscoveredSession {
-                    session_id: if s.name.is_empty() { s.id.to_string() } else { s.name },
+                    wire_name: if s.name.is_empty() { s.id.to_string() } else { s.name },
                     ctl_path: ctl_path.to_path_buf(),
                 })
                 .collect(),
@@ -373,13 +374,22 @@ async fn send_file_handshake(
 /// A stream tagged with the session it belongs to.
 struct TaggedStream {
     stream: tokio::net::UnixStream,
-    /// Human-readable session label (e.g. "local:work").
+    /// Human-readable session label (e.g. "devbox:work"); `None` in-session.
     label: Option<String>,
+}
+
+/// `host:session` as `ls` would show it: the wire name with that host's own
+/// client prefix elided, so the label is both recognizable and typeable as a
+/// `--session` argument.
+fn session_label(config: &gritty::config::ConfigFile, host: &str, wire_name: &str) -> String {
+    let client_name = config.resolve_session(Some(host)).client_name;
+    format!("{host}:{}", gritty::naming::display_session_name(wire_name, &client_name))
 }
 
 /// Connect to service sockets for transfer. Returns one or more tagged streams.
 /// In-session or explicit --session returns one; auto-detect returns all.
 async fn connect_send_sockets(
+    config: &gritty::config::ConfigFile,
     ctl_socket: Option<PathBuf>,
     session_flag: Option<String>,
     role: u8,
@@ -406,7 +416,7 @@ async fn connect_send_sockets(
             .ok_or_else(|| anyhow::anyhow!("--session requires host:session (e.g. local:0)"))?;
         let ctl_path = resolve_ctl_path(ctl_socket, Some(&host))?;
         let stream = send_file_handshake(&ctl_path, &session, role).await?;
-        let label = format!("{host}:{session}");
+        let label = session_label(config, &host, &session);
         return Ok(vec![TaggedStream { stream, label: Some(label) }]);
     }
 
@@ -414,15 +424,9 @@ async fn connect_send_sockets(
     let sessions = discover_all_sessions(ctl_socket.as_deref()).await?;
     let mut streams = Vec::new();
     for s in &sessions {
-        if let Ok(stream) = send_file_handshake(&s.ctl_path, &s.session_id, role).await {
-            // Derive host from ctl_path (connect-*.sock -> host, ctl.sock -> local)
-            let host = s
-                .ctl_path
-                .file_name()
-                .and_then(|f| f.to_str())
-                .and_then(|f| f.strip_prefix("connect-").and_then(|r| r.strip_suffix(".sock")))
-                .unwrap_or("local");
-            let label = format!("{host}:{}", s.session_id);
+        if let Ok(stream) = send_file_handshake(&s.ctl_path, &s.wire_name, role).await {
+            let host = super::util::host_from_ctl_path(&s.ctl_path);
+            let label = session_label(config, &host, &s.wire_name);
             streams.push(TaggedStream { stream, label: Some(label) });
         }
     }
@@ -557,6 +561,7 @@ fn walk_dir(dir: &Path, base: &Path, entries: &mut Vec<SendEntry>) -> anyhow::Re
 }
 
 pub(crate) async fn send_command(
+    config: &gritty::config::ConfigFile,
     ctl_socket: Option<PathBuf>,
     session: Option<String>,
     use_stdin: bool,
@@ -624,9 +629,13 @@ pub(crate) async fn send_command(
     }
     let entries = uniq.entries;
 
-    let tagged =
-        connect_send_sockets(ctl_socket, session, gritty::protocol::SvcRequest::Send.to_byte())
-            .await?;
+    let tagged = connect_send_sockets(
+        config,
+        ctl_socket,
+        session,
+        gritty::protocol::SvcRequest::Send.to_byte(),
+    )
+    .await?;
 
     // Write the manifest on every discovered stream, best-effort: a stale or
     // broken session must not abort the whole transfer and discard healthy
@@ -782,6 +791,7 @@ pub(crate) fn resolve_receive_output(
 }
 
 pub(crate) async fn receive_command(
+    config: &gritty::config::ConfigFile,
     ctl_socket: Option<PathBuf>,
     session: Option<String>,
     use_stdout: bool,
@@ -795,9 +805,13 @@ pub(crate) async fn receive_command(
         anyhow::bail!("{}: not a directory", dest_dir.display());
     }
 
-    let tagged =
-        connect_send_sockets(ctl_socket, session, gritty::protocol::SvcRequest::Receive.to_byte())
-            .await?;
+    let tagged = connect_send_sockets(
+        config,
+        ctl_socket,
+        session,
+        gritty::protocol::SvcRequest::Receive.to_byte(),
+    )
+    .await?;
 
     // Write the dest dir on every discovered stream, best-effort: one broken
     // session must not abort the transfer ("first sender wins").
@@ -929,6 +943,15 @@ pub(crate) async fn receive_command(
 mod tests {
     use super::*;
 
+    #[test]
+    fn session_label_matches_ls_display_form() {
+        let config = gritty::config::ConfigFile::default();
+        let me = config.resolve_session(Some("devbox")).client_name;
+        assert_eq!(session_label(&config, "devbox", &format!("{me}/work")), "devbox:work");
+        assert_eq!(session_label(&config, "devbox", "pat/work"), "devbox:pat/work");
+        assert_eq!(session_label(&config, "local", "7"), "local:7");
+    }
+
     fn resolve(flag: bool, dir: Option<&str>, tty: bool) -> (bool, Option<PathBuf>, bool) {
         resolve_receive_output(flag, dir.map(PathBuf::from), tty)
     }
@@ -1028,8 +1051,8 @@ mod tests {
         assert_eq!(names, vec!["d/real.txt"]);
     }
 
-    fn ds(session_id: &str, ctl_path: &str) -> DiscoveredSession {
-        DiscoveredSession { session_id: session_id.into(), ctl_path: PathBuf::from(ctl_path) }
+    fn ds(wire_name: &str, ctl_path: &str) -> DiscoveredSession {
+        DiscoveredSession { wire_name: wire_name.into(), ctl_path: PathBuf::from(ctl_path) }
     }
 
     // Regression: a daemon reachable through two tunnel sockets was probed
@@ -1043,7 +1066,7 @@ mod tests {
             (9, vec![ds("b/0", "/t/ctl.sock")]),
         ]);
         let got: Vec<_> =
-            deduped.iter().map(|d| (d.session_id.as_str(), d.ctl_path.to_str().unwrap())).collect();
+            deduped.iter().map(|d| (d.wire_name.as_str(), d.ctl_path.to_str().unwrap())).collect();
         assert_eq!(
             got,
             vec![
