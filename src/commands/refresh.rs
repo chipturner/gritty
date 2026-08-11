@@ -297,7 +297,7 @@ async fn refresh_remote(
             ui::success(&format!("{host}: end-to-end protocol verified (v{remote})"));
             Ok(())
         }
-        Ok(remote) => anyhow::bail!("{}", remote_binary_outdated_msg(host, remote, local)),
+        Ok(remote) => anyhow::bail!("{}", remote_binary_outdated_msg(host, &dest, remote, local)),
         Err(e) => {
             // A flaky probe (slow SSH, tunnel mid-reconnect) shouldn't fail
             // refresh -- the .info-based work above already happened.
@@ -313,11 +313,14 @@ async fn refresh_remote(
 /// The actionable error for a cross-machine protocol mismatch that `refresh`
 /// itself cannot repair: the remote *binary* is older/newer than ours, so
 /// restarting processes on either side changes nothing.
-fn remote_binary_outdated_msg(host: &str, remote: u16, local: u16) -> String {
+///
+/// `dest` is the ssh destination (`bootstrap`'s argument); `host` is the
+/// connection name (`refresh`'s argument). They differ for `-n` tunnels.
+fn remote_binary_outdated_msg(host: &str, dest: &str, remote: u16, local: u16) -> String {
     format!(
         "{host}: remote daemon speaks protocol v{remote} but local gritty speaks v{local} -- \
          the remote gritty binary itself is a different release, which refresh cannot fix. \
-         Run `gritty bootstrap {host}` (or update gritty on the remote by hand), \
+         Run `gritty bootstrap {dest}` (or update gritty on the remote by hand), \
          then `gritty refresh {host}` again"
     )
 }
@@ -338,13 +341,15 @@ pub(crate) async fn refresh(
             // unreachable host must not abort the rest. Collect failures and
             // report an aggregate at the end.
             let mut failed = 0usize;
+            // `{e:#}` keeps anyhow's context chain, as main() does for the
+            // single-host form; plain `{e}` dropped every `.context()`.
             if let Err(e) = refresh_local(ctl_socket, yes).await {
-                ui::error(&format!("refresh local: {e}"));
+                ui::error(&format!("refresh local: {e:#}"));
                 failed += 1;
             }
             for name in gritty::connect::enumerate_tunnels() {
                 if let Err(e) = refresh_remote(&name, config, yes).await {
-                    ui::error(&format!("refresh {name}: {e}"));
+                    ui::error(&format!("refresh {name}: {e:#}"));
                     failed += 1;
                 }
             }
@@ -459,11 +464,21 @@ mod tests {
         // The whole point of the end-to-end probe is to break the loop where
         // every tool reports success while nothing works: the message must
         // name both versions and the exact commands that fix it.
-        let msg = remote_binary_outdated_msg("devbox", 21, 22);
+        let msg = remote_binary_outdated_msg("devbox", "devbox", 21, 22);
         assert!(msg.contains("devbox"));
         assert!(msg.contains("v21"));
         assert!(msg.contains("v22"));
         assert!(msg.contains("gritty bootstrap devbox"));
         assert!(msg.contains("gritty refresh devbox"));
+    }
+
+    #[test]
+    fn outdated_remote_message_bootstraps_the_ssh_destination_not_the_tunnel_name() {
+        // `bootstrap` takes an ssh destination; `refresh` takes a connection
+        // name. For a `tunnel-create user@10.0.0.5:2222 -n devbox` tunnel the
+        // two differ, and a pasted `gritty bootstrap devbox` would fail.
+        let msg = remote_binary_outdated_msg("devbox", "user@10.0.0.5:2222", 21, 22);
+        assert!(msg.contains("gritty bootstrap user@10.0.0.5:2222"), "{msg}");
+        assert!(msg.contains("gritty refresh devbox"), "{msg}");
     }
 }

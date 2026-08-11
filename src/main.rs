@@ -1066,11 +1066,11 @@ async fn run(cli: Cli, config: gritty::config::ConfigFile) -> anyhow::Result<()>
         }
         Command::KillSession { targets } => {
             if targets.is_empty() {
-                // No targets: same as the old no-target form -- needs a host
-                // (or --ctl-socket), then lists its sessions to pick from.
-                let ctl_path = resolve_ctl_path(cli.ctl_socket, None)?;
+                // No targets: bare names kill on `local`, so list local's
+                // sessions to pick from (or the --ctl-socket daemon's).
+                let ctl_path = resolve_ctl_path(cli.ctl_socket, Some("local"))?;
                 let client_name = config.resolve_session(None).client_name;
-                suggest_session("kill-session", "host", &ctl_path, &client_name).await?;
+                suggest_session("kill-session", "local", &ctl_path, &client_name).await?;
                 unreachable!()
             }
             kill_sessions(&targets, cli.ctl_socket.as_deref(), &config).await

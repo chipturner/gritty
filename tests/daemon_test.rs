@@ -546,6 +546,82 @@ async fn connect_without_a_terminal_fails_before_creating_a_session() {
     kill_cleanup(&ctl_path, &name).await;
 }
 
+/// Run the binary against the test daemon through the default socket-dir
+/// resolution (`GRITTY_SOCKET_DIR`), i.e. exactly as a user types it, with
+/// no `--ctl-socket`. Config is isolated as in the other binary tests.
+async fn gritty_in(dir: &std::path::Path, args: &[&str]) -> std::process::Output {
+    tokio::process::Command::new(env!("CARGO_BIN_EXE_gritty"))
+        .args(args)
+        .env("GRITTY_SOCKET_DIR", dir)
+        .env("XDG_CONFIG_HOME", dir)
+        .stdin(std::process::Stdio::null())
+        .output()
+        .await
+        .expect("failed to run gritty")
+}
+
+#[tokio::test]
+async fn bare_kill_session_lists_local_sessions() {
+    let (tmp, ctl_path) = test_ctl();
+    let ctl = ctl_path.clone();
+    let _daemon = tokio::spawn(async move { gritty::daemon::run(&ctl, None).await });
+    wait_for_daemon(&ctl_path).await;
+    create_session(&ctl_path, "shared/victim").await;
+
+    // Bare names kill on `local`, so a bare `kill-session` with nothing to
+    // kill should list local's sessions -- not demand a host (the old
+    // message came from the generic ctl-path resolver and mentioned
+    // --ctl-socket, which kill-session users never need).
+    let out = gritty_in(tmp.path(), &["kill-session"]).await;
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(!out.status.success());
+    assert!(stderr.contains("specify a session"), "{stderr}");
+    assert!(stderr.contains("shared/victim"), "must list the candidates: {stderr}");
+    assert!(!stderr.contains("specify a host"), "{stderr}");
+    assert!(!stderr.contains("--ctl-socket"), "{stderr}");
+
+    kill_cleanup(&ctl_path, "shared/victim").await;
+}
+
+#[tokio::test]
+async fn dash_target_reports_the_resolved_session_name() {
+    let (tmp, ctl_path) = test_ctl();
+    let ctl = ctl_path.clone();
+    let _daemon = tokio::spawn(async move { gritty::daemon::run(&ctl, None).await });
+    wait_for_daemon(&ctl_path).await;
+
+    // Nothing has been attached yet: `-` has no referent.
+    let out = gritty_in(tmp.path(), &["connect", "-d", "local:-"]).await;
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(!out.status.success(), "{stderr}");
+    assert!(stderr.contains("no previously-attached session"), "{stderr}");
+
+    // Creating a session makes it the last-attached one. Every line about
+    // it must use its real name -- `connect local:-` used to print
+    // `session - exists` / `attached -`.
+    create_session(&ctl_path, "shared/last").await;
+    // The creating connection was dropped; wait for the session task to
+    // notice, or the -d probe below sees it as still attached.
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    loop {
+        if let Frame::SessionInfo { sessions } =
+            control_request(&ctl_path, Frame::ListSessions).await
+            && sessions.iter().any(|s| s.name == "shared/last" && !s.attached)
+        {
+            break;
+        }
+        assert!(tokio::time::Instant::now() < deadline, "session never settled detached");
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    let out = gritty_in(tmp.path(), &["connect", "-d", "local:-"]).await;
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(out.status.success(), "{stderr}");
+    assert!(stderr.contains("session shared/last exists"), "{stderr}");
+    assert!(!stderr.contains("session - "), "{stderr}");
+
+    kill_cleanup(&ctl_path, "shared/last").await;
+}
+
 #[tokio::test]
 async fn list_sessions_reports_last_activity() {
     let (_tmp, ctl_path) = test_ctl();

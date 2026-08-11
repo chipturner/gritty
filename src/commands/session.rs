@@ -118,7 +118,15 @@ pub(crate) async fn connect_session(
     // socket is down (e.g. after a laptop reboot), and the attach-first path
     // would then silently attach to a pre-existing remote `0` instead
     // of creating a fresh integer-slot session -- violating the --new contract.
+    // `-` is resolved here rather than left to the daemon so every line that
+    // names the session (`attached X`, `-d`'s `X exists`, `~#`) shows the
+    // real name instead of a literal `-`. It can only ever refer to an
+    // existing session, so it also implies --no-create (the referent could
+    // die between the lookup and the attach).
+    let from_dash = preliminary_name.as_deref() == Some("-");
+    let no_create = no_create || from_dash;
     let name = match preliminary_name {
+        Some(_) if from_dash => resolve_last_attached(&ctl_path).await?,
         Some(n) => n,
         None => auto_new_session_name(&ctl_path, &settings.client_name).await,
     };
@@ -177,12 +185,6 @@ pub(crate) async fn connect_session(
             std::process::exit(code);
         }
         Frame::Error { code: gritty::protocol::ErrorCode::NoSuchSession, .. } => {
-            if name == "-" {
-                // `-` means "last-attached session"; creating one named `-`
-                // is reserved and would fail with a misleading error.
-                let host = host_from_ctl_path(&ctl_path);
-                anyhow::bail!("no previously-attached session on {host}");
-            }
             if no_create {
                 anyhow::bail!("no such session: {name}");
             }
@@ -257,6 +259,25 @@ pub(crate) async fn connect_session(
         Frame::Error { message, .. } => anyhow::bail!("{message}"),
         other => anyhow::bail!("unexpected response from server: {other:?}"),
     }
+}
+
+/// Resolve the `-` target to the wire name of the host's last-attached
+/// session, using the same `is_last_attached` flag the daemon itself would
+/// consult for a `-` attach.
+async fn resolve_last_attached(ctl_path: &Path) -> anyhow::Result<String> {
+    use gritty::protocol::Frame;
+
+    let sessions = match server_request(ctl_path, Frame::ListSessions).await? {
+        Frame::SessionInfo { sessions } => sessions,
+        other => anyhow::bail!("unexpected response from server: {other:?}"),
+    };
+    last_attached_name(&sessions).ok_or_else(|| {
+        anyhow::anyhow!("no previously-attached session on {}", host_from_ctl_path(ctl_path))
+    })
+}
+
+fn last_attached_name(sessions: &[gritty::protocol::SessionEntry]) -> Option<String> {
+    sessions.iter().find(|s| s.is_last_attached).map(session_wire_name)
 }
 
 /// Resolve `-n`/`--new` to the next auto-named session slot: the first free
@@ -2344,6 +2365,22 @@ mod tests {
         let rows = build_rows(&sessions, "defiant");
         let names: Vec<&str> = rows.iter().map(|r| r.name.as_str()).collect();
         assert_eq!(names, vec!["defiant/b", "defiant/a", "laptop2/x", "laptop2/y"]);
+    }
+
+    #[test]
+    fn last_attached_name_uses_the_daemon_flag_and_wire_name() {
+        let mut last = auto_entry("laptop/work", false);
+        last.is_last_attached = true;
+        let mut unnamed_last = entry();
+        unnamed_last.is_last_attached = true;
+
+        assert_eq!(last_attached_name(&[auto_entry("laptop/other", false)]), None);
+        assert_eq!(
+            last_attached_name(&[auto_entry("laptop/other", true), last]),
+            Some("laptop/work".to_string())
+        );
+        // An unnamed session is addressed by its id, like everywhere else.
+        assert_eq!(last_attached_name(&[unnamed_last]), Some("3".to_string()));
     }
 
     #[test]

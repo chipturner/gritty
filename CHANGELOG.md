@@ -42,7 +42,14 @@ protocol interoperate with their neighbors.
   canonical name but created the tunnel's files under the spelling you
   typed, so a following `connect <name>` started a second tunnel.
 - **Message fixes.** A failed auto-start / ssh / bootstrap no longer reports
-  `(exit exit status: 1)`.
+  `(exit exit status: 1)`. `connect host:-` says `attached <name>` (and
+  `-d` says `<name> exists`) instead of a literal `-`, and can no longer
+  race into creating a session. Bare `gritty kill` lists `local`'s
+  sessions instead of demanding a host or `--ctl-socket`. `refresh`'s
+  outdated-remote error tells you to `bootstrap` the tunnel's ssh
+  destination rather than its connection name (they differ for `-n`
+  tunnels), and the all-hosts form no longer drops the cause chain from
+  per-host errors.
 - **Fixed: the "server shut down" exit line no longer erases your last line.**
   When the daemon was killed under an attached client (or a `tail`), the
   red exit message was painted over the current row -- the sequence meant
