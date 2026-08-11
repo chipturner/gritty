@@ -2410,8 +2410,16 @@ pub async fn run(
                         }
                         continue;
                     }
-                    _ = open_event_rx.recv() => {
-                        debug!("discarding open event while detached");
+                    event = open_event_rx.recv() => {
+                        // Same explicit "not delivered" byte the attached
+                        // relay sends when forwarding is off, so `gritty open`
+                        // / the $BROWSER shim fail fast (and print the URL)
+                        // instead of timing out. Mirrors the clipboard arm.
+                        if let Some(OpenEvent::Url { mut stream, .. }) = event {
+                            use tokio::io::AsyncWriteExt;
+                            let _ = stream.write_all(&[0x00]).await;
+                        }
+                        debug!("rejecting open event while detached");
                         continue;
                     }
                     event = clipboard_event_rx.recv() => {

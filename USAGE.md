@@ -123,7 +123,7 @@ Flag defaults come from config, with precedence CLI > `[host.<name>]` > `[defaul
 
 ### Send/receive options
 
-- `--session host:session`: target a specific session
+- `--session host:session`: target a specific session (a bare host is rejected -- without the flag, the transfer pairs with whichever session on any host answers first)
 - `-r` / `--recursive` (`send`): send directories recursively (preserves structure, skips symlinks)
 - `-` (`send`): read data from stdin; (`receive`): write data to stdout. `receive` with no destination also auto-switches to stdout when its stdout is redirected (e.g. `gritty receive > foo` or piped); pass a directory to force file mode
 - `--timeout <seconds>`: deadline for pairing with a receiver/sender (default 300; `--no-timeout` waits indefinitely)

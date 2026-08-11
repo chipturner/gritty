@@ -556,16 +556,24 @@ fn client_log_path(
 /// target string, leaving the host part untouched. Used by `send` / `receive`
 /// which take an opaque `--session host:session` string and pass it down to
 /// the transfer helpers (which don't know about config).
+///
+/// `--session` exists to pin the transfer to one session, so a value with no
+/// session part is an error rather than a silent fall-through to
+/// auto-detection across every host.
 fn resolve_target_session(
     config: &gritty::config::ConfigFile,
     target: Option<String>,
-) -> Option<String> {
-    let target = target?;
+) -> anyhow::Result<Option<String>> {
+    let Some(target) = target else {
+        return Ok(None);
+    };
     let (host, session) = parse_target(config, &target);
-    let session = session?;
+    let Some(session) = session else {
+        anyhow::bail!("--session needs a host:session target (got `{target}`, e.g. `{host}:work`)");
+    };
     let client_name = config.resolve_session(Some(&host)).client_name;
     let wire = gritty::naming::resolve_session_name(&session, &client_name);
-    Some(format!("{host}:{wire}"))
+    Ok(Some(format!("{host}:{wire}")))
 }
 
 /// Fork into background, returning the write end of the readiness pipe.
@@ -1133,7 +1141,7 @@ async fn run(cli: Cli, config: gritty::config::ConfigFile) -> anyhow::Result<()>
                 files.retain(|f| f.as_os_str() != "-");
             }
             let timeout = if no_timeout { None } else { Some(timeout) };
-            let session = resolve_target_session(&config, session);
+            let session = resolve_target_session(&config, session)?;
             send_command(cli.ctl_socket, session, use_stdin, timeout, recursive, files).await
         }
         Command::Receive { session, stdout, timeout, no_timeout, dir } => {
@@ -1146,7 +1154,7 @@ async fn run(cli: Cli, config: gritty::config::ConfigFile) -> anyhow::Result<()>
                 );
             }
             let timeout = if no_timeout { None } else { Some(timeout) };
-            let session = resolve_target_session(&config, session);
+            let session = resolve_target_session(&config, session)?;
             receive_command(cli.ctl_socket, session, use_stdout, timeout, dir).await
         }
         Command::Open { url } => {
@@ -1242,6 +1250,28 @@ mod tests {
     #[test]
     fn clap_config_is_valid() {
         Cli::command().debug_assert();
+    }
+
+    #[test]
+    fn transfer_session_target_is_prefixed_or_rejected() {
+        let config = gritty::config::ConfigFile::default();
+        let client = config.resolve_session(None).client_name;
+
+        assert_eq!(resolve_target_session(&config, None).unwrap(), None);
+        assert_eq!(
+            resolve_target_session(&config, Some("devbox:work".into())).unwrap().unwrap(),
+            format!("devbox:{client}/work")
+        );
+        // Slash-bearing names are taken literally, like everywhere else.
+        assert_eq!(
+            resolve_target_session(&config, Some("devbox:pat/work".into())).unwrap().unwrap(),
+            "devbox:pat/work"
+        );
+        // A host alone used to yield None and silently auto-detect across
+        // all hosts -- the opposite of what --session is for.
+        let err = resolve_target_session(&config, Some("devbox".into())).unwrap_err().to_string();
+        assert!(err.contains("host:session"), "{err}");
+        assert!(err.contains("`devbox`"), "{err}");
     }
 
     #[test]

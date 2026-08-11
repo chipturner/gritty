@@ -1405,6 +1405,36 @@ async fn open_forwarding_not_enabled() {
     let _ = timeout(Duration::from_secs(3), server).await;
 }
 
+/// `gritty open` inside a *detached* session must get the same explicit
+/// "not delivered" byte the forwarding-off case gets. The event used to be
+/// dropped without a reply, so `open` sat out its 2s read timeout and then
+/// claimed "could not confirm (server may be older)" -- and the `$BROWSER`
+/// shim never printed the URL for manual opening. `copy` already replied.
+#[tokio::test]
+async fn open_while_detached_replies_not_delivered() {
+    let (client_tx, mut framed, server, _meta, svc_path) = setup_session_with_svc_path().await;
+    wait_for_shell(&mut framed).await;
+    read_available_data(&mut framed, Duration::from_secs(1)).await;
+    framed.send(Frame::OpenForward).await.unwrap();
+
+    // Detach.
+    drop(framed);
+    tokio::time::sleep(Duration::from_millis(300)).await;
+
+    let mut open_conn = UnixStream::connect(&svc_path).await.unwrap();
+    open_conn.write_all(&[gritty::protocol::SvcRequest::OpenUrl.to_byte()]).await.unwrap();
+    open_conn.write_all(b"https://example.com\n").await.unwrap();
+    let mut resp = [0xffu8; 1];
+    timeout(Duration::from_secs(1), open_conn.read_exact(&mut resp))
+        .await
+        .expect("detached session must answer an open request promptly")
+        .expect("reply byte");
+    assert_eq!(resp, [0x00], "detached open must be reported as not delivered");
+
+    client_tx.send(ClientConn::Shutdown).unwrap();
+    let _ = timeout(Duration::from_secs(3), server).await;
+}
+
 #[tokio::test]
 async fn ping_pong_response_is_fast() {
     let (_tx, mut framed, server, _meta) = setup_session().await;

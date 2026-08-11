@@ -827,13 +827,14 @@ pub(crate) fn discover_daemon_probes() -> Vec<DaemonProbe> {
     probes
 }
 
-/// Connect to the per-session svc socket (`$GRITTY_SOCK`).
-/// `context` is appended to the "not set" error (e.g. `" with --forward-open"`).
-fn connect_svc_socket(context: &str) -> std::os::unix::net::UnixStream {
+/// Connect to the per-session svc socket (`$GRITTY_SOCK`). The variable is
+/// exported by every session regardless of forwarding flags, so its absence
+/// means exactly one thing: this shell is not inside a gritty session.
+fn connect_svc_socket() -> std::os::unix::net::UnixStream {
     let sock_path = match std::env::var("GRITTY_SOCK") {
         Ok(p) => p,
         Err(_) => {
-            ui::error(&format!("GRITTY_SOCK not set (are you inside a gritty session{context}?)"));
+            ui::error("GRITTY_SOCK not set (are you inside a gritty session?)");
             std::process::exit(1);
         }
     };
@@ -850,12 +851,16 @@ fn connect_svc_socket(context: &str) -> std::os::unix::net::UnixStream {
 pub(crate) fn clipboard_copy() {
     use std::io::{Read, Write};
 
+    // Connect before consuming stdin: run outside a session by hand, `gritty
+    // copy` otherwise sits waiting for ^D and only then says it can't work.
+    // The svc acceptor has no idle timeout, so holding the connection while
+    // stdin is read is fine.
+    let mut stream = connect_svc_socket();
     let mut data = Vec::new();
     if let Err(e) = std::io::stdin().read_to_end(&mut data) {
         ui::error(&format!("reading stdin: {e}"));
         std::process::exit(1);
     }
-    let mut stream = connect_svc_socket("");
     if let Err(e) = stream
         .write_all(&[gritty::protocol::SvcRequest::Clipboard.to_byte()])
         .and_then(|_| stream.write_all(&[0x01]))
@@ -896,12 +901,13 @@ pub(crate) fn clipboard_copy() {
 pub(crate) fn open_url(url: &str, is_browser_shim: bool) {
     use std::io::{Read, Write};
 
-    let mut stream = connect_svc_socket(" with --forward-open");
+    let mut stream = connect_svc_socket();
     let _ = stream.write_all(&[gritty::protocol::SvcRequest::OpenUrl.to_byte()]);
     let _ = stream.write_all(url.as_bytes());
     let _ = stream.write_all(b"\n");
 
-    // Read response byte: 0x01 = forwarded, 0x00 = no client
+    // Read response byte: 0x01 = forwarded, 0x00 = not delivered (session
+    // detached, or the attached client turned URL forwarding off).
     let _ = stream.set_read_timeout(Some(std::time::Duration::from_secs(2)));
     let mut resp = [0u8; 1];
     match stream.read_exact(&mut resp) {
@@ -914,7 +920,10 @@ pub(crate) fn open_url(url: &str, is_browser_shim: bool) {
                 eprintln!("  {url}");
                 // exit 0: do not break the tool that invoked $BROWSER.
             } else {
-                ui::error("no client is connected with --forward-open");
+                ui::error(
+                    "URL not opened -- no client is attached, or the attached client has URL \
+                     forwarding off (--no-forward-open)",
+                );
                 std::process::exit(1);
             }
         }

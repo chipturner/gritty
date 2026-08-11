@@ -47,6 +47,16 @@ protocol interoperate with their neighbors.
   sessions that is usually a different one. Doctor now prints the same
   typeable `host:name` labels `lf`/`rf` use (`devbox (session #3)` when the
   daemon can't be asked).
+- **In-session helpers.** `gritty open` in a *detached* session now fails
+  immediately (and the `$BROWSER` shim prints the URL for manual opening)
+  instead of waiting out a 2s timeout and then guessing "server may be
+  older" -- the daemon answers detached opens the way it already answered
+  detached copies. Its error no longer claims "no client is connected with
+  --forward-open" when a client is connected; and `GRITTY_SOCK not set` no
+  longer suggests `--forward-open` (the variable is set regardless).
+  `gritty copy` run outside a session errors before reading stdin rather
+  than after you press ^D. `send`/`receive --session <host>` (no session
+  part) is rejected instead of silently auto-detecting across all hosts.
 - **Message fixes.** A failed auto-start / ssh / bootstrap no longer reports
   `(exit exit status: 1)`. `connect host:-` says `attached <name>` (and
   `-d` says `<name> exists`) instead of a literal `-`, and can no longer
