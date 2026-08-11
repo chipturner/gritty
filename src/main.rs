@@ -1066,20 +1066,14 @@ async fn run(cli: Cli, config: gritty::config::ConfigFile) -> anyhow::Result<()>
             std::process::exit(code);
         }
         Command::ListSessions { target, json, full } => {
+            let format = ListFormat { json, full };
             if target.is_none() && cli.ctl_socket.is_none() {
-                list_all_sessions(&config, json, full).await
+                list_all_sessions(&config, format).await
             } else {
-                let host = target.as_deref().map(|t| parse_target(&config, t).0);
-                let ctl_path = resolve_ctl_path(cli.ctl_socket, host.as_deref())?;
-                let client_name = config.resolve_session(host.as_deref()).client_name;
-                list_sessions(
-                    ctl_path,
-                    host.as_deref().unwrap_or("local"),
-                    &client_name,
-                    json,
-                    full,
-                )
-                .await
+                let host = target
+                    .as_deref()
+                    .map_or_else(|| "local".to_string(), |t| parse_target(&config, t).0);
+                list_sessions(probe_for_host(&host, cli.ctl_socket), &config, format).await
             }
         }
         Command::KillSession { targets } => {

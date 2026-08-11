@@ -609,6 +609,60 @@ async fn wait_detached(ctl_path: &std::path::Path, name: &str) {
 }
 
 #[tokio::test]
+async fn ls_dashboard_and_single_host_share_one_shape() {
+    let (tmp, ctl_path) = test_ctl();
+
+    // Nothing running at all: the dashboard is empty, not an error.
+    let out = gritty_in(tmp.path(), &["ls"]).await;
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(out.status.success(), "empty dashboard must exit 0: {stderr}");
+    assert!(
+        String::from_utf8_lossy(&out.stdout).contains("gritty connect"),
+        "empty dashboard should say how to get started: {:?}",
+        String::from_utf8_lossy(&out.stdout)
+    );
+    let out = gritty_in(tmp.path(), &["ls", "--json"]).await;
+    assert!(out.status.success());
+    assert_eq!(String::from_utf8_lossy(&out.stdout).trim(), "[]");
+
+    // An explicitly named host that is down is still an error -- but --json
+    // stays JSON (one group carrying the error) rather than a bare message.
+    let out = gritty_in(tmp.path(), &["ls", "local"]).await;
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(!out.status.success());
+    assert!(stderr.contains("no server running"), "{stderr}");
+    let out = gritty_in(tmp.path(), &["ls", "local", "--json"]).await;
+    assert!(!out.status.success());
+    let v: serde_json::Value = serde_json::from_slice(&out.stdout).expect("json even on failure");
+    assert_eq!(v[0]["hosts"][0]["name"], "local");
+    assert!(v[0]["error"].as_str().unwrap_or("").contains("no server running"), "{v}");
+
+    // With a daemon: both forms render the same group shape.
+    let ctl = ctl_path.clone();
+    let _daemon = tokio::spawn(async move { gritty::daemon::run(&ctl, None).await });
+    wait_for_daemon(&ctl_path).await;
+    create_session(&ctl_path, "shared/x").await;
+    wait_detached(&ctl_path, "shared/x").await;
+
+    let dashboard = gritty_in(tmp.path(), &["ls"]).await;
+    let single = gritty_in(tmp.path(), &["ls", "local"]).await;
+    assert!(dashboard.status.success() && single.status.success());
+    assert_eq!(dashboard.stdout, single.stdout, "one daemon: dashboard == ls local");
+    let text = String::from_utf8_lossy(&single.stdout);
+    assert!(text.starts_with("local\n"), "single-host listing has the group header: {text}");
+    assert!(text.contains("shared/x"), "{text}");
+    assert!(!text.contains("PID"), "compact columns by default: {text}");
+
+    let out = gritty_in(tmp.path(), &["ls", "local", "--json"]).await;
+    let v: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(v[0]["hosts"][0]["name"], "local");
+    assert!(v[0]["error"].is_null());
+    assert_eq!(v[0]["sessions"][0]["name"], "shared/x");
+
+    kill_cleanup(&ctl_path, "shared/x").await;
+}
+
+#[tokio::test]
 async fn sessions_are_addressed_by_name_only() {
     let (tmp, ctl_path) = test_ctl();
     let ctl = ctl_path.clone();

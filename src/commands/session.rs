@@ -1722,38 +1722,102 @@ fn print_session_table(
     }
 }
 
-pub(crate) async fn list_sessions(
-    ctl_path: PathBuf,
-    host: &str,
-    client_name: &str,
-    json: bool,
-    full: bool,
-) -> anyhow::Result<()> {
-    use gritty::protocol::Frame;
+/// How `ls` output should be rendered; shared by both entry points.
+#[derive(Clone, Copy)]
+pub(crate) struct ListFormat {
+    pub(crate) json: bool,
+    pub(crate) full: bool,
+}
 
-    let resp = server_request(&ctl_path, Frame::ListSessions).await?;
-    match resp {
-        Frame::SessionInfo { sessions } => {
-            let now = std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap_or_default()
-                .as_secs();
-            if json {
-                let groups = vec![HostGroupJson {
-                    hosts: vec![HostRefJson { name: host, destination: None, tunnel_status: None }],
-                    error: None,
-                    sessions: sessions.iter().map(|s| session_json(s, now, client_name)).collect(),
-                }];
-                print_json(&groups);
-            } else if sessions.is_empty() {
-                println!("no active sessions");
-            } else {
-                print_session_table(&sessions, now, client_name, full, "");
-            }
-            Ok(())
+/// `gritty ls <host>`: one explicitly named daemon, rendered exactly like its
+/// section of the dashboard (same header, columns, and JSON group shape --
+/// including the tunnel destination/status), so the two forms never drift.
+/// Naming a host that is down is an error: in text mode the message *is* the
+/// output; in `--json` mode the group is still emitted, carrying the error, so
+/// consumers always get JSON, and the exit status reports the failure.
+pub(crate) async fn list_sessions(
+    probe: DaemonProbe,
+    config: &gritty::config::ConfigFile,
+    format: ListFormat,
+) -> anyhow::Result<()> {
+    let probed = probe_host(probe).await;
+    if let Err(e) = &probed.outcome
+        && !format.json
+    {
+        anyhow::bail!("{e}");
+    }
+    let failed = probed.outcome.is_err();
+    render_groups(&group_by_daemon(vec![probed]), config, format);
+    if failed {
+        std::process::exit(1);
+    }
+    Ok(())
+}
+
+/// Render dashboard groups as text sections or as the `--json` array.
+fn render_groups(groups: &[HostGroup], config: &gritty::config::ConfigFile, format: ListFormat) {
+    use gritty::ui::sgr::{DIM, DIM_YELLOW, RESET};
+
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+    // The client_name elision applied to the NAME column uses the *resolved*
+    // client_name for each group's host -- a host with a per-host
+    // `client-name` override (different from `[defaults].client-name`) gets
+    // its own elision.
+    let client_name_for =
+        |group: &HostGroup| config.resolve_session(Some(&group.members[0].0)).client_name;
+
+    if format.json {
+        let json_groups: Vec<HostGroupJson> = groups
+            .iter()
+            .map(|group| {
+                let client_name = client_name_for(group);
+                HostGroupJson {
+                    hosts: group
+                        .members
+                        .iter()
+                        .map(|(name, tunnel)| HostRefJson {
+                            name,
+                            destination: tunnel.as_ref().map(|(d, _)| d.as_str()),
+                            tunnel_status: tunnel.as_ref().map(|(_, s)| s.as_str()),
+                        })
+                        .collect(),
+                    error: group.result.as_ref().err().map(String::as_str),
+                    sessions: group
+                        .result
+                        .as_ref()
+                        .map(|sessions| {
+                            sessions.iter().map(|s| session_json(s, now, &client_name)).collect()
+                        })
+                        .unwrap_or_default(),
+                }
+            })
+            .collect();
+        print_json(&json_groups);
+        return;
+    }
+
+    for (i, group) in groups.iter().enumerate() {
+        if i > 0 {
+            println!();
         }
-        other => {
-            anyhow::bail!("unexpected response from server: {other:?}");
+        let (names, annotation) = group_header(group);
+        match annotation {
+            Some(a) => anstream::println!("{names}  {DIM}({a}){RESET}"),
+            None => println!("{names}"),
+        }
+        match &group.result {
+            Ok(sessions) if sessions.is_empty() => {
+                anstream::println!("  {DIM}(no sessions){RESET}")
+            }
+            Ok(sessions) => {
+                print_session_table(sessions, now, &client_name_for(group), format.full, "  ")
+            }
+            // Stays on stdout: in `--json` mode this same value is the group's
+            // `error` field, so it occupies the table's slot for that host.
+            Err(e) => anstream::println!("  {DIM_YELLOW}\u{26a0} {e}{RESET}"),
         }
     }
 }
@@ -1921,18 +1985,17 @@ fn group_header(group: &HostGroup) -> (String, Option<String>) {
 /// then `ListSessions`. Bounded by a 2s timeout so one dead tunnel cannot
 /// stall the whole listing.
 async fn probe_host(probe: DaemonProbe) -> ProbedHost {
-    use gritty::protocol::{Frame, FrameCodec};
+    use gritty::protocol::Frame;
 
     let DaemonProbe { host, socket, tunnel } = probe;
+    // `connect_handshaked` is what every other command uses, so a failed
+    // probe reads exactly like a failed `tail`/`kill` against the same host
+    // ("no server running (could not connect to ...)", the tunnel hint on a
+    // handshake EOF, the refresh hint on a version mismatch) instead of a raw
+    // errno. `{:#}` keeps that context chain.
     let result = tokio::time::timeout(std::time::Duration::from_secs(2), async {
-        let stream = gritty::security::connect_verified(&socket)
-            .await
-            .map_err(|e| format!("connect: {e}"))?;
-        let mut framed = tokio_util::codec::Framed::new(stream, FrameCodec);
-        let info = gritty::handshake(&mut framed, gritty::get_or_create_device_id())
-            .await
-            .map_err(|e| e.to_string())?;
-        gritty::require_matched_version(&info).map_err(|e| e.to_string())?;
+        let (mut framed, info) =
+            super::util::connect_handshaked(&socket, true).await.map_err(|e| format!("{e:#}"))?;
         futures_util::SinkExt::send(&mut framed, Frame::ListSessions)
             .await
             .map_err(|e| format!("send ListSessions: {e}"))?;
@@ -1966,87 +2029,22 @@ fn is_listable(p: &ProbedHost) -> bool {
 /// local section's Client column.
 pub(crate) async fn list_all_sessions(
     config: &gritty::config::ConfigFile,
-    json: bool,
-    full: bool,
+    format: ListFormat,
 ) -> anyhow::Result<()> {
-    use gritty::ui::sgr::{DIM, DIM_YELLOW, RESET};
-
-    let probes = discover_daemon_probes();
-
-    if probes.is_empty() {
-        anyhow::bail!("no server running and no tunnels found");
-    }
+    use gritty::ui::sgr::{DIM, RESET};
 
     let probed: Vec<ProbedHost> =
-        futures_util::future::join_all(probes.into_iter().map(probe_host)).await;
+        futures_util::future::join_all(discover_daemon_probes().into_iter().map(probe_host)).await;
     let probed: Vec<ProbedHost> = probed.into_iter().filter(is_listable).collect();
-    if probed.is_empty() {
-        anyhow::bail!("no server running and no tunnels found");
-    }
-    let groups = group_by_daemon(probed);
-
-    let now = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_secs();
-
-    if json {
-        let json_groups: Vec<HostGroupJson> = groups
-            .iter()
-            .map(|group| {
-                let client_name = config.resolve_session(Some(&group.members[0].0)).client_name;
-                HostGroupJson {
-                    hosts: group
-                        .members
-                        .iter()
-                        .map(|(name, tunnel)| HostRefJson {
-                            name,
-                            destination: tunnel.as_ref().map(|(d, _)| d.as_str()),
-                            tunnel_status: tunnel.as_ref().map(|(_, s)| s.as_str()),
-                        })
-                        .collect(),
-                    error: group.result.as_ref().err().map(String::as_str),
-                    sessions: group
-                        .result
-                        .as_ref()
-                        .map(|sessions| {
-                            sessions.iter().map(|s| session_json(s, now, &client_name)).collect()
-                        })
-                        .unwrap_or_default(),
-                }
-            })
-            .collect();
-        print_json(&json_groups);
+    // An empty dashboard is a state, not a failure: nothing is running yet.
+    // Scripts get an empty array; humans get the one command that changes it.
+    if probed.is_empty() && !format.json {
+        anstream::println!(
+            "{DIM}no sessions or tunnels -- `gritty connect <host>:<name>` starts one{RESET}"
+        );
         return Ok(());
     }
-
-    for (i, group) in groups.iter().enumerate() {
-        if i > 0 {
-            println!();
-        }
-        let (names, annotation) = group_header(group);
-        match annotation {
-            Some(a) => anstream::println!("{names}  {DIM}({a}){RESET}"),
-            None => println!("{names}"),
-        }
-        match &group.result {
-            Ok(sessions) if sessions.is_empty() => {
-                anstream::println!("  {DIM}(no sessions){RESET}")
-            }
-            Ok(sessions) => {
-                // The client_name elision applied to the NAME column uses the
-                // *resolved* client_name for this host -- a host with a
-                // per-host `client-name` override (different from
-                // `[defaults].client-name`) gets its own elision.
-                let host = &group.members[0].0;
-                let client_name = config.resolve_session(Some(host)).client_name;
-                print_session_table(sessions, now, &client_name, full, "  ");
-            }
-            // Stays on stdout: in `--json` mode this same value is the group's
-            // `error` field, so it occupies the table's slot for that host.
-            Err(e) => anstream::println!("  {DIM_YELLOW}\u{26a0} {e}{RESET}"),
-        }
-    }
+    render_groups(&group_by_daemon(probed), config, format);
     Ok(())
 }
 

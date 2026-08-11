@@ -1738,22 +1738,24 @@ fn cleanup_stale_files(name: &str) {
 }
 
 /// Extract tunnel connection names by globbing lock files in the socket dir.
+///
+/// Sorted by name: this feeds `tunnels`, `doctor`, `info`, `refresh`, and the
+/// `ls` dashboard, all of which would otherwise print in `read_dir` order and
+/// shuffle between runs.
 pub fn enumerate_tunnels() -> Vec<String> {
     let dir = crate::daemon::socket_dir();
     let Ok(entries) = std::fs::read_dir(&dir) else {
         return Vec::new();
     };
-    entries
+    let mut names: Vec<String> = entries
         .filter_map(|e| e.ok())
         .filter_map(|e| {
             let name = e.file_name().to_string_lossy().to_string();
-            if name.starts_with("connect-") && name.ends_with(".lock") {
-                Some(name["connect-".len()..name.len() - ".lock".len()].to_string())
-            } else {
-                None
-            }
+            name.strip_prefix("connect-")?.strip_suffix(".lock").map(str::to_string)
         })
-        .collect()
+        .collect();
+    names.sort();
+    names
 }
 
 // ---------------------------------------------------------------------------

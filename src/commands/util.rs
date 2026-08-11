@@ -820,21 +820,33 @@ pub(crate) struct DaemonProbe {
     pub(crate) tunnel: Option<(String, String)>,
 }
 
-/// Enumerate all reachable daemon sockets: local + tunnels + bare socket files.
+fn local_probe(socket: PathBuf) -> DaemonProbe {
+    DaemonProbe { host: "local".to_string(), socket, tunnel: None }
+}
+
+fn tunnel_probe(info: gritty::connect::TunnelInfo) -> DaemonProbe {
+    DaemonProbe {
+        socket: gritty::connect::connection_socket_path(&info.name),
+        host: info.name,
+        tunnel: Some((info.destination, info.status)),
+    }
+}
+
+/// Enumerate all reachable daemon sockets: local first, then tunnels and bare
+/// `connect-*.sock` files sorted by name, so successive listings (and the
+/// dashboard sections built from them) come out in a stable order rather than
+/// `read_dir` order.
 pub(crate) fn discover_daemon_probes() -> Vec<DaemonProbe> {
     let mut probes = Vec::new();
     let local = gritty::daemon::control_socket_path();
     if local.exists() {
-        probes.push(DaemonProbe { host: "local".to_string(), socket: local, tunnel: None });
+        probes.push(local_probe(local));
     }
     let mut seen = std::collections::HashSet::new();
+    let mut remote = Vec::new();
     for info in gritty::connect::get_tunnel_info() {
         if seen.insert(info.name.clone()) {
-            probes.push(DaemonProbe {
-                host: info.name.clone(),
-                socket: gritty::connect::connection_socket_path(&info.name),
-                tunnel: Some((info.destination, info.status)),
-            });
+            remote.push(tunnel_probe(info));
         }
     }
     if let Ok(entries) = std::fs::read_dir(gritty::daemon::socket_dir()) {
@@ -843,7 +855,7 @@ pub(crate) fn discover_daemon_probes() -> Vec<DaemonProbe> {
             if let Some(stem) = name.strip_prefix("connect-").and_then(|s| s.strip_suffix(".sock"))
                 && seen.insert(stem.to_string())
             {
-                probes.push(DaemonProbe {
+                remote.push(DaemonProbe {
                     host: stem.to_string(),
                     socket: entry.path(),
                     tunnel: None,
@@ -851,7 +863,30 @@ pub(crate) fn discover_daemon_probes() -> Vec<DaemonProbe> {
             }
         }
     }
+    remote.sort_by(|a, b| a.host.cmp(&b.host));
+    probes.extend(remote);
     probes
+}
+
+/// The probe for one explicitly named host (`ls <host>`), or for a
+/// `--ctl-socket` override (labelled by [`host_from_ctl_path`]). Unlike
+/// discovery this never skips a missing socket: the user named the host, so
+/// its unreachability is the answer.
+pub(crate) fn probe_for_host(host: &str, ctl_socket: Option<PathBuf>) -> DaemonProbe {
+    if let Some(socket) = ctl_socket {
+        return DaemonProbe { host: host_from_ctl_path(&socket), socket, tunnel: None };
+    }
+    if host == "local" {
+        return local_probe(gritty::daemon::control_socket_path());
+    }
+    match gritty::connect::get_tunnel_info().into_iter().find(|t| t.name == host) {
+        Some(info) => tunnel_probe(info),
+        None => DaemonProbe {
+            host: host.to_string(),
+            socket: gritty::connect::connection_socket_path(host),
+            tunnel: None,
+        },
+    }
 }
 
 /// Connect to the per-session svc socket (`$GRITTY_SOCK`). The variable is

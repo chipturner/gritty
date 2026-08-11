@@ -14,6 +14,18 @@ protocol interoperate with their neighbors.
   diagnostic columns are behind `ls --full`, and `--json` still carries
   every field. The session picker's CWD column shortens remote homes too
   (it only recognized the local `$HOME` before).
+- **`ls <host>` and bare `ls` are the same listing.** A single host now
+  renders as its dashboard section (header with tunnel destination/status,
+  same columns; `--json` fills in `destination`/`tunnel_status` instead of
+  `null`), and probe failures read like every other command's ("no server
+  running (could not connect to ...)", the refresh hint on a mismatch)
+  rather than a raw errno. Hosts are ordered `local` first, then tunnels by
+  name -- `tunnels`, `doctor`, `info` and `refresh` pick up the same order
+  instead of directory order. Empty states are consistent for scripts: the
+  bare dashboard with nothing running prints a hint (or `[]` under
+  `--json`) and exits 0; naming a host that is down still fails, but
+  `--json` now emits the group with its `error` field rather than a bare
+  message.
 - **Sessions are addressed by name only.** With the ID column gone from
   `ls`, bare `kill 3` no longer falls back to daemon id 3 when you have no
   session named `3` -- on hosts with auto-numbered sessions the two usually
