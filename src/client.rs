@@ -484,13 +484,17 @@ fn reconnect_status_line(
     format!("\r\x1b[2m{glyph} {body}{hint} \u{b7} ^C aborts\x1b[0m\x1b[K")
 }
 
-/// Terminal failure line: replaces the status line, then newline. Caller is
-/// responsible for leaving alt-screen first if needed.
+/// Terminal (fatal) failure line. With `chrome_shown` the reconnect status
+/// line owns the current row, so the error replaces it in place; otherwise
+/// the cursor is still on the user's last line (prompt, half-typed command,
+/// program output) and the error opens a fresh row instead of erasing it.
+/// Caller is responsible for leaving alt-screen first if needed.
 ///
 /// `\r` and `\x1b[K` are cursor control, not styling: they erase whatever the
 /// spinner left on this row and survive `--color=never`.
-fn reconnect_err_line(text: &str) -> String {
-    format!("\r{}\x1b[K\r\n", ui::terminal_body(ui::Level::Error, text))
+fn terminal_err_line(text: &str, chrome_shown: bool) -> String {
+    let lead = if chrome_shown { "" } else { "\r\n" };
+    format!("{lead}\r{}\x1b[K\r\n", ui::terminal_body(ui::Level::Error, text))
 }
 
 /// Paint (or first-time open) the reconnect status line, but only once the
@@ -1058,14 +1062,17 @@ impl ClientRelay<'_> {
                 self.tunnel.teardown();
                 self.pf.teardown();
                 // Leave alt-screen first so the message is visible and not
-                // clobbered by RawModeGuard's Drop.
+                // clobbered by RawModeGuard's Drop. No reconnect chrome is up
+                // during the live relay, so the line must not repaint in place
+                // -- that erased the prompt the session had just drawn.
                 write_stdout_async(
                     self.async_stdout,
                     format!(
                         "{}{}",
                         self.alt_screen.leave_prefix(),
-                        reconnect_err_line(
-                            "server shut down -- session is gone; run `gritty connect` to start fresh"
+                        terminal_err_line(
+                            "server shut down -- session is gone; run `gritty connect` to start fresh",
+                            false,
                         )
                     )
                     .as_bytes(),
@@ -2426,8 +2433,9 @@ pub async fn run(
                             format!(
                                 "{}{}",
                                 alt_screen.leave_prefix(),
-                                reconnect_err_line(
-                                    "server socket gone -- session is unreachable; reconnect manually"
+                                terminal_err_line(
+                                    "server socket gone -- session is unreachable; reconnect manually",
+                                    chrome_shown,
                                 )
                             )
                             .as_bytes(),
@@ -2588,18 +2596,15 @@ pub async fn run(
                     // Emit a terminal red line on stdout. Leave alt-screen
                     // first so the error is visible on main screen --
                     // otherwise TerminalResetGuard's Drop emits `?1049l`
-                    // after the fact and clobbers the message. `lead`
-                    // opens a fresh line when no status line was ever painted,
-                    // so the error doesn't overwrite the user's last output.
+                    // after the fact and clobbers the message.
                     macro_rules! bail_reconnect {
                         ($text:expr) => {{
-                            let lead = if chrome_shown { "" } else { "\r\n" };
                             write_stdout_async(
                                 &async_stdout,
                                 format!(
-                                    "{}{lead}{}",
+                                    "{}{}",
                                     alt_screen.leave_prefix(),
-                                    reconnect_err_line($text)
+                                    terminal_err_line($text, chrome_shown)
                                 )
                                 .as_bytes(),
                             )
@@ -2817,7 +2822,10 @@ pub async fn tail(
                         }
                         Some(Ok(Frame::ServerShutdown)) => {
                             info!("tail: server shutting down");
-                            eprint!("{}", reconnect_err_line("server shut down -- session is gone"));
+                            eprint!(
+                                "{}",
+                                terminal_err_line("server shut down -- session is gone", false)
+                            );
                             break 'relay Some(1);
                         }
                         Some(Ok(_)) => {}
@@ -2934,8 +2942,9 @@ pub async fn tail(
                         );
                         eprint!(
                             "{}",
-                            reconnect_err_line(
-                                "server socket gone -- session is unreachable; reconnect manually"
+                            terminal_err_line(
+                                "server socket gone -- session is unreachable; reconnect manually",
+                                chrome_shown,
                             )
                         );
                         break 'outer 1;
@@ -3019,8 +3028,7 @@ pub async fn tail(
 
                     macro_rules! bail_tail {
                         ($text:expr) => {{
-                            let lead = if chrome_shown { "" } else { "\r\n" };
-                            eprint!("{lead}{}", reconnect_err_line($text));
+                            eprint!("{}", terminal_err_line($text, chrome_shown));
                             break 'outer 1;
                         }};
                     }
@@ -3455,11 +3463,24 @@ mod tests {
     /// stdout (as here, in the test binary) -- or the failure line stacks below
     /// the spinner instead of replacing it.
     #[test]
-    fn reconnect_err_line_repaints_in_place() {
-        let err = reconnect_err_line("boom");
+    fn terminal_err_line_repaints_over_shown_chrome() {
+        let err = terminal_err_line("boom", true);
         assert!(err.starts_with('\r'), "{err:?}");
+        assert!(!err.starts_with("\r\n"), "must not open a new row: {err:?}");
         assert!(err.ends_with("\x1b[K\r\n"), "{err:?}");
         assert!(err.contains("error: boom"), "{err:?}");
+    }
+
+    /// With no status line on screen, the cursor is sitting on the user's
+    /// last line (a shell prompt, half-typed command, or program output);
+    /// repainting in place would erase it. Open a fresh row first.
+    #[test]
+    fn terminal_err_line_opens_a_fresh_row_when_no_chrome_is_shown() {
+        let err = terminal_err_line("boom", false);
+        assert!(err.starts_with("\r\n"), "{err:?}");
+        assert!(err.ends_with("\x1b[K\r\n"), "{err:?}");
+        assert!(err.contains("error: boom"), "{err:?}");
+        assert_eq!(&err[2..], terminal_err_line("boom", true), "same body either way");
     }
 
     #[test]

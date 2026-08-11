@@ -22,6 +22,12 @@ protocol interoperate with their neighbors.
   version-unknown case with the same verdict `refresh` acts on. Existing
   tunnels pick this up on their next `tunnel-create`/`refresh`. No
   protocol change.
+- **Fixed: the "server shut down" exit line no longer erases your last line.**
+  When the daemon was killed under an attached client (or a `tail`), the
+  red exit message was painted over the current row -- the sequence meant
+  for replacing the reconnect spinner -- so the prompt or output you were
+  looking at vanished under it. Fatal exit lines now open a fresh row unless
+  a reconnect status line is actually on screen. No protocol change.
 - **Fixed: `connect` without a terminal no longer leaves a session behind.**
   Run from a script (stdin a pipe or `/dev/null`), `connect` created or
   attached the session and only then died with `ENODEV: No such device`
