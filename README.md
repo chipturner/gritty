@@ -136,7 +136,7 @@ The file lives at `~/.config/gritty/config.toml` on Linux (honors `$XDG_CONFIG_H
 
 **"gritty not found on remote host"** -- gritty must be installed on the remote too. Use `gritty bootstrap <destination>`, `cargo install gritty-cli`, or the review-first install flow above, and make sure it lands on your `$PATH` (`$HOME/bin`, `$HOME/.local/bin`, `$HOME/.cargo/bin`, etc.).
 
-**First connect hangs or fails** -- gritty backgrounds the SSH tunnel, so it can't prompt for a password or host key. Make sure `ssh <destination>` works first, then retry.
+**First connect fails with `ssh to <host> failed: ...`** -- gritty runs the tunnel unattended, so ssh must get in without prompting; the error quotes ssh's own diagnosis (unknown host key, `Permission denied`, unresolvable host) and the exact `ssh ...` command to run by hand to fix it (accept the key, set up key/agent auth), then retry.
 
 **"reconnecting..." forever** -- the SSH tunnel is down and not recovering. Check `gritty tunnels`; if a tunnel is stale, `gritty tunnel-destroy <name>` then `gritty tunnel-create <dest>` to rebuild it. `gritty doctor` reports what's wrong and where the logs are. While the status line is up, any key forces an immediate retry (including past a stale `waiting for network`); `^C` gives up.
 

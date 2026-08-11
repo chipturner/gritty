@@ -709,6 +709,36 @@ async fn wait_gone(ctl_path: &std::path::Path, name: &str) {
 }
 
 #[tokio::test]
+async fn failed_auto_start_fails_fast_with_the_real_cause() {
+    use std::os::unix::fs::PermissionsExt;
+    let tmp = tempfile::tempdir().unwrap();
+    // A socket dir the daemon cannot bind in: `gritty server` exits nonzero
+    // right away. (Owner-only read+exec keeps it a valid 0700-style dir for
+    // the client's own checks; only creating files inside fails.)
+    let dir = tmp.path().join("ro");
+    std::fs::create_dir(&dir).unwrap();
+    std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o500)).unwrap();
+    if std::fs::write(dir.join("probe"), b"").is_ok() {
+        // Running as root (or an ACL): the scenario cannot be set up here.
+        return;
+    }
+
+    let started = std::time::Instant::now();
+    let out = gritty_in(&dir, &["connect", "-d", "local:x"]).await;
+    let elapsed = started.elapsed();
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(!out.status.success());
+    // One verdict naming what did not start, chained to the start failure --
+    // not a dim "retrying" line followed by a generic "did not become ready"
+    // after a 5s retry loop.
+    assert!(stderr.contains("server did not start"), "{stderr}");
+    assert!(!stderr.contains("retrying"), "{stderr}");
+    assert!(!stderr.contains("did not become ready"), "{stderr}");
+    assert!(elapsed < Duration::from_secs(3), "took {elapsed:?}: {stderr}");
+    std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700)).unwrap();
+}
+
+#[tokio::test]
 async fn unnamed_detach_creates_a_new_slot_each_time() {
     let (tmp, ctl_path) = test_ctl();
     let ctl = ctl_path.clone();

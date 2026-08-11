@@ -236,83 +236,73 @@ fn auto_start_failure(args: &[&str], status: std::process::ExitStatus) -> anyhow
     anyhow::anyhow!("failed to start `gritty {}` ({status})", args.join(" "))
 }
 
-/// Try to connect to the control socket. On failure, auto-start the
-/// appropriate process and retry with a bounded loop (or indefinitely
-/// with `--wait`).
-/// Returns `(stream, auto_started)` where `auto_started` is true when the
-/// server or tunnel had to be launched before connecting.
+/// Try to connect to the control socket, auto-starting the daemon or tunnel
+/// if nothing answers. Returns `(stream, auto_started)`.
+///
+/// A failed auto-start is final: the child has already printed why (its
+/// stderr is ours), so after one immediate connect -- which is what a
+/// concurrent `gritty connect` that won the start race would leave
+/// connectable -- we fail with what did not start, rather than sitting out a
+/// retry loop and then reporting a generic "did not become ready" that
+/// buries the real error. `--wait` still waits: that is what it asks for.
 pub(crate) async fn connect_or_start(
     ctl_path: &Path,
     auto_start_mode: &AutoStart,
     wait: bool,
 ) -> anyhow::Result<(tokio::net::UnixStream, bool)> {
-    let auto_started = match gritty::security::connect_verified(ctl_path).await {
-        Ok(s) => {
-            return Ok((s, false));
+    if let Ok(s) = gritty::security::connect_verified(ctl_path).await {
+        return Ok((s, false));
+    }
+    let (what, start_result) = match auto_start_mode {
+        AutoStart::Server => {
+            ui::status("starting server...");
+            ("server".to_string(), auto_start(&["server"]))
         }
-        Err(_) => match auto_start_mode {
-            AutoStart::Server => {
-                ui::status("starting server...");
-                // A concurrent `gritty connect` can race with us here: both
-                // spawn `gritty server`, and one child exits nonzero because
-                // the winner already bound ctl.sock. Don't bail on that
-                // failure -- drop into the retry loop so we attach to the
-                // racer's daemon if one came up.
-                if let Err(e) = auto_start(&["server"]) {
-                    ui::status(&format!(
-                        "auto-start failed ({e}); retrying connect in case another process started one"
-                    ));
-                }
-                true
-            }
-            AutoStart::Tunnel { name: host, config_dest } => {
-                // The connection name alone is not a valid SSH destination
-                // when the user originally passed `user@host`, `host:port`,
-                // or `--name <alias>`. Recover the original destination from
-                // the `.dest` sidecar, falling back to the config-implied
-                // destination (first `[host.<name>] aliases` entry), then
-                // the name itself.
-                let destination =
-                    gritty::connect::resolve_destination(host, config_dest.as_deref());
-                ui::status(&format!("starting tunnel {host}..."));
-                // Replay any persisted CLI -o options so a reboot/respawn
-                // doesn't silently lose a ProxyJump/IdentityFile/Port.
-                let recreate = gritty::connect::tunnel_recreate_args(host, &destination);
-                let recreate: Vec<&str> = recreate.iter().map(String::as_str).collect();
-                // Same rationale: `connect::run` returns Ok(0) when another
-                // instance already holds the lock, so a tunnel-create race
-                // is usually fine -- but if auto_start errors for any other
-                // reason, still try to connect before giving up.
-                if let Err(e) = auto_start(&recreate) {
-                    ui::status(&format!(
-                        "auto-start failed ({e}); retrying connect in case another process started one"
-                    ));
-                }
-                true
-            }
-            AutoStart::None if wait => false,
-            AutoStart::None => {
-                anyhow::bail!("no server running (could not connect to {})", ctl_path.display());
-            }
-        },
+        AutoStart::Tunnel { name: host, config_dest } => {
+            // The connection name alone is not a valid SSH destination when
+            // the user originally passed `user@host`, `host:port`, or
+            // `--name <alias>`. Recover the original destination from the
+            // `.dest` sidecar, falling back to the config-implied destination
+            // (first `[host.<name>] aliases` entry), then the name itself.
+            let destination = gritty::connect::resolve_destination(host, config_dest.as_deref());
+            ui::status(&format!("starting tunnel {host}..."));
+            // Replay any persisted CLI -o options so a reboot/respawn doesn't
+            // silently lose a ProxyJump/IdentityFile/Port.
+            let recreate = gritty::connect::tunnel_recreate_args(host, &destination);
+            let recreate: Vec<&str> = recreate.iter().map(String::as_str).collect();
+            (format!("tunnel {host}"), auto_start(&recreate))
+        }
+        AutoStart::None if wait => (String::new(), Ok(())),
+        AutoStart::None => {
+            anyhow::bail!("no server running (could not connect to {})", ctl_path.display());
+        }
     };
+    let auto_started = !matches!(auto_start_mode, AutoStart::None);
 
-    // Retry loop: bounded (10 retries, 500ms apart) or indefinite (--wait)
+    if let Err(e) = start_result
+        && !wait
+    {
+        return match gritty::security::connect_verified(ctl_path).await {
+            // A racing invocation started it; ours losing is fine.
+            Ok(s) => Ok((s, auto_started)),
+            Err(_) => Err(e.context(format!("{what} did not start"))),
+        };
+    }
+
+    // Started (or --wait): the starter returns once the socket is bound, so
+    // this normally succeeds first time; the bounded loop absorbs the
+    // hand-off. --wait polls indefinitely.
     let max_retries = if wait { u32::MAX } else { 10 };
     for _ in 0..max_retries {
-        match gritty::security::connect_verified(ctl_path).await {
-            Ok(s) => {
-                return Ok((s, auto_started));
-            }
-            Err(_) => {
-                if wait {
-                    ui::status("waiting for server...");
-                }
-                tokio::time::sleep(std::time::Duration::from_millis(500)).await;
-            }
+        if let Ok(s) = gritty::security::connect_verified(ctl_path).await {
+            return Ok((s, auto_started));
         }
+        if wait {
+            ui::status("waiting for server...");
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
     }
-    anyhow::bail!("server did not become ready ({})", ctl_path.display())
+    anyhow::bail!("{what} started but its socket never became connectable ({})", ctl_path.display())
 }
 
 /// Compact duration: "12s", "5m", "3h", "2d".

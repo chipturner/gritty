@@ -26,6 +26,16 @@ protocol interoperate with their neighbors.
   `--json`) and exits 0; naming a host that is down still fails, but
   `--json` now emits the group with its `error` field rather than a bare
   message.
+- **A failed first connect now says what ssh said.** The tunnel preflight
+  used to discard ssh's stderr and blame "a password or host key" for
+  everything (including a typo'd hostname), and `connect` then spent five
+  seconds retrying before adding a generic "server did not become ready".
+  Now: `ssh to devbox failed: <ssh's own last line>` plus a remedy matched
+  to it (accept the host key / fix unattended auth / check by hand, each
+  with the exact interactive ssh command including your `-o` options), and
+  a failed auto-start ends immediately with `tunnel devbox did not start`
+  (`--wait` still waits). Later tunnel failures point at the `.out` file
+  and the interactive ssh command instead of suggesting `--foreground`.
 - **Connecting to a session someone else holds now asks.** `session work
   is already attached by laptop2 -- take it over? [y/N]` replaces the
   error-plus-retype-with-`--force` dance (which is what the flag's help

@@ -1358,39 +1358,55 @@ pub fn parse_host(destination: &str) -> anyhow::Result<String> {
     Ok(Destination::parse(destination)?.host)
 }
 
-/// Synchronous SSH connectivity check -- call before daemonizing to catch
-/// host-key prompts and password prompts while the terminal is still attached.
+/// Synchronous, non-interactive SSH connectivity check, run before
+/// daemonizing so that the common first-connect failures (unknown host key,
+/// no usable key, typo'd host) are reported on the user's terminal with
+/// ssh's own diagnostic, instead of surfacing later as a dead tunnel.
 pub fn preflight_ssh(
     dest_str: &str,
     ssh_options: &[String],
     connect_timeout: u64,
 ) -> anyhow::Result<()> {
     let dest = Destination::parse(dest_str)?;
-    let mut cmd = std::process::Command::new("ssh");
-    cmd.args(dest.port_args());
-    for opt in ssh_options {
-        cmd.arg("-o");
-        cmd.arg(opt);
+    let output = std::process::Command::new("ssh")
+        .args(base_ssh_args(&dest, ssh_options, false, connect_timeout))
+        .arg(dest.ssh_dest())
+        .arg("true")
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::piped())
+        .output()
+        .context("failed to run ssh")?;
+    if output.status.success() {
+        return Ok(());
     }
-    cmd.args(["-o", "BatchMode=yes"]);
-    if connect_timeout > 0 {
-        cmd.args(["-o", &format!("ConnectTimeout={connect_timeout}")]);
-    }
-    cmd.arg(dest.ssh_dest());
-    cmd.arg("true");
-    cmd.stdin(std::process::Stdio::null());
-    cmd.stdout(std::process::Stdio::null());
-    cmd.stderr(std::process::Stdio::null());
-    let status = cmd.status().context("failed to run ssh")?;
-    if !status.success() {
-        bail!(
-            "SSH cannot connect non-interactively to {}\n  \
-             if SSH needs a password or host key accept, use: gritty tunnel-create --foreground {}",
-            dest.ssh_dest(),
-            dest_str
-        );
-    }
-    Ok(())
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    // The interactive form of the same command: what the user should run by
+    // hand, since it can answer the prompts BatchMode refused.
+    let interactive = format_ssh_diag(&dest, ssh_options, true, connect_timeout);
+    bail!("{}", preflight_failure(&dest.ssh_dest(), &stderr, &interactive));
+}
+
+/// The preflight error: ssh's last diagnostic line (the part that actually
+/// says what is wrong -- BatchMode turns every prompt into one), plus the
+/// remedy that line calls for. Pure, so the wording is testable.
+fn preflight_failure(ssh_dest: &str, ssh_stderr: &str, interactive_cmd: &str) -> String {
+    let reason = ssh_stderr
+        .lines()
+        .map(str::trim)
+        .rfind(|l| !l.is_empty())
+        .unwrap_or("ssh exited without a diagnostic");
+    let remedy = if reason.contains("Host key verification failed") {
+        format!("accept the host key once, then retry: {interactive_cmd}")
+    } else if reason.contains("Permission denied") {
+        format!(
+            "the tunnel runs unattended, so `{interactive_cmd}` must log in without a password \
+             prompt (key + agent); fix that, then retry"
+        )
+    } else {
+        format!("check the connection by hand: {interactive_cmd}")
+    };
+    format!("ssh to {ssh_dest} failed: {reason}\n  {remedy}")
 }
 
 // ---------------------------------------------------------------------------
@@ -2130,15 +2146,14 @@ pub async fn run(opts: ConnectOpts, ready_fd: Option<OwnedFd>) -> anyhow::Result
     // mode), so both the timeout arm and the child-exit arm point the user at
     // that output rather than trying to re-read the pipe here.
     let mut child = guard.child.take().unwrap();
-    let diag = format_ssh_diag(&dest, &opts.ssh_options, opts.foreground, opts.connect_timeout);
+    // The hand-diagnosis command is always the interactive form (no
+    // BatchMode): preflight already proved non-interactive auth works, so
+    // whatever is wrong now is something the user wants to see ssh say.
+    let diag = format_ssh_diag(&dest, &opts.ssh_options, true, opts.connect_timeout);
     let fg_hint = if opts.foreground {
         String::new()
     } else {
-        format!(
-            "\n  ssh output: {}\n  if SSH needs a password or host key accept, use: gritty tunnel-create --foreground {}",
-            connect_out_path(&connection_name).display(),
-            opts.destination,
-        )
+        format!("\n  ssh output: {}", connect_out_path(&connection_name).display())
     };
     tokio::select! {
         result = wait_for_socket(&local_sock, socket_wait_deadline(opts.connect_timeout)) => {
@@ -2780,6 +2795,45 @@ mod tests {
         assert!(args.contains(&"ProxyJump=bastion".to_string()));
         assert!(args.contains(&"ConnectTimeout=30".to_string()));
         assert!(!args.contains(&"BatchMode=yes".to_string()));
+    }
+
+    #[test]
+    fn preflight_failure_quotes_ssh_and_matches_the_remedy_to_it() {
+        let cmd = "ssh -o 'ProxyJump=bastion' devbox";
+
+        let m = preflight_failure(
+            "devbox",
+            "ssh: Could not resolve hostname devbox: nodename nor servname provided, or not known\n",
+            cmd,
+        );
+        assert!(
+            m.starts_with("ssh to devbox failed: ssh: Could not resolve hostname devbox"),
+            "{m}"
+        );
+        assert!(
+            m.contains("check the connection by hand: ssh -o 'ProxyJump=bastion' devbox"),
+            "{m}"
+        );
+
+        let m = preflight_failure("devbox", "Host key verification failed.\r\n", cmd);
+        assert!(m.contains("failed: Host key verification failed."), "{m}");
+        assert!(m.contains("accept the host key once, then retry: ssh -o"), "{m}");
+
+        // ssh prints a banner first; the last line is the diagnosis.
+        let m = preflight_failure(
+            "u@devbox",
+            "Welcome banner\n\nu@devbox: Permission denied (publickey).\n",
+            cmd,
+        );
+        assert!(m.contains("failed: u@devbox: Permission denied (publickey)."), "{m}");
+        assert!(m.contains("without a password"), "{m}");
+        assert!(!m.contains("Welcome banner"), "{m}");
+
+        let m = preflight_failure("devbox", "", cmd);
+        assert!(m.contains("ssh exited without a diagnostic"), "{m}");
+        // The old text blamed prompts and pointed at --foreground regardless
+        // of the cause; neither survives.
+        assert!(!m.contains("--foreground") && !m.contains("non-interactively"), "{m}");
     }
 
     #[test]

@@ -293,9 +293,13 @@ kill the remote daemon and its live sessions.
      spec, `ExitOnForwardFailure=yes` tripping, remote host rejected
      the connection after auth.
    - **SocketTimeout** (`wait_for_socket` deadline): ssh is still alive
-     but never called bind() on the forward. Bail with a diagnostic
-     that additionally points at the `--foreground` hint (a password
-     prompt that wasn't answered is the common cause).
+     but never called bind() on the forward. Bail with the same
+     diagnostic. Both branches print the *interactive* form of the ssh
+     command (no BatchMode) to run by hand, plus the `.out` path in
+     daemonized mode; a prompt is not a plausible cause here, because
+     `main.rs` runs `preflight_ssh` (BatchMode, stderr captured) before
+     daemonizing and reports ssh's own last line -- host key, auth,
+     resolution -- with a matching remedy (`preflight_failure`).
 
    On socket-ready first, run one `probe_tunnel_alive` against the local
    socket to confirm the forward actually reaches a live remote daemon.
