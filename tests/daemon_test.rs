@@ -501,6 +501,52 @@ async fn prune_kills_only_matching_client_sessions() {
 }
 
 #[tokio::test]
+async fn connect_without_a_terminal_fails_before_creating_a_session() {
+    let (tmp, ctl_path) = test_ctl();
+
+    let ctl = ctl_path.clone();
+    let _daemon = tokio::spawn(async move { gritty::daemon::run(&ctl, None).await });
+    wait_for_daemon(&ctl_path).await;
+
+    let connect = async |extra: &[&str]| {
+        tokio::process::Command::new(env!("CARGO_BIN_EXE_gritty"))
+            .args(["--ctl-socket", ctl_path.to_str().unwrap(), "connect"])
+            .args(extra)
+            .env("XDG_CONFIG_HOME", tmp.path())
+            .stdin(std::process::Stdio::null())
+            .output()
+            .await
+            .expect("failed to run gritty connect")
+    };
+    let list = async || match control_request(&ctl_path, Frame::ListSessions).await {
+        Frame::SessionInfo { sessions } => sessions,
+        other => panic!("expected SessionInfo, got {other:?}"),
+    };
+
+    // A scripted `connect` with no tty used to create the session and only
+    // then die enabling raw mode ("ENODEV"), leaving the session behind.
+    let out = connect(&["local:scripted"]).await;
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(!out.status.success(), "connect without a tty must fail: {stderr}");
+    assert!(stderr.contains("not a terminal"), "error must say why: {stderr}");
+    assert!(stderr.contains("-d"), "error must point at --detach: {stderr}");
+    assert!(!stderr.contains("ENODEV"), "must fail before touching the terminal: {stderr}");
+    let leaked = list().await;
+    assert!(leaked.is_empty(), "no session may be created: {leaked:?}");
+
+    // -d is the supported non-interactive form and still works.
+    let out = connect(&["-d", "local:scripted"]).await;
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(out.status.success(), "connect -d must work without a tty: {stderr}");
+    let sessions = list().await;
+    assert_eq!(sessions.len(), 1, "{sessions:?}");
+    assert!(sessions[0].name.ends_with("/scripted"), "{sessions:?}");
+
+    let name = sessions[0].name.clone();
+    kill_cleanup(&ctl_path, &name).await;
+}
+
+#[tokio::test]
 async fn list_sessions_reports_last_activity() {
     let (_tmp, ctl_path) = test_ctl();
 

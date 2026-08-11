@@ -85,6 +85,16 @@ pub(crate) async fn connect_session(
         linger_from_cli,
     } = flags;
 
+    // Attaching puts stdin into raw mode, which a pipe or /dev/null can't do.
+    // Refuse before talking to the daemon: failing later (at raw-mode time)
+    // used to leave behind the session this scripted invocation just created.
+    if !detach && !std::io::IsTerminal::is_terminal(&std::io::stdin()) {
+        anyhow::bail!(
+            "stdin is not a terminal, so there is nothing to attach\n  \
+             use `connect -d` to create a session without attaching"
+        );
+    }
+
     // Resolve the session name. An explicit name or the interactive picker
     // can be resolved up front; -n/--new must wait until connect_or_start has
     // proven the socket reachable.

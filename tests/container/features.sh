@@ -193,19 +193,20 @@ test_force_takeover() {
         return
     }
 
-    # Probe via the daemon API directly: a second Attach on this client name
-    # without --force should fail with AlreadyAttached. We do this from the
-    # main test shell so we get the error directly without tmux timing games.
-    local out exit_code
-    out=$(gritty connect --no-create local:takeover < /dev/null 2>&1) && exit_code=0 || exit_code=$?
-    if echo "${out}" | grep -qiE "already attached|alreadyattached"; then
+    # A second Attach on this client name without --force must be rejected
+    # with AlreadyAttached. `connect` refuses to run at all without a tty on
+    # stdin, so probe from a second pane rather than with stdin redirected;
+    # the rejected connect exits straight back to that pane's shell.
+    tmux split-window -t feat -d
+    tmux send-keys -t feat.1 'gritty connect --no-create local:takeover' Enter
+    if wait_for_text "already attached" feat.1 5; then
         pass "takeover: second client rejected without --force"
     else
-        fail "takeover: second client rejected without --force" "exit=${exit_code} out='${out}'"
+        fail "takeover: second client rejected without --force" \
+            "$(tmux capture-pane -t feat.1 -p -S - | tail -5)"
     fi
 
-    # With --force, the steal should succeed from a second tmux pane.
-    tmux split-window -t feat -d
+    # With --force, the steal should succeed from that same second pane.
     tmux send-keys -t feat.1 'gritty connect --force local:takeover' Enter
     sleep 2
     tmux send-keys -t feat.1 'echo TAKEOVER_B_HERE' Enter

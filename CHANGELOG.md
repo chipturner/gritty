@@ -22,6 +22,13 @@ protocol interoperate with their neighbors.
   version-unknown case with the same verdict `refresh` acts on. Existing
   tunnels pick this up on their next `tunnel-create`/`refresh`. No
   protocol change.
+- **Fixed: `connect` without a terminal no longer leaves a session behind.**
+  Run from a script (stdin a pipe or `/dev/null`), `connect` created or
+  attached the session and only then died with `ENODEV: No such device`
+  when it tried to put stdin into raw mode -- so every accidental scripted
+  `connect` littered a fresh session. It now refuses up front, before
+  talking to the daemon, and points at `connect -d`, which remains the
+  non-interactive form. No protocol change.
 - **`send` disambiguates duplicate file names instead of erroring.**
   `gritty send docs/a/reference.md docs/b/reference.md` used to refuse
   ("duplicate file name `reference.md`"); it now sends them as

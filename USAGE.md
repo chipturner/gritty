@@ -95,7 +95,7 @@ Flag defaults come from config, with precedence CLI > `[host.<name>]` > `[defaul
 - `--no-forward-agent`: never forward the agent, even if `forward-agent = true` in config
 - `-O` / `--forward-open`: forward URL opens to local machine (on by default; `-O` overrides a `forward-open = false` in config, `--no-forward-open` disables for this connect)
 - `-c <cmd>` / `--command`: run a command instead of a login shell (when creating)
-- `-d` / `--detach`: create session without attaching (background jobs)
+- `-d` / `--detach`: create session without attaching (background jobs). This is the only form that works without a terminal on stdin -- a scripted `connect` (stdin from a pipe or `/dev/null`) is refused up front rather than creating a session it can't attach to
 - `--force`: take over an already-attached session without prompting
 - `--pick`: always show session picker (interactive when in a terminal)
 - `--no-pick`: never show session list; always target session `0`
