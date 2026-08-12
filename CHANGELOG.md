@@ -36,6 +36,11 @@ protocol interoperate with their neighbors.
   supervisor's log, since by then the supervisor has backgrounded -- it
   travels back through the readiness pipe like a startup error does), with
   the refusal message rewritten to name both versions and `bootstrap`.
+- **Fixed: a tunnel that fails after ssh is spawned reports the failure at
+  once.** The daemonize readiness pipe was inherited by everything the
+  supervisor and daemon exec'd, so `tunnel-create`'s error read waited for
+  EOF until that ssh (or, for the daemon, a session shell) happened to
+  exit; the pipe is now close-on-exec.
 - **Gone sockets are noticed promptly.** If a tunnel's local socket file
   disappears (a `/tmp` sweeper, an external `rm`), the supervisor now
   respawns ssh on the next 30s tick instead of counting the missing file as

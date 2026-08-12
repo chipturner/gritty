@@ -670,7 +670,14 @@ fn resolve_target_session(
 /// Otherwise they go to `/dev/null`. stdin always goes to `/dev/null`.
 fn daemonize(on_ready: impl FnOnce(u32), output_path: Option<&Path>) -> anyhow::Result<OwnedFd> {
     use nix::unistd::{ForkResult, fork, pipe, setsid};
+    // CLOEXEC (pipe2 is not portable to macOS): the pipe must survive the
+    // forks (it does -- only exec closes it) but not leak into what the
+    // daemon/supervisor go on to exec (ssh, session shells). A leaked write
+    // end keeps the parent's error read from seeing EOF until that unrelated
+    // process happens to exit.
     let (read_fd, write_fd) = pipe()?;
+    gritty::security::set_cloexec(read_fd.as_raw_fd())?;
+    gritty::security::set_cloexec(write_fd.as_raw_fd())?;
 
     // Safety: fork before any threads (tokio runtime not yet created)
     match unsafe { fork() }? {
