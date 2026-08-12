@@ -26,6 +26,16 @@ protocol interoperate with their neighbors.
   `--json`) and exits 0; naming a host that is down still fails, but
   `--json` now emits the group with its `error` field rather than a bare
   message.
+- **Message fixes.** Every counted noun goes through one helper, so
+  `session(s)`, `target(s)` and friends are gone (`failed to kill 2 of 3
+  sessions`); `kill` of a single session reports its error once instead of
+  `work: no such session: work` plus a `failed to kill 1 of 1` trailer;
+  `refresh` with no host says how many hosts it tried; and
+  `tunnel-create --ignore-version-mismatch` now prints the mismatch it is
+  ignoring on your terminal (the warning used to go only to the
+  supervisor's log, since by then the supervisor has backgrounded -- it
+  travels back through the readiness pipe like a startup error does), with
+  the refusal message rewritten to name both versions and `bootstrap`.
 - **Gone sockets are noticed promptly.** If a tunnel's local socket file
   disappears (a `/tmp` sweeper, an external `rm`), the supervisor now
   respawns ssh on the next 30s tick instead of counting the missing file as

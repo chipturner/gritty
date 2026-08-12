@@ -114,7 +114,7 @@ Flag defaults come from config, with precedence CLI > `[host.<name>]` > `[defaul
 - `--no-server-start`: don't auto-start the remote server
 - `--dry-run`: print SSH commands instead of running them
 - `-f` / `--foreground`: run in the foreground instead of backgrounding
-- `--ignore-version-mismatch`: connect even if the remote protocol version differs from local
+- `--ignore-version-mismatch`: start the tunnel even if the remote's protocol version differs from this binary's. The mismatch is still printed as a warning by the command that started the tunnel (session commands through it will be refused until the versions match; see [Debugging](#debugging))
 
 In the background (default) mode `tunnel-create` prints one status line; when stdout is not a terminal it also prints the tunnel's local socket path on stdout, so `sock=$(gritty tunnel-create devbox)` works in scripts.
 

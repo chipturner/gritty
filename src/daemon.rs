@@ -708,18 +708,9 @@ pub async fn run_with_options(
     let mut sigusr2 =
         tokio::signal::unix::signal(tokio::signal::unix::SignalKind::user_defined2())?;
 
-    // Now fully initialized -- signal readiness to parent (daemonize pipe):
-    // [0x01][pid: u32 LE]
-    if let Some(fd) = ready_fd {
-        use std::io::Write;
-        let mut f = std::fs::File::from(fd);
-        let pid = std::process::id();
-        let mut buf = [0u8; 5];
-        buf[0] = 0x01;
-        buf[1..5].copy_from_slice(&pid.to_le_bytes());
-        let _ = f.write_all(&buf);
-        // f drops here, closing the pipe
-    }
+    // Now fully initialized -- tell the daemonize parent, then close our end.
+    crate::signal_ready(&ready_fd);
+    drop(ready_fd);
 
     // Channel for handshake results -- spawned tasks send completed handshakes here
     let (conn_tx, mut conn_rx) =

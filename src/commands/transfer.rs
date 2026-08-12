@@ -715,8 +715,7 @@ pub(crate) async fn send_command(
     } else {
         let total_bytes: u64 = entries.iter().map(|(_, s, _, _)| s).sum();
         let total_str = gritty::client::format_size(total_bytes);
-        let s = if entries.len() == 1 { "" } else { "s" };
-        ui::status(&format!("sending {} file{s} ({total_str})", entries.len()));
+        ui::status(&format!("sending {} ({total_str})", ui::count(entries.len(), "file")));
 
         let mut buf = vec![0u8; 64 * 1024];
         for (name, size, _mode, path) in &entries {
@@ -844,8 +843,7 @@ where
     let mut buf = vec![0u8; 64 * 1024];
     while let Some((name, file_size, mode)) = read_entry_header(reader).await? {
         if received == 0 {
-            let s = if file_count == 1 { "" } else { "s" };
-            ui::status(&format!("receiving {file_count} file{s}"));
+            ui::status(&format!("receiving {}", ui::count(file_count as usize, "file")));
         }
         let target = dest_dir.join(&name);
         if let Some(parent) = target.parent() {
@@ -1010,8 +1008,11 @@ pub(crate) async fn receive_command(
     if received == 0 {
         ui::status("no files received");
     } else {
-        let s = if received == 1 { "" } else { "s" };
-        ui::success(&format!("received {received} file{s} into {}", dest_dir.display()));
+        ui::success(&format!(
+            "received {} into {}",
+            ui::count(received as usize, "file"),
+            dest_dir.display()
+        ));
     }
     Ok(())
 }

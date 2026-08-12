@@ -592,6 +592,31 @@ async fn bare_kill_session_lists_local_sessions() {
     kill_cleanup(&ctl_path, "shared/victim").await;
 }
 
+#[tokio::test]
+async fn kill_reports_one_error_line_per_failure_and_summarizes_only_batches() {
+    let (tmp, ctl_path) = test_ctl();
+    let ctl = ctl_path.clone();
+    let _daemon = tokio::spawn(async move { gritty::daemon::run(&ctl, None).await });
+    wait_for_daemon(&ctl_path).await;
+
+    // One target: its own error, once -- no "target:" prefix restating the
+    // name and no "failed to kill 1 of 1" trailer.
+    let out = gritty_in(tmp.path(), &["kill-session", "local:ghost"]).await;
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(!out.status.success());
+    assert_eq!(stderr.matches("error:").count(), 1, "{stderr}");
+    assert!(stderr.contains("no such session: ghost"), "{stderr}");
+    assert!(!stderr.contains("failed to kill"), "{stderr}");
+
+    // A batch: per-target attribution plus a properly pluralized summary.
+    let out = gritty_in(tmp.path(), &["kill-session", "local:ghost", "local:phantom"]).await;
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(stderr.contains("local:ghost: no such session"), "{stderr}");
+    assert!(stderr.contains("local:phantom: no such session"), "{stderr}");
+    assert!(stderr.contains("failed to kill 2 of 2 sessions"), "{stderr}");
+    assert!(!stderr.contains("(s)"), "{stderr}");
+}
+
 /// Wait until `name` is listed and detached (the creating connection's EOF is
 /// noticed asynchronously).
 async fn wait_detached(ctl_path: &std::path::Path, name: &str) {

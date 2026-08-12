@@ -129,8 +129,9 @@ async fn refresh_local(ctl_socket: Option<PathBuf>, yes: bool) -> anyhow::Result
         use gritty::protocol::Frame;
         if let Some(n) = restart_blocked_by(attached_session_count(&ctl_path).await, yes) {
             anyhow::bail!(
-                "local daemon is stale, but restarting it would kill {n} attached session(s)\n  \
-                 rerun with -y to restart anyway, or wait for the clients to detach"
+                "local daemon is stale, but restarting it would kill {} attached\n  \
+                 rerun with -y to restart anyway, or wait for the clients to detach",
+                ui::count(n, "session")
             );
         }
         match util::server_request_any_version(&ctl_path, Frame::KillServer).await {
@@ -346,14 +347,19 @@ pub(crate) async fn refresh(
                 ui::error(&format!("refresh local: {e:#}"));
                 failed += 1;
             }
-            for name in gritty::connect::enumerate_tunnels() {
+            let tunnels = gritty::connect::enumerate_tunnels();
+            let total = 1 + tunnels.len();
+            for name in tunnels {
                 if let Err(e) = refresh_remote(&name, config, yes).await {
                     ui::error(&format!("refresh {name}: {e:#}"));
                     failed += 1;
                 }
             }
             if failed > 0 {
-                anyhow::bail!("refresh failed for {failed} target(s) (see errors above)");
+                anyhow::bail!(
+                    "refresh failed for {failed} of {} (see errors above)",
+                    ui::count(total, "host")
+                );
             }
             Ok(())
         }

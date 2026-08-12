@@ -1282,10 +1282,10 @@ impl ClientRelay<'_> {
             }
             Some(Ok(Frame::SendOffer { file_count, total_bytes })) => {
                 let size_str = format_size(total_bytes);
-                let s = if file_count == 1 { "" } else { "s" };
+                let files = crate::ui::count(file_count as usize, "file");
                 write_stdout_async(
                     self.async_stdout,
-                    status_msg(&format!("receiving {file_count} file{s} ({size_str})")).as_bytes(),
+                    status_msg(&format!("receiving {files} ({size_str})")).as_bytes(),
                 )
                 .await?;
             }

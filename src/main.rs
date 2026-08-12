@@ -660,8 +660,9 @@ fn resolve_target_session(
 ///
 /// Double-fork daemonize: parent -> session leader -> grandchild (daemon).
 ///
-/// Parent: blocks reading the pipe. Gets `[0x01][pid: u32 LE]` -> daemon ready, runs
-/// `on_ready(pid)`, exits 0. Gets other data -> error message, exits 1. Gets EOF -> crashed.
+/// Parent: blocks reading the pipe (record format: lib.rs readiness section) --
+/// warnings are printed as they arrive; ready runs `on_ready(pid)` and exits 0;
+/// an error message exits 1; EOF means the child crashed.
 /// Session leader (middle child): calls setsid(), forks again, exits immediately.
 /// Grandchild (daemon): redirects stdio, chdir("/"), returns Ok(OwnedFd) for the pipe.
 ///
@@ -680,28 +681,17 @@ fn daemonize(on_ready: impl FnOnce(u32), output_path: Option<&Path>) -> anyhow::
             // Reap the middle child (exits immediately after second fork)
             let _ = nix::sys::wait::waitpid(child, None);
 
-            // Read from pipe: 0x01 + pid = daemon ready, other data = error, EOF = crashed
-            let mut first = [0u8; 1];
-            let mut read_file = std::fs::File::from(read_fd);
-            use std::io::Read;
-            match read_file.read(&mut first) {
-                Ok(1) if first[0] == 0x01 => {
-                    let mut pid_buf = [0u8; 4];
-                    if read_file.read_exact(&mut pid_buf).is_ok() {
-                        on_ready(u32::from_le_bytes(pid_buf));
-                        std::process::exit(0);
-                    }
-                    ui::error("failed to start");
+            // Record format: see the readiness-pipe section of lib.rs.
+            match gritty::read_ready_pipe(std::fs::File::from(read_fd), ui::warn) {
+                gritty::ReadyOutcome::Ready { pid } => {
+                    on_ready(pid);
+                    std::process::exit(0);
+                }
+                gritty::ReadyOutcome::Failed(msg) => {
+                    ui::error(&msg);
                     std::process::exit(1);
                 }
-                Ok(1) => {
-                    // Error message from child -- read the rest
-                    let mut msg = vec![first[0]];
-                    let _ = read_file.read_to_end(&mut msg);
-                    ui::error(String::from_utf8_lossy(&msg).trim());
-                    std::process::exit(1);
-                }
-                _ => {
+                gritty::ReadyOutcome::Crashed => {
                     ui::error("failed to start");
                     std::process::exit(1);
                 }

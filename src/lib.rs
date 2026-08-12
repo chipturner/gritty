@@ -305,9 +305,148 @@ pub fn spawn_channel_relay<R, W, F, G>(
     });
 }
 
+// ---------------------------------------------------------------------------
+// Readiness pipe (daemonize <-> daemon / tunnel supervisor)
+// ---------------------------------------------------------------------------
+//
+// `main.rs::daemonize()` forks and then blocks on a pipe until the grandchild
+// says how startup went. Records, child -> parent:
+//
+//   [0x01][pid: u32 LE]                    ready; the parent reports success and exits 0
+//   [0x03][len: u16 LE][utf-8 message]      a warning to show the user; more records follow
+//   anything else, to EOF                   an error message; the parent prints it and exits 1
+//   EOF with nothing                        the child died before saying anything
+//
+// Warnings exist because after the fork the child's stderr is the `.out` file:
+// something like "connecting despite a protocol mismatch" written there is
+// invisible at the moment it matters. In foreground mode there is no pipe and
+// the same call renders straight to the terminal.
+
+const READY_TAG: u8 = 0x01;
+const WARNING_TAG: u8 = 0x03;
+
+/// What the parent side of the readiness pipe concluded.
+#[derive(Debug, PartialEq, Eq)]
+pub enum ReadyOutcome {
+    Ready { pid: u32 },
+    Failed(String),
+    Crashed,
+}
+
+/// Child side: startup finished. `None` (foreground) is a no-op.
+pub fn signal_ready(ready_fd: &Option<std::os::fd::OwnedFd>) {
+    if let Some(fd) = ready_fd {
+        let mut record = [READY_TAG; 5];
+        record[1..].copy_from_slice(&std::process::id().to_le_bytes());
+        let _ = nix::unistd::write(fd, &record);
+    }
+}
+
+/// Child side: something the user should see even though startup will go on
+/// to succeed. Through the pipe when there is one, otherwise (foreground)
+/// straight to the terminal.
+pub fn signal_warning(ready_fd: &Option<std::os::fd::OwnedFd>, message: &str) {
+    let Some(fd) = ready_fd else {
+        ui::warn(message);
+        return;
+    };
+    let _ = nix::unistd::write(fd, &warning_record(message));
+}
+
+fn warning_record(message: &str) -> Vec<u8> {
+    let body = &message.as_bytes()[..message.len().min(u16::MAX as usize)];
+    let mut record = Vec::with_capacity(3 + body.len());
+    record.push(WARNING_TAG);
+    record.extend_from_slice(&(body.len() as u16).to_le_bytes());
+    record.extend_from_slice(body);
+    record
+}
+
+/// Parent side: consume records until the child's verdict, handing each
+/// warning to `on_warning` as it arrives.
+pub fn read_ready_pipe(
+    mut pipe: impl std::io::Read,
+    mut on_warning: impl FnMut(&str),
+) -> ReadyOutcome {
+    loop {
+        let mut tag = [0u8; 1];
+        match pipe.read(&mut tag) {
+            Ok(1) => {}
+            _ => return ReadyOutcome::Crashed,
+        }
+        match tag[0] {
+            READY_TAG => {
+                let mut pid = [0u8; 4];
+                return match pipe.read_exact(&mut pid) {
+                    Ok(()) => ReadyOutcome::Ready { pid: u32::from_le_bytes(pid) },
+                    Err(_) => ReadyOutcome::Crashed,
+                };
+            }
+            WARNING_TAG => {
+                let mut len = [0u8; 2];
+                if pipe.read_exact(&mut len).is_err() {
+                    return ReadyOutcome::Crashed;
+                }
+                let mut body = vec![0u8; u16::from_le_bytes(len) as usize];
+                if pipe.read_exact(&mut body).is_err() {
+                    return ReadyOutcome::Crashed;
+                }
+                on_warning(String::from_utf8_lossy(&body).trim());
+            }
+            first => {
+                let mut message = vec![first];
+                let _ = pipe.read_to_end(&mut message);
+                return ReadyOutcome::Failed(String::from_utf8_lossy(&message).trim().to_string());
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn ready_record(pid: u32) -> Vec<u8> {
+        let mut r = vec![READY_TAG];
+        r.extend_from_slice(&pid.to_le_bytes());
+        r
+    }
+
+    #[test]
+    fn ready_pipe_yields_the_pid_after_any_warnings() {
+        let mut stream = warning_record("first thing");
+        stream.extend(warning_record("second thing"));
+        stream.extend(ready_record(4242));
+        let mut warnings = Vec::new();
+        let outcome = read_ready_pipe(stream.as_slice(), |w| warnings.push(w.to_string()));
+        assert_eq!(outcome, ReadyOutcome::Ready { pid: 4242 });
+        assert_eq!(warnings, ["first thing", "second thing"]);
+    }
+
+    #[test]
+    fn ready_pipe_treats_plain_text_as_the_failure_message() {
+        let mut warnings = Vec::new();
+        let outcome = read_ready_pipe(&b"ssh to devbox failed: no route\n"[..], |w| {
+            warnings.push(w.to_string())
+        });
+        assert_eq!(outcome, ReadyOutcome::Failed("ssh to devbox failed: no route".into()));
+        assert!(warnings.is_empty());
+
+        // A warning followed by a failure: the warning is still delivered.
+        let mut stream = warning_record("heads up");
+        stream.extend_from_slice(b"then it died");
+        let outcome = read_ready_pipe(stream.as_slice(), |w| warnings.push(w.to_string()));
+        assert_eq!(outcome, ReadyOutcome::Failed("then it died".into()));
+        assert_eq!(warnings, ["heads up"]);
+    }
+
+    #[test]
+    fn ready_pipe_eof_anywhere_short_of_a_verdict_is_a_crash() {
+        assert_eq!(read_ready_pipe(&b""[..], |_| {}), ReadyOutcome::Crashed);
+        assert_eq!(read_ready_pipe(&[READY_TAG, 1, 2][..], |_| {}), ReadyOutcome::Crashed);
+        let truncated = &warning_record("a longer warning")[..6];
+        assert_eq!(read_ready_pipe(truncated, |_| {}), ReadyOutcome::Crashed);
+    }
 
     /// Each task reports the span it sees *at poll time*. The entered guard is
     /// released before either handle is awaited, which is what the daemon

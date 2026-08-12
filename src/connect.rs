@@ -1724,21 +1724,44 @@ pub enum TunnelStatus {
 /// `probe_tunnel_alive` observes): without this being applied on *both*, a
 /// cached connect to a freshly-upgraded remote would silently succeed and
 /// defeat the fail-fast diagnostic this check exists to provide.
-fn check_remote_protocol_version(remote: u16, ignore: bool) -> anyhow::Result<()> {
-    if remote == crate::protocol::PROTOCOL_VERSION {
-        return Ok(());
+/// The version gate. Ignoring a mismatch is a user decision that they must
+/// be able to see they made: the warning goes back through the readiness
+/// pipe so the `tunnel-create` (or auto-starting `connect`) in the terminal
+/// prints it, not just the supervisor's log.
+fn check_remote_protocol_version(
+    remote: u16,
+    ignore: bool,
+    ready_fd: &Option<OwnedFd>,
+) -> anyhow::Result<()> {
+    match mismatch_message(remote, crate::protocol::PROTOCOL_VERSION, ignore) {
+        None => Ok(()),
+        Some(msg) if ignore => {
+            warn!("{msg}");
+            crate::signal_warning(ready_fd, &msg);
+            Ok(())
+        }
+        Some(msg) => bail!("{msg}"),
     }
-    let msg = format!(
-        "remote protocol version ({remote}) differs from local ({}); \
-         use --ignore-version-mismatch to connect anyway",
-        crate::protocol::PROTOCOL_VERSION
-    );
-    if ignore {
-        warn!("{msg}");
-        Ok(())
+}
+
+/// `None` when the versions agree; otherwise the text for the gate's verdict.
+fn mismatch_message(remote: u16, local: u16, ignoring: bool) -> Option<String> {
+    if remote == local {
+        return None;
+    }
+    Some(if ignoring {
+        format!(
+            "remote speaks protocol v{remote}, this gritty speaks v{local} -- tunnel started \
+             anyway (--ignore-version-mismatch); session commands will be refused until the \
+             versions match"
+        )
     } else {
-        bail!("{msg}");
-    }
+        format!(
+            "remote speaks protocol v{remote}, this gritty speaks v{local}; upgrade one side \
+             (gritty bootstrap <host>), or pass --ignore-version-mismatch to start the tunnel \
+             anyway"
+        )
+    })
 }
 
 /// Probe the tunnel for a live remote daemon, returning the remote's protocol
@@ -2134,7 +2157,7 @@ pub async fn run(opts: ConnectOpts, ready_fd: Option<OwnedFd>) -> anyhow::Result
             } else {
                 report_already_running(&connection_name, &local_sock);
             }
-            signal_ready(&ready_fd);
+            crate::signal_ready(&ready_fd);
             return Ok(0);
         }
     };
@@ -2206,7 +2229,7 @@ pub async fn run(opts: ConnectOpts, ready_fd: Option<OwnedFd>) -> anyhow::Result
     // `remote_version == None` and is gated later against the version
     // observed by probe_tunnel_alive.
     if let Some(rv) = remote_version {
-        check_remote_protocol_version(rv, opts.ignore_version_mismatch)?;
+        check_remote_protocol_version(rv, opts.ignore_version_mismatch, &ready_fd)?;
     }
 
     // 5. Spawn SSH tunnel
@@ -2309,7 +2332,7 @@ pub async fn run(opts: ConnectOpts, ready_fd: Option<OwnedFd>) -> anyhow::Result
     // otherwise a cached connect to a freshly-upgraded remote would succeed
     // silently, defeating the fail-fast diagnostic the slow path provides.
     if used_cache {
-        check_remote_protocol_version(probed_version, opts.ignore_version_mismatch)?;
+        check_remote_protocol_version(probed_version, opts.ignore_version_mismatch, &ready_fd)?;
     }
     let _ = std::fs::write(&remote_sock_cache, &remote_sock);
 
@@ -2325,7 +2348,7 @@ pub async fn run(opts: ConnectOpts, ready_fd: Option<OwnedFd>) -> anyhow::Result
     }
 
     // 7. Signal readiness to parent (or print if foreground)
-    signal_ready(&ready_fd);
+    crate::signal_ready(&ready_fd);
 
     // 8. Hand off the child to the tunnel monitor background task
     let original_child = guard.child.take().unwrap();
@@ -2367,17 +2390,6 @@ pub async fn run(opts: ConnectOpts, ready_fd: Option<OwnedFd>) -> anyhow::Result
     drop(guard);
 
     Ok(0)
-}
-
-/// Write readiness signal to the pipe fd: [0x01][pid: u32 LE].
-fn signal_ready(ready_fd: &Option<OwnedFd>) {
-    if let Some(fd) = ready_fd {
-        let pid = std::process::id();
-        let mut buf = [0u8; 5];
-        buf[0] = 0x01;
-        buf[1..5].copy_from_slice(&pid.to_le_bytes());
-        let _ = nix::unistd::write(fd, &buf);
-    }
 }
 
 // ---------------------------------------------------------------------------
@@ -3183,6 +3195,18 @@ mod tests {
     }
 
     #[test]
+    fn mismatch_message_distinguishes_refusing_from_ignoring() {
+        assert_eq!(mismatch_message(23, 23, false), None);
+        assert_eq!(mismatch_message(23, 23, true), None);
+        let refused = mismatch_message(22, 23, false).unwrap();
+        assert!(refused.contains("v22") && refused.contains("v23"), "{refused}");
+        assert!(refused.contains("--ignore-version-mismatch"), "{refused}");
+        let ignored = mismatch_message(22, 23, true).unwrap();
+        assert!(ignored.contains("anyway"), "{ignored}");
+        assert!(!ignored.contains("pass --ignore"), "must not suggest the flag in use: {ignored}");
+    }
+
+    #[test]
     fn respawn_is_immediate_when_the_socket_file_is_gone_else_after_strikes() {
         // Missing file: definitive, regardless of the strike count.
         assert!(respawn_now(false, 0));
@@ -3742,13 +3766,15 @@ mod tests {
 
     #[test]
     fn version_gate_accepts_matching_version() {
-        assert!(check_remote_protocol_version(crate::protocol::PROTOCOL_VERSION, false).is_ok());
+        assert!(
+            check_remote_protocol_version(crate::protocol::PROTOCOL_VERSION, false, &None).is_ok()
+        );
     }
 
     #[test]
     fn version_gate_rejects_mismatch() {
         let rv = crate::protocol::PROTOCOL_VERSION.wrapping_add(1);
-        let err = check_remote_protocol_version(rv, false).unwrap_err().to_string();
+        let err = check_remote_protocol_version(rv, false, &None).unwrap_err().to_string();
         assert!(err.contains(&rv.to_string()), "message names remote version: {err}");
         assert!(
             err.contains(&crate::protocol::PROTOCOL_VERSION.to_string()),
@@ -3758,10 +3784,21 @@ mod tests {
     }
 
     #[test]
-    fn version_gate_ignore_flag_downgrades_to_warn() {
+    fn version_gate_ignore_flag_passes_and_sends_the_warning_to_the_parent() {
         let rv = crate::protocol::PROTOCOL_VERSION.wrapping_add(1);
-        // With the escape hatch set, a mismatch must not bail.
-        assert!(check_remote_protocol_version(rv, true).is_ok());
+        let (read_end, write_end) = nix::unistd::pipe().unwrap();
+        let ready_fd = Some(write_end);
+        // With the escape hatch set, a mismatch must not bail...
+        assert!(check_remote_protocol_version(rv, true, &ready_fd).is_ok());
+        drop(ready_fd);
+        // ...and the daemonize parent must be handed the warning (the child's
+        // own stderr is the .out file by then). EOF after it = no verdict yet.
+        let mut warnings = Vec::new();
+        let outcome =
+            crate::read_ready_pipe(std::fs::File::from(read_end), |w| warnings.push(w.to_string()));
+        assert_eq!(outcome, crate::ReadyOutcome::Crashed);
+        assert_eq!(warnings.len(), 1, "{warnings:?}");
+        assert!(warnings[0].contains(&format!("v{rv}")), "{warnings:?}");
     }
 
     #[test]

@@ -216,9 +216,23 @@ fn emit(level: Level, text: &str) {
     anstream::eprintln!("{}", format(level, text, LineEnding::None));
 }
 
+/// `1 session` / `3 sessions` -- every counted noun gritty prints goes
+/// through here, so nothing says `session(s)`. Nouns pluralize with a plain
+/// `s`; that is true of everything gritty counts.
+pub fn count(n: usize, noun: &str) -> String {
+    if n == 1 { format!("1 {noun}") } else { format!("{n} {noun}s") }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn count_pluralizes_everything_but_one() {
+        assert_eq!(count(0, "session"), "0 sessions");
+        assert_eq!(count(1, "session"), "1 session");
+        assert_eq!(count(2, "file"), "2 files");
+    }
 
     #[test]
     fn narration_levels_carry_the_marker() {

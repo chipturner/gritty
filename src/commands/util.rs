@@ -1059,9 +1059,7 @@ pub(crate) async fn info(ctl_socket: Option<PathBuf>, json: bool) -> anyhow::Res
             ("loaded", None, "loaded".to_string())
         }
         gritty::config::ConfigStatus::Valid(cfg) => {
-            let n = cfg.host.len();
-            let s = if n == 1 { "" } else { "s" };
-            ("loaded", None, format!("loaded, {n} host{s}"))
+            ("loaded", None, format!("loaded, {}", gritty::ui::count(cfg.host.len(), "host")))
         }
     };
 
@@ -1138,10 +1136,7 @@ fn render_info(r: &InfoJson, cfg_status: &str) -> String {
 
     let pid = r.server_pid.map(|p| format!("pid {p}, ")).unwrap_or_default();
     let server = match (r.server_state, r.sessions) {
-        ("running", Some(n)) => {
-            let s = if n == 1 { "" } else { "s" };
-            format!("running ({pid}{n} session{s})")
-        }
+        ("running", Some(n)) => format!("running ({pid}{})", gritty::ui::count(n, "session")),
         ("version-mismatch", _) => {
             format!("running ({pid}protocol version mismatch -- run `gritty refresh`)")
         }

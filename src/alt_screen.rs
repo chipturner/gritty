@@ -1,10 +1,10 @@
-/// Tracks whether the terminal is in alternate screen mode by scanning
-/// PTY output for standard escape sequences.
-///
-/// Sequences tracked:
-/// - `\x1b[?1049h` / `\x1b[?1049l` (standard smcup/rmcup)
-/// - `\x1b[?47h` / `\x1b[?47l` (legacy)
-/// - `\x1b[?1047h` / `\x1b[?1047l` (legacy)
+//! Tracks whether the terminal is in alternate screen mode by scanning
+//! PTY output for standard escape sequences.
+//!
+//! Sequences tracked:
+//! - `\x1b[?1049h` / `\x1b[?1049l` (standard smcup/rmcup)
+//! - `\x1b[?47h` / `\x1b[?47l` (legacy)
+//! - `\x1b[?1047h` / `\x1b[?1047l` (legacy)
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ScanState {

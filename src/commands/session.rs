@@ -1377,13 +1377,20 @@ pub(crate) async fn kill_sessions(
                 kill_one(&session, &client_name, &ctl_path).await
             }
         };
-        if let Err(e) = result {
-            ui::error(&format!("{target}: {e:#}"));
-            failed += 1;
+        match result {
+            // A lone target's error stands on its own (kill_one's messages
+            // name the session); attribution and a summary only earn their
+            // lines when several targets are in play.
+            Err(e) if targets.len() == 1 => return Err(e),
+            Err(e) => {
+                ui::error(&format!("{target}: {e:#}"));
+                failed += 1;
+            }
+            Ok(()) => {}
         }
     }
     if failed > 0 {
-        anyhow::bail!("failed to kill {failed} of {} session(s)", targets.len());
+        anyhow::bail!("failed to kill {failed} of {}", ui::count(targets.len(), "session"));
     }
     Ok(())
 }
@@ -1498,9 +1505,11 @@ async fn tui_mark_sessions(
             );
         }
         if confirm {
-            let n = marked.len();
-            let s = if n == 1 { "" } else { "s" };
-            let _ = write!(stderr, "\x1b[31;1m  kill {n} session{s}? y/n\x1b[0m\r\n");
+            let _ = write!(
+                stderr,
+                "\x1b[31;1m  kill {}? y/n\x1b[0m\r\n",
+                ui::count(marked.len(), "session")
+            );
         } else {
             let _ = write!(
                 stderr,
@@ -1680,7 +1689,10 @@ pub(crate) async fn prune_sessions(
     } else {
         print_session_table(&candidates, now, client_name, false, "");
         if !yes {
-            ui::detail(&format!("dry run -- pass -y to kill {} session(s)", candidates.len()));
+            ui::detail(&format!(
+                "dry run -- pass -y to kill {}",
+                ui::count(candidates.len(), "session")
+            ));
             return Ok(());
         }
         candidates
@@ -1708,7 +1720,7 @@ pub(crate) async fn prune_sessions(
         }
     }
     if failed > 0 {
-        anyhow::bail!("failed to kill {failed} of {} session(s)", victims.len());
+        anyhow::bail!("failed to kill {failed} of {}", ui::count(victims.len(), "session"));
     }
     Ok(())
 }

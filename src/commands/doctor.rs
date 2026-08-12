@@ -119,13 +119,9 @@ fn render(groups: &[(&str, Vec<Check>)]) {
     println!();
     match (fails, warns) {
         (0, 0) => println!("no issues found"),
-        (0, w) => println!("{w} warning{}", if w == 1 { "" } else { "s" }),
-        (f, 0) => println!("{f} issue{}", if f == 1 { "" } else { "s" }),
-        (f, w) => println!(
-            "{f} issue{}, {w} warning{}",
-            if f == 1 { "" } else { "s" },
-            if w == 1 { "" } else { "s" },
-        ),
+        (0, w) => println!("{}", ui::count(w, "warning")),
+        (f, 0) => println!("{}", ui::count(f, "issue")),
+        (f, w) => println!("{}, {}", ui::count(f, "issue"), ui::count(w, "warning")),
     }
 }
 
@@ -172,10 +168,9 @@ fn session_summary(sessions: &[gritty::protocol::SessionEntry]) -> String {
     let attached = sessions.iter().filter(|s| s.attached).count();
     match (n, attached) {
         (0, _) => "no sessions".to_string(),
-        (1, 0) => "1 session".to_string(),
+        (_, 0) => ui::count(n, "session"),
         (1, _) => "1 session, attached".to_string(),
-        (n, 0) => format!("{n} sessions"),
-        (n, a) => format!("{n} sessions, {a} attached"),
+        (_, a) => format!("{}, {a} attached", ui::count(n, "session")),
     }
 }
 
@@ -211,9 +206,10 @@ fn check_config() -> Vec<Check> {
             if cfg.host.is_empty() {
                 checks.push(Check::ok("config valid"));
             } else {
-                let n = cfg.host.len();
-                let s = if n == 1 { "" } else { "s" };
-                checks.push(Check::ok(format!("config valid ({n} host{s})")));
+                checks.push(Check::ok(format!(
+                    "config valid ({})",
+                    ui::count(cfg.host.len(), "host")
+                )));
             }
         }
         gritty::config::ConfigStatus::Invalid(e) => {
@@ -596,11 +592,12 @@ fn check_stale_bindlocks(socket_dir: &Path) -> Vec<Check> {
     if stale.is_empty() {
         return Vec::new();
     }
-    let n = stale.len();
-    let s = if n == 1 { "" } else { "s" };
     vec![
-        Check::warn(format!("{n} stale bind-lock file{s} (socket already gone)"))
-            .with_hint(format!("safe to remove: rm '{}'/*.bindlock", socket_dir.display())),
+        Check::warn(format!(
+            "{} (socket already gone)",
+            ui::count(stale.len(), "stale bind-lock file")
+        ))
+        .with_hint(format!("safe to remove: rm '{}'/*.bindlock", socket_dir.display())),
     ]
 }
 
@@ -765,10 +762,8 @@ fn check_sockets(socket_dir: &Path, live_session_ids: &[u32]) -> Vec<Check> {
     }
 
     orphaned.sort();
-    let n = orphaned.len();
-    let s = if n == 1 { "" } else { "s" };
     let list = orphaned.join(", ");
-    vec![Check::warn(format!("{n} orphaned socket file{s}: {list}"))]
+    vec![Check::warn(format!("{}: {list}", ui::count(orphaned.len(), "orphaned socket file")))]
 }
 
 // ---- Helpers ----------------------------------------------------------------
