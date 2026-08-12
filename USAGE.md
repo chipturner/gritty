@@ -17,8 +17,8 @@ Complete command and flag reference. For an overview and quick start, see [READM
 | `gritty refresh [host]` | `-y` | Restart only processes running stale code, reap orphaned daemons, and (for remote hosts) verify protocol compatibility end to end (idempotent). No args = local + all tunnels. Refuses to restart a daemon that has attached sessions unless `-y` is given (restarting kills them) |
 | `gritty tunnels [--json]` | `tun` | List active SSH tunnels |
 | `gritty tunnel-create <destination>` | | Set up SSH tunnel to remote host |
-| `gritty tunnel-destroy <name>` | | Tear down an SSH tunnel |
-| `gritty bootstrap <destination>` | | Install gritty on a remote host |
+| `gritty tunnel-destroy <name>` | | Tear down an SSH tunnel. A name gritty has never seen is an error (it lists the ones it knows); the remembered destination and `-o` options are kept, so a later `connect <name>` comes back to the same place -- run `tunnel-create <new-dest> -n <name>` to change them |
+| `gritty bootstrap <destination>` | | Install gritty on a remote host (this binary's release by default), then confirm the installed protocol version matches and print the `connect` command to run next |
 | `gritty local-forward [target] <port>` | `lf` | Make a local (client-side) port reachable inside the session (like ssh `-R`) |
 | `gritty remote-forward [target] <port>` | `rf` | Bring a remote (session-side) port to the client (like ssh `-L`) |
 | `gritty send [files...]` | | Send files to a paired receiver |
@@ -44,7 +44,7 @@ A session is addressed as `host:session`.
 laptop$ gritty connect devbox:work          # "devbox" = the host you ssh to
 ```
 
-It is technically the name assigned by `gritty tunnel-create`, which defaults to the hostname but can be remapped with `-n`. Remapping is only useful when the SSH destination and the name you want to type differ:
+It is technically the name assigned by `gritty tunnel-create`, which defaults to the hostname but can be remapped with `-n`. Remapping is only useful when the SSH destination and the name you want to type differ; the mapping is remembered in the socket dir (it survives `tunnel-destroy` and reboots that keep the dir, and `connect devbox` re-uses it), while a `[host.devbox] aliases` config entry is the form that survives anything:
 
 ```
 laptop$ gritty tunnel-create user@10.0.0.5 -n devbox
@@ -116,9 +116,12 @@ Flag defaults come from config, with precedence CLI > `[host.<name>]` > `[defaul
 - `-f` / `--foreground`: run in the foreground instead of backgrounding
 - `--ignore-version-mismatch`: connect even if the remote protocol version differs from local
 
+In the background (default) mode `tunnel-create` prints one status line; when stdout is not a terminal it also prints the tunnel's local socket path on stdout, so `sock=$(gritty tunnel-create devbox)` works in scripts.
+
 ### Bootstrap options (`bootstrap`)
 
 - `--install-dir <dir>`: remote install directory (default: `~/.local/bin`)
+- `--release <version>`: release to install (default: this binary's version, so both sides speak the same protocol; `latest` installs the newest published release)
 - `-o <option>` / `--ssh-option`: extra SSH options (repeatable)
 
 ### Send/receive options

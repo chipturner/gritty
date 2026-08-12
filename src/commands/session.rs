@@ -1779,8 +1779,8 @@ pub(crate) async fn restart(
         // name and break SSH.
         let destination =
             gritty::connect::resolve_destination(&host, config.alias_destination(&host).as_deref());
-        // Capture the recreate args (destination + persisted CLI -o options)
-        // *before* disconnect wipes the sidecar files.
+        // Recreate args come from the .dest/.ssh-opts caches, which disconnect
+        // leaves in place.
         let recreate = gritty::connect::tunnel_recreate_args(&host, &destination);
         // Tear down the tunnel (the supervisor may already be exiting
         // because the ctl socket vanished when the daemon died, but

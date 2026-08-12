@@ -33,9 +33,9 @@ A tunnel named `NAME` owns these files in `socket_dir()`:
 | `connect-NAME.lock`     | `try_acquire_lock` (flock exclusive)     | Liveness: flock held == supervisor alive. |
 | `connect-NAME.pid`      | `run()` immediately after lock acquired  | Target for `disconnect`'s SIGTERM. |
 | `connect-NAME.sock`     | `ssh -L` bind target                     | Client connects here to reach remote `ctl.sock`. |
-| `connect-NAME.dest`     | `run()` after socket is up               | Original destination string, for `restart` / auto-start recovery. |
+| `connect-NAME.dest`     | `run()` after socket is up               | Original destination string, for `restart` / auto-start recovery. Persistence cache: survives teardown (like `.remote-sock`), so `connect NAME` after a `tunnel-destroy` or a supervisor death returns to the same `user@host:port`; overwritten by the next `tunnel-create`. |
 | `connect-NAME.info`     | `run()` via `runinfo`                    | Protocol version + git hash + exe of the running supervisor; the staleness signal `doctor`/`refresh` read. |
-| `connect-NAME.ssh-opts` | `run()` after socket is up               | Pre-merge CLI `-o` options (one per line), replayed on `restart` / auto-start via `tunnel_recreate_args`. Config `ssh-options` are re-resolved and not stored here. |
+| `connect-NAME.ssh-opts` | `run()` after socket is up               | Pre-merge CLI `-o` options (one per line), replayed on `restart` / auto-start via `tunnel_recreate_args`. Config `ssh-options` are re-resolved and not stored here. Persistence cache like `.dest`; a `tunnel-create` without `-o` removes it. |
 | `connect-NAME.log`      | tracing subscriber                       | Supervisor's own structured logs. |
 | `connect-NAME.out`      | daemonize stderr redirection             | ssh child's stderr (forward-setup errors, etc.). |
 | `connect-NAME.remote-sock` | `run()` after post-bind probe succeeds | Cache of remote `ctl.sock` path. Survives teardown so subsequent connects can skip the Preflight `ensure_remote_ready` SSH-exec. A non-absolute-path entry (poison from a failed probe) is discarded on read. |
@@ -66,7 +66,7 @@ Three guards keep that state from becoming destructive:
    `LockIdentity { dev, ino }` from its held flock fd. On drop it compares
    that against `stat(lock_path)`: if they differ (the path was replaced or
    removed), the supervisor is a ghost and removes **nothing** -- the real
-   owner's `.sock`/`.pid`/`.info`/`.dest`/`.ssh-opts`/`.kick`/`.lock` all survive. When the
+   owner's `.sock`/`.pid`/`.info`/`.kick`/`.lock` all survive. When the
    identities match, it unlinks the sidecar files *while still holding the
    flock* (a racing `O_CREAT` after the unlink gets a brand-new inode and
    flocks it independently) and releases the flock last.
@@ -176,7 +176,7 @@ stateDiagram-v2
         KillChild --> CheckOwnership: ConnectGuard.drop\n(SIGTERM ssh)
         CheckOwnership --> CleanupFiles: LockIdentity matches path
         CheckOwnership --> ReleaseFlock: path replaced / gone\n(ghost; leave owner's files alone)
-        CleanupFiles --> ReleaseFlock: rm sock/pid/info/dest/\nssh-opts/kick/lock\n(while flock still held)
+        CleanupFiles --> ReleaseFlock: rm sock/pid/info/\nkick/lock\n(while flock still held)
         ReleaseFlock --> [*]: drop Flock
     }
 
@@ -250,7 +250,7 @@ kill the remote daemon and its live sessions.
    startup surfaces as a fast, diagnosable error instead of forcing us to
    wait the full `socket_wait_deadline`.
 2. **Absent -> Starting** -- `try_acquire_lock` returned `Ok`. We own the
-   supervisor role. Clean any stale `.sock`/`.pid`/`.info`/`.dest`/`.ssh-opts`/`.kick` (we
+   supervisor role. Clean any stale `.sock`/`.pid`/`.info`/`.kick` (we
    don't remove the lock we just acquired), then write the `.pid` file **immediately**
    so `disconnect` can find us during the startup window. A `LockFileBailGuard`
    is armed here too: if the fallible setup that follows (`ensure_remote_ready`,
@@ -433,8 +433,13 @@ Two entry points into `Stopping`:
   or fell out of the main `select!` because the monitor returned (e.g.
   non-transient exit). `Drop` cancels the stop token, SIGTERMs the ssh
   child directly as a belt-and-braces (the monitor also kills on cancel),
-  then removes `.sock`, `.pid`, `.info`, `.dest`, `.ssh-opts`, `.kick`, `.lock`. The flock is
-  released last when `_lock` drops.
+  then removes `.sock`, `.pid`, `.info`, `.kick`, `.lock` -- never the persistence caches
+  (`.dest`, `.ssh-opts`, `.remote-sock`), which is what makes a later auto-start land on the
+  same destination. The flock is released last when `_lock` drops.
+  `tunnel-destroy` itself (`destroy_tunnel`) first checks that *some* `connect-NAME.*` file
+  exists and otherwise errors with the known names -- a typo must not report "already
+  stopped"; `restart`/`refresh` call the `disconnect` primitive directly, for which nothing
+  to stop is success.
 - **`disconnect(name)`** (external command) -- reads `.pid`, sends SIGTERM,
   polls `is_lock_held` for up to 2s. If still held, escalates to SIGKILL
   plus `killpg` to catch any detached ssh children. Then calls

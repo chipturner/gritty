@@ -26,6 +26,20 @@ protocol interoperate with their neighbors.
   `--json`) and exits 0; naming a host that is down still fails, but
   `--json` now emits the group with its `error` field rather than a bare
   message.
+- **Tunnel bookkeeping.** `tunnel-destroy` of a name gritty has never seen
+  is now an error listing the tunnels it does know (it used to say "already
+  stopped" and exit 0, so a typo left the real tunnel running). A tunnel's
+  remembered destination and CLI `-o` options now survive `tunnel-destroy`
+  and supervisor death, like the remote-socket cache already did, so
+  `connect devbox` after tearing down `tunnel-create user@10.0.0.5 -n
+  devbox` goes back to `user@10.0.0.5` instead of trying to ssh to
+  `devbox` (`doctor` no longer counts those two files as residue).
+  `tunnel-create` prints its socket path on stdout only when stdout is not
+  a terminal -- scripts still get it, and a `connect` that auto-starts a
+  tunnel no longer drops a raw path above your shell. `bootstrap` installs
+  this binary's release by default (`--release latest` for the newest),
+  then confirms the remote's protocol version and prints the `connect`
+  command to run next; it used to install `latest` and exit silently.
 - **Help cleanup.** Each command's `--help` lists `--ctl-socket`/`-v`/
   `--color` under a separate "Global options" heading instead of shuffled
   in with its own flags; `--ctl-socket` is rejected (usage error) by the

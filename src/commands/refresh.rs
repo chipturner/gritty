@@ -231,8 +231,7 @@ async fn refresh_remote(
     // resolve_tunnel only knows config `ssh-options`; the CLI `-o` options the
     // tunnel was created with live in the `.ssh-opts` sidecar. Merge them or a
     // host reachable only via a CLI -o ProxyJump/IdentityFile/Port can't be
-    // reached here and its daemon is silently never refreshed. The sidecar is
-    // still present -- `disconnect` (below) is what wipes it.
+    // reached here and its daemon is silently never refreshed.
     let ssh_options = gritty::connect::merge_ssh_options(
         &gritty::connect::read_persisted_ssh_options(host),
         &tun_cfg.ssh_options,
@@ -275,8 +274,8 @@ async fn refresh_remote(
     // (possibly freshly-refreshed) remote daemon and connects cleanly
     // instead of tripping over a half-restarted one.
     if supervisor_verdict.needs_restart() {
-        // Capture the recreate args (incl. persisted CLI -o options) before
-        // disconnect wipes the sidecars.
+        // The recreate args come from the .dest/.ssh-opts caches, which
+        // disconnect leaves in place; captured up front purely for clarity.
         let recreate = gritty::connect::tunnel_recreate_args(host, &dest);
         gritty::connect::disconnect(host).await?;
         let recreate: Vec<&str> = recreate.iter().map(String::as_str).collect();

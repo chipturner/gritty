@@ -1433,34 +1433,96 @@ fn quote_remote_install_dir(install_dir: &str) -> String {
     }
 }
 
-/// Install gritty on a remote host by running the install script via SSH.
+/// The remote install command line. install.sh reads the release from `$1`
+/// (`sh -c "$script" sh <release>`); the release is shell-quoted because it
+/// comes from the command line.
+fn install_command(install_dir: &str, release: &str) -> String {
+    format!(
+        "GRITTY_INSTALL_DIR={} sh -c \"$(curl -sSfL {INSTALL_SCRIPT_URL})\" sh {}",
+        quote_remote_install_dir(install_dir),
+        shell_quote(release)
+    )
+}
+
+/// The two closing lines of a bootstrap: what got installed (and whether its
+/// protocol matches ours, when the post-install probe answered), and the
+/// command to run next -- `connection_name` is what `connect` takes, which
+/// differs from the ssh destination for `user@host` / aliased hosts.
+fn bootstrap_report(
+    connection_name: &str,
+    ssh_dest: &str,
+    release: &str,
+    remote_protocol: Option<u16>,
+    local_protocol: u16,
+) -> (String, String) {
+    let what = if release == "latest" {
+        "gritty (latest)".to_string()
+    } else {
+        format!("gritty {release}")
+    };
+    let verdict = match remote_protocol {
+        Some(v) if v == local_protocol => format!("protocol v{v}, matches this machine"),
+        Some(v) => format!(
+            "protocol v{v}, but this machine speaks v{local_protocol} -- upgrade one side before connecting"
+        ),
+        None => "could not confirm the installed version; try `gritty refresh` after connecting"
+            .to_string(),
+    };
+    (
+        format!("installed {what} on {ssh_dest} ({verdict})"),
+        format!("next: gritty connect {connection_name}:<name>"),
+    )
+}
+
+/// `gritty bootstrap`: install the given release on the remote via install.sh
+/// (interactively, so ssh may prompt), then confirm what landed by asking the
+/// remote binary for its protocol version.
 pub async fn bootstrap(
     dest_str: &str,
+    connection_name: &str,
     ssh_options: &[String],
     install_dir: &str,
+    release: &str,
     connect_timeout: u64,
 ) -> anyhow::Result<()> {
     let dest = Destination::parse(dest_str)?;
 
-    ui::detail(&format!("installing gritty on {}...", dest.ssh_dest()));
-
-    let install_cmd = format!(
-        "GRITTY_INSTALL_DIR={} sh -c \"$(curl -sSfL {INSTALL_SCRIPT_URL})\"",
-        quote_remote_install_dir(install_dir)
-    );
+    ui::status(&format!("installing gritty {release} on {}...", dest.ssh_dest()));
 
     // Run interactively (foreground=true) so SSH can prompt if needed,
     // and pipe stdout/stderr through so the user sees install progress.
     let mut cmd = Command::new("ssh");
     cmd.args(base_ssh_args(&dest, ssh_options, true, connect_timeout));
     cmd.arg(dest.ssh_dest());
-    cmd.arg(&install_cmd);
+    cmd.arg(install_command(install_dir, release));
 
     let status = cmd.status().await.context("failed to run ssh")?;
     if !status.success() {
-        bail!("remote install failed ({status})");
+        bail!(
+            "remote install failed ({status})\n  \
+             if release {release} has no published build, retry with --release latest"
+        );
     }
 
+    // Post-install probe through the same PATH prefix the tunnel will use, so
+    // this also proves the install dir is reachable non-interactively.
+    let remote_protocol =
+        remote_exec(&dest, "gritty protocol-version", ssh_options, true, connect_timeout)
+            .await
+            .ok()
+            .and_then(|out| out.trim().parse::<u16>().ok());
+    let (line, next) = bootstrap_report(
+        connection_name,
+        &dest.ssh_dest(),
+        release,
+        remote_protocol,
+        crate::protocol::PROTOCOL_VERSION,
+    );
+    match remote_protocol {
+        Some(v) if v == crate::protocol::PROTOCOL_VERSION => ui::success(&line),
+        _ => ui::warn(&line),
+    }
+    ui::detail(&next);
     Ok(())
 }
 
@@ -1722,22 +1784,37 @@ pub fn read_pid_hint(name: &str) -> Option<u32> {
     std::fs::read_to_string(connect_pid_path(name)).ok().and_then(|s| s.trim().parse().ok())
 }
 
+/// `tunnel-create`'s one line of stdout: the local socket path, for scripts
+/// (`sock=$(gritty tunnel-create host)`). A human at a terminal gets only the
+/// status line -- the raw path was noise there, most visibly when `connect`
+/// auto-started a tunnel and the path landed above the shell.
+pub fn announce_socket_path(local_sock: &Path) {
+    use std::io::IsTerminal;
+    if !std::io::stdout().is_terminal() {
+        println!("{}", local_sock.display());
+    }
+}
+
 /// `tunnel-create`'s report for a tunnel that is already up: the socket path
-/// on stdout (the same line a fresh start prints, so scripts see one shape)
-/// and a success line naming the existing supervisor. Shared by the parent's
+/// on stdout (same rule as a fresh start, so scripts see one shape) and a
+/// success line naming the existing supervisor. Shared by the parent's
 /// pre-fork check in `main.rs` and the lock-held branch of [`run`], so the two
 /// can't drift.
 pub fn report_already_running(connection_name: &str, local_sock: &Path) {
-    println!("{}", local_sock.display());
+    announce_socket_path(local_sock);
     match read_pid_hint(connection_name) {
         Some(pid) => ui::success(&format!("tunnel {connection_name} already running (pid {pid})")),
         None => ui::success(&format!("tunnel {connection_name} already running")),
     }
 }
 
-/// Remove the non-lock sidecar files (`.sock`, `.pid`, `.info`, `.dest`,
-/// `.ssh-opts`, `.kick`) of a stale tunnel. No signals are sent -- the
-/// process is confirmed dead (lock released); orphaned ssh children
+/// Remove a stale tunnel's *live-state* sidecars (`.sock`, `.pid`, `.info`,
+/// `.kick`). The persistence caches -- `.remote-sock`, `.dest`, `.ssh-opts`
+/// -- are deliberately left: they are how a later auto-start (`connect
+/// devbox` after a `tunnel-destroy`, or after the supervisor died) gets back
+/// to the same `user@host:port` with the same `-o` options; a fresh
+/// `tunnel-create` overwrites them at startup anyway. No signals are sent --
+/// the process is confirmed dead (lock released); orphaned ssh children
 /// self-terminate via ServerAliveInterval/ServerAliveCountMax.
 /// Callers must hold the tunnel flock -- either they just acquired it
 /// (`run()`, `cleanup_if_unheld()`) or they verified ownership via
@@ -1748,8 +1825,6 @@ fn cleanup_stale_files(name: &str) {
     let _ = std::fs::remove_file(local_socket_path(name));
     let _ = std::fs::remove_file(connect_pid_path(name));
     let _ = std::fs::remove_file(crate::runinfo::connect_info_path(name));
-    let _ = std::fs::remove_file(connect_dest_path(name));
-    let _ = std::fs::remove_file(connect_ssh_opts_path(name));
     let _ = std::fs::remove_file(connect_kick_path(name));
 }
 
@@ -1784,8 +1859,6 @@ struct ConnectGuard {
     pid_file: PathBuf,
     info_file: PathBuf,
     lock_file: PathBuf,
-    dest_file: PathBuf,
-    ssh_opts_file: PathBuf,
     kick_file: PathBuf,
     _lock: Option<nix::fcntl::Flock<std::fs::File>>,
     stop: tokio_util::sync::CancellationToken,
@@ -1829,8 +1902,7 @@ impl Drop for ConnectGuard {
             let _ = std::fs::remove_file(&self.local_sock);
             let _ = std::fs::remove_file(&self.pid_file);
             let _ = std::fs::remove_file(&self.info_file);
-            let _ = std::fs::remove_file(&self.dest_file);
-            let _ = std::fs::remove_file(&self.ssh_opts_file);
+            // `.dest` / `.ssh-opts` / `.remote-sock` stay: see cleanup_stale_files.
             let _ = std::fs::remove_file(&self.kick_file);
             let _ = std::fs::remove_file(&self.lock_file);
         } else {
@@ -2027,7 +2099,7 @@ pub async fn run(opts: ConnectOpts, ready_fd: Option<OwnedFd>) -> anyhow::Result
                         );
                     }
                 }
-                println!("{}", local_sock.display());
+                announce_socket_path(&local_sock);
                 match pid_hint {
                     Some(pid) => {
                         ui::success(&format!("tunnel {connection_name} ready (pid {pid})"))
@@ -2131,8 +2203,6 @@ pub async fn run(opts: ConnectOpts, ready_fd: Option<OwnedFd>) -> anyhow::Result
         pid_file: pid_file.clone(),
         info_file: crate::runinfo::connect_info_path(&connection_name),
         lock_file: lock_path,
-        dest_file: dest_file.clone(),
-        ssh_opts_file: connect_ssh_opts_path(&connection_name),
         kick_file: connect_kick_path(&connection_name),
         _lock: Some(lock_fd),
         stop: stop.clone(),
@@ -2289,6 +2359,37 @@ fn signal_ready(ready_fd: &Option<OwnedFd>) {
 // Disconnect
 // ---------------------------------------------------------------------------
 
+/// Does anything on disk mention this tunnel name -- a live or stale lock,
+/// or any other `connect-<name>.*` sidecar (persistence caches included)?
+fn has_sidecars_in(dir: &Path, name: &str) -> bool {
+    let prefix = format!("connect-{name}.");
+    std::fs::read_dir(dir).into_iter().flatten().flatten().any(|e| {
+        e.file_name()
+            .to_str()
+            .and_then(|f| f.strip_prefix(&prefix))
+            // What remains must be a bare extension: names may contain dots,
+            // so for name `dev` the file `connect-dev.box.sock` (tunnel
+            // `dev.box`) leaves `box.sock` and must not count.
+            .is_some_and(|ext| !ext.contains('.'))
+    })
+}
+
+/// `gritty tunnel-destroy`: unlike the [`disconnect`] primitive (which
+/// `restart`/`refresh` call and which treats "nothing to stop" as success), a
+/// name gritty has never heard of is an error -- otherwise a typo reports
+/// "already stopped" and the real tunnel keeps running.
+pub async fn destroy_tunnel(name: &str) -> anyhow::Result<()> {
+    validate_connection_name(name)?;
+    if !has_sidecars_in(&crate::daemon::socket_dir(), name) {
+        let known = enumerate_tunnels();
+        if known.is_empty() {
+            bail!("no tunnel named {name} (no tunnels exist)");
+        }
+        bail!("no tunnel named {name}; tunnels: {}", known.join(", "));
+    }
+    disconnect(name).await
+}
+
 pub async fn disconnect(name: &str) -> anyhow::Result<()> {
     validate_connection_name(name)?;
     // `cleanup_if_unheld` is the race-safe "acquire flock, sweep, unlink lock"
@@ -2441,6 +2542,53 @@ mod tests {
         assert_eq!(d.user.as_deref(), Some("user"));
         assert_eq!(d.host, "host");
         assert_eq!(d.port, None);
+    }
+
+    #[test]
+    fn has_sidecars_in_matches_the_exact_tunnel_name() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("connect-dev.box.remote-sock"), "").unwrap();
+        std::fs::write(dir.path().join("connect-fate.x.net.dest"), "fate").unwrap();
+        assert!(has_sidecars_in(dir.path(), "dev.box"));
+        assert!(has_sidecars_in(dir.path(), "fate.x.net"));
+        assert!(!has_sidecars_in(dir.path(), "dev"), "prefix of another tunnel's name");
+        assert!(!has_sidecars_in(dir.path(), "fate"));
+        assert!(!has_sidecars_in(dir.path(), "nope"));
+        assert!(!has_sidecars_in(&dir.path().join("missing"), "dev.box"));
+    }
+
+    #[test]
+    fn install_command_pins_the_release_and_quotes_it() {
+        // install.sh takes the version as $1: `sh -c "$script" sh <version>`.
+        // Pinning to the local release is what keeps a fresh remote on the
+        // same protocol as the laptop that bootstrapped it; `latest` opts out.
+        let cmd = install_command("~/.local/bin", "0.15.5");
+        assert!(cmd.starts_with("GRITTY_INSTALL_DIR=\"$HOME\"/.local/bin sh -c \""), "{cmd}");
+        assert!(cmd.ends_with("\" sh 0.15.5"), "{cmd}");
+        assert!(install_command("/opt/bin", "latest").ends_with("\" sh latest"));
+        // A hostile release string can't break out of the command line.
+        let cmd = install_command("/opt/bin", "1.0; touch pwned");
+        assert!(cmd.ends_with("\" sh '1.0; touch pwned'"), "{cmd}");
+    }
+
+    #[test]
+    fn bootstrap_report_confirms_the_protocol_and_says_what_to_run_next() {
+        let (line, next) = bootstrap_report("devbox", "user@devbox", "0.15.5", Some(23), 23);
+        assert_eq!(
+            line,
+            "installed gritty 0.15.5 on user@devbox (protocol v23, matches this machine)"
+        );
+        assert_eq!(next, "next: gritty connect devbox:<name>");
+
+        let (line, _) = bootstrap_report("devbox", "user@devbox", "0.15.5", Some(22), 23);
+        assert!(
+            line.contains("protocol v22") && line.contains("this machine speaks v23"),
+            "{line}"
+        );
+
+        let (line, _) = bootstrap_report("devbox", "user@devbox", "latest", None, 23);
+        assert!(line.contains("installed gritty (latest) on user@devbox"), "{line}");
+        assert!(line.contains("could not confirm"), "{line}");
     }
 
     #[test]

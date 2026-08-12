@@ -487,10 +487,11 @@ async fn check_tunnels(socket_dir: &Path) -> Vec<Check> {
 /// were historically skipped by [`check_sockets`], so a tunnel that died
 /// without running cleanup (SIGKILL, power loss, crash before `ConnectGuard`
 /// existed) leaves residue no diagnostic could see. `.log`/`.out` (kept for
-/// post-mortem debugging) and `.remote-sock` (a cache that deliberately
-/// survives teardown) are not residue.
+/// post-mortem debugging) and the persistence caches that deliberately
+/// survive teardown (`.remote-sock`, `.dest`, `.ssh-opts` -- see the on-disk
+/// inventory in docs/internals.md) are not residue.
 fn check_tunnel_residue(socket_dir: &Path) -> Vec<Check> {
-    const RESIDUE_EXTS: [&str; 5] = ["sock", "pid", "dest", "info", "ssh-opts"];
+    const RESIDUE_EXTS: [&str; 3] = ["sock", "pid", "info"];
     let Ok(entries) = std::fs::read_dir(socket_dir) else {
         return Vec::new();
     };
@@ -1058,10 +1059,13 @@ mod tests {
     #[test]
     fn tunnel_residue_ignores_deliberate_survivors() {
         let dir = tempfile::tempdir().unwrap();
-        // Logs and the remote-sock cache survive teardown by design.
-        std::fs::write(dir.path().join("connect-old.log"), "").unwrap();
-        std::fs::write(dir.path().join("connect-old.out"), "").unwrap();
-        std::fs::write(dir.path().join("connect-old.remote-sock"), "").unwrap();
+        // Logs and the three persistence caches (remote socket path, original
+        // destination, CLI -o options) survive teardown by design: they are
+        // what lets `connect old` after a `tunnel-destroy` come back to the
+        // same place.
+        for ext in ["log", "out", "remote-sock", "dest", "ssh-opts"] {
+            std::fs::write(dir.path().join(format!("connect-old.{ext}")), "").unwrap();
+        }
         assert!(check_tunnel_residue(dir.path()).is_empty());
     }
 

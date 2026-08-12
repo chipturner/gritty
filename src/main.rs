@@ -454,6 +454,11 @@ enum Command {
         #[arg(long, default_value = "~/.local/bin")]
         install_dir: String,
 
+        /// Release to install: defaults to this binary's version so both
+        /// sides speak the same protocol; `latest` takes the newest published
+        #[arg(long, value_name = "VERSION", default_value = env!("CARGO_PKG_VERSION"))]
+        release: String,
+
         /// Extra SSH options (can be repeated)
         #[arg(long = "ssh-option", short = 'o')]
         ssh_options: Vec<String>,
@@ -950,11 +955,11 @@ fn main() {
             let ready_fd = if foreground || dry_run {
                 None
             } else {
-                let sock_display = local_sock.display().to_string();
+                let sock = local_sock.clone();
                 let conn_name = connection_name.clone();
                 match daemonize(
                     move |_pid| {
-                        println!("{sock_display}");
+                        gritty::connect::announce_socket_path(&sock);
                         ui::success(&format!("tunnel {conn_name} started"));
                     },
                     Some(&out_path),
@@ -1261,7 +1266,7 @@ async fn run(cli: Cli, config: gritty::config::ConfigFile) -> anyhow::Result<()>
         Command::RemoteForward { target, port } => {
             port_forward_command(&config, cli.ctl_socket, target, port, 1).await
         }
-        Command::Bootstrap { destination, install_dir, ssh_options } => {
+        Command::Bootstrap { destination, install_dir, release, ssh_options } => {
             // Canonicalize so a `[host.FOO]` section (ssh-options etc.)
             // applies when bootstrapping via an alias destination.
             let host = config.canonical_host(&gritty::connect::parse_host(&destination)?);
@@ -1274,13 +1279,15 @@ async fn run(cli: Cli, config: gritty::config::ConfigFile) -> anyhow::Result<()>
                 gritty::connect::merge_ssh_options(&ssh_options, &resolved.ssh_options);
             gritty::connect::bootstrap(
                 &destination,
+                &host,
                 &merged_ssh_options,
                 &install_dir,
+                &release,
                 resolved.connect_timeout,
             )
             .await
         }
-        Command::TunnelDestroy { name } => gritty::connect::disconnect(&name).await,
+        Command::TunnelDestroy { name } => gritty::connect::destroy_tunnel(&name).await,
         Command::Tunnels { json } => {
             gritty::connect::list_tunnels(json);
             Ok(())
