@@ -26,6 +26,16 @@ protocol interoperate with their neighbors.
   `--json`) and exits 0; naming a host that is down still fails, but
   `--json` now emits the group with its `error` field rather than a bare
   message.
+- **`info` and `doctor` read better.** `info` now says `local server:
+  not running` (on a laptop that only talks to remote hosts that isn't a
+  problem), omits log paths that don't exist instead of printing a page of
+  `(not found)`, and shows tunnels as a table with their destinations.
+  `doctor`'s healthy-tunnel lines report what is behind the tunnel
+  (`3 sessions, 2 attached`) instead of restating the protocol version,
+  and the Clients group is one line per host instead of one per session.
+  `tail`/`kill` invoked without a session now show the host's sessions in
+  the same table `ls` prints (typeable names; the old ID/Name/Age table
+  misaligned on long names).
 - **Tunnel bookkeeping.** `tunnel-destroy` of a name gritty has never seen
   is now an error listing the tunnels it does know (it used to say "already
   stopped" and exit 0, so a typo left the real tunnel running). A tunnel's

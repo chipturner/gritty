@@ -318,10 +318,6 @@ pub(crate) fn format_duration(secs: u64) -> String {
     }
 }
 
-pub(crate) fn format_age(now: u64, created_at: u64) -> String {
-    format!("{} ago", format_duration(now.saturating_sub(created_at)))
-}
-
 /// Idle column value: compact time since `last_activity`, or "-" when the
 /// timestamp is unknown (0 -- e.g. an older server that doesn't track it).
 pub(crate) fn format_idle(now: u64, last_activity: u64) -> String {
@@ -1099,76 +1095,99 @@ pub(crate) async fn info(ctl_socket: Option<PathBuf>, json: bool) -> anyhow::Res
     let out_path = socket_dir.join("daemon.out");
     let tunnels = gritty::connect::get_tunnel_info();
 
+    let report = InfoJson {
+        version: env!("CARGO_PKG_VERSION"),
+        config_path: cfg_path,
+        config_state,
+        config_error,
+        socket_dir,
+        ctl_socket: ctl_path,
+        device_id: device_id.to_string(),
+        device_id_path,
+        server_state,
+        server_pid: pid,
+        sessions,
+        server_log: log_path,
+        server_out: out_path,
+        tunnels,
+    };
     if json {
-        let report = InfoJson {
-            version: env!("CARGO_PKG_VERSION"),
-            config_path: cfg_path,
-            config_state,
-            config_error,
-            socket_dir,
-            ctl_socket: ctl_path,
-            device_id: device_id.to_string(),
-            device_id_path,
-            server_state,
-            server_pid: pid,
-            sessions,
-            server_log: log_path,
-            server_out: out_path,
-            tunnels,
-        };
         println!("{}", serde_json::to_string_pretty(&report)?);
         return Ok(());
     }
 
-    println!("gritty {}", env!("CARGO_PKG_VERSION"));
-    println!();
-    println!("config:         {} ({cfg_status})", cfg_path.display());
-    println!("socket dir:     {}", socket_dir.display());
-    println!("server socket:  {}", ctl_path.display());
-    println!("device id:      {device_id} ({})", device_id_path.display());
-
-    match (server_state, sessions) {
-        ("running", Some(n)) => {
-            let s = if n == 1 { "" } else { "s" };
-            match pid {
-                Some(p) => println!("server status:  running (pid {p}, {n} session{s})"),
-                None => println!("server status:  running ({n} session{s})"),
-            }
-        }
-        ("version-mismatch", _) => {
-            let pid_str = pid.map(|p| format!("pid {p}, ")).unwrap_or_default();
-            println!(
-                "server status:  running ({pid_str}protocol version mismatch -- run `gritty refresh`)"
-            );
-        }
-        _ => println!("server status:  not running"),
-    }
-
-    print_path("server log:    ", &log_path);
-    print_path("server output: ", &out_path);
-
-    if !tunnels.is_empty() {
-        println!();
-        println!("tunnels:");
-        for t in &tunnels {
-            let pid_str = match t.pid {
-                Some(p) => format!(" (pid {p})"),
-                None => String::new(),
-            };
-            println!("  {:<14}{}{pid_str}", t.name, t.status);
-            print_path("                log:", &canonicalize_or_raw(t.log_path.clone()));
-        }
-    }
-
+    print!("{}", render_info(&report, &cfg_status));
     Ok(())
 }
 
-pub(crate) fn print_path(label: &str, path: &Path) {
-    if path.exists() {
-        println!("{label} {}", path.display());
-    } else {
-        println!("{label} {} (not found)", path.display());
+/// The human form of `info`: the same facts as `--json`, laid out for a
+/// glance. Paths that don't exist yet are simply omitted (a laptop that only
+/// ever talks to remote hosts has no local daemon logs, and a page of
+/// "(not found)" said nothing useful); the server line says *local* so its
+/// "not running" doesn't read as a problem on such a machine.
+fn render_info(r: &InfoJson, cfg_status: &str) -> String {
+    use std::fmt::Write as _;
+
+    let mut out = String::new();
+    let _ =
+        writeln!(out, "gritty {} (protocol v{})", r.version, gritty::protocol::PROTOCOL_VERSION);
+    let _ = writeln!(out);
+    let _ = writeln!(out, "config:        {} ({cfg_status})", r.config_path.display());
+    let _ = writeln!(out, "socket dir:    {}", r.socket_dir.display());
+    let _ = writeln!(out, "device id:     {} ({})", r.device_id, r.device_id_path.display());
+
+    let pid = r.server_pid.map(|p| format!("pid {p}, ")).unwrap_or_default();
+    let server = match (r.server_state, r.sessions) {
+        ("running", Some(n)) => {
+            let s = if n == 1 { "" } else { "s" };
+            format!("running ({pid}{n} session{s})")
+        }
+        ("version-mismatch", _) => {
+            format!("running ({pid}protocol version mismatch -- run `gritty refresh`)")
+        }
+        _ => "not running".to_string(),
+    };
+    let _ = writeln!(out, "local server:  {server}");
+    for (label, path) in [
+        ("server socket:", &r.ctl_socket),
+        ("server log:   ", &r.server_log),
+        ("server output:", &r.server_out),
+    ] {
+        if path.exists() {
+            let _ = writeln!(out, "{label} {}", path.display());
+        }
     }
+
+    if r.tunnels.is_empty() {
+        let _ = writeln!(out, "tunnels:       none");
+        return out;
+    }
+    let _ = writeln!(out, "tunnels:");
+    let rows: Vec<Vec<String>> = r
+        .tunnels
+        .iter()
+        .map(|t| {
+            let dest = if t.destination == t.name || t.destination == "-" {
+                String::new()
+            } else {
+                t.destination.clone()
+            };
+            let status = match t.pid {
+                Some(p) => format!("{} (pid {p})", t.status),
+                None => t.status.clone(),
+            };
+            vec![
+                t.name.clone(),
+                dest,
+                status,
+                canonicalize_or_raw(t.log_path.clone()).display().to_string(),
+            ]
+        })
+        .collect();
+    for line in gritty::table::format_table(&["Name", "Destination", "Status", "Log"], &rows) {
+        let _ = writeln!(out, "  {line}");
+    }
+    out
 }
 
 /// Resolve symlinks in the path (e.g. /tmp -> /private/tmp on macOS).
@@ -1389,26 +1408,6 @@ mod tests {
     }
 
     #[test]
-    fn format_age_seconds() {
-        assert_eq!(format_age(100, 70), "30s ago");
-    }
-
-    #[test]
-    fn format_age_minutes() {
-        assert_eq!(format_age(1000, 700), "5m ago");
-    }
-
-    #[test]
-    fn format_age_hours() {
-        assert_eq!(format_age(10000, 0), "2h ago");
-    }
-
-    #[test]
-    fn format_age_days() {
-        assert_eq!(format_age(200000, 0), "2d ago");
-    }
-
-    #[test]
     fn format_idle_compact_durations() {
         assert_eq!(format_idle(100, 70), "30s");
         assert_eq!(format_idle(1000, 700), "5m");
@@ -1606,6 +1605,72 @@ mod tests {
         assert_eq!(live[0].session_id, 3);
         assert!(live[0].path.ends_with("fwd-devbox-3.sock"));
         assert_eq!(candidate_label(&live[0], None, "laptop"), "devbox (session #3)");
+    }
+
+    fn info_fixture(dir: &Path, server_state: &'static str) -> InfoJson {
+        InfoJson {
+            version: "9.9.9",
+            config_path: dir.join("config.toml"),
+            config_state: "not-found",
+            config_error: None,
+            socket_dir: dir.to_path_buf(),
+            ctl_socket: dir.join("ctl.sock"),
+            device_id: "42".to_string(),
+            device_id_path: dir.join("device_id"),
+            server_state,
+            server_pid: (server_state == "running").then_some(4242),
+            sessions: (server_state == "running").then_some(2),
+            server_log: dir.join("daemon.log"),
+            server_out: dir.join("daemon.out"),
+            tunnels: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn info_text_for_a_machine_that_never_ran_a_local_daemon() {
+        // The remote-only laptop case: say the *local* server isn't running
+        // and don't list log files that have never existed.
+        let dir = tempfile::tempdir().unwrap();
+        let text = render_info(&info_fixture(dir.path(), "not-running"), "not found");
+        assert!(text.contains("local server:  not running"), "{text}");
+        assert!(!text.contains("daemon.log"), "{text}");
+        assert!(!text.contains("server log") && !text.contains("server output"), "{text}");
+        assert!(text.contains("tunnels:       none"), "{text}");
+        assert!(text.starts_with("gritty 9.9.9 (protocol v"), "{text}");
+    }
+
+    #[test]
+    fn info_text_shows_logs_and_tunnel_destinations_when_present() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("daemon.log"), "").unwrap();
+        let mut report = info_fixture(dir.path(), "running");
+        let tunnel = |name: &str, dest: &str, status: &str| gritty::connect::TunnelInfo {
+            name: name.to_string(),
+            destination: dest.to_string(),
+            status: status.to_string(),
+            pid: Some(7),
+            log_path: dir.path().join(format!("connect-{name}.log")),
+        };
+        report.tunnels = vec![
+            tunnel("fate", "chip@fate.example:2222", "healthy"),
+            tunnel("coder", "coder", "reconnecting"),
+        ];
+        let text = render_info(&report, "loaded, 2 hosts");
+        assert!(text.contains("local server:  running (pid 4242, 2 sessions)"), "{text}");
+        assert!(text.contains("server log:    ") && text.contains("daemon.log"), "{text}");
+        assert!(!text.contains("daemon.out"), "only files that exist: {text}");
+        // Destination shown when it adds information, elided when it is the name.
+        assert!(
+            text.contains("fate")
+                && text.contains("chip@fate.example:2222")
+                && text.contains("healthy"),
+            "{text}"
+        );
+        let coder_line = text.lines().find(|l| l.trim_start().starts_with("coder")).unwrap();
+        // Name, then an empty destination cell, then status: the second
+        // token is the status, not a repeat of the name.
+        assert_eq!(coder_line.split_whitespace().nth(1), Some("reconnecting"), "{coder_line}");
+        assert!(text.contains("pid 7"), "{text}");
     }
 
     #[test]

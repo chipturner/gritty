@@ -165,6 +165,40 @@ fn render_paths(paths: &[(&str, PathBuf)]) {
 
 // ---- Checks -----------------------------------------------------------------
 
+/// `no sessions` / `1 session, attached` / `3 sessions, 2 attached` -- the
+/// same phrase for the local server and for each tunnel's daemon.
+fn session_summary(sessions: &[gritty::protocol::SessionEntry]) -> String {
+    let n = sessions.len();
+    let attached = sessions.iter().filter(|s| s.attached).count();
+    match (n, attached) {
+        (0, _) => "no sessions".to_string(),
+        (1, 0) => "1 session".to_string(),
+        (1, _) => "1 session, attached".to_string(),
+        (n, 0) => format!("{n} sessions"),
+        (n, a) => format!("{n} sessions, {a} attached"),
+    }
+}
+
+/// One line per host for the Clients group, from `(host, label)` pairs: with
+/// several sessions held per host, one line each was the noisiest part of a
+/// healthy report, and the labels are what the reader wants anyway.
+fn client_summary(entries: Vec<(String, String)>) -> Vec<String> {
+    let mut by_host: std::collections::BTreeMap<String, Vec<String>> = Default::default();
+    for (host, label) in entries {
+        by_host.entry(host).or_default().push(label);
+    }
+    by_host
+        .into_values()
+        .map(|mut labels| {
+            labels.sort();
+            match labels.len() {
+                1 => format!("1 client on this machine holds {}", labels[0]),
+                n => format!("{n} clients on this machine hold {}", labels.join(", ")),
+            }
+        })
+        .collect()
+}
+
 fn check_config() -> Vec<Check> {
     let mut checks = Vec::new();
     let path = gritty::config::config_path();
@@ -285,14 +319,13 @@ async fn check_local_server(
     // Probe server via socket
     match probe_server(ctl_path).await {
         Ok((version, sessions)) => {
-            let n = sessions.len();
-            let s = if n == 1 { "" } else { "s" };
             let pid_str = match pid {
                 Some(p) => format!("pid {p}, "),
                 None => String::new(),
             };
             checks.push(Check::ok(format!(
-                "server running ({pid_str}protocol v{version}, {n} session{s})"
+                "server running ({pid_str}protocol v{version}, {})",
+                session_summary(&sessions)
             )));
             if version != PROTOCOL_VERSION {
                 checks.push(Check::warn(format!(
@@ -406,13 +439,14 @@ async fn check_tunnels(socket_dir: &Path) -> Vec<Check> {
                 // Probe protocol version through tunnel socket
                 let tunnel_ctl = socket_dir.join(format!("connect-{name}.sock"));
                 match probe_server(&tunnel_ctl).await {
-                    Ok((v, _)) => {
-                        let note = if v != PROTOCOL_VERSION {
-                            format!(", remote protocol v{v}")
-                        } else {
-                            format!(", protocol v{v}")
-                        };
-                        checks.push(Check::ok(format!("{name}: healthy{pid_str}{note}")));
+                    // A successful probe implies a matched protocol (a
+                    // mismatch takes the arm below), so report what the
+                    // reader can act on: what is running behind the tunnel.
+                    Ok((_, sessions)) => {
+                        checks.push(Check::ok(format!(
+                            "{name}: healthy{pid_str}, {}",
+                            session_summary(&sessions)
+                        )));
                     }
                     Err(msg) if msg.contains("version mismatch") => {
                         let msg = msg.strip_prefix("version mismatch: ").unwrap_or(&msg);
@@ -537,11 +571,9 @@ async fn check_clients(socket_dir: &Path, config: &gritty::config::ConfigFile) -
     // (The forward socket only carries the session *id*; printing `host:id`
     // read like a target but `host:3` addresses the session *named* 3.)
     let live = super::util::live_forward_sockets(socket_dir);
-    super::util::forward_candidate_labels(config, &live)
-        .await
-        .into_iter()
-        .map(|label| Check::ok(format!("client on this machine holds {label}")))
-        .collect()
+    let labels = super::util::forward_candidate_labels(config, &live).await;
+    let entries = live.iter().map(|c| c.host.clone()).zip(labels).collect();
+    client_summary(entries).into_iter().map(Check::ok).collect()
 }
 
 /// Bind-lock companions whose socket no longer exists. Cleanup paths now
@@ -883,6 +915,56 @@ fn report_json(paths: &[(&str, PathBuf)], groups: &[(&str, Vec<Check>)]) -> serd
 mod tests {
     use super::*;
     use gritty::runinfo::RunInfo;
+
+    // --- summaries ---
+
+    fn sess(attached: bool) -> gritty::protocol::SessionEntry {
+        gritty::protocol::SessionEntry {
+            id: 0,
+            name: String::new(),
+            pty_path: String::new(),
+            shell_pid: 1,
+            created_at: 0,
+            attached,
+            last_heartbeat: 0,
+            foreground_cmd: String::new(),
+            cwd: String::new(),
+            client_name: String::new(),
+            agent_forwarding_active: false,
+            is_last_attached: false,
+            last_activity: 0,
+            linger_secs: 0,
+        }
+    }
+
+    #[test]
+    fn session_summary_counts_and_attached() {
+        assert_eq!(session_summary(&[]), "no sessions");
+        assert_eq!(session_summary(&[sess(false)]), "1 session");
+        assert_eq!(session_summary(&[sess(true)]), "1 session, attached");
+        assert_eq!(
+            session_summary(&[sess(true), sess(false), sess(true)]),
+            "3 sessions, 2 attached"
+        );
+    }
+
+    #[test]
+    fn client_summary_is_one_line_per_host_sorted() {
+        let entries = vec![
+            ("fate".to_string(), "fate:2".to_string()),
+            ("coder".to_string(), "coder:1".to_string()),
+            ("fate".to_string(), "fate:0".to_string()),
+            ("fate".to_string(), "fate (session #9)".to_string()),
+        ];
+        assert_eq!(
+            client_summary(entries),
+            [
+                "1 client on this machine holds coder:1",
+                "3 clients on this machine hold fate (session #9), fate:0, fate:2",
+            ]
+        );
+        assert!(client_summary(Vec::new()).is_empty());
+    }
 
     // --- check_staleness: must agree with refresh's verdicts ---
 
@@ -1226,7 +1308,7 @@ mod tests {
         assert_eq!(checks[0].status, Status::Ok);
         assert_eq!(
             checks[0].message,
-            "client on this machine holds fate.x.pattern-net (session #14)"
+            "1 client on this machine holds fate.x.pattern-net (session #14)"
         );
     }
 

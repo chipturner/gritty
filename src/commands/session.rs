@@ -5,8 +5,7 @@ use gritty::ui;
 
 use super::AutoStart;
 use super::util::{
-    DaemonProbe, discover_daemon_probes, format_age, format_timestamp, host_from_ctl_path,
-    server_request,
+    DaemonProbe, discover_daemon_probes, format_timestamp, host_from_ctl_path, server_request,
 };
 
 /// Every session-table column, in [`session_status_cols`] order. This is the
@@ -2237,9 +2236,30 @@ pub(crate) async fn list_all_sessions(
     Ok(())
 }
 
-/// Print available sessions and exit with an error when a session-requiring
-/// command is invoked without the session part (e.g. `gritty tail local`
-/// instead of `gritty tail local:session`).
+/// The message for a session-requiring command invoked without the session
+/// part (`gritty tail devbox`): the shape to type, then the host's sessions
+/// in exactly the `ls` layout (compact columns, own sessions first, names in
+/// typeable form) so the reader can copy a name straight out of it.
+fn suggestion_message(
+    cmd: &str,
+    host: &str,
+    sessions: &[gritty::protocol::SessionEntry],
+    client_name: &str,
+    now: u64,
+) -> String {
+    let ordered = order_sessions(sessions, client_name);
+    let rows: Vec<Vec<String>> =
+        ordered.iter().map(|(s, _)| table_row(s, now, client_name, false)).collect();
+    let mut msg = format!("specify a session: gritty {cmd} {host}:<name>");
+    for line in gritty::table::format_table(&table_headers(false), &rows) {
+        msg.push_str("\n  ");
+        msg.push_str(&line);
+    }
+    msg
+}
+
+/// Bail with [`suggestion_message`] (or the bare shape when the host can't
+/// be listed) -- for `tail`/`kill-session` invoked without a session.
 pub(crate) async fn suggest_session(
     cmd: &str,
     host: &str,
@@ -2248,38 +2268,18 @@ pub(crate) async fn suggest_session(
 ) -> anyhow::Result<()> {
     use gritty::protocol::Frame;
 
-    let ctl_path_buf = ctl_path.to_path_buf();
-    let resp = match server_request(&ctl_path_buf, Frame::ListSessions).await {
-        Ok(resp) => resp,
-        Err(_) => {
-            anyhow::bail!("specify a session: gritty {cmd} {host}:<session>");
+    match server_request(ctl_path, Frame::ListSessions).await {
+        Ok(Frame::SessionInfo { sessions }) if sessions.is_empty() => {
+            anyhow::bail!("no active sessions on {host}")
         }
-    };
-
-    match resp {
-        Frame::SessionInfo { sessions } if sessions.is_empty() => {
-            anyhow::bail!("no active sessions on {host}");
-        }
-        Frame::SessionInfo { sessions } => {
+        Ok(Frame::SessionInfo { sessions }) => {
             let now = std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .unwrap_or_default()
                 .as_secs();
-
-            let mut msg = format!("specify a session: gritty {cmd} {host}:<session>\n\n");
-            msg.push_str("  ID  Name     Age\n");
-            for s in &sessions {
-                let name = if s.name.is_empty() {
-                    "-".to_string()
-                } else {
-                    gritty::naming::display_session_name(&s.name, client_name).to_string()
-                };
-                let age = format_age(now, s.created_at);
-                msg.push_str(&format!("  {}   {:<8} {}\n", s.id, name, age));
-            }
-            anyhow::bail!("{msg}");
+            anyhow::bail!("{}", suggestion_message(cmd, host, &sessions, client_name, now))
         }
-        _ => anyhow::bail!("specify a session: gritty {cmd} {host}:<session>"),
+        _ => anyhow::bail!("specify a session: gritty {cmd} {host}:<name>"),
     }
 }
 
@@ -2559,6 +2559,26 @@ mod tests {
         let rows = build_rows(&sessions, "defiant");
         assert_eq!((rows[0].display.as_str(), rows[0].name.as_str()), ("a", "defiant/a"));
         assert_eq!((rows[1].display.as_str(), rows[1].name.as_str()), ("laptop2/x", "laptop2/x"));
+    }
+
+    #[test]
+    fn suggestion_message_uses_the_ls_table_and_typeable_names() {
+        let mut own = auto_entry("defiant/work", true);
+        own.cwd = "/home/x/proj".to_string();
+        let sessions = vec![auto_entry("laptop2/x", false), own];
+        let msg = suggestion_message("tail", "devbox", &sessions, "defiant", 100);
+        let lines: Vec<&str> = msg.lines().collect();
+        assert_eq!(lines[0], "specify a session: gritty tail devbox:<name>");
+        // Same columns as `ls`, no ID column, own session first and elided.
+        assert!(lines[1].starts_with("  Name"), "{msg}");
+        assert!(
+            lines[1].contains("Status") && !lines[1].contains("ID") && !lines[1].contains("Age"),
+            "{msg}"
+        );
+        assert!(lines[2].starts_with("  work"), "{msg}");
+        assert!(lines[2].contains("~/proj") && lines[2].contains("attached"), "{msg}");
+        assert!(lines[3].starts_with("  laptop2/x"), "{msg}");
+        assert_eq!(lines.len(), 4, "{msg}");
     }
 
     #[test]
