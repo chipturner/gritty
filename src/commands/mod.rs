@@ -1,3 +1,4 @@
+pub(crate) mod complete;
 mod doctor;
 mod refresh;
 mod report;

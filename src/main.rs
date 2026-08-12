@@ -60,7 +60,6 @@ Configuration:
 
 Plumbing:
   server (s)                 Start the server (backgrounds; -f stays in the foreground)
-  completions                Generate shell completions
   mangen                     Write man pages into a directory (for packagers)
   socket-path (socket)       Print the control socket path
   protocol-version           Print the wire protocol version
@@ -139,6 +138,7 @@ enum Command {
     Connect {
         /// Target host, with optional session name (host or host:name);
         /// host defaults to `local` when omitted
+        #[arg(add = complete::target())]
         target: Option<String>,
 
         /// Command to run instead of a login shell when the session is created
@@ -216,12 +216,14 @@ enum Command {
     #[command(display_order = 2, visible_alias = "t")]
     Tail {
         /// Target host and session (host:session); host defaults to `local`
+        #[arg(add = complete::target())]
         target: Option<String>,
     },
     /// List sessions (every known host unless one is given)
     #[command(display_order = 1, visible_alias = "ls", visible_alias = "list")]
     ListSessions {
         /// Target host (omit to list every known host)
+        #[arg(add = complete::host())]
         target: Option<String>,
 
         /// Machine-readable output (array of host groups with sessions)
@@ -238,6 +240,7 @@ enum Command {
     KillSession {
         /// Sessions to kill: `host:session`, or a bare session name killed on
         /// `local` (a bare known host name lists that host's sessions instead)
+        #[arg(add = complete::kill_target())]
         targets: Vec<String>,
     },
     /// Bulk-kill stale detached sessions (dry run unless -y)
@@ -247,6 +250,7 @@ enum Command {
     #[command(display_order = 4, group = clap::ArgGroup::new("prune_filter").multiple(true))]
     Prune {
         /// Target host (defaults to `local`)
+        #[arg(add = complete::host())]
         target: Option<String>,
 
         /// Only sessions created by this client (the `name/` prefix shown in
@@ -277,6 +281,7 @@ enum Command {
     #[command(display_order = 6)]
     KillServer {
         /// Target host (defaults to `local`)
+        #[arg(add = complete::host())]
         target: Option<String>,
     },
     /// Kill and restart a host's server and tunnel (sessions die)
@@ -288,6 +293,7 @@ enum Command {
     )]
     Restart {
         /// Target host (defaults to `local`)
+        #[arg(add = complete::host())]
         target: Option<String>,
     },
     /// Restart only processes running stale code (idempotent)
@@ -300,6 +306,7 @@ enum Command {
     )]
     Refresh {
         /// Target host (defaults to `local` plus all active tunnels)
+        #[arg(add = complete::host())]
         target: Option<String>,
         /// Restart a stale daemon even when clients are attached (their
         /// sessions are killed). Without this, refresh refuses.
@@ -310,6 +317,7 @@ enum Command {
     #[command(display_order = 5)]
     Rename {
         /// Target host and session (host:session)
+        #[arg(add = complete::target())]
         target: String,
         /// New name for the session
         new_name: String,
@@ -319,7 +327,7 @@ enum Command {
     #[command(display_order = 32)]
     Send {
         /// Session to use (host:session); auto-detected if omitted
-        #[arg(long)]
+        #[arg(long, add = complete::target())]
         session: Option<String>,
 
         /// Read data from stdin instead of files (use - as shorthand)
@@ -345,7 +353,7 @@ enum Command {
     #[command(display_order = 33)]
     Receive {
         /// Session to use (host:session); auto-detected if omitted
-        #[arg(long)]
+        #[arg(long, add = complete::target())]
         session: Option<String>,
 
         /// Write received data to stdout instead of files (use - as shorthand)
@@ -388,6 +396,7 @@ enum Command {
     )]
     LocalForward {
         /// Target session (host[:session]); omit to use the only attached session
+        #[arg(add = complete::target())]
         target: Option<String>,
         /// Required. PORT (same number on both ends) or LISTEN_PORT:TARGET_PORT
         port: Option<String>,
@@ -403,6 +412,7 @@ enum Command {
     )]
     RemoteForward {
         /// Target session (host[:session]); omit to use the only attached session
+        #[arg(add = complete::target())]
         target: Option<String>,
         /// Required. PORT (same number on both ends) or LISTEN_PORT:TARGET_PORT
         port: Option<String>,
@@ -442,6 +452,7 @@ enum Command {
     #[command(display_order = 12)]
     TunnelDestroy {
         /// Connection name (as shown in `gritty tunnels`)
+        #[arg(add = complete::tunnel())]
         name: String,
     },
     /// Install gritty on a remote host over ssh
@@ -515,12 +526,6 @@ enum Command {
         #[arg(long, value_name = "N", requires = "llm")]
         log_lines: Option<usize>,
     },
-    /// Generate shell completions
-    #[command(display_order = 41)]
-    Completions {
-        /// Shell to generate completions for
-        shell: clap_complete::Shell,
-    },
     /// Write man pages into a directory (for packagers)
     #[command(display_order = 44)]
     Mangen {
@@ -550,7 +555,6 @@ impl Command {
                 | Command::Open { .. }
                 | Command::Copy
                 | Command::Config
-                | Command::Completions { .. }
                 | Command::Mangen { .. }
                 | Command::ProtocolVersion
         )
@@ -786,6 +790,11 @@ fn report_error(error_pipe: &Option<OwnedFd>, e: &anyhow::Error) -> ! {
 }
 
 fn main() {
+    // `COMPLETE=<shell> gritty` prints that shell's completion glue; while
+    // completing, the glue re-invokes gritty with COMPLETE set and this call
+    // answers and exits. Must run before anything writes to stdout.
+    clap_complete::CompleteEnv::with_factory(Cli::command).complete();
+
     // When invoked as "gritty-open" (symlink), dispatch directly to open.
     if let Some(prog) = std::env::args().next()
         && Path::new(&prog).file_name().and_then(|f| f.to_str()) == Some("gritty-open")
@@ -1304,10 +1313,6 @@ async fn run(cli: Cli, config: gritty::config::ConfigFile) -> anyhow::Result<()>
         },
         Command::ProtocolVersion => {
             println!("{}", gritty::protocol::PROTOCOL_VERSION);
-            Ok(())
-        }
-        Command::Completions { shell } => {
-            clap_complete::generate(shell, &mut Cli::command(), "gritty", &mut std::io::stdout());
             Ok(())
         }
         Command::Mangen { dir } => {

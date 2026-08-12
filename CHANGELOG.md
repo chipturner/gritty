@@ -8,6 +8,14 @@ protocol interoperate with their neighbors.
 
 ## Unreleased
 
+- **Breaking: `gritty completions <shell>` is replaced by dynamic
+  completions.** Put `source <(COMPLETE=zsh gritty)` (or the bash/fish/
+  elvish equivalent, see USAGE) in your shell rc and delete any generated
+  `_gritty`/`gritty.bash` file. Besides flags, TAB now completes host
+  names, tunnel names for `tunnel-destroy`, and -- after the colon --
+  the live sessions of that host for `connect`, `tail`, `rename`, `kill`,
+  `lf`/`rf` and `--session`, and it stays in step with the installed
+  binary automatically.
 - **`ls` fits on a normal terminal.** The table now shows `Name Cmd CWD
   Client Idle Linger Status` (CWD home-relative); it used to run ~130
   columns wide with ID, PTY, PID and a full timestamp on every row. Those
