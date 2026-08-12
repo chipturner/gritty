@@ -129,6 +129,7 @@ stateDiagram-v2
         ProbeFailing --> Alive: next probe ok
         ProbeFailing --> KillingChild: counter >= 2\n(kill ssh; counter resets when the\nreplacement child is installed)
         Alive --> KillingChild: net path changed\n+ one-shot probe failed\n(macOS only; gated on uptime >= 5s)
+        Alive --> KillingChild: socket file gone\n(definitive; first tick, no strikes)
         Alive --> ChildExited: child.wait() returned
         KillingChild --> ChildExited: child.wait() observes kill
 
@@ -335,8 +336,12 @@ The monitor runs a `tokio::select!` with five arms:
   event races the sub-second outage itself. The kill is further gated on
   `state.past_spawn_grace()` (`uptime >= SPAWN_GRACE`, 5s) -- a fresh ssh
   whose `-L` hasn't bound yet isn't killed by its own startup race.
-- **`probe_ticker.tick()`** -- every 30s, run `probe_tunnel_alive` against
-  the local socket. The probe does `Hello -> HelloAck -> ListSessions` with
+- **`probe_ticker.tick()`** -- every 30s. First, if the local socket *file*
+  no longer exists (external `rm`, a `/tmp` sweeper, a wiped dir), kill ssh
+  at once (`respawn_now`): it is listening on an unlinked inode that no
+  client can reach, so waiting for strikes only delays the respawn -- this
+  used to take up to a minute. Otherwise run `probe_tunnel_alive` against
+  the socket. The probe does `Hello -> HelloAck -> ListSessions` with
   a 3s outer timeout and 1s inner timeouts. This catches remote-daemon death
   (OOM, crash, manual kill) that ssh can't see: ssh's `ServerAliveInterval`
   only covers TCP-layer liveness. Two consecutive probe failures kill the
@@ -484,7 +489,7 @@ These must hold; violating them has in the past caused specific, nasty bugs:
 |---------------------------------------|----------------|----------------------|-----------|
 | `ServerAliveInterval` / `CountMax`    | 3s / 2 (=6s)   | `TUNNEL_SSH_OPTS`    | TCP-layer dead-peer detection inside ssh. |
 | `PROBE_INTERVAL`                      | 30s            | `tunnel_monitor`     | App-layer Hello handshake cadence. Longer than `ServerAliveInterval` so ssh catches TCP failures first. |
-| `PROBE_FAILURES_BEFORE_RESPAWN`       | 2              | `tunnel_monitor`     | One missed probe can be a transient network blip; two in a row (60s window) is a confident "remote daemon is dead". |
+| `PROBE_FAILURES_BEFORE_RESPAWN`       | 2              | `tunnel_monitor`     | One missed probe can be a transient network blip; two in a row (60s window) is a confident "remote daemon is dead". Applies only to app-layer failures -- a missing socket file respawns on the first tick (`respawn_now`). |
 | Probe outer timeout                   | 3s             | `probe_tunnel_alive` | Runs inside the supervisor select; slow probe blocks everything. |
 | Probe inner (HelloAck) timeout        | 1s             | `probe_tunnel_alive` | Same. |
 | Backoff min / max                     | 1s / 60s       | `tunnel_monitor`     | Aggressive first retry (usual case: transient ssh exit 255); cap at 60s to avoid hammering. |

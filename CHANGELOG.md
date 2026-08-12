@@ -26,6 +26,12 @@ protocol interoperate with their neighbors.
   `--json`) and exits 0; naming a host that is down still fails, but
   `--json` now emits the group with its `error` field rather than a bare
   message.
+- **Gone sockets are noticed promptly.** If a tunnel's local socket file
+  disappears (a `/tmp` sweeper, an external `rm`), the supervisor now
+  respawns ssh on the next 30s tick instead of counting the missing file as
+  two 30s strikes; and an attached client whose server socket has been
+  removed exits when its 3s grace is up, rather than after whatever
+  reconnect backoff happened to be scheduled (observed: ~8s).
 - **`info` and `doctor` read better.** `info` now says `local server:
   not running` (on a laptop that only talks to remote hosts that isn't a
   problem), omits log paths that don't exist instead of printing a page of

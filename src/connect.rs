@@ -422,8 +422,23 @@ const HEALTHY_CHILD_THRESHOLD: Duration = Duration::from_secs(30);
 /// covers TCP-level liveness, but can't detect a remote gritty daemon
 /// that died while ssh stayed up (OOM, crash, manual kill).
 const PROBE_INTERVAL: Duration = Duration::from_secs(30);
-/// Consecutive probe failures before we kill ssh to force a respawn.
+/// Consecutive *app-layer* probe failures before we kill ssh to force a
+/// respawn -- a single failure can be a slow remote. A missing socket file
+/// is not an app-layer failure; see [`respawn_now`].
 const PROBE_FAILURES_BEFORE_RESPAWN: u32 = 2;
+
+/// Should this probe tick kill ssh so it respawns? Two triggers:
+///
+/// * the local `-L` socket *file* is gone (external `rm`, a `/tmp` sweeper,
+///   a wiped dir) -- ssh is still listening on an unlinked inode nobody can
+///   reach, and no amount of waiting changes that, so this is definitive on
+///   the first tick rather than a strike (with 30s ticks and two strikes it
+///   used to take up to a minute);
+/// * otherwise, `PROBE_FAILURES_BEFORE_RESPAWN` consecutive failed probes,
+///   which is the ambiguous "remote daemon may be dead" signal.
+fn respawn_now(socket_file_exists: bool, consecutive_failures: u32) -> bool {
+    !socket_file_exists || consecutive_failures >= PROBE_FAILURES_BEFORE_RESPAWN
+}
 /// Debounce window for the net-change-triggered probe. macOS
 /// `nw_path_monitor` fires a burst of events (~100-200ms apart) during wifi
 /// renegotiation; probing on the first one races the outage itself and
@@ -944,33 +959,43 @@ async fn tunnel_monitor(
                     return;
                 }
                 refresh_mtimes(&cfg.keep_fresh);
-                match probe_tunnel_alive(&cfg.local_sock).await {
-                    Ok(_) => {
-                        if state.probe_failures > 0 {
-                            info!("tunnel probe recovered");
+                let socket_file_exists = cfg.local_sock.exists();
+                if !socket_file_exists {
+                    warn!(
+                        path = %cfg.local_sock.display(),
+                        "tunnel socket file is gone; ssh is listening on an unlinked inode -- \
+                         killing it to respawn"
+                    );
+                } else {
+                    match probe_tunnel_alive(&cfg.local_sock).await {
+                        Ok(_) => {
+                            if state.probe_failures > 0 {
+                                info!("tunnel probe recovered");
+                            }
+                            state.probe_failures = 0;
+                            ms.last_healthy = Some(std::time::SystemTime::now());
+                            ms.saw_unsatisfied = false;
                         }
-                        state.probe_failures = 0;
-                        ms.last_healthy = Some(std::time::SystemTime::now());
-                        ms.saw_unsatisfied = false;
-                    }
-                    Err(why) => {
-                        state.probe_failures += 1;
-                        info!(
-                            "tunnel probe failed ({why}) [{}/{PROBE_FAILURES_BEFORE_RESPAWN}]",
-                            state.probe_failures
-                        );
-                        if state.probe_failures >= PROBE_FAILURES_BEFORE_RESPAWN {
-                            warn!(
-                                "tunnel probe failed {}x; remote daemon looks dead, killing ssh to respawn",
+                        Err(why) => {
+                            state.probe_failures += 1;
+                            info!(
+                                "tunnel probe failed ({why}) [{}/{PROBE_FAILURES_BEFORE_RESPAWN}]",
                                 state.probe_failures
                             );
-                            ms.we_killed = true;
-                            let _ = state.child.kill().await;
-                            // The failure counter is zeroed when the
-                            // replacement ChildState is installed below;
-                            // no need to reset here.
                         }
                     }
+                }
+                if respawn_now(socket_file_exists, state.probe_failures) {
+                    if socket_file_exists {
+                        warn!(
+                            "tunnel probe failed {}x; remote daemon looks dead, killing ssh to respawn",
+                            state.probe_failures
+                        );
+                    }
+                    ms.we_killed = true;
+                    let _ = state.child.kill().await;
+                    // The failure counter is zeroed when the replacement
+                    // ChildState is installed below.
                 }
                 continue;
             }
@@ -3155,6 +3180,16 @@ mod tests {
             assert_eq!(std::fs::read_to_string(p).unwrap(), "x", "touch must not truncate");
         }
         assert!(!dir.path().join("absent.ssh-opts").exists(), "touch must not create files");
+    }
+
+    #[test]
+    fn respawn_is_immediate_when_the_socket_file_is_gone_else_after_strikes() {
+        // Missing file: definitive, regardless of the strike count.
+        assert!(respawn_now(false, 0));
+        // App-layer failures accumulate strikes first.
+        assert!(!respawn_now(true, 0));
+        assert!(!respawn_now(true, PROBE_FAILURES_BEFORE_RESPAWN - 1));
+        assert!(respawn_now(true, PROBE_FAILURES_BEFORE_RESPAWN));
     }
 
     #[test]

@@ -387,6 +387,21 @@ impl PersistenceGate {
     fn streak(&self, now: Instant) -> Option<Duration> {
         self.since.map(|s| now.saturating_duration_since(s))
     }
+
+    /// Time left until a current streak trips the gate; `None` when not
+    /// streaking. Zero once it is due.
+    fn remaining(&self, now: Instant) -> Option<Duration> {
+        self.streak(now).map(|held| self.grace.saturating_sub(held))
+    }
+}
+
+/// The backoff to actually sleep: the scheduled delay, shortened so that a
+/// terminal verdict already streaking lands when its grace expires rather
+/// than after whatever exponential sleep happened to be scheduled (a
+/// 3s grace was observed taking ~8s to fire once backoff had climbed). The
+/// nominal delay still drives the schedule; only the wait is capped.
+fn cap_backoff(sleep_for: Duration, gates: &[&PersistenceGate], now: Instant) -> Duration {
+    gates.iter().filter_map(|g| g.remaining(now)).fold(sleep_for, Duration::min)
 }
 
 /// Terminal message when the ctl socket refuses connections and no supervisor
@@ -2257,7 +2272,9 @@ pub async fn run(
                     // `continue` below and doubled the backoff without ever
                     // attempting to connect.
                     let sleep_for = next_reconnect_delay(backoff);
-                    let deadline = tokio::time::Instant::now() + sleep_for;
+                    let wait =
+                        cap_backoff(sleep_for, &[&socket_gone, &daemon_gone], Instant::now());
+                    let deadline = tokio::time::Instant::now() + wait;
                     let mut net_hint = false;
                     let mut key_hint = false;
                     // Wait out the backoff, animating the status line. Each
@@ -3481,6 +3498,46 @@ mod tests {
         assert!(err.ends_with("\x1b[K\r\n"), "{err:?}");
         assert!(err.contains("error: boom"), "{err:?}");
         assert_eq!(&err[2..], terminal_err_line("boom", true), "same body either way");
+    }
+
+    #[test]
+    fn persistence_gate_remaining_counts_down_only_while_streaking() {
+        let t0 = Instant::now();
+        let mut gate = PersistenceGate::new(Duration::from_secs(3));
+        assert_eq!(gate.remaining(t0), None);
+        assert!(!gate.exceeded(true, t0));
+        assert_eq!(gate.remaining(t0 + Duration::from_secs(1)), Some(Duration::from_secs(2)));
+        assert_eq!(gate.remaining(t0 + Duration::from_secs(9)), Some(Duration::ZERO));
+        assert!(!gate.exceeded(false, t0 + Duration::from_secs(1)));
+        assert_eq!(gate.remaining(t0 + Duration::from_secs(2)), None, "cleared streak");
+    }
+
+    #[test]
+    fn backoff_is_capped_to_the_soonest_streaking_verdict() {
+        let t0 = Instant::now();
+        let mut socket = PersistenceGate::new(Duration::from_secs(3));
+        let mut daemon = PersistenceGate::new(Duration::from_secs(5));
+        let eight = Duration::from_secs(8);
+
+        // Nothing streaking: the schedule stands.
+        assert_eq!(cap_backoff(eight, &[&socket, &daemon], t0), eight);
+
+        // Socket gone for 1s of a 3s grace: wake in 2s, not 8.
+        socket.exceeded(true, t0);
+        let now = t0 + Duration::from_secs(1);
+        assert_eq!(cap_backoff(eight, &[&socket, &daemon], now), Duration::from_secs(2));
+
+        // Both streaking: the sooner one wins.
+        daemon.exceeded(true, t0);
+        assert_eq!(cap_backoff(eight, &[&socket, &daemon], now), Duration::from_secs(2));
+        socket.reset();
+        assert_eq!(cap_backoff(eight, &[&socket, &daemon], now), Duration::from_secs(4));
+
+        // A schedule shorter than the remaining grace is left alone.
+        assert_eq!(
+            cap_backoff(Duration::from_secs(1), &[&socket, &daemon], now),
+            Duration::from_secs(1)
+        );
     }
 
     #[test]
