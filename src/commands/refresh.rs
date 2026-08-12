@@ -129,9 +129,9 @@ async fn refresh_local(ctl_socket: Option<PathBuf>, yes: bool) -> anyhow::Result
         use gritty::protocol::Frame;
         if let Some(n) = restart_blocked_by(attached_session_count(&ctl_path).await, yes) {
             anyhow::bail!(
-                "local daemon is stale, but restarting it would kill {} attached\n  \
+                "local daemon is stale, but restarting it would kill {}\n  \
                  rerun with -y to restart anyway, or wait for the clients to detach",
-                ui::count(n, "session")
+                ui::count(n, "attached session")
             );
         }
         match util::server_request_any_version(&ctl_path, Frame::KillServer).await {
