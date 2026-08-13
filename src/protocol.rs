@@ -97,6 +97,18 @@ pub const CLIPBOARD_REPLY_DROPPED: u8 = 0x00;
 pub const CLIPBOARD_REPLY_DELIVERED: u8 = 0x01;
 pub const CLIPBOARD_REPLY_TOO_LARGE: u8 = 0x02;
 
+/// The one byte the server writes to a waiting *sender* on the svc socket
+/// (docs/wire-protocol.md, transfer manifest). `PAIRED` starts the data
+/// phase; the other two are written just before the server closes the
+/// stream so `gritty send` can say why its offer ended instead of guessing.
+/// A pre-existing sender that is displaced by a newer offer in the same
+/// session gets `SUPERSEDED`; an offer made while a relay is running gets
+/// `BUSY`. Receivers have no such byte: their stream begins with the file
+/// count, and an unpaired receiver simply sees EOF.
+pub const TRANSFER_GO_PAIRED: u8 = 0x01;
+pub const TRANSFER_GO_SUPERSEDED: u8 = 0x02;
+pub const TRANSFER_GO_BUSY: u8 = 0x03;
+
 /// How long the server waits with no inbound client frames before declaring the
 /// attached client dead and dropping to the unattached ring-buffer state. This
 /// is a cross-module contract: `config.rs` clamps client heartbeat settings so

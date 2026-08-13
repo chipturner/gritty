@@ -1285,7 +1285,10 @@ impl ClientRelay<'_> {
                 let files = crate::ui::count(file_count as usize, "file");
                 write_stdout_async(
                     self.async_stdout,
-                    status_msg(&format!("receiving {files} ({size_str})")).as_bytes(),
+                    // The viewer is a bystander: the relay runs between two
+                    // other processes, and which direction the bytes flow
+                    // relative to this terminal is not knowable here.
+                    status_msg(&format!("transfer started: {files} ({size_str})")).as_bytes(),
                 )
                 .await?;
             }

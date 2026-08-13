@@ -8,6 +8,16 @@ protocol interoperate with their neighbors.
 
 ## Unreleased
 
+- **Transfer messages.** When an offer ends without pairing, `send` now
+  says why per session (`local:work: replaced by a newer gritty send in
+  that session`, `…: busy with another transfer`, `…: closed before
+  pairing` -- the server tells it, via two new svc go bytes) instead of
+  "no receiver connected"; a pairing timeout names the budget and both ways
+  to extend it; `send -` announces up front that the payload lands as a
+  file named `stdin` unless the receiver uses `-`; per-file progress bars
+  in a batch line up in one column; and the notice painted into the
+  attached terminal reads `transfer started: 3 files (1.2 MiB)` -- it
+  used to say "receiving" even when the session was the sending side.
 - **Fixed: `gritty copy` of more than 512 KiB was silently truncated and
   acknowledged as success.** The server now refuses an oversize payload
   (new svc reply byte `0x02`; an older `copy` binary against a new server fails on the closed socket instead), and

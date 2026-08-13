@@ -2,7 +2,58 @@ use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 
 use super::util::{resolve_ctl_path, split_target};
+use gritty::protocol::{
+    TRANSFER_GO_BUSY as GO_BUSY, TRANSFER_GO_PAIRED as GO_PAIRED,
+    TRANSFER_GO_SUPERSEDED as GO_SUPERSEDED,
+};
 use gritty::ui;
+
+/// The pairing race gave up on every session: why, per session when the
+/// server said (see the `TRANSFER_GO_*` bytes), else the generic causes.
+fn unpaired_message(peer: &str, reasons: &[String]) -> String {
+    if reasons.is_empty() {
+        return format!(
+            "no {peer} paired: every offered session closed the offer (a newer `gritty send` in \
+             the same session replaces an earlier one; a session mid-transfer takes no new offers)"
+        );
+    }
+    format!("no {peer} paired: {}", reasons.join("; "))
+}
+
+fn timeout_message(peer: &str, secs: u64) -> String {
+    format!(
+        "no {peer} paired within {secs}s (raise --timeout, or --no-timeout to wait indefinitely)"
+    )
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum GoOutcome {
+    Paired,
+    /// This session is out of the race; the text goes into [`unpaired_message`].
+    Skipped(String),
+    /// A byte outside the protocol: something is badly wrong, abort.
+    Protocol(String),
+}
+
+/// Interpret what a waiting sender read from one session's svc socket:
+/// `Ok(byte)`, or `Err(())` for EOF. `label` is `None` when `send` runs
+/// inside the session itself (one unlabeled stream via `GRITTY_SOCK`), where
+/// naming the session would only be noise.
+fn classify_go(read: Result<u8, ()>, label: Option<&str>) -> GoOutcome {
+    let at = label.map(|l| format!("{l}: ")).unwrap_or_default();
+    let session = if label.is_some() { "that session" } else { "this session" };
+    match read {
+        Ok(GO_PAIRED) => GoOutcome::Paired,
+        Ok(GO_SUPERSEDED) => {
+            GoOutcome::Skipped(format!("{at}replaced by a newer gritty send in {session}"))
+        }
+        Ok(GO_BUSY) => GoOutcome::Skipped(format!("{at}busy with another transfer")),
+        Ok(other) => {
+            GoOutcome::Protocol(format!("{at}unexpected signal from server: 0x{other:02x}"))
+        }
+        Err(()) => GoOutcome::Skipped(format!("{at}closed before pairing")),
+    }
+}
 
 /// Sanitize a filename to its basename, rejecting ".." and empty names.
 fn sanitize_basename(name: &str) -> anyhow::Result<String> {
@@ -31,6 +82,10 @@ fn sanitize_path(name: &str) -> anyhow::Result<String> {
     }
     Ok(name.to_string())
 }
+
+/// The wire name `send -` gives its payload; a directory receiver writes a
+/// file of this name, a `receive -` never sees it.
+const STDIN_WIRE_NAME: &str = "stdin";
 
 struct DiscoveredSession {
     /// The name to put in `SendFile` (an unnamed session's is its id).
@@ -510,9 +565,13 @@ async fn write_send_manifest(
 /// cannot rescue it -- the sink would strip the erase-line along with the color
 /// and leave the bar stacking one line per repaint. Color is a separate
 /// question, so `--color=never` on a terminal still gets a bar.
-fn print_progress(name: &str, transferred: u64, total: u64, last_render: &mut std::time::Instant) {
-    use gritty::ui::sgr::{DIM, GREEN, RESET};
-
+fn print_progress(
+    name: &str,
+    name_width: usize,
+    transferred: u64,
+    total: u64,
+    last_render: &mut std::time::Instant,
+) {
     if !ui::stderr_is_interactive() {
         return;
     }
@@ -521,19 +580,35 @@ fn print_progress(name: &str, transferred: u64, total: u64, last_render: &mut st
         return;
     }
     *last_render = now;
+    eprint!(
+        "\x1b[2K\r{}",
+        progress_line(name, name_width, transferred, total, ui::stderr_is_colored())
+    );
+}
+
+/// One rendering of the bar. `name_width` is the widest name of the batch,
+/// so consecutive files' bars line up in one column.
+fn progress_line(
+    name: &str,
+    name_width: usize,
+    transferred: u64,
+    total: u64,
+    colored: bool,
+) -> String {
+    use gritty::ui::sgr::{DIM, GREEN, RESET};
+
     let pct = (transferred * 100).checked_div(total).map_or(100, |v| v.min(100));
     let bar_width = 20usize;
     let filled = (pct as usize * bar_width / 100).min(bar_width);
     let empty = bar_width - filled;
-    let transferred_str = gritty::client::format_size(transferred);
-    let total_str = gritty::client::format_size(total);
-    let (green, dim, reset) =
-        if ui::stderr_is_colored() { (GREEN, DIM, RESET) } else { ("", "", "") };
-    eprint!(
-        "\x1b[2K\r  {name}  {green}{}{dim}{}{reset}  {pct}%  {transferred_str}/{total_str}",
+    let (green, dim, reset) = if colored { (GREEN, DIM, RESET) } else { ("", "", "") };
+    format!(
+        "  {name:<name_width$}  {green}{}{dim}{}{reset}  {pct}%  {}/{}",
         "=".repeat(filled),
         "-".repeat(empty),
-    );
+        gritty::client::format_size(transferred),
+        gritty::client::format_size(total),
+    )
 }
 
 /// End-of-file line for the progress display: paint the completed bar (also
@@ -541,12 +616,12 @@ fn print_progress(name: &str, transferred: u64, total: u64, last_render: &mut st
 /// for it) and move off the row. Interactive-only, like [`print_progress`]
 /// -- an unconditional newline here put one blank line per file into every
 /// piped/redirected stderr, where no bar was ever drawn.
-fn finish_progress(name: &str, total: u64) {
+fn finish_progress(name: &str, name_width: usize, total: u64) {
     if !ui::stderr_is_interactive() {
         return;
     }
     // transferred == total bypasses the render throttle, so any instant does.
-    print_progress(name, total, total, &mut std::time::Instant::now());
+    print_progress(name, name_width, total, total, &mut std::time::Instant::now());
     eprintln!();
 }
 
@@ -661,7 +736,13 @@ pub(crate) async fn send_command(
     // broken session must not abort the whole transfer and discard healthy
     // sessions that were ready to pair ("first receiver wins").
     let manifest = match &stdin_temp {
-        Some((_, size)) => vec![("stdin".to_string(), *size, 0o644u32, PathBuf::new())],
+        Some((_, size)) => {
+            ui::status(&format!(
+                "stdin will arrive as a file named `{STDIN_WIRE_NAME}` (a `gritty receive -` \
+                 streams it to stdout instead)"
+            ));
+            vec![(STDIN_WIRE_NAME.to_string(), *size, 0o644u32, PathBuf::new())]
+        }
         None => entries.clone(),
     };
     let mut live = Vec::with_capacity(tagged.len());
@@ -682,26 +763,33 @@ pub(crate) async fn send_command(
     // that closes before pairing is skipped (its socket reads EOF), not
     // treated as a failure of the whole transfer.
     ui::status(&waiting_line("receiver", "gritty receive", &labels_of(&tagged)));
+    let reasons: std::sync::Arc<std::sync::Mutex<Vec<String>>> = Default::default();
     let select = race_first_ready(tagged, |mut ts| {
+        let reasons = std::sync::Arc::clone(&reasons);
         Box::pin(async move {
             let mut go = [0u8; 1];
-            match ts.stream.read_exact(&mut go).await {
-                Ok(_) if go[0] == 0x01 => Some(Ok(ts)),
-                Ok(_) => {
-                    Some(Err(anyhow::anyhow!("unexpected signal from server: 0x{:02x}", go[0])))
+            let read = ts.stream.read_exact(&mut go).await.map(|_| go[0]).map_err(|_| ());
+            match classify_go(read, ts.label.as_deref()) {
+                GoOutcome::Paired => Some(Ok(ts)),
+                GoOutcome::Skipped(why) => {
+                    reasons.lock().unwrap_or_else(|p| p.into_inner()).push(why);
+                    None // out of the race; keep waiting on the survivors
                 }
-                Err(_) => None, // this session closed before pairing -- skip it
+                GoOutcome::Protocol(msg) => Some(Err(anyhow::anyhow!(msg))),
             }
         })
     });
     let ts = if let Some(secs) = timeout {
         tokio::time::timeout(std::time::Duration::from_secs(secs), select)
             .await
-            .map_err(|_| anyhow::anyhow!("timed out waiting for receiver"))??
+            .map_err(|_| anyhow::anyhow!("{}", timeout_message("receiver", secs)))??
     } else {
         select.await?
     }
-    .ok_or_else(|| anyhow::anyhow!("no receiver connected"))?;
+    .ok_or_else(|| {
+        let reasons = reasons.lock().unwrap_or_else(|p| p.into_inner());
+        anyhow::anyhow!("{}", unpaired_message("receiver", &reasons))
+    })?;
     if let Some(ref label) = ts.label {
         ui::success(&format!("paired with session {label}"));
     }
@@ -717,6 +805,7 @@ pub(crate) async fn send_command(
         let total_str = gritty::client::format_size(total_bytes);
         ui::status(&format!("sending {} ({total_str})", ui::count(entries.len(), "file")));
 
+        let name_width = entries.iter().map(|(name, ..)| name.chars().count()).max().unwrap_or(0);
         let mut buf = vec![0u8; 64 * 1024];
         for (name, size, _mode, path) in &entries {
             let mut file = tokio::fs::File::open(path).await?;
@@ -732,9 +821,9 @@ pub(crate) async fn send_command(
                 stream.write_all(&buf[..n]).await?;
                 remaining -= n as u64;
                 transferred += n as u64;
-                print_progress(name, transferred, *size, &mut last_render);
+                print_progress(name, name_width, transferred, *size, &mut last_render);
             }
-            finish_progress(name, *size);
+            finish_progress(name, name_width, *size);
         }
     }
 
@@ -840,11 +929,15 @@ where
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
     let mut received = 0u32;
+    // Headers arrive one file at a time, so the receiver can only align to
+    // the widest name seen so far (the sender knows the whole batch up front).
+    let mut name_width = 0usize;
     let mut buf = vec![0u8; 64 * 1024];
     while let Some((name, file_size, mode)) = read_entry_header(reader).await? {
         if received == 0 {
             ui::status(&format!("receiving {}", ui::count(file_count as usize, "file")));
         }
+        name_width = name_width.max(name.chars().count());
         let target = dest_dir.join(&name);
         if let Some(parent) = target.parent() {
             tokio::fs::create_dir_all(parent)
@@ -886,7 +979,7 @@ where
                 }
                 file.write_all(&buf[..n]).await?;
                 transferred += n as u64;
-                print_progress(&name, transferred, file_size, &mut last_render);
+                print_progress(&name, name_width, transferred, file_size, &mut last_render);
             }
             file.flush().await
         };
@@ -900,7 +993,7 @@ where
         }
         drop(file);
         partial.commit(&target).await.map_err(|e| anyhow::anyhow!("{}: {e}", target.display()))?;
-        finish_progress(&name, file_size);
+        finish_progress(&name, name_width, file_size);
         received += 1;
     }
     Ok(received)
@@ -986,11 +1079,11 @@ pub(crate) async fn receive_command(
     let (ts, file_count) = if let Some(secs) = timeout {
         tokio::time::timeout(std::time::Duration::from_secs(secs), select)
             .await
-            .map_err(|_| anyhow::anyhow!("timed out waiting for sender"))??
+            .map_err(|_| anyhow::anyhow!("{}", timeout_message("sender", secs)))??
     } else {
         select.await?
     }
-    .ok_or_else(|| anyhow::anyhow!("no sender connected"))?;
+    .ok_or_else(|| anyhow::anyhow!("{}", unpaired_message("sender", &[])))?;
     if let Some(ref label) = ts.label {
         ui::success(&format!("paired with session {label}"));
     }
@@ -1020,6 +1113,79 @@ pub(crate) async fn receive_command(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn timeout_message_names_the_budget_and_both_ways_out() {
+        let msg = timeout_message("receiver", 300);
+        assert_eq!(
+            msg,
+            "no receiver paired within 300s (raise --timeout, or --no-timeout to wait indefinitely)"
+        );
+        assert!(timeout_message("sender", 5).starts_with("no sender paired within 5s"));
+    }
+
+    #[test]
+    fn unpaired_message_explains_each_closed_offer() {
+        // Nothing specific known: the generic explanation of what closes an
+        // offer before pairing.
+        let msg = unpaired_message("receiver", &[]);
+        assert!(
+            msg.starts_with("no receiver paired: every offered session closed the offer"),
+            "{msg}"
+        );
+        assert!(msg.contains("newer `gritty send`"), "{msg}");
+
+        let msg = unpaired_message(
+            "receiver",
+            &[
+                "local:work: replaced by a newer gritty send".to_string(),
+                "devbox:x: busy with another transfer".to_string(),
+            ],
+        );
+        assert_eq!(
+            msg,
+            "no receiver paired: local:work: replaced by a newer gritty send; devbox:x: busy with another transfer"
+        );
+    }
+
+    #[test]
+    fn go_signal_outcomes() {
+        let work = Some("local:work");
+        assert_eq!(classify_go(Ok(GO_PAIRED), work), GoOutcome::Paired);
+        assert_eq!(
+            classify_go(Ok(GO_SUPERSEDED), work),
+            GoOutcome::Skipped(
+                "local:work: replaced by a newer gritty send in that session".into()
+            )
+        );
+        assert_eq!(
+            classify_go(Ok(GO_BUSY), work),
+            GoOutcome::Skipped("local:work: busy with another transfer".into())
+        );
+        // EOF: the session went away (or an older server dropped us); no claim made.
+        assert_eq!(
+            classify_go(Err(()), work),
+            GoOutcome::Skipped("local:work: closed before pairing".into())
+        );
+        assert!(matches!(classify_go(Ok(0x7f), work), GoOutcome::Protocol(_)));
+        // Run inside the session (no label): no "?:" prefix, and "this session".
+        assert_eq!(
+            classify_go(Ok(GO_SUPERSEDED), None),
+            GoOutcome::Skipped("replaced by a newer gritty send in this session".into())
+        );
+    }
+
+    #[test]
+    fn progress_lines_pad_the_name_to_the_batch_width() {
+        let width = "longer-name".len();
+        let a = progress_line("a", width, 50, 100, false);
+        let b = progress_line("longer-name", width, 100, 100, false);
+        // Both bars start in the same column: the name cell is padded.
+        assert_eq!(a.find('=').unwrap(), b.find('=').unwrap(), "{a:?} vs {b:?}");
+        assert!(a.contains("50%") && a.contains("50 B/100 B"), "{a}");
+        assert!(a.starts_with("  a          "), "{a:?}");
+        assert!(b.contains("100%"), "{b}");
+    }
 
     #[test]
     fn waiting_line_names_where_the_offer_went() {

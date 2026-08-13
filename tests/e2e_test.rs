@@ -2146,14 +2146,14 @@ async fn duplicate_sender_does_not_abort_active_transfer() {
     assert_eq!(files[0].0, "big.bin");
     assert_eq!(files[0].1, file_data);
 
-    // The duplicate's stream was dropped by the server: it reads EOF instead
-    // of a go byte.
-    let mut go2 = [0u8; 1];
-    let n = timeout(Duration::from_secs(3), s2.read(&mut go2))
+    // The duplicate is told the session is busy, then its stream is closed --
+    // never a go byte, so it can't start streaming into a live relay.
+    let mut tail = Vec::new();
+    timeout(Duration::from_secs(3), s2.read_to_end(&mut tail))
         .await
-        .expect("timed out waiting for duplicate sender EOF")
+        .expect("timed out waiting for the duplicate sender to be closed")
         .expect("read error on duplicate sender stream");
-    assert_eq!(n, 0, "duplicate sender should see EOF, got byte 0x{:02x}", go2[0]);
+    assert_eq!(tail, [gritty::protocol::TRANSFER_GO_BUSY], "busy byte, then EOF");
 
     // The active client sees a clean SendOffer + SendDone, never a cancel.
     loop {
@@ -2276,6 +2276,35 @@ async fn send_nested_path_preserved() {
     assert_eq!(files.len(), 1);
     assert_eq!(files[0].0, "dir/sub/file.txt");
     assert_eq!(files[0].1, b"nested");
+
+    let _ = framed.send(Frame::Data(Bytes::from("exit\n"))).await;
+    let _ = timeout(Duration::from_secs(3), server).await;
+}
+
+async fn go_byte(stream: &mut UnixStream) -> u8 {
+    let mut go = [0xffu8; 1];
+    timeout(Duration::from_secs(2), stream.read_exact(&mut go))
+        .await
+        .expect("server must answer the waiting sender")
+        .expect("go byte, not EOF");
+    go[0]
+}
+
+#[tokio::test]
+async fn displaced_sender_is_told_it_was_superseded() {
+    let (_client_tx, mut framed, server, _meta, svc_path) = setup_session_with_svc_path().await;
+    wait_for_shell(&mut framed).await;
+    wait_until(|| svc_path.exists(), Duration::from_secs(5)).await;
+
+    let mut first = UnixStream::connect(&svc_path).await.unwrap();
+    write_sender_manifest(&mut first, "first.txt", 1).await;
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    let mut second = UnixStream::connect(&svc_path).await.unwrap();
+    write_sender_manifest(&mut second, "second.txt", 1).await;
+
+    // Before this byte existed the first sender just saw EOF and reported
+    // "no receiver connected", which read as if the receiver were at fault.
+    assert_eq!(go_byte(&mut first).await, gritty::protocol::TRANSFER_GO_SUPERSEDED);
 
     let _ = framed.send(Frame::Data(Bytes::from("exit\n"))).await;
     let _ = timeout(Duration::from_secs(3), server).await;

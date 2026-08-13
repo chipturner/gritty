@@ -2945,8 +2945,9 @@ fn handle_send_event(
         && !relay_handle.is_finished()
     {
         match event {
-            SendEvent::SenderArrived { .. } => {
-                info!("transfer: relay active, dropping extra sender")
+            SendEvent::SenderArrived { stream, .. } => {
+                info!("transfer: relay active, dropping extra sender");
+                let _ = stream.try_write(&[crate::protocol::TRANSFER_GO_BUSY]);
             }
             SendEvent::ReceiverArrived { .. } => {
                 info!("transfer: relay active, dropping extra receiver")
@@ -2970,7 +2971,13 @@ fn handle_send_event(
                         spawn_transfer_relay(stream, receiver_stream, manifest, notify_tx.clone());
                     *state = TransferState::Active { relay_handle: handle };
                 }
-                _ => {
+                displaced => {
+                    if let TransferState::WaitingForReceiver { sender_stream, .. } = displaced {
+                        // Tell the earlier sender why its offer is ending
+                        // before its stream drops (one byte into an empty
+                        // socket buffer: try_write cannot meaningfully fail).
+                        let _ = sender_stream.try_write(&[crate::protocol::TRANSFER_GO_SUPERSEDED]);
+                    }
                     info!(files = manifest.files.len(), "transfer: sender waiting for receiver");
                     *state = TransferState::WaitingForReceiver { sender_stream: stream, manifest };
                 }
