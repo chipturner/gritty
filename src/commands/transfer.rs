@@ -83,9 +83,13 @@ fn sanitize_path(name: &str) -> anyhow::Result<String> {
     Ok(name.to_string())
 }
 
-/// The wire name `send -` gives its payload; a directory receiver writes a
-/// file of this name, a `receive -` never sees it.
-const STDIN_WIRE_NAME: &str = "stdin";
+/// The wire name `send -` gives its payload: `stdin-YYYYMMDD-HHMMSS` in the
+/// sender's local time, so repeated pipes into a directory receiver don't
+/// overwrite each other and the file says when it was sent. A `receive -`
+/// never sees the name.
+fn stdin_wire_name(now: jiff::Timestamp) -> String {
+    now.to_zoned(jiff::tz::TimeZone::system()).strftime("stdin-%Y%m%d-%H%M%S").to_string()
+}
 
 struct DiscoveredSession {
     /// The name to put in `SendFile` (an unnamed session's is its id).
@@ -740,11 +744,12 @@ pub(crate) async fn send_command(
     // sessions that were ready to pair ("first receiver wins").
     let manifest = match &stdin_temp {
         Some((_, size)) => {
+            let name = stdin_wire_name(jiff::Timestamp::now());
             ui::status(&format!(
-                "stdin will arrive as a file named `{STDIN_WIRE_NAME}` (a `gritty receive -` \
-                 streams it to stdout instead)"
+                "stdin will arrive as a file named `{name}` (a `gritty receive -` streams it to \
+                 stdout instead)"
             ));
-            vec![(STDIN_WIRE_NAME.to_string(), *size, 0o644u32, PathBuf::new())]
+            vec![(name, *size, 0o644u32, PathBuf::new())]
         }
         None => entries.clone(),
     };
@@ -1116,6 +1121,19 @@ pub(crate) async fn receive_command(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn stdin_wire_name_is_timestamped_and_filesystem_safe() {
+        let name = stdin_wire_name(jiff::Timestamp::from_second(1_786_600_000).unwrap());
+        // Local-time rendering varies by zone; the shape does not.
+        assert!(name.starts_with("stdin-20260"), "{name}");
+        assert_eq!(name.len(), "stdin-YYYYMMDD-HHMMSS".len(), "{name}");
+        assert!(
+            name.chars().all(|c| c.is_ascii_alphanumeric() || c == '-'),
+            "no separators a shell or filesystem cares about: {name}"
+        );
+        assert!(sanitize_basename(&name).is_ok());
+    }
 
     #[test]
     fn timeout_message_names_the_budget_and_both_ways_out() {

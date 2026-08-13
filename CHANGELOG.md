@@ -23,8 +23,9 @@ protocol interoperate with their neighbors.
   that session`, `…: busy with another transfer`, `…: closed before
   pairing` -- the server tells it, via two new svc go bytes) instead of
   "no receiver connected"; a pairing timeout names the budget and both ways
-  to extend it; `send -` announces up front that the payload lands as a
-  file named `stdin` unless the receiver uses `-`; per-file progress bars
+  to extend it; `send -` names its payload `stdin-YYYYMMDD-HHMMSS` (it was a
+  file literally called `stdin`, so a second pipe overwrote the first) and
+  prints that name up front unless the receiver uses `-`; per-file progress bars
   in a batch line up in one column; and the notice painted into the
   attached terminal reads `transfer started: 3 files (1.2 MiB)` -- it
   used to say "receiving" even when the session was the sending side.
