@@ -41,11 +41,11 @@ test-daemon:
 
 # Socat tunnel disruption tests (requires socat; skips gracefully if missing)
 test-socat:
-    cargo nextest run --test socat_tunnel_test -j 1
+    cargo nextest run --test socat_tunnel_test
 
 # Socat bridge integration tests (requires socat; skips gracefully if missing)
 test-socat-bridge:
-    cargo nextest run --test socat_bridge_test -j 1
+    cargo nextest run --test socat_bridge_test
 
 # Run full suite N times and report pass/fail tally
 stress count="10":

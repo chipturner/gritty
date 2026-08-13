@@ -74,7 +74,7 @@ async fn create_session(ctl_path: &std::path::Path, name: &str) -> String {
         ctl_path,
         Frame::NewSession {
             name: name.to_string(),
-            command: String::new(),
+            command: "exec sh".to_string(),
             cwd: String::new(),
             cols: 0,
             rows: 0,
@@ -289,7 +289,7 @@ async fn daemon_rejects_duplicate_name() {
         &ctl_path,
         Frame::NewSession {
             name: "dupname".to_string(),
-            command: String::new(),
+            command: "exec sh".to_string(),
             cwd: String::new(),
             cols: 0,
             rows: 0,
@@ -315,7 +315,7 @@ async fn daemon_rejects_name_with_tab() {
         &ctl_path,
         Frame::NewSession {
             name: "bad\tname".to_string(),
-            command: String::new(),
+            command: "exec sh".to_string(),
             cwd: String::new(),
             cols: 0,
             rows: 0,
@@ -341,7 +341,7 @@ async fn daemon_rejects_name_with_newline() {
         &ctl_path,
         Frame::NewSession {
             name: "bad\nname".to_string(),
-            command: String::new(),
+            command: "exec sh".to_string(),
             cwd: String::new(),
             cols: 0,
             rows: 0,
@@ -396,8 +396,8 @@ async fn daemon_kills_session() {
     let resp = control_request(&ctl_path, Frame::KillSession { session: id.clone() }).await;
     assert_eq!(resp, Frame::Ok);
 
-    // List should be empty
-    tokio::time::sleep(Duration::from_millis(200)).await;
+    // List should become empty
+    wait_gone(&ctl_path, "killme").await;
     let resp = control_request(&ctl_path, Frame::ListSessions).await;
     match &resp {
         Frame::SessionInfo { sessions } => {
@@ -422,7 +422,7 @@ async fn daemon_kills_session_by_name() {
         control_request(&ctl_path, Frame::KillSession { session: "named-kill".to_string() }).await;
     assert_eq!(resp, Frame::Ok);
 
-    tokio::time::sleep(Duration::from_millis(200)).await;
+    wait_gone(&ctl_path, "named-kill").await;
     let resp = control_request(&ctl_path, Frame::ListSessions).await;
     match &resp {
         Frame::SessionInfo { sessions } => {
@@ -987,7 +987,7 @@ async fn create_after_kill_same_name() {
     // Kill it
     let resp = control_request(&ctl_path, Frame::KillSession { session: id1.clone() }).await;
     assert_eq!(resp, Frame::Ok);
-    tokio::time::sleep(Duration::from_millis(200)).await;
+    wait_gone(&ctl_path, "reuse").await;
 
     // Create again with same name
     let id2 = create_session(&ctl_path, "reuse").await;
@@ -1245,7 +1245,7 @@ async fn list_before_session_ready() {
         &ctl_path,
         Frame::NewSession {
             name: "early".to_string(),
-            command: String::new(),
+            command: "exec sh".to_string(),
             cwd: String::new(),
             cols: 0,
             rows: 0,
@@ -1450,7 +1450,7 @@ async fn second_attach_during_birth_window_is_rejected() {
     do_handshake(&mut a).await;
     a.send(Frame::NewSession {
         name: "birthrace".to_string(),
-        command: String::new(),
+        command: "exec sh".to_string(),
         cwd: String::new(),
         cols: 0,
         rows: 0,
@@ -1550,8 +1550,9 @@ async fn attach_dead_session_returns_error() {
         libc::kill(shell_pid as i32, libc::SIGKILL);
     }
 
-    // Wait for server task to notice and exit
-    tokio::time::sleep(Duration::from_secs(1)).await;
+    // Wait for the daemon to reap the dead session (the ListSessions poll
+    // inside wait_gone drives reap_sessions).
+    wait_gone(&ctl_path, "dying").await;
 
     // Attach should get an error, not Ok + disconnect
     let resp = control_request(
@@ -1608,8 +1609,9 @@ async fn kill_dead_session_returns_error() {
         libc::kill(shell_pid as i32, libc::SIGKILL);
     }
 
-    // Wait for server task to notice and exit
-    tokio::time::sleep(Duration::from_secs(1)).await;
+    // Wait for the daemon to reap the dead session (the ListSessions poll
+    // inside wait_gone drives reap_sessions).
+    wait_gone(&ctl_path, "dying2").await;
 
     // Kill should get an error, not Ok for a stale entry
     let resp = control_request(&ctl_path, Frame::KillSession { session: id.clone() }).await;
@@ -1670,15 +1672,42 @@ async fn reconnect_via_daemon_after_disconnect() {
 
     let id = create_session(&ctl_path, "reconn").await;
 
-    // First attach — set an env marker
+    // First attach — probe until the shell *executes* a command before
+    // typing the export. Input sent earlier can be lost two ways: the server
+    // consumes one pre-spawn frame as the "unexpected frame instead of Env",
+    // and shell init can flush queued PTY input (tcsetattr TCSAFLUSH). The
+    // echoed probe contains "READY:$((41+1))"; only real execution prints
+    // "READY:42".
     let mut framed = attach_session(&ctl_path, &id).await;
-    drain_data(&mut framed, Duration::from_millis(500)).await;
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(15);
+    let mut out: Vec<u8> = Vec::new();
+    'ready: loop {
+        framed.send(Frame::Data(Bytes::from("echo READY:$((41+1))\n"))).await.unwrap();
+        let retry_at = tokio::time::Instant::now() + Duration::from_millis(300);
+        loop {
+            let now = tokio::time::Instant::now();
+            if now >= retry_at {
+                break;
+            }
+            if let Ok(Some(Ok(Frame::Data(data)))) = timeout(retry_at - now, framed.next()).await {
+                out.extend_from_slice(&data);
+                if out.windows(8).any(|w| w == b"READY:42") {
+                    break 'ready;
+                }
+            }
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "shell did not execute the readiness probe within 15s, got: {:?}",
+            String::from_utf8_lossy(&out)
+        );
+    }
     framed.send(Frame::Data(Bytes::from("export RECONN_MARKER=persisted\n"))).await.unwrap();
-    drain_data(&mut framed, Duration::from_millis(500)).await;
+    drain_data(&mut framed, Duration::from_millis(100)).await;
 
     // Disconnect
     drop(framed);
-    tokio::time::sleep(Duration::from_millis(500)).await;
+    wait_detached(&ctl_path, "reconn").await;
 
     // Re-attach via new daemon connection (raw — shell already running, no guaranteed output)
     let stream = UnixStream::connect(&ctl_path).await.unwrap();
@@ -1708,7 +1737,7 @@ async fn reconnect_via_daemon_after_disconnect() {
         "expected AttachAck for re-attach, got {resp:?}"
     );
     framed.send(Frame::Resize { cols: 80, rows: 24 }).await.unwrap();
-    drain_data(&mut framed, Duration::from_millis(500)).await;
+    drain_data(&mut framed, Duration::from_millis(100)).await;
 
     // Verify marker persists. Poll until the expanded value appears — the shell is a
     // separate process and may lag the kernel PTY echo under CPU contention, so a
@@ -1747,16 +1776,16 @@ async fn reconnect_after_session_killed_returns_error() {
 
     // Attach
     let mut framed = attach_session(&ctl_path, &id).await;
-    drain_data(&mut framed, Duration::from_millis(500)).await;
+    drain_data(&mut framed, Duration::from_millis(100)).await;
 
     // Disconnect
     drop(framed);
-    tokio::time::sleep(Duration::from_millis(300)).await;
+    wait_detached(&ctl_path, "doomed-reconn").await;
 
     // Kill the session
     let resp = control_request(&ctl_path, Frame::KillSession { session: id.clone() }).await;
     assert_eq!(resp, Frame::Ok);
-    tokio::time::sleep(Duration::from_millis(300)).await;
+    wait_gone(&ctl_path, "doomed-reconn").await;
 
     // Try to re-attach -- should get Error
     let resp = control_request(
@@ -1856,7 +1885,7 @@ async fn daemon_rejects_purely_numeric_name() {
         &ctl_path,
         Frame::NewSession {
             name: "42".to_string(),
-            command: String::new(),
+            command: "exec sh".to_string(),
             cwd: String::new(),
             cols: 0,
             rows: 0,
@@ -2040,7 +2069,7 @@ async fn new_session_for_test(
     framed
         .send(Frame::NewSession {
             name: name.to_string(),
-            command: String::new(),
+            command: "exec sh".to_string(),
             cwd: String::new(),
             cols: 0,
             rows: 0,
@@ -2179,7 +2208,7 @@ async fn already_attached_error_names_current_client() {
     framed_a
         .send(Frame::NewSession {
             name: "alpha".to_string(),
-            command: String::new(),
+            command: "exec sh".to_string(),
             cwd: String::new(),
             cols: 0,
             rows: 0,
@@ -2521,7 +2550,7 @@ async fn create_lingering_session(
         ctl_path,
         Frame::NewSession {
             name: name.to_string(),
-            command: String::new(),
+            command: "exec sh".to_string(),
             cwd: String::new(),
             cols: 0,
             rows: 0,

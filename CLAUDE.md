@@ -109,7 +109,8 @@ Read-only commands (`ls`, `info`, `tunnels`, `doctor` without `--clean`, `socket
 - **E2e**: `UnixStream::pair()` + channel to `server::run()`. No socket files.
 - **Daemon**: real socket in `tempfile::tempdir()`. `do_handshake()` + `wait_for_daemon()`.
 - **Protocol**: codec unit tests + property tests (`tests/protocol_proptest.rs`).
-- **Nextest**: e2e + daemon capped at 2 concurrent; socat/SSH serial; 2 retries for flaky tests. Per-process isolation.
+- **Nextest**: e2e/daemon/procscan run at default parallelism (one thread per core) with 2 retries; socat suites capped at 4 concurrent (timing windows around killed processes). Per-process isolation.
+- **Test waits are event-driven, not sleep-based**: `read_until_contains` (returns on marker, not after a silence window), `wait_detached` (polls session metadata), `sync_ping` (Pong round-trip proves earlier frames were processed), flag files touched by shell jobs (poll for completion). `wait_for_shell` probes with `echo READY:$((41+1))` until the shell *executes* it -- output alone proves nothing, since the PTY line discipline echoes input that shell init later flushes (tcsetattr TCSAFLUSH). Sessions spawn `exec sh` (`FAST_SHELL`), not the user's login shell -- a herd of `$SHELL -l` inits sourcing real dotfiles is what made full parallelism flaky; only `login_shell_starts_in_home` uses `-l`. Keep fixed sleeps only for genuinely unobservable windows (negative assertions, cross-channel races).
 - **Socat**: auto-detect availability, skip gracefully. `GRITTY_SOCAT_TEST=0` to force-skip. SSH coverage lives in the container suite (`just test-container`), gated on Docker.
 
 ### Workflow

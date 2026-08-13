@@ -1,19 +1,14 @@
-[test-groups.pty-tests]
-max-threads = 2
-
+# Socat disruption suites: each test is tempdir-isolated (own server + proxy
+# processes), but they assert on timing windows around killed processes, so
+# they get modest parallelism rather than the default one-per-core.
 [test-groups.serial]
-max-threads = 1
+max-threads = 4
 
+# PTY/daemon suites run at nextest's default parallelism (one thread per
+# logical core). Timing waits are event-driven (marker reads, polls), so
+# they tolerate load; retries absorb residual scheduler-jitter flakes.
 [[profile.default.overrides]]
-filter = 'binary(e2e_test) | binary(daemon_test)'
-test-group = 'pty-tests'
-retries = 2
-
-# Spawns real self-daemonized `gritty server` processes; same group + retry
-# policy as the other process-heavy suites.
-[[profile.default.overrides]]
-filter = 'binary(procscan_test)'
-test-group = 'pty-tests'
+filter = 'binary(e2e_test) | binary(daemon_test) | binary(procscan_test)'
 retries = 2
 
 [[profile.default.overrides]]
