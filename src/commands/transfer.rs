@@ -366,7 +366,10 @@ async fn discover_all_sessions(
     };
 
     if probes.is_empty() {
-        anyhow::bail!("no server running");
+        anyhow::bail!(
+            "no sessions to offer the transfer to: neither a local server nor any tunnel is \
+             running (`gritty connect [host]` starts one)"
+        );
     }
 
     let futures: Vec<_> = probes

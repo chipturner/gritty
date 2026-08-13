@@ -74,6 +74,57 @@ pub(crate) fn resolve_ctl_path(
     }
 }
 
+/// Which kind of thing a control socket path stands for, from its shape.
+#[derive(Debug, PartialEq, Eq)]
+enum SocketRole<'a> {
+    /// The default local `ctl.sock`.
+    Local,
+    /// A tunnel's forward socket; `supervised` = its supervisor holds the lock
+    /// (ssh is down but being respawned).
+    Tunnel { name: &'a str, supervised: bool },
+    /// A `--ctl-socket` override or anything else we can't characterize.
+    Other,
+}
+
+fn socket_role(ctl_path: &Path) -> SocketRole<'_> {
+    if let Some(name) = gritty::connect::ctl_socket_tunnel_name(ctl_path) {
+        let supervised = gritty::connect::ctl_socket_lock_path(ctl_path)
+            .as_deref()
+            .is_some_and(gritty::connect::is_lock_held);
+        return SocketRole::Tunnel { name, supervised };
+    }
+    if ctl_path == gritty::daemon::control_socket_path() {
+        return SocketRole::Local;
+    }
+    SocketRole::Other
+}
+
+/// The error for a control socket nothing answers on, phrased as what is
+/// down in the user's terms and how to bring it up. Only `connect` starts
+/// things; every other command lands here when its host is down.
+pub(crate) fn no_server_message(ctl_path: &Path) -> String {
+    no_server_message_for(socket_role(ctl_path), ctl_path)
+}
+
+fn no_server_message_for(role: SocketRole<'_>, ctl_path: &Path) -> String {
+    let path = ctl_path.display();
+    match role {
+        SocketRole::Local => format!(
+            "no local server running (could not connect to {path}) -- `gritty connect` starts \
+             one, or `gritty server`"
+        ),
+        SocketRole::Tunnel { name, supervised: false } => format!(
+            "tunnel {name} is not running (could not connect to {path}) -- `gritty connect \
+             {name}` brings it up"
+        ),
+        SocketRole::Tunnel { name, supervised: true } => format!(
+            "tunnel {name} is reconnecting (could not connect to {path}) -- retry in a moment; \
+             `gritty tunnels` shows its state"
+        ),
+        SocketRole::Other => format!("no server running (could not connect to {path})"),
+    }
+}
+
 /// A control connection whose version handshake is complete, kept open so the
 /// caller can keep streaming on it (unlike the one-shot [`server_request`]).
 pub(crate) type HandshakedConn =
@@ -82,7 +133,7 @@ pub(crate) type HandshakedConn =
 /// Connect to a daemon control socket and complete the version handshake,
 /// returning the live `Framed` plus the [`gritty::HandshakeInfo`] (callers
 /// such as `tail` need `server_id` for reconnect detection). A failed connect
-/// maps to the standard "no server running" error. `check_version` mirrors the
+/// maps to [`no_server_message`]. `check_version` mirrors the
 /// [`server_request`] / [`server_request_any_version`] split.
 pub(crate) async fn connect_handshaked(
     ctl_path: &Path,
@@ -91,9 +142,9 @@ pub(crate) async fn connect_handshaked(
     use gritty::protocol::FrameCodec;
     use tokio_util::codec::Framed;
 
-    let stream = gritty::security::connect_verified(ctl_path).await.map_err(|_| {
-        anyhow::anyhow!("no server running (could not connect to {})", ctl_path.display())
-    })?;
+    let stream = gritty::security::connect_verified(ctl_path)
+        .await
+        .map_err(|_| anyhow::anyhow!("{}", no_server_message(ctl_path)))?;
     let mut framed = Framed::new(stream, FrameCodec);
     let info = gritty::handshake(&mut framed, gritty::get_or_create_device_id())
         .await
@@ -273,9 +324,7 @@ pub(crate) async fn connect_or_start(
             (format!("tunnel {host}"), auto_start(&recreate))
         }
         AutoStart::None if wait => (String::new(), Ok(())),
-        AutoStart::None => {
-            anyhow::bail!("no server running (could not connect to {})", ctl_path.display());
-        }
+        AutoStart::None => anyhow::bail!("{}", no_server_message(ctl_path)),
     };
     let auto_started = !matches!(auto_start_mode, AutoStart::None);
 
@@ -1687,6 +1736,38 @@ mod tests {
         // token is the status, not a repeat of the name.
         assert_eq!(coder_line.split_whitespace().nth(1), Some("reconnecting"), "{coder_line}");
         assert!(text.contains("pid 7"), "{text}");
+    }
+
+    #[test]
+    fn no_server_message_names_what_is_down_and_how_to_start_it() {
+        let p = Path::new("/run/g/connect-devbox.sock");
+        let down =
+            no_server_message_for(SocketRole::Tunnel { name: "devbox", supervised: false }, p);
+        assert!(down.starts_with("tunnel devbox is not running"), "{down}");
+        assert!(down.contains("gritty connect devbox"), "{down}");
+        assert!(down.contains("/run/g/connect-devbox.sock"), "{down}");
+
+        let respawning =
+            no_server_message_for(SocketRole::Tunnel { name: "devbox", supervised: true }, p);
+        assert!(respawning.starts_with("tunnel devbox is reconnecting"), "{respawning}");
+        assert!(!respawning.contains("gritty connect"), "no start hint mid-respawn: {respawning}");
+
+        let local = no_server_message_for(SocketRole::Local, Path::new("/run/g/ctl.sock"));
+        assert!(local.starts_with("no local server running"), "{local}");
+        assert!(local.contains("gritty server"), "{local}");
+
+        let other = no_server_message_for(SocketRole::Other, Path::new("/x/custom.sock"));
+        assert_eq!(other, "no server running (could not connect to /x/custom.sock)");
+    }
+
+    #[test]
+    fn socket_role_is_derived_from_the_path_shape() {
+        assert_eq!(
+            socket_role(Path::new("/nonexistent-dir/connect-devbox.sock")),
+            SocketRole::Tunnel { name: "devbox", supervised: false }
+        );
+        assert_eq!(socket_role(&gritty::daemon::control_socket_path()), SocketRole::Local);
+        assert_eq!(socket_role(Path::new("/x/custom.sock")), SocketRole::Other);
     }
 
     #[test]

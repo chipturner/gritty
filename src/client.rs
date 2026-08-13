@@ -2775,6 +2775,15 @@ pub async fn run(
     }
 }
 
+/// What `tail` prints when the session it is watching ends.
+fn tail_exit_text(code: i32) -> String {
+    if code == 0 {
+        "session exited".to_string()
+    } else {
+        format!("session exited with code {code}")
+    }
+}
+
 /// Read-only tail of a session's PTY output.
 /// No raw mode, no stdin, no escape processing, no forwarding.
 /// Ctrl-C triggers clean exit with terminal reset.
@@ -2838,6 +2847,9 @@ pub async fn tail(
                         }
                         Some(Ok(Frame::Pong)) => {}
                         Some(Ok(Frame::Exit { code })) => {
+                            // Without this, output just stops -- which is
+                            // also what a quiet session looks like.
+                            eprint!("{}", status_msg(&tail_exit_text(code)));
                             break 'relay Some(code);
                         }
                         Some(Ok(Frame::ServerShutdown)) => {
@@ -3501,6 +3513,12 @@ mod tests {
         assert!(err.ends_with("\x1b[K\r\n"), "{err:?}");
         assert!(err.contains("error: boom"), "{err:?}");
         assert_eq!(&err[2..], terminal_err_line("boom", true), "same body either way");
+    }
+
+    #[test]
+    fn tail_exit_text_mentions_the_code_only_when_nonzero() {
+        assert_eq!(tail_exit_text(0), "session exited");
+        assert_eq!(tail_exit_text(3), "session exited with code 3");
     }
 
     #[test]

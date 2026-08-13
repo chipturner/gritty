@@ -8,6 +8,16 @@ protocol interoperate with their neighbors.
 
 ## Unreleased
 
+- **`tail` and down hosts.** `tail` now prints `session exited [with code
+  N]` when the session it is watching ends (its output used to just stop,
+  the same as a quiet session) and exits with that code. Commands other
+  than `connect` never start anything, and their error for a down host now
+  says what is down and how to bring it up -- `tunnel devbox is not
+  running … -- gritty connect devbox brings it up`, `tunnel devbox is
+  reconnecting … retry in a moment`, or `no local server running … --
+  gritty connect starts one` -- instead of "no server running" for all
+  three; `send`/`receive` with nothing running at all say so in the same
+  terms.
 - **Transfer messages.** When an offer ends without pairing, `send` now
   says why per session (`local:work: replaced by a newer gritty send in
   that session`, `…: busy with another transfer`, `…: closed before

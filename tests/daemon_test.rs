@@ -617,6 +617,26 @@ async fn kill_reports_one_error_line_per_failure_and_summarizes_only_batches() {
     assert!(!stderr.contains("(s)"), "{stderr}");
 }
 
+#[tokio::test]
+async fn tail_announces_the_sessions_exit_and_passes_its_code_through() {
+    let (tmp, ctl_path) = test_ctl();
+    let ctl = ctl_path.clone();
+    let _daemon = tokio::spawn(async move { gritty::daemon::run(&ctl, None).await });
+    wait_for_daemon(&ctl_path).await;
+
+    let out =
+        gritty_in(tmp.path(), &["connect", "-d", "local:shared/brief", "-c", "sleep 1.5; exit 3"])
+            .await;
+    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+
+    // Output simply stopping used to be all a tail viewer got when the
+    // session ended -- indistinguishable from a quiet session.
+    let out = gritty_in(tmp.path(), &["tail", "local:shared/brief"]).await;
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(3), "tail exits with the session's code: {stderr}");
+    assert!(stderr.contains("session exited with code 3"), "{stderr}");
+}
+
 /// Wait until `name` is listed and detached (the creating connection's EOF is
 /// noticed asynchronously).
 async fn wait_detached(ctl_path: &std::path::Path, name: &str) {
@@ -655,12 +675,12 @@ async fn ls_dashboard_and_single_host_share_one_shape() {
     let out = gritty_in(tmp.path(), &["ls", "local"]).await;
     let stderr = String::from_utf8_lossy(&out.stderr);
     assert!(!out.status.success());
-    assert!(stderr.contains("no server running"), "{stderr}");
+    assert!(stderr.contains("no local server running"), "{stderr}");
     let out = gritty_in(tmp.path(), &["ls", "local", "--json"]).await;
     assert!(!out.status.success());
     let v: serde_json::Value = serde_json::from_slice(&out.stdout).expect("json even on failure");
     assert_eq!(v[0]["hosts"][0]["name"], "local");
-    assert!(v[0]["error"].as_str().unwrap_or("").contains("no server running"), "{v}");
+    assert!(v[0]["error"].as_str().unwrap_or("").contains("no local server running"), "{v}");
 
     // With a daemon: both forms render the same group shape.
     let ctl = ctl_path.clone();
