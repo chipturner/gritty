@@ -909,6 +909,10 @@ pub(crate) fn clipboard_copy() {
         ui::error(&format!("reading stdin: {e}"));
         std::process::exit(1);
     }
+    if let Some(msg) = clipboard_too_large(data.len()) {
+        ui::error(&msg);
+        std::process::exit(1);
+    }
     if let Err(e) = stream
         .write_all(&[gritty::protocol::SvcRequest::Clipboard.to_byte()])
         .and_then(|_| stream.write_all(&[0x01]))
@@ -919,24 +923,41 @@ pub(crate) fn clipboard_copy() {
         ui::error(&format!("clipboard copy failed: {e}"));
         std::process::exit(1);
     }
-    // Read the 1-byte delivery confirmation: 0x01 = set, 0x00 = dropped (no
-    // attached client, or the client lacks clipboard support). An older server
-    // sends nothing and closes -- read_exact then errors and we degrade to a
-    // soft warning, matching `gritty open`.
+    // Read the 1-byte delivery reply (protocol::CLIPBOARD_REPLY_*). An older
+    // server sends nothing and closes -- read_exact then errors and we degrade
+    // to a soft warning, matching `gritty open`.
     let _ = stream.set_read_timeout(Some(std::time::Duration::from_secs(2)));
     let mut resp = [0u8; 1];
     match stream.read_exact(&mut resp) {
-        Ok(()) if resp[0] == 0x00 => {
-            eprintln!(
-                "error: clipboard not delivered -- no client is attached, or it lacks clipboard support"
-            );
+        Ok(()) if resp[0] == gritty::protocol::CLIPBOARD_REPLY_DELIVERED => {}
+        Ok(()) if resp[0] == gritty::protocol::CLIPBOARD_REPLY_TOO_LARGE => {
+            // Only reachable against a server with a smaller limit than ours;
+            // the local check above catches the normal case with exact numbers.
+            ui::error("clipboard not set -- the server refused the payload as too large");
             std::process::exit(1);
         }
-        Ok(()) => {}
+        Ok(()) => {
+            ui::error("clipboard not set -- no client is attached, or it lacks clipboard support");
+            std::process::exit(1);
+        }
         Err(_) => {
             ui::warn("could not confirm clipboard was set (server may be older)");
         }
     }
+}
+
+/// The error for a payload over [`gritty::protocol::CLIPBOARD_MAX_BYTES`],
+/// or `None` when it fits. Checked client-side so the message can quote the
+/// actual size and suggest the alternative that has no limit.
+fn clipboard_too_large(len: usize) -> Option<String> {
+    let limit = gritty::protocol::CLIPBOARD_MAX_BYTES;
+    (len > limit).then(|| {
+        format!(
+            "clipboard payload is {} (limit {}); for something this large use `gritty send`",
+            gritty::client::format_size(len as u64),
+            gritty::client::format_size(limit as u64)
+        )
+    })
 }
 
 /// Forward a URL to the attached client to open locally.
@@ -1666,6 +1687,16 @@ mod tests {
         // token is the status, not a repeat of the name.
         assert_eq!(coder_line.split_whitespace().nth(1), Some("reconnecting"), "{coder_line}");
         assert!(text.contains("pid 7"), "{text}");
+    }
+
+    #[test]
+    fn clipboard_limit_message_quotes_both_sizes_and_the_alternative() {
+        let limit = gritty::protocol::CLIPBOARD_MAX_BYTES;
+        assert_eq!(clipboard_too_large(0), None);
+        assert_eq!(clipboard_too_large(limit), None, "exactly the limit fits");
+        let msg = clipboard_too_large(3 * limit).unwrap();
+        assert!(msg.contains("1.50 MiB") && msg.contains("512 KiB"), "{msg}");
+        assert!(msg.contains("gritty send"), "{msg}");
     }
 
     #[test]

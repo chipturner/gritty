@@ -82,6 +82,21 @@ pub const PROTOCOL_VERSION: u16 = 23;
 /// Capability bit: client/server supports clipboard forwarding.
 pub const CAP_CLIPBOARD: u32 = 0x01;
 
+/// Largest payload `gritty copy` accepts. A copy travels as one
+/// `ClipboardSet` frame, so this must stay under `MAX_FRAME_SIZE`; the svc
+/// sub-protocol's contract is that anything larger is *refused*
+/// ([`CLIPBOARD_REPLY_TOO_LARGE`]), never silently cut down -- `gritty copy`
+/// checks it before sending so the error is exact, the server enforces it.
+pub const CLIPBOARD_MAX_BYTES: usize = 512 * 1024;
+
+/// Reply bytes to a svc-socket clipboard copy (documented in
+/// docs/wire-protocol.md). Older clients took any reply but `DROPPED` as
+/// success, so a refusing server closes without draining the payload: the
+/// old client's write fails with EPIPE instead of misreading `TOO_LARGE`.
+pub const CLIPBOARD_REPLY_DROPPED: u8 = 0x00;
+pub const CLIPBOARD_REPLY_DELIVERED: u8 = 0x01;
+pub const CLIPBOARD_REPLY_TOO_LARGE: u8 = 0x02;
+
 /// How long the server waits with no inbound client frames before declaring the
 /// attached client dead and dropping to the unattached ring-buffer state. This
 /// is a cross-module contract: `config.rs` clamps client heartbeat settings so

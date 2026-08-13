@@ -8,6 +8,11 @@ protocol interoperate with their neighbors.
 
 ## Unreleased
 
+- **Fixed: `gritty copy` of more than 512 KiB was silently truncated and
+  acknowledged as success.** The server now refuses an oversize payload
+  (new svc reply byte `0x02`; an older `copy` binary against a new server fails on the closed socket instead), and
+  `copy` itself checks the limit first so the error quotes the size
+  (`clipboard payload is 1.50 MiB (limit 512 KiB); … use gritty send`).
 - **Breaking: `gritty completions <shell>` is replaced by dynamic
   completions.** Put `source <(COMPLETE=zsh gritty)` (or the bash/fish/
   elvish equivalent, see USAGE) in your shell rc and delete any generated

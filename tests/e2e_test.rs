@@ -102,6 +102,20 @@ async fn setup_session_with_svc_path() -> (
     Arc<OnceLock<gritty::server::SessionMetadata>>,
     PathBuf,
 ) {
+    setup_svc_session(0).await
+}
+
+/// Like [`setup_session_with_svc_path`], with the attached client advertising
+/// `capabilities` (e.g. `CAP_CLIPBOARD`).
+async fn setup_svc_session(
+    capabilities: u32,
+) -> (
+    mpsc::UnboundedSender<ClientConn>,
+    Framed<UnixStream, FrameCodec>,
+    JoinHandle<anyhow::Result<()>>,
+    Arc<OnceLock<gritty::server::SessionMetadata>>,
+    PathBuf,
+) {
     let (client_tx, client_rx) = mpsc::unbounded_channel();
     let meta = Arc::new(OnceLock::new());
     let meta_clone = Arc::clone(&meta);
@@ -126,7 +140,7 @@ async fn setup_session_with_svc_path() -> (
         .send(ClientConn::Active {
             framed: Framed::new(server_stream, FrameCodec),
             client_name: String::new(),
-            capabilities: 0,
+            capabilities,
             cols: 0,
             rows: 0,
             rendered_offset: 0,
@@ -1430,6 +1444,76 @@ async fn open_while_detached_replies_not_delivered() {
         .expect("detached session must answer an open request promptly")
         .expect("reply byte");
     assert_eq!(resp, [0x00], "detached open must be reported as not delivered");
+
+    client_tx.send(ClientConn::Shutdown).unwrap();
+    let _ = timeout(Duration::from_secs(3), server).await;
+}
+
+/// Drive one `gritty copy` request by hand: `[Clipboard][0x01][data]`, half-close,
+/// read the reply byte. Returns the reply and whether a `ClipboardSet` frame
+/// reached the attached client within a second.
+async fn copy_via_svc(
+    svc_path: &std::path::Path,
+    framed: &mut Framed<UnixStream, FrameCodec>,
+    payload: &[u8],
+) -> (u8, Option<usize>) {
+    let mut conn = UnixStream::connect(svc_path).await.unwrap();
+    conn.write_all(&[gritty::protocol::SvcRequest::Clipboard.to_byte(), 0x01]).await.unwrap();
+    conn.write_all(payload).await.unwrap();
+    conn.shutdown().await.unwrap();
+    // The server acks only after the frame is handed to the client, and a
+    // limit-sized frame doesn't fit in the socketpair buffer, so the client
+    // side must be drained concurrently with waiting for the ack.
+    let mut reply = [0xffu8; 1];
+    let ack = async {
+        timeout(Duration::from_secs(2), conn.read_exact(&mut reply))
+            .await
+            .expect("copy must be answered")
+            .expect("reply byte");
+    };
+    let drain = async {
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(1);
+        loop {
+            match timeout(deadline - tokio::time::Instant::now(), framed.next()).await {
+                Ok(Some(Ok(Frame::ClipboardSet { data }))) => break Some(data.len()),
+                Ok(Some(Ok(_))) => continue,
+                _ => break None,
+            }
+        }
+    };
+    let ((), delivered) = tokio::join!(ack, drain);
+    (reply[0], delivered)
+}
+
+#[tokio::test]
+async fn copy_within_the_limit_is_delivered_whole() {
+    let (client_tx, mut framed, server, _meta, svc_path) =
+        setup_svc_session(gritty::protocol::CAP_CLIPBOARD).await;
+    wait_for_shell(&mut framed).await;
+    read_available_data(&mut framed, Duration::from_secs(1)).await;
+
+    let payload = vec![b'x'; gritty::protocol::CLIPBOARD_MAX_BYTES];
+    let (reply, delivered) = copy_via_svc(&svc_path, &mut framed, &payload).await;
+    assert_eq!(reply, gritty::protocol::CLIPBOARD_REPLY_DELIVERED);
+    assert_eq!(delivered, Some(payload.len()), "exactly the limit must go through intact");
+
+    client_tx.send(ClientConn::Shutdown).unwrap();
+    let _ = timeout(Duration::from_secs(3), server).await;
+}
+
+#[tokio::test]
+async fn oversize_copy_is_refused_not_truncated() {
+    let (client_tx, mut framed, server, _meta, svc_path) =
+        setup_svc_session(gritty::protocol::CAP_CLIPBOARD).await;
+    wait_for_shell(&mut framed).await;
+    read_available_data(&mut framed, Duration::from_secs(1)).await;
+
+    // One byte over: the old server silently cut it down and acked success,
+    // so a `cat big.log | gritty copy` pasted a truncated file with no hint.
+    let payload = vec![b'x'; gritty::protocol::CLIPBOARD_MAX_BYTES + 1];
+    let (reply, delivered) = copy_via_svc(&svc_path, &mut framed, &payload).await;
+    assert_eq!(reply, gritty::protocol::CLIPBOARD_REPLY_TOO_LARGE);
+    assert_eq!(delivered, None, "nothing may reach the clipboard on refusal");
 
     client_tx.send(ClientConn::Shutdown).unwrap();
     let _ = timeout(Duration::from_secs(3), server).await;

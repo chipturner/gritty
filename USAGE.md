@@ -24,7 +24,7 @@ Complete command and flag reference. For an overview and quick start, see [READM
 | `gritty send [files...]` | | Send files to a paired receiver |
 | `gritty receive [dir]` | | Receive files from a paired sender |
 | `gritty open <url>` | | Open a URL on the local machine (for use inside gritty sessions) |
-| `gritty copy` | | Copy stdin to the client clipboard (for use inside gritty sessions) |
+| `gritty copy` | | Copy stdin to the client clipboard (for use inside gritty sessions). Payloads over 512 KiB are refused with an error (use `gritty send` for those); nothing is ever silently truncated |
 | `gritty info [--json]` | | One-screen status: version/protocol, config path and load state, socket dir, device id, whether the *local* server is running, and a tunnel table (name, destination, status, log). Paths that don't exist yet are omitted; `--json` always has every field |
 | `gritty config` | | Open config in `$VISUAL`/`$EDITOR`/vi (creates from template if missing) |
 | `gritty doctor [--clean \| --json \| --llm [desc]]` | | Show key paths and check for common issues (stale processes, orphaned daemons, orphaned sockets, config errors); `--clean` removes socket-dir files this version doesn't recognize; `--llm` prints an LLM-ready diagnostic report instead (mutually exclusive with `--clean`/`--json`; `--log-lines <N>` adjusts log excerpt size -- see [Debugging](#debugging)) |

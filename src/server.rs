@@ -883,25 +883,34 @@ fn spawn_svc_acceptor(
                         }
                         match op[0] {
                             0x01 => {
-                                // Copy: read remaining data, capped so it fits in a single frame.
-                                const CLIPBOARD_MAX: usize = 512 * 1024;
+                                use crate::protocol::{
+                                    CLIPBOARD_MAX_BYTES, CLIPBOARD_REPLY_DELIVERED,
+                                    CLIPBOARD_REPLY_DROPPED, CLIPBOARD_REPLY_TOO_LARGE,
+                                };
+                                // Copy: read at most one byte past the limit --
+                                // enough to know it was exceeded without
+                                // buffering an unbounded payload.
                                 let mut data = Vec::new();
-                                let mut limited = stream.take((CLIPBOARD_MAX + 1) as u64);
+                                let mut limited = stream.take((CLIPBOARD_MAX_BYTES + 1) as u64);
                                 let _ = limited.read_to_end(&mut data).await;
                                 let mut stream = limited.into_inner();
-                                if data.len() > CLIPBOARD_MAX {
+                                if data.len() > CLIPBOARD_MAX_BYTES {
+                                    // Refuse outright: a truncated paste that
+                                    // was acked as success is worse than none.
+                                    // Deliberately no drain -- see the reply
+                                    // constants' doc for why an old client
+                                    // needs to hit EPIPE here.
                                     warn!(
-                                        size = data.len(),
-                                        "clipboard copy truncated to {CLIPBOARD_MAX} bytes"
+                                        limit = CLIPBOARD_MAX_BYTES,
+                                        "clipboard copy over the limit; refused"
                                     );
-                                    data.truncate(CLIPBOARD_MAX);
+                                    let _ = stream.write_all(&[CLIPBOARD_REPLY_TOO_LARGE]).await;
+                                    return;
                                 }
-                                // Reply 1 byte: 0x01 = delivered to an attached
-                                // clipboard-capable client, 0x00 = dropped. An
-                                // older client never reads it (harmless write to
-                                // a closed socket); a current client uses it so
-                                // `gritty copy` no longer exits 0 on a silent
-                                // drop.
+                                // Reply 1 byte (see protocol consts). An older
+                                // client never reads it (harmless write to a
+                                // closed socket); a current client uses it so
+                                // `gritty copy` no longer exits 0 on a drop.
                                 let delivered = if !has_cap || data.is_empty() {
                                     if !has_cap {
                                         debug!("svc socket: clipboard copy but no CAP_CLIPBOARD");
@@ -916,7 +925,12 @@ fn spawn_svc_acceptor(
                                     .is_ok()
                                         && rx.await.unwrap_or(false)
                                 };
-                                let _ = stream.write_all(&[u8::from(delivered)]).await;
+                                let reply = if delivered {
+                                    CLIPBOARD_REPLY_DELIVERED
+                                } else {
+                                    CLIPBOARD_REPLY_DROPPED
+                                };
+                                let _ = stream.write_all(&[reply]).await;
                             }
                             0x02 => {
                                 // Paste: request clipboard from client
