@@ -689,10 +689,26 @@ async fn ls_dashboard_and_single_host_share_one_shape() {
     create_session(&ctl_path, "shared/x").await;
     wait_detached(&ctl_path, "shared/x").await;
 
-    let dashboard = gritty_in(tmp.path(), &["ls"]).await;
-    let single = gritty_in(tmp.path(), &["ls", "local"]).await;
-    assert!(dashboard.status.success() && single.status.success());
-    assert_eq!(dashboard.stdout, single.stdout, "one daemon: dashboard == ls local");
+    // The Cmd column tracks the foreground process *name*, which changes as
+    // `$SHELL -c "exec sh"` execs its way down (on macOS: zsh -> sh -> bash,
+    // since /bin/sh is a re-exec shim, and each exec is slow enough that two
+    // back-to-back listings can straddle one). Shape equality is stable once
+    // the chain settles and never holds if the shapes truly differ, so poll.
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    let single = loop {
+        let dashboard = gritty_in(tmp.path(), &["ls"]).await;
+        let single = gritty_in(tmp.path(), &["ls", "local"]).await;
+        assert!(dashboard.status.success() && single.status.success());
+        if dashboard.stdout == single.stdout {
+            break single;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "one daemon: dashboard == ls local\n{}---\n{}",
+            String::from_utf8_lossy(&dashboard.stdout),
+            String::from_utf8_lossy(&single.stdout)
+        );
+    };
     let text = String::from_utf8_lossy(&single.stdout);
     assert!(text.starts_with("local\n"), "single-host listing has the group header: {text}");
     assert!(text.contains("shared/x"), "{text}");
