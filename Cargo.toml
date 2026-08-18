@@ -29,7 +29,7 @@ anyhow = "1"
 bytes = "1"
 clap = { version = "4", features = ["derive"] }
 clap_complete = { version = "4", features = ["unstable-dynamic"] }
-clap_mangen = "0.3.0"
+clap_mangen = "0.3.3"
 crossterm = { version = "0.29", default-features = false, features = ["events"] }
 directories = "6"
 futures-util = { version = "0.3", features = ["sink"] }
@@ -41,7 +41,7 @@ libproc = "0.14.11"
 nix = { version = "0.31", features = ["term", "process", "signal", "fs", "hostname", "user"] }
 opener = "0.8"
 serde = { version = "1", features = ["derive"] }
-serde_json = "1.0.150"
+serde_json = "1.0.151"
 shlex = "2"
 tempfile = "3"
 terminal_size = "0.4"
