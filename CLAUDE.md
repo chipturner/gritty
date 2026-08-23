@@ -23,6 +23,7 @@ just fmt                             # format all source files
 just test                            # all tests (pass args to filter: just test session)
 just test-protocol                   # codec unit tests only
 just test-daemon                     # daemon integration tests only
+just test-client                     # interactive client on a real pty against a real daemon
 just test-e2e                        # e2e session tests only
 just test-container                  # container tests (lifecycle + SSH tunnel + features)
 just test-socat                      # socat tunnel disruption tests (requires socat)
@@ -108,6 +109,7 @@ Read-only commands (`ls`, `info`, `tunnels`, `doctor` without `--clean`, `socket
 ### Testing
 - **E2e**: `UnixStream::pair()` + channel to `server::run()`. No socket files.
 - **Daemon**: real socket in `tempfile::tempdir()`. `do_handshake()` + `wait_for_daemon()`.
+- **Client (pty)**: `tests/client_pty_test.rs` runs the real `gritty connect` binary with a controlling tty (`openpty` + `TIOCSCTTY`) against a `gritty server -f` child, typing into the master and waiting for markers in the transcript. The only in-repo exercise of `client::run()`'s relay loop -- escapes, heartbeat/liveness, auto-reconnect, exit codes. State the client keeps off the terminal (link-down detection, reconnect completion) is asserted via `client.log` next to the ctl socket; keystrokes during the reconnect loop mean "retry now", so wait for `reconnect: connected` before typing.
 - **Protocol**: codec unit tests + property tests (`tests/protocol_proptest.rs`).
 - **Nextest**: e2e/daemon/procscan run at default parallelism (one thread per core) with 2 retries; socat suites capped at 4 concurrent (timing windows around killed processes). Per-process isolation. The `stress` profile (`just stress`, nightly CI) runs with no retries and no fail-fast -- use it when hunting flakes; the default profile's retries hide them.
 - **Test waits are event-driven, not sleep-based**: `read_until_contains` (returns on marker, not after a silence window), `wait_detached` (polls session metadata), `sync_ping` (Pong round-trip proves earlier frames were processed), flag files touched by shell jobs (poll for completion). `wait_for_shell` probes with `echo READY:$((41+1))` until the shell *executes* it -- output alone proves nothing, since the PTY line discipline echoes input that shell init later flushes (tcsetattr TCSAFLUSH). Sessions spawn `exec sh` (`FAST_SHELL`), not the user's login shell -- a herd of `$SHELL -l` inits sourcing real dotfiles is what made full parallelism flaky; only `login_shell_starts_in_home` uses `-l`. Keep fixed sleeps only for genuinely unobservable windows (negative assertions, cross-channel races).

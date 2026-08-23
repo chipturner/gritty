@@ -39,6 +39,10 @@ test-e2e:
 test-daemon:
     cargo nextest run --test daemon_test
 
+# Interactive client tests (real binary on a pty against a real daemon)
+test-client:
+    cargo nextest run --test client_pty_test
+
 # Socat tunnel disruption tests (requires socat; skips gracefully if missing)
 test-socat:
     cargo nextest run --test socat_tunnel_test

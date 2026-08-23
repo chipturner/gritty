@@ -26,7 +26,8 @@ cargo run -- server   # start a server; connect with: cargo run -- connect local
 
 Test tiers (all under `tests/`): protocol codec unit/property tests,
 daemon integration tests (real sockets in tempdirs), e2e session tests
-(socketpair straight into `server::run()`, no files), and optional
+(socketpair straight into `server::run()`, no files), interactive client
+tests (the real binary on a pty, `just test-client`), and optional
 container / socat / SSH suites (`just test-container`, `just test-socat`)
 that skip gracefully when their tooling is absent.
 

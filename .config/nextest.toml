@@ -8,7 +8,7 @@ max-threads = 4
 # logical core). Timing waits are event-driven (marker reads, polls), so
 # they tolerate load; retries absorb residual scheduler-jitter flakes.
 [[profile.default.overrides]]
-filter = 'binary(e2e_test) | binary(daemon_test) | binary(procscan_test)'
+filter = 'binary(e2e_test) | binary(daemon_test) | binary(procscan_test) | binary(client_pty_test)'
 retries = 2
 
 [[profile.default.overrides]]
