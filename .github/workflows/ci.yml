@@ -57,8 +57,10 @@ jobs:
       - name: Build
         run: cargo build
 
+      # Also the suites that need socat only for their link-disruption cases
+      # (the scripted-ssh supervisor bridge, the client reconnect test).
       - name: Socat tunnel tests
-        run: cargo nextest run --test socat_tunnel_test -j 1
+        run: cargo nextest run --locked --test socat_tunnel_test --test tunnel_test --test client_pty_test
 
   container-tests:
     name: Container Tests
@@ -155,4 +157,4 @@ jobs:
         run: cargo build
 
       - name: Socat bridge tests
-        run: cargo nextest run --test socat_bridge_test -j 1
+        run: cargo nextest run --locked --test socat_bridge_test -j 1

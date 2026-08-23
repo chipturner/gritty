@@ -8,6 +8,11 @@ protocol interoperate with their neighbors.
 
 ## Unreleased
 
+- **`tunnel-create` failure cleanup.** When tunnel setup bails after taking
+  the lock (ssh preflight passed but the remote `gritty` was unusable, say),
+  the `connect-NAME.pid` and `.info` written alongside the lock are now
+  removed with it instead of lingering until the next `tunnel-create` or
+  `doctor --clean`.
 - **`tail` and down hosts.** `tail` now prints `session exited [with code
   N]` when the session it is watching ends (its output used to just stop,
   the same as a quiet session) and exits with that code. Commands other

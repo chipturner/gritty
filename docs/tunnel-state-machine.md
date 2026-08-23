@@ -257,8 +257,9 @@ kill the remote daemon and its live sessions.
    is armed here too: if the fallible setup that follows (`ensure_remote_ready`,
    version gate, `spawn_tunnel`, `wait_for_socket`) returns early, dropping
    `lock_fd` releases the advisory lock but would leave the `.lock` *file* on
-   disk -- an orphaned ghost lock. The guard removes that file on early bail
-   (only while we still own the inode, via `lock_still_owned`) and is disarmed
+   disk -- an orphaned ghost lock. The guard removes that file -- and the `.pid`/`.info` written
+   alongside it -- on early bail (only while we still own the inode, via
+   `lock_still_owned`) and is disarmed
    once `ConnectGuard` takes over cleanup. This matters at wake-from-suspend:
    an auto-start `tunnel-create` can grab the lock and then fail in
    `ensure_remote_ready` because the SSH agent (e.g. a Secure-Enclave signer)

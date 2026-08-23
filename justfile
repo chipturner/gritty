@@ -43,6 +43,10 @@ test-daemon:
 test-client:
     cargo nextest run --test client_pty_test
 
+# Tunnel supervisor tests with a scripted ssh (requires socat; no sshd)
+test-tunnel:
+    cargo nextest run --test tunnel_test
+
 # Socat tunnel disruption tests (requires socat; skips gracefully if missing)
 test-socat:
     cargo nextest run --test socat_tunnel_test

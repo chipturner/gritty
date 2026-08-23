@@ -24,6 +24,7 @@ just test                            # all tests (pass args to filter: just test
 just test-protocol                   # codec unit tests only
 just test-daemon                     # daemon integration tests only
 just test-client                     # interactive client on a real pty against a real daemon
+just test-tunnel                     # tunnel supervisor against a scripted ssh (requires socat)
 just test-e2e                        # e2e session tests only
 just test-container                  # container tests (lifecycle + SSH tunnel + features)
 just test-socat                      # socat tunnel disruption tests (requires socat)
@@ -113,7 +114,8 @@ Read-only commands (`ls`, `info`, `tunnels`, `doctor` without `--clean`, `socket
 - **Protocol**: codec unit tests + property tests (`tests/protocol_proptest.rs`).
 - **Nextest**: e2e/daemon/procscan run at default parallelism (one thread per core) with 2 retries; socat suites capped at 4 concurrent (timing windows around killed processes). Per-process isolation. The `stress` profile (`just stress`, nightly CI) runs with no retries and no fail-fast -- use it when hunting flakes; the default profile's retries hide them.
 - **Test waits are event-driven, not sleep-based**: `read_until_contains` (returns on marker, not after a silence window), `wait_detached` (polls session metadata), `sync_ping` (Pong round-trip proves earlier frames were processed), flag files touched by shell jobs (poll for completion). `wait_for_shell` probes with `echo READY:$((41+1))` until the shell *executes* it -- output alone proves nothing, since the PTY line discipline echoes input that shell init later flushes (tcsetattr TCSAFLUSH). Sessions spawn `exec sh` (`FAST_SHELL`), not the user's login shell -- a herd of `$SHELL -l` inits sourcing real dotfiles is what made full parallelism flaky; only `login_shell_starts_in_home` uses `-l`. Keep fixed sleeps only for genuinely unobservable windows (negative assertions, cross-channel races).
-- **Socat**: auto-detect availability, skip gracefully. `GRITTY_SOCAT_TEST=0` to force-skip. SSH coverage lives in the container suite (`just test-container`), gated on Docker.
+- **Tunnel (scripted ssh)**: `tests/tunnel_test.rs` puts a shell-script `ssh` first on `PATH` (`connect.rs` resolves `ssh` via `PATH`; `GRITTY_BIN_DIR` makes the "remote" `gritty` ours) so the real supervisor runs with real sidecars and a socat `-L` bridge. A mode file switches the script's behavior between invocations -- preflight auth failure, `ERR:` from the remote ensure command, bridge exit 255 (transient) or exit 1 (non-transient) -- so the docs/tunnel-state-machine.md transitions (respawn, backoff climb, `.kick`, bail-guard cleanup) are asserted without an sshd. The remote daemon is the local one (`remote_exec` forwards `GRITTY_SOCKET_DIR`); a genuinely remote daemon is the container suite's job.
+- **Socat**: auto-detect availability, skip gracefully. `GRITTY_SOCAT_TEST=0` to force-skip. Real-sshd coverage lives in the container suite (`just test-container`), gated on Docker.
 
 ### Workflow
 - Run `just fmt` after making code changes.

@@ -1984,6 +1984,7 @@ impl Drop for ConnectGuard {
 /// ([`lock_still_owned`]), so it can never yank a racing supervisor's fresh
 /// lock. Disarmed once `ConnectGuard` owns cleanup.
 struct LockFileBailGuard {
+    name: String,
     lock_path: PathBuf,
     identity: Option<LockIdentity>,
     armed: bool,
@@ -2006,6 +2007,10 @@ impl Drop for LockFileBailGuard {
                 "tunnel setup failed before the supervisor started; removing \
                  lock file to avoid a ghost lock"
             );
+            // The .pid/.info written right after the lock describe a
+            // supervisor that never started; sweep them with it (never the
+            // persistence caches).
+            cleanup_stale_files(&self.name);
             let _ = std::fs::remove_file(&self.lock_path);
         }
     }
@@ -2172,8 +2177,12 @@ pub async fn run(opts: ConnectOpts, ready_fd: Option<OwnedFd>) -> anyhow::Result
     // wait_for_socket would drop `lock_fd` (releasing the advisory lock) but
     // leave the lock *file* behind -- a ghost lock that trips the client's
     // reconnect loop. Disarmed once `ConnectGuard` takes over cleanup.
-    let mut lock_file_bail =
-        LockFileBailGuard { lock_path: lock_path.clone(), identity: lock_identity, armed: true };
+    let mut lock_file_bail = LockFileBailGuard {
+        name: connection_name.clone(),
+        lock_path: lock_path.clone(),
+        identity: lock_identity,
+        armed: true,
+    };
 
     // 3. Install SIGTERM/SIGINT handlers *before* any slow step so a signal
     //    during ensure_remote_ready / spawn_tunnel / wait_for_socket no
@@ -3244,7 +3253,12 @@ mod tests {
         let fd = try_acquire_lock(&lock_path).unwrap();
         let identity = LockIdentity::of_held(&fd);
         {
-            let _bail = LockFileBailGuard { lock_path: lock_path.clone(), identity, armed: true };
+            let _bail = LockFileBailGuard {
+                name: "t".into(),
+                lock_path: lock_path.clone(),
+                identity,
+                armed: true,
+            };
             // Simulate the early `?` return: the bail guard drops first (while
             // the flock is still held), then the Flock.
         }
@@ -3260,8 +3274,12 @@ mod tests {
         let fd = try_acquire_lock(&lock_path).unwrap();
         let identity = LockIdentity::of_held(&fd);
         {
-            let mut bail =
-                LockFileBailGuard { lock_path: lock_path.clone(), identity, armed: true };
+            let mut bail = LockFileBailGuard {
+                name: "t".into(),
+                lock_path: lock_path.clone(),
+                identity,
+                armed: true,
+            };
             bail.disarm();
         }
         assert!(lock_path.exists(), "disarmed bail guard must leave the lock file alone");
@@ -3283,8 +3301,12 @@ mod tests {
         let theirs = try_acquire_lock(&lock_path).unwrap();
 
         {
-            let _bail =
-                LockFileBailGuard { lock_path: lock_path.clone(), identity: our_id, armed: true };
+            let _bail = LockFileBailGuard {
+                name: "t".into(),
+                lock_path: lock_path.clone(),
+                identity: our_id,
+                armed: true,
+            };
         }
         assert!(
             is_lock_held(&lock_path),
