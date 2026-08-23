@@ -1390,3 +1390,58 @@ fn session_created_tolerates_trailing_bytes() {
     let decoded = codec.decode(&mut buf).unwrap().unwrap();
     assert_eq!(decoded, Frame::SessionCreated { id: 7 });
 }
+
+// ---------------------------------------------------------------------------
+// Code tables. Mutation testing showed the roundtrip property is blind to a
+// dropped `from_u16` arm (Unknown(n) roundtrips just as well), so pin the
+// tables directly.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn every_known_error_code_maps_to_itself_and_is_not_unknown() {
+    for v in 1..=8u16 {
+        let code = ErrorCode::from_u16(v);
+        assert!(!matches!(code, ErrorCode::Unknown(_)), "code {v} decodes as Unknown");
+        assert_eq!(code.to_u16(), v);
+    }
+    assert_eq!(ErrorCode::from_u16(0), ErrorCode::Unknown(0));
+    assert_eq!(ErrorCode::from_u16(9), ErrorCode::Unknown(9));
+    assert_eq!(ErrorCode::OwnerChanged.to_u16(), 8);
+}
+
+#[test]
+fn svc_request_byte_table_is_total_and_stable() {
+    use gritty::protocol::SvcRequest;
+    let known = [
+        (1u8, SvcRequest::OpenUrl),
+        (2, SvcRequest::Send),
+        (3, SvcRequest::Receive),
+        (5, SvcRequest::Clipboard),
+    ];
+    // SvcRequest is a bare byte enum (no Debug/PartialEq); compare through
+    // the byte it encodes to.
+    for (byte, req) in known {
+        assert_eq!(req.to_byte(), byte);
+        assert_eq!(SvcRequest::from_byte(byte).map(SvcRequest::to_byte), Some(byte), "byte {byte}");
+    }
+    for byte in [0u8, 4, 6, 255] {
+        assert!(SvcRequest::from_byte(byte).is_none(), "byte {byte} must be unassigned");
+    }
+}
+
+#[test]
+fn roundtrip_diag_request() {
+    let mut codec = FrameCodec;
+    let mut buf = BytesMut::new();
+    codec.encode(Frame::DiagRequest, &mut buf).unwrap();
+    assert_eq!(codec.decode(&mut buf).unwrap().unwrap(), Frame::DiagRequest);
+}
+
+#[test]
+fn roundtrip_diag_response() {
+    let mut codec = FrameCodec;
+    let mut buf = BytesMut::new();
+    let original = Frame::DiagResponse { text: "sessions: 2\nuptime: 5m".to_string() };
+    codec.encode(original.clone(), &mut buf).unwrap();
+    assert_eq!(codec.decode(&mut buf).unwrap().unwrap(), original);
+}
