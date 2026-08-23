@@ -8,6 +8,10 @@ on:
 env:
   CARGO_TERM_COLOR: always
 
+permissions:
+  contents: read
+  issues: write
+
 jobs:
   stress:
     name: Stress Test (5 runs)
@@ -22,9 +26,34 @@ jobs:
 
       - uses: taiki-e/install-action@nextest
 
+      # The `stress` profile disables retries (a pass-on-retry is a flake, and
+      # this job exists to find flakes) and fail-fast (one failure must not
+      # hide the rest of the run). More proptest cases than a PR run can
+      # afford: the codec properties are where random seeds pay off.
       - name: Run test suite 5 times
+        env:
+          PROPTEST_CASES: "4096"
         run: |
+          status=0
           for i in 1 2 3 4 5; do
             echo "=== Run $i/5 ==="
-            cargo nextest run --locked
+            cargo nextest run --locked --profile stress || status=1
           done
+          exit "$status"
+
+      # A scheduled run has no PR to turn red, so a failure would otherwise
+      # go unnoticed. Keep one rolling issue rather than one per night.
+      - name: Report failure
+        if: failure()
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          title="Nightly stress failed"
+          body="Nightly stress run failed: ${RUN_URL}"
+          existing=$(gh issue list --state open --search "in:title \"${title}\"" --json number -q '.[0].number')
+          if [ -n "${existing}" ]; then
+            gh issue comment "${existing}" --body "${body}"
+          else
+            gh issue create --title "${title}" --body "${body}"
+          fi

@@ -19,3 +19,10 @@ retries = 2
 [[profile.default.overrides]]
 filter = 'binary(protocol_proptest)'
 retries = 0
+
+# Flake hunting (`just stress`, nightly): no retries, so a test that passes on
+# its second try is reported as the failure it is, and no fail-fast, so one
+# failure does not hide the rest of the run's signal.
+[profile.stress]
+retries = 0
+fail-fast = false

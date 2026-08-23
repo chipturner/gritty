@@ -47,13 +47,13 @@ test-socat:
 test-socat-bridge:
     cargo nextest run --test socat_bridge_test
 
-# Run full suite N times and report pass/fail tally
+# Run full suite N times (no retries, no fail-fast) and report pass/fail tally
 stress count="10":
     #!/usr/bin/env zsh
     pass=0 fail=0
     for i in $(seq 1 {{ count }}); do
         echo -n "Run $i/{{ count }}: "
-        if ! cargo nextest run &>/dev/null; then
+        if ! cargo nextest run --profile stress &>/dev/null; then
             echo "FAILED"
             ((fail++))
         else

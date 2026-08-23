@@ -12,16 +12,10 @@ fn arb_string() -> impl Strategy<Value = String> {
 }
 
 fn arb_error_code() -> impl Strategy<Value = ErrorCode> {
-    prop_oneof![
-        Just(ErrorCode::NoSuchSession),
-        Just(ErrorCode::NameAlreadyExists),
-        Just(ErrorCode::InvalidName),
-        Just(ErrorCode::EmptyName),
-        Just(ErrorCode::VersionMismatch),
-        Just(ErrorCode::UnexpectedFrame),
-        Just(ErrorCode::AlreadyAttached),
-        (8u16..=1000u16).prop_map(ErrorCode::Unknown),
-    ]
+    // Derive from the codec's own mapping so the strategy cannot drift when a
+    // new code is assigned: every u16 is a valid wire value, and the
+    // roundtrip property then genuinely tests `to_u16 . from_u16 = id`.
+    any::<u16>().prop_map(ErrorCode::from_u16)
 }
 
 fn arb_session_entry() -> impl Strategy<Value = SessionEntry> {
