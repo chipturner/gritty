@@ -31,8 +31,9 @@ just test-container                  # container tests (lifecycle + SSH tunnel +
 just test-socat                      # socat tunnel disruption tests (requires socat)
 just test-socat-bridge               # socat bridge tests (requires socat)
 just stress 10                       # run full suite N times, report pass/fail tally
-just coverage                        # test coverage summary
+just coverage                        # test coverage summary (CI publishes one per run as a job summary + lcov artifact)
 just coverage-html                   # HTML coverage report
+just mutants                         # cargo-mutants over the pure modules in .cargo/mutants.toml (nightly CI, informational)
 just demo                            # record demo GIFs into demo/out/ (requires vhs + tmux; see demo/record.sh)
                                      # README embeds blessed copies from docs/images/ -- refresh them from demo/out/ when a demo changes
 ```

@@ -9,6 +9,11 @@ on:
 env:
   CARGO_TERM_COLOR: always
 
+# A new push to the same PR supersedes the running build.
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
 jobs:
   check:
     name: Check (${{ matrix.os }})
@@ -81,6 +86,44 @@ jobs:
         run: |
           docker build -t gritty-container-test -f tests/container/Dockerfile .
           timeout 480 docker run --rm gritty-container-test
+
+  coverage:
+    name: Coverage
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v6
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: llvm-tools-preview
+
+      - uses: Swatinem/rust-cache@v2
+
+      - uses: taiki-e/install-action@nextest
+
+      - uses: taiki-e/install-action@cargo-llvm-cov
+
+      # socat lets the link-disruption tests (tunnel bridge, client
+      # reconnect) count instead of skipping.
+      - name: Install socat
+        run: sudo apt-get update && sudo apt-get install -y socat
+
+      - name: Coverage
+        run: |
+          cargo llvm-cov nextest --locked --lcov --output-path lcov.info
+          {
+            echo '## Coverage'
+            echo
+            echo '```'
+            cargo llvm-cov report --summary-only
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: lcov
+          path: lcov.info
 
   msrv:
     name: MSRV (1.88)

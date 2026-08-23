@@ -101,6 +101,10 @@ coverage-html:
     cargo llvm-cov nextest --html
     @echo "Report: target/llvm-cov/html/index.html"
 
+# Mutation testing over the pure, load-bearing modules (see .cargo/mutants.toml)
+mutants *args:
+    cargo mutants {{ args }}
+
 # Clean coverage artifacts
 coverage-clean:
     cargo llvm-cov clean --workspace

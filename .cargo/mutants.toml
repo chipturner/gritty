@@ -1,0 +1,32 @@
+# cargo-mutants configuration (`just mutants`, nightly CI).
+#
+# Mutation testing answers the question line coverage cannot: do the tests
+# *assert* on this code, or merely execute it? It is slow -- every surviving
+# mutant is a full test run -- so it is scoped to the small, pure, load-bearing
+# modules where a silent assertion gap would matter most. Widen the list as
+# modules earn it; a run over the whole crate is a deliberate one-off.
+examine_globs = [
+    "src/protocol.rs",
+    "src/security.rs",
+    "src/naming.rs",
+    "src/alt_screen.rs",
+    "src/line_shadow.rs",
+    "src/scrollback.rs",
+    "src/config.rs",
+    "src/runinfo.rs",
+]
+
+# The codec's fuzz-style tests make the unit/protocol binaries the only ones
+# that matter here; the PTY/daemon suites would add minutes per mutant without
+# catching anything these modules' own tests don't.
+test_tool = "nextest"
+additional_cargo_test_args = [
+    "--test", "protocol_test",
+    "--test", "protocol_proptest",
+    "--test", "protocol_golden_test",
+    "--lib",
+]
+
+# Mutants that hang (a mutated loop bound) are killed at this multiple of the
+# baseline run time.
+timeout_multiplier = 3.0

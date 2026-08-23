@@ -57,3 +57,43 @@ jobs:
           else
             gh issue create --title "${title}" --body "${body}"
           fi
+
+  mutants:
+    name: Mutation Testing
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v6
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      - uses: taiki-e/install-action@nextest
+
+      - uses: taiki-e/install-action@cargo-mutants
+
+      # Informational: the scope and the survivors are listed in the job
+      # summary and kept as an artifact. Surviving mutants are assertion
+      # gaps to triage, not a red build -- promote to a gate once the
+      # baseline is clean.
+      - name: Mutants
+        run: |
+          cargo mutants --no-shuffle --output mutants.out || true
+          {
+            echo '## Mutants'
+            echo
+            echo '### Missed'
+            echo '```'
+            cat mutants.out/missed.txt 2>/dev/null || echo '(none)'
+            echo '```'
+            echo '### Timeouts'
+            echo '```'
+            cat mutants.out/timeout.txt 2>/dev/null || echo '(none)'
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: mutants
+          path: mutants.out
