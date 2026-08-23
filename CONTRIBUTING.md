@@ -28,7 +28,9 @@ Test tiers (all under `tests/`): protocol codec unit/property tests,
 daemon integration tests (real sockets in tempdirs), e2e session tests
 (socketpair straight into `server::run()`, no files), interactive client
 tests (the real binary on a pty, `just test-client`), tunnel supervisor
-tests against a scripted ssh (`just test-tunnel`), and optional
+tests against a scripted ssh (`just test-tunnel`), one-shot CLI commands
+against a real daemon (`just test-cli`), golden wire vectors and doc-drift
+guards, and optional
 container / socat / SSH suites (`just test-container`, `just test-socat`)
 that skip gracefully when their tooling is absent.
 

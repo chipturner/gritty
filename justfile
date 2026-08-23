@@ -47,6 +47,10 @@ test-client:
 test-tunnel:
     cargo nextest run --test tunnel_test
 
+# One-shot CLI commands end to end against a real daemon
+test-cli:
+    cargo nextest run --test cli_test
+
 # Socat tunnel disruption tests (requires socat; skips gracefully if missing)
 test-socat:
     cargo nextest run --test socat_tunnel_test

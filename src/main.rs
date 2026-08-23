@@ -1501,6 +1501,38 @@ mod tests {
     /// group subcommands), so pin it to the enum: every subcommand must appear
     /// with exactly its registered aliases and exactly its `about`, in the
     /// listing's `  name (aliases)  about` shape.
+    /// USAGE.md's command table is hand-written too. Every subcommand must
+    /// have a row starting `| \`gritty <name>`, and that row's alias column
+    /// must list each registered alias (hidden subcommands excepted).
+    #[test]
+    fn usage_command_table_lists_every_subcommand_and_alias() {
+        let usage = include_str!("../USAGE.md");
+        // `\|` inside a code span is a literal pipe, not a column break.
+        let lines: Vec<String> = usage
+            .lines()
+            .filter(|l| l.starts_with("| `gritty "))
+            .map(|l| l.replace("\\|", "\u{0}"))
+            .collect();
+        let rows: Vec<Vec<&str>> =
+            lines.iter().map(|l| l.split('|').map(str::trim).collect()).collect();
+        for sub in Cli::command().get_subcommands().filter(|s| !s.is_hide_set()) {
+            let name = sub.get_name();
+            let row = rows
+                .iter()
+                .find(|cols| {
+                    let cmd = cols[1].trim_start_matches('`').trim_start_matches("gritty ");
+                    cmd.split([' ', '`']).next() == Some(name)
+                })
+                .unwrap_or_else(|| panic!("USAGE.md command table has no row for `gritty {name}`"));
+            for alias in sub.get_visible_aliases() {
+                assert!(
+                    row[2].contains(&format!("`{alias}`")),
+                    "USAGE.md row for `gritty {name}` does not list alias `{alias}`: {row:?}"
+                );
+            }
+        }
+    }
+
     #[test]
     fn help_template_matches_every_subcommand() {
         let help = Cli::command().render_help().to_string();
