@@ -18,7 +18,7 @@ The full command table and all flags live in [USAGE.md](USAGE.md). Session addre
 Rust edition 2024, MSRV 1.88 (let-chains; CI enforces via a pinned-toolchain `cargo check`). Uses `just` as the task runner. Tests via `cargo-nextest` (concurrency in `.config/nextest.toml`).
 
 ```bash
-just check                           # clippy + full test suite (pre-push gate)
+just check                           # fmt-check + clippy + full test suite (mirrors the CI gate)
 just fmt                             # format all source files
 just test                            # all tests (pass args to filter: just test session)
 just test-protocol                   # codec unit tests only
@@ -122,7 +122,7 @@ Read-only commands (`ls`, `info`, `tunnels`, `doctor` without `--clean`, `socket
 - **Socat**: auto-detect availability, skip gracefully. `GRITTY_SOCAT_TEST=0` to force-skip. Real-sshd coverage lives in the container suite (`just test-container`), gated on Docker.
 
 ### Workflow
-- Run `just fmt` after making code changes.
+- `.claude/settings.json` runs `just fmt` after every Edit/Write; `just check` still verifies formatting.
 - Run `just check` (clippy + full test suite) before finishing work.
 - When changing code, update docs **in the same commit**. Files to check:
   - **README.md** -- overview, install, quick start, features, comparison, short config pointer, common troubleshooting, security model

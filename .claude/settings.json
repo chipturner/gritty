@@ -1,0 +1,48 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(cargo build:*)",
+      "Bash(cargo clippy:*)",
+      "Bash(cargo nextest:*)",
+      "Bash(cargo doc:*)",
+      "Bash(cargo fmt:*)",
+      "Bash(cargo llvm-cov:*)",
+      "Bash(cargo mutants:*)",
+      "Bash(cargo package:*)",
+      "Bash(cargo publish --dry-run:*)",
+      "Bash(just fmt)",
+      "Bash(just check:*)",
+      "Bash(just test:*)",
+      "Bash(just coverage)",
+      "Bash(just coverage-html)",
+      "Bash(just mutants:*)",
+      "Bash(just man)",
+      "Bash(./target/debug/gritty ls:*)",
+      "Bash(./target/debug/gritty info:*)",
+      "Bash(./target/debug/gritty doctor)",
+      "Bash(./target/debug/gritty --version)",
+      "WebFetch(domain:docs.rs)",
+      "WebFetch(domain:github.com)",
+      "WebFetch(domain:raw.githubusercontent.com)"
+    ],
+    "deny": [
+      "Bash(./target/debug/gritty refresh:*)",
+      "Bash(./target/debug/gritty restart:*)",
+      "Bash(./target/debug/gritty kill-server:*)",
+      "Bash(./target/debug/gritty prune:*)"
+    ]
+  },
+  "hooks": {
+    "PostToolUse": [
+      {
+        "matcher": "Edit|Write",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "cd \"$CLAUDE_PROJECT_DIR\" && just fmt"
+          }
+        ]
+      }
+    ]
+  }
+}

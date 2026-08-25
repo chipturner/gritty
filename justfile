@@ -10,8 +10,9 @@ up:
 build:
     cargo build
 
-# Clippy (strict) then full test suite — the pre-push gate
+# fmt-check + clippy (strict, incl. tests) + nextest -- mirrors the CI gate
 check:
+    cargo fmt -- --check
     cargo clippy --all-targets -- -D warnings
     cargo nextest run
 
