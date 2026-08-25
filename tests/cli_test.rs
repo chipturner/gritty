@@ -6,11 +6,13 @@
 //! commands end to end -- including `restart`, which mutates a live daemon
 //! and had no automated invocation anywhere.
 
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::process::{Child, Command, Output, Stdio};
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
-const GRITTY: &str = env!("CARGO_BIN_EXE_gritty");
+mod common;
+use common::{GRITTY, stderr, stdout, wait_for_socket};
+
 const WAIT: Duration = Duration::from_secs(10);
 
 /// A socket dir and a home dir, kept apart: `doctor` audits every entry of
@@ -43,7 +45,7 @@ impl Sandbox {
             .spawn()
             .expect("spawn gritty server -f");
         sb.daemon = Some(child);
-        wait_for_socket(&sb.ctl_path());
+        wait_for_socket(&sb.ctl_path(), WAIT);
         sb
     }
 
@@ -107,25 +109,6 @@ impl Drop for Sandbox {
             let _ = child.wait();
         }
     }
-}
-
-fn wait_for_socket(path: &Path) {
-    let deadline = Instant::now() + WAIT;
-    while Instant::now() < deadline {
-        if std::os::unix::net::UnixStream::connect(path).is_ok() {
-            return;
-        }
-        std::thread::sleep(Duration::from_millis(20));
-    }
-    panic!("socket {} never became connectable", path.display());
-}
-
-fn stdout(out: &Output) -> String {
-    String::from_utf8_lossy(&out.stdout).into_owned()
-}
-
-fn stderr(out: &Output) -> String {
-    String::from_utf8_lossy(&out.stderr).into_owned()
 }
 
 fn json(out: &Output) -> serde_json::Value {
@@ -235,7 +218,7 @@ fn restart_replaces_the_local_daemon() {
     assert!(err.contains("server killed"), "{err}");
     assert!(err.contains("server restarted"), "{err}");
 
-    wait_for_socket(&sb.ctl_path());
+    wait_for_socket(&sb.ctl_path(), WAIT);
     assert_ne!(sb.daemon_pid(), old_pid, "restart must start a new daemon process");
     // Sessions do not survive a restart (unlike refresh, which refuses).
     let out = sb.ok(&["ls", "local", "--json"]);
@@ -249,7 +232,7 @@ fn restart_with_no_daemon_starts_one() {
     let err = stderr(&out);
     assert!(err.contains("no server running"), "{err}");
     assert!(err.contains("server restarted"), "{err}");
-    wait_for_socket(&sb.ctl_path());
+    wait_for_socket(&sb.ctl_path(), WAIT);
 }
 
 // ---------------------------------------------------------------------------

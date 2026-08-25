@@ -21,28 +21,11 @@ use std::time::{Duration, Instant};
 use nix::sys::signal::{Signal, kill};
 use nix::unistd::Pid;
 
-const GRITTY: &str = env!("CARGO_BIN_EXE_gritty");
+mod common;
+use common::{GRITTY, require_socat, stderr};
+
 const WAIT: Duration = Duration::from_secs(15);
 const NAME: &str = "fakehost";
-
-/// socat is a hard requirement of this suite: a missing tool must fail the
-/// run, never silently pass it. `GRITTY_SOCAT_TEST=0` is the only, explicit,
-/// opt-out (for a developer box without socat; CI never sets it).
-fn require_socat() {
-    if std::env::var("GRITTY_SOCAT_TEST").as_deref() == Ok("0") {
-        panic!("GRITTY_SOCAT_TEST=0 set: this suite's socat tests are disabled on this machine");
-    }
-    let found = std::process::Command::new("socat")
-        .arg("-V")
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .status()
-        .is_ok();
-    assert!(
-        found,
-        "socat not found on PATH -- install it (apt/brew install socat); these tests do not skip"
-    );
-}
 
 /// The scripted ssh. `$FAKE_SSH_DIR/mode` selects behavior for the *next*
 /// invocation; `$FAKE_SSH_DIR/calls` records every argv; a `-L` bridge writes
@@ -285,10 +268,6 @@ fn set_executable(path: &Path) {
     fs::set_permissions(path, fs::Permissions::from_mode(0o755)).unwrap();
 }
 
-fn stderr_of(out: &Output) -> String {
-    String::from_utf8_lossy(&out.stderr).into_owned()
-}
-
 // ---------------------------------------------------------------------------
 // Startup and teardown
 // ---------------------------------------------------------------------------
@@ -308,8 +287,8 @@ fn tunnel_create_brings_up_a_healthy_tunnel_and_destroy_tears_it_down() {
     assert_eq!(fx.bridge_calls(), 1);
 
     let out = fx.gritty(&["tunnel-destroy", NAME]);
-    assert!(out.status.success(), "{}", stderr_of(&out));
-    assert!(stderr_of(&out).contains(&format!("tunnel {NAME} stopped")), "{}", stderr_of(&out));
+    assert!(out.status.success(), "{}", stderr(&out));
+    assert!(stderr(&out).contains(&format!("tunnel {NAME} stopped")), "{}", stderr(&out));
     for ext in ["lock", "pid", "sock", "info"] {
         assert!(!fx.sidecar(ext).exists(), "connect-{NAME}.{ext} survived destroy");
     }
@@ -327,8 +306,8 @@ fn tunnel_create_is_idempotent_while_healthy() {
     let calls_before = fx.calls().lines().count();
 
     let out = fx.gritty(&["tunnel-create", NAME]);
-    assert!(out.status.success(), "{}", stderr_of(&out));
-    assert!(stderr_of(&out).contains("already running"), "{}", stderr_of(&out));
+    assert!(out.status.success(), "{}", stderr(&out));
+    assert!(stderr(&out).contains("already running"), "{}", stderr(&out));
     // Found, not re-established: no second supervisor, no ssh at all.
     assert_eq!(fx.calls().lines().count(), calls_before, "{}", fx.calls());
     assert_eq!(fx.bridge_calls(), 1);
@@ -341,7 +320,7 @@ fn sessions_are_reachable_through_the_tunnel() {
     fx.create();
 
     let out = fx.gritty(&["connect", "-d", &format!("{NAME}:job"), "-c", "sleep 30"]);
-    assert!(out.status.success(), "{}", stderr_of(&out));
+    assert!(out.status.success(), "{}", stderr(&out));
     let out = fx.gritty(&["ls", NAME, "--json"]);
     let text = String::from_utf8_lossy(&out.stdout);
     assert!(
@@ -350,15 +329,15 @@ fn sessions_are_reachable_through_the_tunnel() {
     );
 
     let out = fx.gritty(&["kill-session", &format!("{NAME}:job")]);
-    assert!(out.status.success(), "{}", stderr_of(&out));
+    assert!(out.status.success(), "{}", stderr(&out));
 }
 
 #[test]
 fn dry_run_prints_the_ssh_commands_without_invoking_ssh() {
     let fx = Fixture::new();
     let out = fx.gritty(&["tunnel-create", "--dry-run", NAME]);
-    assert!(out.status.success(), "{}", stderr_of(&out));
-    let text = format!("{}{}", String::from_utf8_lossy(&out.stdout), stderr_of(&out));
+    assert!(out.status.success(), "{}", stderr(&out));
+    let text = format!("{}{}", String::from_utf8_lossy(&out.stdout), stderr(&out));
     assert!(text.contains("ssh ") && text.contains("-L "), "{text}");
     assert!(fx.calls().is_empty(), "dry-run ran ssh: {}", fx.calls());
     assert!(!fx.sidecar("lock").exists());
@@ -370,12 +349,12 @@ fn tunnel_destroy_unknown_name_names_the_known_tunnels() {
     let fx = Fixture::new();
     let out = fx.gritty(&["tunnel-destroy", "nosuch"]);
     assert!(!out.status.success());
-    assert!(stderr_of(&out).contains("no tunnel named nosuch"), "{}", stderr_of(&out));
+    assert!(stderr(&out).contains("no tunnel named nosuch"), "{}", stderr(&out));
 
     fx.create();
     let out = fx.gritty(&["tunnel-destroy", "nosuch"]);
     assert!(!out.status.success());
-    assert!(stderr_of(&out).contains(NAME), "known tunnels missing: {}", stderr_of(&out));
+    assert!(stderr(&out).contains(NAME), "known tunnels missing: {}", stderr(&out));
 }
 
 // ---------------------------------------------------------------------------
@@ -387,8 +366,8 @@ fn preflight_failure_reports_ssh_stderr_and_leaves_no_sidecars() {
     let fx = Fixture::new();
     fx.set_mode("preflight-fail");
     let out = fx.gritty(&["tunnel-create", NAME]);
-    assert!(!out.status.success(), "{}", stderr_of(&out));
-    assert!(stderr_of(&out).contains("Permission denied"), "{}", stderr_of(&out));
+    assert!(!out.status.success(), "{}", stderr(&out));
+    assert!(stderr(&out).contains("Permission denied"), "{}", stderr(&out));
     assert_eq!(
         fx.calls().lines().count(),
         1,
@@ -408,10 +387,10 @@ fn remote_ensure_failure_is_reported_and_leaves_no_ghost_lock() {
     let fx = Fixture::new();
     fx.set_mode("ensure-fail");
     let out = fx.gritty(&["tunnel-create", NAME]);
-    assert!(!out.status.success(), "{}", stderr_of(&out));
+    assert!(!out.status.success(), "{}", stderr(&out));
     // Background mode: the supervisor child reports through .out; the parent
     // relays the failure. Either way the user is pointed at bootstrap.
-    let text = format!("{}{}", stderr_of(&out), fx.all_logs());
+    let text = format!("{}{}", stderr(&out), fx.all_logs());
     assert!(text.contains("bootstrap"), "{text}");
     // The LockFileBailGuard contract: an early bail after acquiring the
     // flock must not strand the .lock file, nor the .pid/.info written with it.

@@ -8,36 +8,8 @@ use tokio::net::UnixStream;
 use tokio::time::timeout;
 use tokio_util::codec::Framed;
 
-// ---------------------------------------------------------------------------
-// require_socat & binary path
-// ---------------------------------------------------------------------------
-
-/// socat is a hard requirement of this suite: a missing tool must fail the
-/// run, never silently pass it. `GRITTY_SOCAT_TEST=0` is the only, explicit,
-/// opt-out (for a developer box without socat; CI never sets it).
-fn require_socat() {
-    if std::env::var("GRITTY_SOCAT_TEST").as_deref() == Ok("0") {
-        panic!("GRITTY_SOCAT_TEST=0 set: this suite's socat tests are disabled on this machine");
-    }
-    let found = std::process::Command::new("socat")
-        .arg("-V")
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .status()
-        .is_ok();
-    assert!(
-        found,
-        "socat not found on PATH -- install it (apt/brew install socat); these tests do not skip"
-    );
-}
-
-fn gritty_bin() -> PathBuf {
-    let mut path = PathBuf::from(env!("CARGO_BIN_EXE_gritty"));
-    if !path.exists() {
-        path = PathBuf::from("target/debug/gritty");
-    }
-    path
-}
+mod common;
+use common::{GRITTY, require_socat, wait_for_socket};
 
 // ---------------------------------------------------------------------------
 // Process guards
@@ -69,7 +41,7 @@ impl Drop for SocatGuard {
 
 fn start_server(ctl_sock: &Path) -> ServerGuard {
     ServerGuard(
-        Command::new(gritty_bin())
+        Command::new(PathBuf::from(GRITTY))
             .args(["server", "--foreground", "--ctl-socket"])
             .arg(ctl_sock)
             .stdout(Stdio::null())
@@ -98,16 +70,6 @@ fn start_socat_proxy(listen: &Path, connect: &Path) -> SocatGuard {
             .spawn()
             .expect("failed to start socat proxy")
     })
-}
-
-fn wait_for_socket(path: &Path, timeout_secs: u64) {
-    let deadline = std::time::Instant::now() + Duration::from_secs(timeout_secs);
-    while !path.exists() {
-        if std::time::Instant::now() > deadline {
-            panic!("socket never appeared: {path:?}");
-        }
-        std::thread::sleep(Duration::from_millis(100));
-    }
 }
 
 async fn do_handshake(framed: &mut Framed<UnixStream, FrameCodec>) {
@@ -304,9 +266,9 @@ impl TestEnv {
         let ctl_path = tmp.path().join("ctl.sock");
         let proxy_path = tmp.path().join("proxy.sock");
         let server = start_server(&ctl_path);
-        wait_for_socket(&ctl_path, 5);
+        wait_for_socket(&ctl_path, Duration::from_secs(5));
         let socat = start_socat_proxy(&proxy_path, &ctl_path);
-        wait_for_socket(&proxy_path, 5);
+        wait_for_socket(&proxy_path, Duration::from_secs(5));
         std::thread::sleep(Duration::from_millis(200));
         Self { _tmp: tmp, ctl_path, proxy_path, _server: server, socat: Some(socat) }
     }
@@ -322,7 +284,7 @@ impl TestEnv {
         }
         let _ = std::fs::remove_file(&self.proxy_path);
         self.socat = Some(start_socat_proxy(&self.proxy_path, &self.ctl_path));
-        wait_for_socket(&self.proxy_path, 5);
+        wait_for_socket(&self.proxy_path, Duration::from_secs(5));
         std::thread::sleep(Duration::from_millis(200));
     }
 
@@ -1288,17 +1250,17 @@ async fn kill_server_through_proxy() {
     let ctl_path = tmp.path().join("ctl.sock");
     let proxy_path = tmp.path().join("proxy.sock");
 
-    let mut server_child = Command::new(gritty_bin())
+    let mut server_child = Command::new(PathBuf::from(GRITTY))
         .args(["server", "--foreground", "--ctl-socket"])
         .arg(&ctl_path)
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .spawn()
         .expect("failed to start server");
-    wait_for_socket(&ctl_path, 5);
+    wait_for_socket(&ctl_path, Duration::from_secs(5));
 
     let _socat = start_socat_proxy(&proxy_path, &ctl_path);
-    wait_for_socket(&proxy_path, 5);
+    wait_for_socket(&proxy_path, Duration::from_secs(5));
     std::thread::sleep(Duration::from_millis(200));
 
     // Create a session first

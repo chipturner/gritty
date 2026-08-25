@@ -7,35 +7,11 @@ use tokio::net::UnixStream;
 use tokio::time::timeout;
 use tokio_util::codec::Framed;
 
-/// socat is a hard requirement of this suite: a missing tool must fail the
-/// run, never silently pass it. `GRITTY_SOCAT_TEST=0` is the only, explicit,
-/// opt-out (for a developer box without socat; CI never sets it).
-fn require_socat() {
-    if std::env::var("GRITTY_SOCAT_TEST").as_deref() == Ok("0") {
-        panic!("GRITTY_SOCAT_TEST=0 set: this suite's socat tests are disabled on this machine");
-    }
-    let found = std::process::Command::new("socat")
-        .arg("-V")
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .status()
-        .is_ok();
-    assert!(
-        found,
-        "socat not found on PATH -- install it (apt/brew install socat); these tests do not skip"
-    );
-}
-
-fn gritty_bin() -> PathBuf {
-    let mut path = PathBuf::from(env!("CARGO_BIN_EXE_gritty"));
-    if !path.exists() {
-        path = PathBuf::from("target/debug/gritty");
-    }
-    path
-}
+mod common;
+use common::{GRITTY, require_socat, wait_for_socket};
 
 fn start_server(ctl_sock: &std::path::Path) -> Child {
-    Command::new(gritty_bin())
+    Command::new(PathBuf::from(GRITTY))
         .args(["server", "--foreground", "--ctl-socket"])
         .arg(ctl_sock)
         .stdout(std::process::Stdio::null())
@@ -64,18 +40,8 @@ fn start_socat_proxy(listen: &std::path::Path, connect: &std::path::Path) -> Chi
     }
 }
 
-fn wait_for_socket(path: &std::path::Path, timeout_secs: u64) {
-    let deadline = std::time::Instant::now() + Duration::from_secs(timeout_secs);
-    while !path.exists() {
-        if std::time::Instant::now() > deadline {
-            panic!("socket never appeared: {path:?}");
-        }
-        std::thread::sleep(Duration::from_millis(100));
-    }
-}
-
 fn gritty_list(ctl_sock: &std::path::Path) -> Result<String, String> {
-    let out = Command::new(gritty_bin())
+    let out = Command::new(PathBuf::from(GRITTY))
         .args(["ls", "--ctl-socket"])
         .arg(ctl_sock)
         .output()
@@ -115,11 +81,11 @@ fn tunnel_death_server_survives() {
 
     // Start server
     let _server = ServerGuard(start_server(&ctl_sock));
-    wait_for_socket(&ctl_sock, 5);
+    wait_for_socket(&ctl_sock, Duration::from_secs(5));
 
     // Start socat proxy
     let socat = start_socat_proxy(&proxy_sock, &ctl_sock);
-    wait_for_socket(&proxy_sock, 5);
+    wait_for_socket(&proxy_sock, Duration::from_secs(5));
     let mut socat = SocatGuard(socat);
 
     // Works through proxy
@@ -138,7 +104,7 @@ fn tunnel_death_server_survives() {
 
     // Restart socat on same path
     let _socat2 = SocatGuard(start_socat_proxy(&proxy_sock, &ctl_sock));
-    wait_for_socket(&proxy_sock, 5);
+    wait_for_socket(&proxy_sock, Duration::from_secs(5));
     // Small delay for socat to be ready to accept
     std::thread::sleep(Duration::from_millis(200));
 
@@ -156,11 +122,11 @@ async fn tunnel_death_session_persists() {
 
     // Start server
     let _server = ServerGuard(start_server(&ctl_sock));
-    wait_for_socket(&ctl_sock, 5);
+    wait_for_socket(&ctl_sock, Duration::from_secs(5));
 
     // Start socat proxy
     let socat = start_socat_proxy(&proxy_sock, &ctl_sock);
-    wait_for_socket(&proxy_sock, 5);
+    wait_for_socket(&proxy_sock, Duration::from_secs(5));
     let mut socat = SocatGuard(socat);
 
     // Create a session via protocol through the proxy
@@ -212,7 +178,7 @@ async fn tunnel_death_session_persists() {
 
     // Restart socat
     let _socat2 = SocatGuard(start_socat_proxy(&proxy_sock, &ctl_sock));
-    wait_for_socket(&proxy_sock, 5);
+    wait_for_socket(&proxy_sock, Duration::from_secs(5));
     tokio::time::sleep(Duration::from_millis(200)).await;
 
     // List sessions -- our session should still be there

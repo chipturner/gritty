@@ -24,27 +24,10 @@ use std::time::{Duration, Instant};
 use nix::sys::signal::{Signal, kill};
 use nix::unistd::Pid;
 
-const GRITTY: &str = env!("CARGO_BIN_EXE_gritty");
-const WAIT: Duration = Duration::from_secs(10);
+mod common;
+use common::{GRITTY, require_socat, wait_for_socket};
 
-/// socat is a hard requirement of this suite: a missing tool must fail the
-/// run, never silently pass it. `GRITTY_SOCAT_TEST=0` is the only, explicit,
-/// opt-out (for a developer box without socat; CI never sets it).
-fn require_socat() {
-    if std::env::var("GRITTY_SOCAT_TEST").as_deref() == Ok("0") {
-        panic!("GRITTY_SOCAT_TEST=0 set: this suite's socat tests are disabled on this machine");
-    }
-    let found = std::process::Command::new("socat")
-        .arg("-V")
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .status()
-        .is_ok();
-    assert!(
-        found,
-        "socat not found on PATH -- install it (apt/brew install socat); these tests do not skip"
-    );
-}
+const WAIT: Duration = Duration::from_secs(10);
 
 // ---------------------------------------------------------------------------
 // Daemon: a foreground `gritty server -f` child in its own socket dir.
@@ -67,7 +50,7 @@ impl Daemon {
             .spawn()
             .expect("spawn gritty server -f");
         let me = Self { child, dir };
-        wait_for_socket(&me.ctl_path());
+        wait_for_socket(&me.ctl_path(), WAIT);
         me
     }
 
@@ -153,17 +136,6 @@ fn base_env(dir: &Path) -> Vec<(&'static str, String)> {
         // Plain text in the transcript so assertions need no SGR stripping.
         ("NO_COLOR", "1".to_string()),
     ]
-}
-
-fn wait_for_socket(path: &Path) {
-    let deadline = Instant::now() + WAIT;
-    while Instant::now() < deadline {
-        if std::os::unix::net::UnixStream::connect(path).is_ok() {
-            return;
-        }
-        std::thread::sleep(Duration::from_millis(20));
-    }
-    panic!("socket {} never became connectable", path.display());
 }
 
 // ---------------------------------------------------------------------------
@@ -513,7 +485,7 @@ impl Socat {
                 .spawn()
                 .expect("start socat proxy")
         };
-        wait_for_socket(listen);
+        wait_for_socket(listen, WAIT);
         Self(child)
     }
 
