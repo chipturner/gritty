@@ -54,6 +54,11 @@ verifying by hand.
   `feat(scope): ...` / `fix(scope): ...` as in `git log`.
 - `main()` returns `()`; errors are reported via `eprintln!("error: ...")`.
 
+## Releasing
+
+release.yml publishes to crates.io after the GitHub release; `cargo release`
+is configured with `publish = false`.
+
 ## Changing the wire protocol
 
 Bump `PROTOCOL_VERSION` in `src/protocol.rs` whenever frame types,

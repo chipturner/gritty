@@ -43,6 +43,10 @@ jobs:
       - name: Test
         run: cargo nextest run --locked
 
+      - name: Check publishable
+        if: matrix.os == 'ubuntu-latest'
+        run: cargo publish --locked --dry-run
+
   socat-tunnel:
     name: Socat Tunnel Tests
     runs-on: ubuntu-latest
@@ -120,6 +124,11 @@ jobs:
             echo '```'
           } >> "$GITHUB_STEP_SUMMARY"
 
+      # Floor is ~5 points under the measured baseline; it catches a suite
+      # that stopped running, not a hard target. Raise it as coverage grows.
+      - name: Enforce coverage floor
+        run: cargo llvm-cov report --fail-under-lines 70
+
       - uses: actions/upload-artifact@v4
         with:
           name: lcov
@@ -179,6 +188,22 @@ jobs:
             echo "error: $bin is not statically linked" >&2
             exit 1
           }
+
+  docs:
+    name: Rustdoc
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v6
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Build docs (broken intra-doc links are errors)
+        run: cargo doc --no-deps --document-private-items --locked
+        env:
+          RUSTDOCFLAGS: -D warnings
 
   socat-bridge:
     name: Socat Bridge Tests

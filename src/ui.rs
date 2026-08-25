@@ -6,7 +6,7 @@
 //! what each looks like, and an ASCII fallback for terminals whose locale
 //! cannot render the marker glyph.
 //!
-//! **Styling is emitted unconditionally by [`format`]; whether those bytes
+//! **Styling is emitted unconditionally by [`format()`]; whether those bytes
 //! survive is the sink's decision.** The CLI sinks below print through
 //! `anstream`, which strips ANSI when the destination is not a terminal and
 //! honors `NO_COLOR`, `CLICOLOR`, `CLICOLOR_FORCE`, `TERM=dumb`, and `--color`.
@@ -132,7 +132,7 @@ pub fn format(level: Level, text: &str, ending: LineEnding) -> String {
 
 /// Wrap `text` in an [`sgr`] sequence and a reset. For the things that are not
 /// [`Level`] messages -- status glyphs, table rows, parenthetical annotations.
-/// Like [`format`], it always styles; the sink decides whether that survives.
+/// Like [`format()`], it always styles; the sink decides whether that survives.
 pub fn paint(sgr: &str, text: &str) -> String {
     format!("{sgr}{text}{RESET}")
 }
