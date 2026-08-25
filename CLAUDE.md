@@ -110,6 +110,15 @@ Read-only commands (`ls`, `info`, `tunnels`, `doctor` without `--clean`, `socket
 - `server::run()` / `client::run()` / `ClientConn::Active` signatures are documented in [docs/internals.md](docs/internals.md) -- they are shared by the daemon and tests; update both.
 
 ### Testing
+
+#### Test conventions
+- **No sleeps.** Waits are event-driven: `read_until_contains` (marker), `wait_detached` (metadata poll), `sync_ping` (Pong proves earlier frames were processed), `wait_for_socket` (connect succeeds), flag files for shell jobs. A fixed sleep is allowed only for a genuinely unobservable window (a negative assertion, a cross-channel race) and carries a comment saying which.
+- **Missing tools fail, never skip.** socat is required (`require_socat`); bash/sh and a pty are assumed. A silent early return is a green test that tested nothing.
+- **No network.** The tunnel suite scripts `ssh`; real sshd only in the container suite.
+- **Pin what the docs restate.** `tests/docs_drift_test.rs` and the `main.rs` help/USAGE tests fail when a constant or command table drifts from the code; add to them when adding a documented constant.
+- **Golden vectors change only with `PROTOCOL_VERSION`.** Regenerate `tests/protocol_golden_test.rs` only alongside a bump.
+- **Isolation.** Every suite owns its tempdir socket dir and `$HOME`; nothing touches the live daemon.
+
 - **E2e**: `UnixStream::pair()` + channel to `server::run()`. No socket files.
 - **Daemon**: real socket in `tempfile::tempdir()`. `do_handshake()` + `wait_for_daemon()`.
 - **Client (pty)**: `tests/client_pty_test.rs` runs the real `gritty connect` binary with a controlling tty (`openpty` + `TIOCSCTTY`) against a `gritty server -f` child, typing into the master and waiting for markers in the transcript. The only in-repo exercise of `client::run()`'s relay loop -- escapes, heartbeat/liveness, auto-reconnect, exit codes. State the client keeps off the terminal (link-down detection, reconnect completion) is asserted via `client.log` next to the ctl socket; keystrokes during the reconnect loop mean "retry now", so wait for `reconnect: connected` before typing.
