@@ -18,7 +18,7 @@ cargo install just cargo-nextest   # task runner + test runner
 ## Build, test, iterate
 
 ```bash
-just check            # clippy + full test suite -- the pre-push gate
+just check            # fmt-check + clippy + full test suite -- the pre-push gate
 just fmt              # format everything
 just test session     # run a filtered subset
 cargo run -- server   # start a server; connect with: cargo run -- connect local:dev
@@ -52,7 +52,8 @@ verifying by hand.
   orphans) exist because violating them loses user sessions.
 - Commit messages: descriptive, focused, single-purpose --
   `feat(scope): ...` / `fix(scope): ...` as in `git log`.
-- `main()` returns `()`; errors are reported via `eprintln!("error: ...")`.
+- `main()` returns `()`; errors are reported via `ui::error(...)` (renders
+  `error: <msg>`).
 
 ## Releasing
 

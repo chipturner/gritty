@@ -8,6 +8,16 @@ protocol interoperate with their neighbors.
 
 ## Unreleased
 
+- **`gritty config` template.** The generated config now writes
+  `[defaults.tunnel]` commented out in the template; uncommenting the
+  header uncomments any tunnel key alongside it.
+- **Messages through `ui`.** `created <path>` and the `gritty-open` usage
+  message now render through `ui` (the marker glyph, the `error:` prefix)
+  instead of a bare `println!`/`eprintln!`, so `NO_COLOR` and `--color` are
+  honored for them too.
+- **Releases publish to crates.io automatically.** After the GitHub
+  release is cut, a workflow step now runs `cargo publish` so a tagged
+  release reaches crates.io without a manual step.
 - **`tunnel-create` failure cleanup.** When tunnel setup bails after taking
   the lock (ssh preflight passed but the remote `gritty` was unusable, say),
   the `connect-NAME.pid` and `.info` written alongside the lock are now

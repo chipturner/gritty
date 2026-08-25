@@ -9,7 +9,7 @@
       "Bash(cargo llvm-cov:*)",
       "Bash(cargo mutants:*)",
       "Bash(cargo package:*)",
-      "Bash(cargo publish --dry-run:*)",
+      "Bash(cargo publish --locked --dry-run:*)",
       "Bash(just fmt)",
       "Bash(just check:*)",
       "Bash(just test:*)",
@@ -29,7 +29,18 @@
       "Bash(./target/debug/gritty refresh:*)",
       "Bash(./target/debug/gritty restart:*)",
       "Bash(./target/debug/gritty kill-server:*)",
-      "Bash(./target/debug/gritty prune:*)"
+      "Bash(./target/debug/gritty prune:*)",
+      "Bash(./target/debug/gritty server:*)",
+      "Bash(target/debug/gritty refresh:*)",
+      "Bash(target/debug/gritty restart:*)",
+      "Bash(target/debug/gritty kill-server:*)",
+      "Bash(target/debug/gritty prune:*)",
+      "Bash(target/debug/gritty server:*)",
+      "Bash(cargo run -- refresh:*)",
+      "Bash(cargo run -- restart:*)",
+      "Bash(cargo run -- kill-server:*)",
+      "Bash(cargo run -- prune:*)",
+      "Bash(cargo run -- server:*)"
     ]
   },
   "hooks": {

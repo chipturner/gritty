@@ -62,7 +62,7 @@ test-socat-bridge:
 
 # No socat on this machine? Run the rest of the suite without the socat
 # suites instead of letting them fail:
-#   cargo nextest run -E 'not (binary(socat_tunnel_test) | binary(socat_bridge_test))'
+#   cargo nextest run -E 'not (binary(socat_tunnel_test) | binary(socat_bridge_test) | binary(tunnel_test) | test(client_reconnects_after_the_daemon_link_drops))'
 
 # Run full suite N times (no retries, no fail-fast) and report pass/fail tally
 stress count="10":

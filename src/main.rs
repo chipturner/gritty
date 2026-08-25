@@ -802,7 +802,7 @@ fn main() {
         let url = match std::env::args().nth(1) {
             Some(u) => u,
             None => {
-                ui::error("usage: gritty-open <url>");
+                ui::error("gritty-open needs a <url> argument");
                 std::process::exit(1);
             }
         };

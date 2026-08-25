@@ -23,12 +23,12 @@ set -euo pipefail
 #
 # Finally, publish the current GIFs so the README never 404s. docs/images/
 # was removed from this repo, so pull the last blessed copies out of history
-# (commit 57afe8c is the last one that has them), or re-record with `just
-# demo`. demo/out/ is gitignored -- it's a staging area, not a tracked dir:
+# (the `v0.16.1` tag still contains them), or re-record with `just demo`.
+# demo/out/ is gitignored -- it's a staging area, not a tracked dir:
 #
 #   mkdir -p demo/out
-#   git show 57afe8c:docs/images/persist.gif > demo/out/persist.gif
-#   git show 57afe8c:docs/images/transfer.gif > demo/out/transfer.gif
+#   git show v0.16.1:docs/images/persist.gif > demo/out/persist.gif
+#   git show v0.16.1:docs/images/transfer.gif > demo/out/transfer.gif
 #   just demo-publish
 #   curl -sSfI https://chipturner.github.io/gritty/demo/persist.gif | head -1
 #
