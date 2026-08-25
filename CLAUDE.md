@@ -56,7 +56,7 @@ Eighteen modules -- seventeen behind a lib crate (`src/lib.rs` hosts shared help
 | Module | Responsibility |
 |--------|----------------|
 | `security` | Socket/dir creation (0700/0600), ownership validation, `SO_PEERCRED`. **All socket binding and dir creation MUST go through this module** |
-| `config` | TOML config: `[defaults]` + `[host.<name>]`. Precedence: CLI > host > defaults > built-in. Host aliases (`canonical_host`, `alias_destination`) |
+| `config` | TOML config: `[defaults]` + `[host.<name>]`. Precedence: CLI > host > defaults > built-in. Host aliases (`canonical_host`, `alias_destination`); `config.toml` is pinned by unit tests -- as shipped (fully commented) it must parse to `ConfigFile::default()`, and with every documented line uncommented it must still parse (not equal defaults -- `Defaults`/`TunnelDefaults` fields are `Option<T>`, so an explicit value is never `None`) -- change both together |
 | `protocol` | `Frame` enum, encoder/decoder, `PROTOCOL_VERSION`, `IDLE_EVICT_TIMEOUT` contract |
 | `daemon` | Accept loop on `ctl.sock`; handshake, route, hand off `Framed<UnixStream>` to session tasks. Periodic socket self-check: re-binds (sessions survive) or exits cleanly if the socket dir is wiped externally |
 | `server` | Per-session: PTY, client relay, offset-indexed `History`, forwarding, file transfer, tail |

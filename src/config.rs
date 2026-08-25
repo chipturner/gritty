@@ -1019,4 +1019,43 @@ mod tests {
             );
         }
     }
+
+    /// The shipped template (`config.toml`, written by `gritty config`) must be
+    /// a valid config and, with every key commented out, equal the defaults.
+    #[test]
+    fn default_template_parses_to_defaults() {
+        let parsed: ConfigFile = toml::from_str(DEFAULT_CONFIG).expect("template parses");
+        assert_eq!(format!("{parsed:?}"), format!("{:?}", ConfigFile::default()));
+    }
+
+    /// Uncommenting every documented `# key = value` line and every
+    /// `# [section]` table header must still parse -- the documented values
+    /// are real TOML, not just plausible-looking text. Table headers must be
+    /// uncommented alongside their keys so a key inside a commented-out
+    /// nested table (`[defaults.tunnel]`, `[host.<name>]`) lands in that
+    /// table, not in whatever section happens to still be open. Lines that
+    /// are prose comments (no ` = ` and no `[`) stay comments.
+    ///
+    /// This does not also assert the result equals `ConfigFile::default()`:
+    /// every field on `Defaults`/`TunnelDefaults` is `Option<T>`, so setting
+    /// one explicitly -- even to its own default value -- produces `Some(x)`,
+    /// which never equals the all-`None` `ConfigFile::default()`. Parsing
+    /// without error is the meaningful guarantee here; matching the true
+    /// default value of each key is checked by hand against
+    /// `SessionSettings::default()` / `resolve_tunnel()` when editing the
+    /// template.
+    #[test]
+    fn uncommented_template_parses() {
+        let uncommented: String = DEFAULT_CONFIG
+            .lines()
+            .map(|l| {
+                l.strip_prefix("# ")
+                    .filter(|rest| rest.contains(" = ") || rest.starts_with('['))
+                    .unwrap_or(l)
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        let _parsed: ConfigFile = toml::from_str(&uncommented)
+            .unwrap_or_else(|e| panic!("uncommented template: {e}\n{uncommented}"));
+    }
 }

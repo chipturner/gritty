@@ -25,14 +25,14 @@
 # client-name = "my-laptop"  # default: hostname
 
 # Tunnel-specific global defaults (for tunnel-create).
-[defaults.tunnel]
+# [defaults.tunnel]
 # ssh-options = []
 # no-server-start = false
 # isolate-control-path = true   # default; forces ControlPath=none on the tunnel ssh. Set false to ride an existing ControlMaster mux.
 # connect-timeout = 30          # ssh -o ConnectTimeout (seconds); 0 = defer to ssh_config
 
 # Per-host overrides, keyed by connection name.
-# Connection name = hostname from destination, or -n <name> override.
+# Connection name: hostname from destination, or -n <name> override.
 #
 # aliases: alternate names for this connection. Typing an alias as the host
 # part of any target resolves to the canonical name, so `gritty c devbox` and
