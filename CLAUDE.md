@@ -35,7 +35,7 @@ just coverage                        # test coverage summary (CI publishes one p
 just coverage-html                   # HTML coverage report
 just mutants                         # cargo-mutants over the pure modules in .cargo/mutants.toml (nightly CI, informational)
 just demo                            # record demo GIFs into demo/out/ (requires vhs + tmux; see demo/record.sh)
-                                     # README embeds blessed copies from docs/images/ -- refresh them from demo/out/ when a demo changes
+                                     # then `just demo-publish` pushes demo/out/*.gif to gh-pages, which the README hot-links
 ```
 
 ```bash

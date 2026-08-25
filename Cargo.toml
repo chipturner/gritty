@@ -23,7 +23,6 @@ exclude = [
     "TODO-liveness.md",
     "demo/",
     "deny.toml",
-    "docs/images/",
     "docs/superpowers/",
     "install.sh",
     "justfile",
