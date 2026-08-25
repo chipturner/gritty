@@ -268,7 +268,7 @@ pub(crate) async fn connect_session(
             // Declined at the prompt, or no terminal to ask on.
             let host = host_from_ctl_path(&ctl_path);
             ui::error(&attached_elsewhere(&shown, holder.as_deref()));
-            eprintln!("  gritty connect {host}:{shown} --force   to take over");
+            ui::detail(&format!("gritty connect {host}:{shown} --force   to take over"));
             std::process::exit(1);
         }
         Frame::Error { message, .. } => anyhow::bail!("{message}"),
@@ -548,7 +548,7 @@ fn print_session_list(host: &str, sessions: &[gritty::protocol::SessionEntry], c
     let (headline, lines) = session_list_lines(host, sessions, client_name);
     ui::error(&headline);
     for line in lines {
-        eprintln!("{line}");
+        anstream::eprintln!("{line}");
     }
 }
 

@@ -1031,11 +1031,11 @@ pub(crate) fn open_url(url: &str, is_browser_shim: bool) {
     match stream.read_exact(&mut resp) {
         Ok(()) if resp[0] == 0x00 => {
             if is_browser_shim {
-                eprintln!(
-                    "gritty: could not open URL in your browser (URL forwarding is off \
-                           or no client is attached); open it manually:"
+                ui::warn(
+                    "could not open URL in your browser (URL forwarding is off \
+                           or no client is attached); open it manually:",
                 );
-                eprintln!("  {url}");
+                ui::detail(url);
                 // exit 0: do not break the tool that invoked $BROWSER.
             } else {
                 ui::error(
@@ -1060,7 +1060,7 @@ pub(crate) fn config_edit() -> anyhow::Result<()> {
             gritty::security::secure_create_dir_all(parent)?;
         }
         std::fs::write(&path, gritty::config::DEFAULT_CONFIG)?;
-        eprintln!("created {}", path.display());
+        ui::success(&format!("created {}", path.display()));
     }
     let editor = std::env::var("VISUAL")
         .or_else(|_| std::env::var("EDITOR"))

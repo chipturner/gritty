@@ -731,20 +731,6 @@ fn decode_session_info(payload: BytesMut) -> Result<Option<Frame>, io::Error> {
     let count = read_u32(p, 0) as usize;
     let mut off = 4;
     let mut sessions = Vec::with_capacity(count.min(1024));
-    let read_str = |p: &[u8], off: &mut usize| -> Result<String, io::Error> {
-        if *off + 2 > p.len() {
-            return Err(io::Error::new(io::ErrorKind::InvalidData, "session info truncated"));
-        }
-        let len = read_u16(p, *off) as usize;
-        *off += 2;
-        if *off + len > p.len() {
-            return Err(io::Error::new(io::ErrorKind::InvalidData, "session info truncated"));
-        }
-        let s = String::from_utf8(p[*off..*off + len].to_vec())
-            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
-        *off += len;
-        Ok(s)
-    };
     for _ in 0..count {
         // Read entry_len prefix
         if off + 4 > p.len() {
@@ -853,9 +839,6 @@ fn decode_session_info(payload: BytesMut) -> Result<Option<Frame>, io::Error> {
         });
         off = entry_end;
     }
-    // Suppress unused-closure warning: read_str is kept for reference but entry decoding
-    // uses read_entry_str within the entry_slice bounds.
-    let _ = &read_str;
     Ok(Some(Frame::SessionInfo { sessions }))
 }
 

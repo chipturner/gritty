@@ -367,10 +367,10 @@ impl ConfigFile {
             [] => typed.to_string(),
             _ => {
                 if warn {
-                    eprintln!(
-                        "warning: alias '{typed}' is claimed by multiple hosts ({}); using '{typed}' literally",
+                    ui::warn(&format!(
+                        "alias '{typed}' is claimed by multiple hosts ({}); using '{typed}' literally",
                         owners.join(", ")
-                    );
+                    ));
                 }
                 typed.to_string()
             }

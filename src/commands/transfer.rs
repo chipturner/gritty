@@ -629,7 +629,7 @@ fn finish_progress(name: &str, name_width: usize, total: u64) {
     }
     // transferred == total bypasses the render throttle, so any instant does.
     print_progress(name, name_width, total, total, &mut std::time::Instant::now());
-    eprintln!();
+    anstream::eprintln!();
 }
 
 /// Recursively walk a directory, collecting regular files with paths relative to `base`.

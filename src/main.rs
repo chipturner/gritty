@@ -802,7 +802,7 @@ fn main() {
         let url = match std::env::args().nth(1) {
             Some(u) => u,
             None => {
-                eprintln!("usage: gritty-open <url>");
+                ui::error("usage: gritty-open <url>");
                 std::process::exit(1);
             }
         };
@@ -903,9 +903,9 @@ fn main() {
             // section) as `connect FOO`.
             let connection_name = config.canonical_host(&connection_name);
             if connection_name == "local" {
-                eprintln!(
-                    "error: 'local' is reserved for the local server; \
-                     use 'localhost.' to SSH to this machine"
+                ui::error(
+                    "'local' is reserved for the local server; \
+                     use 'localhost.' to SSH to this machine",
                 );
                 std::process::exit(1);
             }
