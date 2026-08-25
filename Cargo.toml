@@ -10,7 +10,26 @@ homepage = "https://github.com/chipturner/gritty"
 repository = "https://github.com/chipturner/gritty"
 keywords = ["terminal", "tty", "ssh", "session", "persistent"]
 categories = ["command-line-utilities"]
-exclude = [".github/", "CLAUDE.md", "justfile", "quicktest.tmux"]
+# Ship source, tests, the embedded docs (`docs/llm-primer.md`, `config.toml`),
+# and the top-level docs. Everything else is repo tooling.
+exclude = [
+    ".cargo/",
+    ".claude/",
+    ".config/",
+    ".dockerignore",
+    ".github/",
+    "CLAUDE.md",
+    "CONTRIBUTING.md",
+    "TODO-liveness.md",
+    "demo/",
+    "deny.toml",
+    "docs/images/",
+    "docs/superpowers/",
+    "install.sh",
+    "justfile",
+    "quicktest.tmux",
+    "tests/container/",
+]
 
 [lib]
 name = "gritty"
