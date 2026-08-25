@@ -27,6 +27,25 @@ use nix::unistd::Pid;
 const GRITTY: &str = env!("CARGO_BIN_EXE_gritty");
 const WAIT: Duration = Duration::from_secs(10);
 
+/// socat is a hard requirement of this suite: a missing tool must fail the
+/// run, never silently pass it. `GRITTY_SOCAT_TEST=0` is the only, explicit,
+/// opt-out (for a developer box without socat; CI never sets it).
+fn require_socat() {
+    if std::env::var("GRITTY_SOCAT_TEST").as_deref() == Ok("0") {
+        panic!("GRITTY_SOCAT_TEST=0 set: this suite's socat tests are disabled on this machine");
+    }
+    let found = std::process::Command::new("socat")
+        .arg("-V")
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .is_ok();
+    assert!(
+        found,
+        "socat not found on PATH -- install it (apt/brew install socat); these tests do not skip"
+    );
+}
+
 // ---------------------------------------------------------------------------
 // Daemon: a foreground `gritty server -f` child in its own socket dir.
 // ---------------------------------------------------------------------------
@@ -419,10 +438,7 @@ fn resize_reaches_the_session() {
 
 #[test]
 fn client_reconnects_after_the_daemon_link_drops() {
-    if Command::new("socat").arg("-V").output().is_err() {
-        eprintln!("skipping (socat not found)");
-        return;
-    }
+    require_socat();
     let daemon = Daemon::start();
     let proxy_path = daemon.dir.path().join("proxy.sock");
     let mut proxy = Socat::start(&proxy_path, &daemon.ctl_path());

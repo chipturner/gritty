@@ -25,13 +25,23 @@ const GRITTY: &str = env!("CARGO_BIN_EXE_gritty");
 const WAIT: Duration = Duration::from_secs(15);
 const NAME: &str = "fakehost";
 
-macro_rules! skip_if_no_socat {
-    () => {
-        if Command::new("socat").arg("-V").output().is_err() {
-            eprintln!("skipping (socat not found)");
-            return;
-        }
-    };
+/// socat is a hard requirement of this suite: a missing tool must fail the
+/// run, never silently pass it. `GRITTY_SOCAT_TEST=0` is the only, explicit,
+/// opt-out (for a developer box without socat; CI never sets it).
+fn require_socat() {
+    if std::env::var("GRITTY_SOCAT_TEST").as_deref() == Ok("0") {
+        panic!("GRITTY_SOCAT_TEST=0 set: this suite's socat tests are disabled on this machine");
+    }
+    let found = std::process::Command::new("socat")
+        .arg("-V")
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .is_ok();
+    assert!(
+        found,
+        "socat not found on PATH -- install it (apt/brew install socat); these tests do not skip"
+    );
 }
 
 /// The scripted ssh. `$FAKE_SSH_DIR/mode` selects behavior for the *next*
@@ -285,7 +295,7 @@ fn stderr_of(out: &Output) -> String {
 
 #[test]
 fn tunnel_create_brings_up_a_healthy_tunnel_and_destroy_tears_it_down() {
-    skip_if_no_socat!();
+    require_socat();
     let fx = Fixture::new();
     fx.create();
     assert_eq!(fx.status().as_deref(), Some("healthy"), "{}", fx.diagnostics());
@@ -311,7 +321,7 @@ fn tunnel_create_brings_up_a_healthy_tunnel_and_destroy_tears_it_down() {
 
 #[test]
 fn tunnel_create_is_idempotent_while_healthy() {
-    skip_if_no_socat!();
+    require_socat();
     let fx = Fixture::new();
     fx.create();
     let calls_before = fx.calls().lines().count();
@@ -326,7 +336,7 @@ fn tunnel_create_is_idempotent_while_healthy() {
 
 #[test]
 fn sessions_are_reachable_through_the_tunnel() {
-    skip_if_no_socat!();
+    require_socat();
     let fx = Fixture::new();
     fx.create();
 
@@ -356,7 +366,7 @@ fn dry_run_prints_the_ssh_commands_without_invoking_ssh() {
 
 #[test]
 fn tunnel_destroy_unknown_name_names_the_known_tunnels() {
-    skip_if_no_socat!();
+    require_socat();
     let fx = Fixture::new();
     let out = fx.gritty(&["tunnel-destroy", "nosuch"]);
     assert!(!out.status.success());
@@ -417,7 +427,7 @@ fn remote_ensure_failure_is_reported_and_leaves_no_ghost_lock() {
 
 #[test]
 fn ssh_signal_death_is_transient_and_respawned() {
-    skip_if_no_socat!();
+    require_socat();
     let mut fx = Fixture::new();
     fx.create_foreground();
     let first = fx.bridge_pid();
@@ -438,7 +448,7 @@ fn ssh_signal_death_is_transient_and_respawned() {
 
 #[test]
 fn nontransient_ssh_exit_stops_the_supervisor_and_cleans_up() {
-    skip_if_no_socat!();
+    require_socat();
     let mut fx = Fixture::new();
     fx.create_foreground();
 
@@ -472,7 +482,7 @@ fn nontransient_ssh_exit_stops_the_supervisor_and_cleans_up() {
 
 #[test]
 fn failed_respawns_back_off_and_a_kick_retries_immediately() {
-    skip_if_no_socat!();
+    require_socat();
     let mut fx = Fixture::new();
     fx.create_foreground();
 

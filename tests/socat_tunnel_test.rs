@@ -7,23 +7,23 @@ use tokio::net::UnixStream;
 use tokio::time::timeout;
 use tokio_util::codec::Framed;
 
-macro_rules! skip_if_no_socat {
-    () => {
-        if std::env::var("GRITTY_SOCAT_TEST").as_deref() == Ok("0") {
-            eprintln!("skipping (GRITTY_SOCAT_TEST=0)");
-            return;
-        }
-        if std::process::Command::new("socat")
-            .arg("-V")
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
-            .status()
-            .is_err()
-        {
-            eprintln!("skipping (socat not found)");
-            return;
-        }
-    };
+/// socat is a hard requirement of this suite: a missing tool must fail the
+/// run, never silently pass it. `GRITTY_SOCAT_TEST=0` is the only, explicit,
+/// opt-out (for a developer box without socat; CI never sets it).
+fn require_socat() {
+    if std::env::var("GRITTY_SOCAT_TEST").as_deref() == Ok("0") {
+        panic!("GRITTY_SOCAT_TEST=0 set: this suite's socat tests are disabled on this machine");
+    }
+    let found = std::process::Command::new("socat")
+        .arg("-V")
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .is_ok();
+    assert!(
+        found,
+        "socat not found on PATH -- install it (apt/brew install socat); these tests do not skip"
+    );
 }
 
 fn gritty_bin() -> PathBuf {
@@ -107,7 +107,7 @@ impl Drop for SocatGuard {
 
 #[test]
 fn tunnel_death_server_survives() {
-    skip_if_no_socat!();
+    require_socat();
 
     let tmp = tempfile::tempdir().unwrap();
     let ctl_sock = tmp.path().join("ctl.sock");
@@ -148,7 +148,7 @@ fn tunnel_death_server_survives() {
 
 #[tokio::test]
 async fn tunnel_death_session_persists() {
-    skip_if_no_socat!();
+    require_socat();
 
     let tmp = tempfile::tempdir().unwrap();
     let ctl_sock = tmp.path().join("ctl.sock");

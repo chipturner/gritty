@@ -52,13 +52,17 @@ test-tunnel:
 test-cli:
     cargo nextest run --test cli_test
 
-# Socat tunnel disruption tests (requires socat; skips gracefully if missing)
+# Socat tunnel disruption tests (requires socat)
 test-socat:
     cargo nextest run --test socat_tunnel_test
 
-# Socat bridge integration tests (requires socat; skips gracefully if missing)
+# Socat bridge integration tests (requires socat)
 test-socat-bridge:
     cargo nextest run --test socat_bridge_test
+
+# No socat on this machine? Run the rest of the suite without the socat
+# suites instead of letting them fail:
+#   cargo nextest run -E 'not (binary(socat_tunnel_test) | binary(socat_bridge_test))'
 
 # Run full suite N times (no retries, no fail-fast) and report pass/fail tally
 stress count="10":

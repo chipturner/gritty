@@ -33,6 +33,11 @@ jobs:
 
       - uses: taiki-e/install-action@nextest
 
+      - name: Install socat
+        run: |
+          if [ "$RUNNER_OS" = "macOS" ]; then brew list socat >/dev/null 2>&1 || brew install socat
+          else sudo apt-get update && sudo apt-get install -y socat; fi
+
       - name: Format
         if: matrix.os == 'ubuntu-latest'
         run: cargo fmt --check
@@ -108,8 +113,7 @@ jobs:
 
       - uses: taiki-e/install-action@cargo-llvm-cov
 
-      # socat lets the link-disruption tests (tunnel bridge, client
-      # reconnect) count instead of skipping.
+      # socat is required by the tunnel/bridge suites.
       - name: Install socat
         run: sudo apt-get update && sudo apt-get install -y socat
 
@@ -166,6 +170,10 @@ jobs:
 
       - uses: taiki-e/install-action@nextest
         if: matrix.target == 'x86_64-unknown-linux-musl'
+
+      - name: Install socat
+        if: matrix.target == 'x86_64-unknown-linux-musl'
+        run: sudo apt-get update && sudo apt-get install -y socat
 
       - name: Build
         run: cargo build --release --locked --target ${{ matrix.target }}

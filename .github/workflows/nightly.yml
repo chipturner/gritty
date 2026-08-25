@@ -26,6 +26,9 @@ jobs:
 
       - uses: taiki-e/install-action@nextest
 
+      - name: Install socat
+        run: sudo apt-get update && sudo apt-get install -y socat
+
       # The `stress` profile disables retries (a pass-on-retry is a flake, and
       # this job exists to find flakes) and fail-fast (one failure must not
       # hide the rest of the run). More proptest cases than a PR run can

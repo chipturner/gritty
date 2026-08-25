@@ -9,26 +9,26 @@ use tokio::time::timeout;
 use tokio_util::codec::Framed;
 
 // ---------------------------------------------------------------------------
-// Skip macro & binary path
+// require_socat & binary path
 // ---------------------------------------------------------------------------
 
-macro_rules! skip_if_no_socat {
-    () => {
-        if std::env::var("GRITTY_SOCAT_TEST").as_deref() == Ok("0") {
-            eprintln!("skipping (GRITTY_SOCAT_TEST=0)");
-            return;
-        }
-        if Command::new("socat")
-            .arg("-V")
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .status()
-            .is_err()
-        {
-            eprintln!("skipping (socat not found)");
-            return;
-        }
-    };
+/// socat is a hard requirement of this suite: a missing tool must fail the
+/// run, never silently pass it. `GRITTY_SOCAT_TEST=0` is the only, explicit,
+/// opt-out (for a developer box without socat; CI never sets it).
+fn require_socat() {
+    if std::env::var("GRITTY_SOCAT_TEST").as_deref() == Ok("0") {
+        panic!("GRITTY_SOCAT_TEST=0 set: this suite's socat tests are disabled on this machine");
+    }
+    let found = std::process::Command::new("socat")
+        .arg("-V")
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .is_ok();
+    assert!(
+        found,
+        "socat not found on PATH -- install it (apt/brew install socat); these tests do not skip"
+    );
 }
 
 fn gritty_bin() -> PathBuf {
@@ -342,7 +342,7 @@ impl TestEnv {
 
 #[tokio::test]
 async fn session_create_interact_through_proxy() {
-    skip_if_no_socat!();
+    require_socat();
     let env = TestEnv::new();
 
     let (_, mut framed) = create_session(&env.proxy_path, "work").await;
@@ -354,7 +354,7 @@ async fn session_create_interact_through_proxy() {
 
 #[tokio::test]
 async fn session_create_list_kill_through_proxy() {
-    skip_if_no_socat!();
+    require_socat();
     let env = TestEnv::new();
 
     let (id_a, _) = create_session(&env.proxy_path, "alpha").await;
@@ -405,7 +405,7 @@ async fn session_create_list_kill_through_proxy() {
 
 #[tokio::test]
 async fn session_env_forwarding_through_proxy() {
-    skip_if_no_socat!();
+    require_socat();
     let env = TestEnv::new();
 
     let (_, mut framed) = create_session(&env.proxy_path, "envtest").await;
@@ -433,7 +433,7 @@ async fn session_env_forwarding_through_proxy() {
 
 #[tokio::test]
 async fn session_disconnect_reattach_preserves_state() {
-    skip_if_no_socat!();
+    require_socat();
     let env = TestEnv::new();
 
     let (id, mut framed) = create_session(&env.proxy_path, "persist").await;
@@ -457,7 +457,7 @@ async fn session_disconnect_reattach_preserves_state() {
 
 #[tokio::test]
 async fn session_exit_detected_through_proxy() {
-    skip_if_no_socat!();
+    require_socat();
     let env = TestEnv::new();
 
     let (id, mut framed) = create_session(&env.proxy_path, "exiter").await;
@@ -503,7 +503,7 @@ async fn session_exit_detected_through_proxy() {
 
 #[tokio::test]
 async fn second_client_detaches_first_through_proxy() {
-    skip_if_no_socat!();
+    require_socat();
     let env = TestEnv::new();
 
     let (id, mut client1) = create_session(&env.proxy_path, "takeover").await;
@@ -538,7 +538,7 @@ async fn second_client_detaches_first_through_proxy() {
 
 #[tokio::test]
 async fn rapid_takeover_cycles_through_proxy() {
-    skip_if_no_socat!();
+    require_socat();
     let env = TestEnv::new();
 
     let (id, mut framed) = create_session(&env.proxy_path, "rapid").await;
@@ -567,7 +567,7 @@ async fn rapid_takeover_cycles_through_proxy() {
 
 #[tokio::test]
 async fn takeover_by_name_and_by_id() {
-    skip_if_no_socat!();
+    require_socat();
     let env = TestEnv::new();
 
     let (id, framed) = create_session(&env.proxy_path, "named").await;
@@ -593,7 +593,7 @@ async fn takeover_by_name_and_by_id() {
 
 #[tokio::test]
 async fn tunnel_death_during_active_session() {
-    skip_if_no_socat!();
+    require_socat();
     let mut env = TestEnv::new();
 
     let (id, mut framed) = create_session(&env.proxy_path, "survivor").await;
@@ -620,7 +620,7 @@ async fn tunnel_death_during_active_session() {
 
 #[tokio::test]
 async fn tunnel_death_buffered_output_preserved() {
-    skip_if_no_socat!();
+    require_socat();
     let mut env = TestEnv::new();
 
     let (id, mut framed) = create_session(&env.proxy_path, "buffered").await;
@@ -660,7 +660,7 @@ async fn tunnel_death_buffered_output_preserved() {
 
 #[tokio::test]
 async fn tunnel_death_ring_buffer_overflow_marker() {
-    skip_if_no_socat!();
+    require_socat();
     let mut env = TestEnv::new();
 
     let (id, mut framed) = create_session(&env.proxy_path, "overflow").await;
@@ -702,7 +702,7 @@ async fn tunnel_death_ring_buffer_overflow_marker() {
 
 #[tokio::test]
 async fn tunnel_death_multiple_sessions_survive() {
-    skip_if_no_socat!();
+    require_socat();
     let mut env = TestEnv::new();
 
     // Create 3 sessions with unique markers
@@ -740,7 +740,7 @@ async fn tunnel_death_multiple_sessions_survive() {
 
 #[tokio::test]
 async fn tunnel_flap_rapid_kill_restart() {
-    skip_if_no_socat!();
+    require_socat();
     let mut env = TestEnv::new();
 
     let (id, mut framed) = create_session(&env.proxy_path, "flapper").await;
@@ -771,7 +771,7 @@ async fn tunnel_flap_rapid_kill_restart() {
 
 #[tokio::test]
 async fn tail_receives_output_through_proxy() {
-    skip_if_no_socat!();
+    require_socat();
     let env = TestEnv::new();
 
     let (id, mut client) = create_session(&env.proxy_path, "tailtarget").await;
@@ -817,7 +817,7 @@ async fn tail_receives_output_through_proxy() {
 
 #[tokio::test]
 async fn tail_survives_tunnel_death() {
-    skip_if_no_socat!();
+    require_socat();
     let mut env = TestEnv::new();
 
     let (id, mut client) = create_session(&env.proxy_path, "taildeath").await;
@@ -869,7 +869,7 @@ async fn tail_survives_tunnel_death() {
 
 #[tokio::test]
 async fn tail_does_not_detach_active_through_proxy() {
-    skip_if_no_socat!();
+    require_socat();
     let env = TestEnv::new();
 
     let (id, mut client) = create_session(&env.proxy_path, "tailnodetach").await;
@@ -897,7 +897,7 @@ async fn tail_does_not_detach_active_through_proxy() {
 
 #[tokio::test]
 async fn file_transfer_single_file_through_daemon() {
-    skip_if_no_socat!();
+    require_socat();
     let env = TestEnv::new();
 
     let (id, mut client) = create_session(&env.proxy_path, "xfer").await;
@@ -1002,7 +1002,7 @@ async fn file_transfer_single_file_through_daemon() {
 
 #[tokio::test]
 async fn file_transfer_receiver_first_through_daemon() {
-    skip_if_no_socat!();
+    require_socat();
     let env = TestEnv::new();
 
     let (id, mut _client) = create_session(&env.proxy_path, "xfer-recv-first").await;
@@ -1082,7 +1082,7 @@ async fn file_transfer_receiver_first_through_daemon() {
 
 #[tokio::test]
 async fn file_transfer_survives_tunnel_death() {
-    skip_if_no_socat!();
+    require_socat();
     let mut env = TestEnv::new();
 
     let (id, mut client) = create_session(&env.proxy_path, "xfer-death").await;
@@ -1172,7 +1172,7 @@ async fn file_transfer_survives_tunnel_death() {
 
 #[tokio::test]
 async fn ping_pong_through_proxy() {
-    skip_if_no_socat!();
+    require_socat();
     let env = TestEnv::new();
 
     let (_, mut framed) = create_session(&env.proxy_path, "pingpong").await;
@@ -1185,7 +1185,7 @@ async fn ping_pong_through_proxy() {
 
 #[tokio::test]
 async fn heartbeat_updates_metadata_through_proxy() {
-    skip_if_no_socat!();
+    require_socat();
     let env = TestEnv::new();
 
     let (id, mut framed) = create_session(&env.proxy_path, "hbmeta").await;
@@ -1234,7 +1234,7 @@ async fn heartbeat_updates_metadata_through_proxy() {
 
 #[tokio::test]
 async fn attach_nonexistent_session_through_proxy() {
-    skip_if_no_socat!();
+    require_socat();
     let env = TestEnv::new();
 
     let resp = control_request(
@@ -1260,7 +1260,7 @@ async fn attach_nonexistent_session_through_proxy() {
 
 #[tokio::test]
 async fn no_handshake_rejected_through_proxy() {
-    skip_if_no_socat!();
+    require_socat();
     let env = TestEnv::new();
 
     // Connect and send ListSessions without Hello
@@ -1282,7 +1282,7 @@ async fn no_handshake_rejected_through_proxy() {
 
 #[tokio::test]
 async fn kill_server_through_proxy() {
-    skip_if_no_socat!();
+    require_socat();
     // Use a fresh env so we don't conflict with other tests
     let tmp = tempfile::tempdir().unwrap();
     let ctl_path = tmp.path().join("ctl.sock");
@@ -1330,7 +1330,7 @@ async fn kill_server_through_proxy() {
 
 #[tokio::test]
 async fn concurrent_control_requests_through_proxy() {
-    skip_if_no_socat!();
+    require_socat();
     let env = TestEnv::new();
 
     // Create a session first so ListSessions has something to return

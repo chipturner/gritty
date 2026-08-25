@@ -26,6 +26,11 @@ jobs:
 
       - uses: taiki-e/install-action@nextest
 
+      - name: Install socat
+        run: |
+          if [ "$RUNNER_OS" = "macOS" ]; then brew list socat >/dev/null 2>&1 || brew install socat
+          else sudo apt-get update && sudo apt-get install -y socat; fi
+
       - name: Test
         run: cargo nextest run --locked
 
