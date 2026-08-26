@@ -62,11 +62,16 @@ jobs:
           fi
 
   mutants:
-    name: Mutation Testing
+    name: Mutation Testing (shard ${{ matrix.shard }}/4)
     runs-on: ubuntu-latest
-    # ~850 mutants; 22 min at -j 4 on a 64-core box, so budget generously
-    # for a 4-vCPU runner at -j 2.
+    # ~850 mutants at ~50s each (30s incremental build + 20s test) on a
+    # 4-vCPU runner is ~5h serial -- 150 minutes never finished (two nights,
+    # ~300 mutants each). Four shards of ~210 run ~80 min, leaving headroom.
     timeout-minutes: 150
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: [0, 1, 2, 3]
     steps:
       - uses: actions/checkout@v6
 
@@ -81,12 +86,17 @@ jobs:
       # Informational: the scope and the survivors are listed in the job
       # summary and kept as an artifact. Surviving mutants are assertion
       # gaps to triage, not a red build -- promote to a gate once the
-      # baseline is clean.
+      # baseline is clean. Shards are 0-based (`--shard k/n`, k in 0..n).
       - name: Mutants
+        run: cargo mutants --no-shuffle --jobs 2 --shard ${{ matrix.shard }}/4 --output mutants.out || true
+
+      # `always()` so a shard that still hits the job timeout leaves its
+      # partial results behind instead of discarding the whole run.
+      - name: Summarize
+        if: always()
         run: |
-          cargo mutants --no-shuffle --jobs 2 --output mutants.out || true
           {
-            echo '## Mutants'
+            echo "## Mutants (shard ${{ matrix.shard }}/4)"
             echo
             echo '### Missed'
             echo '```'
@@ -99,6 +109,7 @@ jobs:
           } >> "$GITHUB_STEP_SUMMARY"
 
       - uses: actions/upload-artifact@v4
+        if: always()
         with:
-          name: mutants
+          name: mutants-${{ matrix.shard }}
           path: mutants.out
