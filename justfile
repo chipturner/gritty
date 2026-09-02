@@ -52,6 +52,10 @@ test-tunnel:
 test-cli:
     cargo nextest run --test cli_test
 
+# `bootstrap` end to end: real install.sh, scripted ssh + curl (no network)
+test-bootstrap:
+    cargo nextest run --test bootstrap_test
+
 # Socat tunnel disruption tests (requires socat)
 test-socat:
     cargo nextest run --test socat_tunnel_test

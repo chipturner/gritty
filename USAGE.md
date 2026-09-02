@@ -119,7 +119,7 @@ In the background (default) mode `tunnel-create` prints one status line; when st
 
 ### Bootstrap options (`bootstrap`)
 
-- `--install-dir <dir>`: remote install directory (default: `~/.local/bin`)
+- `--install-dir <dir>`: remote install directory (default: `~/.local/bin`; a relative path is relative to the remote home). The tunnel finds `gritty` through a fixed PATH prefix (`~/bin`, `~/.local/bin`, `~/.cargo/bin`, `~/.nix-profile/bin`, `/usr/local/bin`, `/opt/homebrew/bin`, `/snap/bin`), so an install dir outside it works for the install but not for `connect`; `bootstrap` warns when its post-install probe cannot find the binary that way
 - `--release <version>`: release to install (default: this binary's version, so both sides speak the same protocol; `latest` installs the newest published release)
 - `-o <option>` / `--ssh-option`: extra SSH options (repeatable)
 

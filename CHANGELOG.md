@@ -8,6 +8,29 @@ protocol interoperate with their neighbors.
 
 ## Unreleased
 
+- **`bootstrap` no longer reports an install that never happened.** When
+  the remote could not fetch `install.sh` (github.com reachable but
+  raw.githubusercontent.com not, say), the remote command exited 0 and
+  bootstrap printed "installed gritty" with a "could not confirm" caveat.
+  The script is now fetched before it is run, so a failed fetch is a failed
+  bootstrap.
+- **`bootstrap --install-dir` with a relative path.** `install.sh` read the
+  install dir after changing into its scratch directory, so `--install-dir
+  bin` installed into the scratch dir and then removed it. Relative paths
+  now resolve against the remote home, where ssh starts the command.
+- **`bootstrap` says when the binary is out of the tunnel's reach.** An
+  install dir outside the PATH prefix gritty uses over ssh (`~/bin`,
+  `~/.local/bin`, `~/.cargo/bin`, ...) is now reported as such, instead of
+  the generic "could not confirm the installed version; try refresh". The
+  probe also reads its answer from the last stdout line, so a remote rc file
+  that echoes on login no longer defeats it, and recognizes dash's
+  `not found` alongside bash's `command not found`. The closing "next:" line
+  points at `gritty refresh <host>` for the upgrade case, since a daemon
+  already running there keeps the old binary until restarted.
+- **Destinations may not start with `-`.** `tunnel-create`, `bootstrap`,
+  and `refresh` pass the ssh destination after ssh's options with no `--`,
+  so a leading dash would have been parsed as an ssh option; it is now
+  rejected up front.
 - **`gritty config` template.** The generated config now writes
   `[defaults.tunnel]` commented out in the template; uncommenting the
   header uncomments any tunnel key alongside it.

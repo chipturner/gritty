@@ -24,6 +24,11 @@ impl Destination {
         if s.is_empty() {
             bail!("empty destination");
         }
+        // ssh gets the destination after its options with no `--`, so a
+        // leading dash would be parsed as an option (`-oProxyCommand=...`).
+        if s.starts_with('-') {
+            bail!("destination must not start with '-': {s}");
+        }
 
         let (user, remainder) = if let Some(at) = s.find('@') {
             let u = &s[..at];
@@ -181,6 +186,27 @@ fn remote_exec_command(
     cmd
 }
 
+/// `remote_exec` could not find `gritty` on the remote's non-interactive
+/// PATH. Typed so `bootstrap` can tell it apart from ssh failing.
+#[derive(Debug)]
+struct RemoteGrittyMissing {
+    ssh_dest: String,
+}
+
+impl std::fmt::Display for RemoteGrittyMissing {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "gritty not found on remote host\n  \
+             quick install:  gritty bootstrap {}\n  \
+             manual install: ssh {} 'cargo install gritty-cli'",
+            self.ssh_dest, self.ssh_dest
+        )
+    }
+}
+
+impl std::error::Error for RemoteGrittyMissing {}
+
 /// Run a command on the remote host via SSH, returning stdout.
 ///
 /// Stderr is always piped so we can include SSH errors in our error messages.
@@ -218,14 +244,10 @@ async fn remote_exec(
         let stderr = String::from_utf8_lossy(&output.stderr);
         let stderr = stderr.trim();
         debug!("ssh failed (status {}): {stderr}", output.status);
-        if stderr.contains("command not found") || stderr.contains("No such file") {
-            bail!(
-                "gritty not found on remote host\n  \
-                 quick install:  gritty bootstrap {}\n  \
-                 manual install: ssh {} 'cargo install gritty-cli'",
-                dest.ssh_dest(),
-                dest.ssh_dest(),
-            );
+        // bash: "gritty: command not found"; zsh: "command not found: gritty";
+        // dash: "gritty: not found"; a stale symlink: "No such file".
+        if stderr.contains("not found") || stderr.contains("No such file") {
+            return Err(RemoteGrittyMissing { ssh_dest: dest.ssh_dest() }.into());
         }
         let diag = format_ssh_diag(dest, extra_ssh_opts, foreground, connect_timeout);
         if stderr.is_empty() {
@@ -1461,12 +1483,37 @@ fn quote_remote_install_dir(install_dir: &str) -> String {
 /// The remote install command line. install.sh reads the release from `$1`
 /// (`sh -c "$script" sh <release>`); the release is shell-quoted because it
 /// comes from the command line.
+///
+/// The script is fetched into a variable first: `sh -c "$(curl ...)"` alone
+/// runs an empty command -- exit 0 -- when the fetch fails, and the install
+/// would be reported as done. An assignment carries the substitution's exit
+/// status, so a failed fetch reaches `bootstrap` as a failed ssh command.
 fn install_command(install_dir: &str, release: &str) -> String {
     format!(
-        "GRITTY_INSTALL_DIR={} sh -c \"$(curl -sSfL {INSTALL_SCRIPT_URL})\" sh {}",
+        "s=$(curl -sSfL {INSTALL_SCRIPT_URL}) || {{ rc=$?; echo \"could not fetch install.sh\" >&2; exit $rc; }}; \
+         GRITTY_INSTALL_DIR={} sh -c \"$s\" sh {}",
         quote_remote_install_dir(install_dir),
         shell_quote(release)
     )
+}
+
+/// What the post-install probe (`gritty protocol-version` through the
+/// tunnel's PATH prefix) established about the remote binary.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Probe {
+    /// The installed binary answered with its protocol version.
+    Version(u16),
+    /// The install dir is outside `REMOTE_PATH_PREFIX`, so the tunnel will
+    /// not find the binary either.
+    NotOnPath,
+    /// ssh failed, or the binary printed something that is not a version.
+    Unknown,
+}
+
+/// The probe's answer is its last stdout line; a remote rc file that echoes
+/// on login puts noise in front of it.
+fn parse_probe_output(out: &str) -> Probe {
+    out.lines().last().and_then(|l| l.trim().parse().ok()).map_or(Probe::Unknown, Probe::Version)
 }
 
 /// The two closing lines of a bootstrap: what got installed (and whether its
@@ -1477,7 +1524,8 @@ fn bootstrap_report(
     connection_name: &str,
     ssh_dest: &str,
     release: &str,
-    remote_protocol: Option<u16>,
+    install_dir: &str,
+    probe: Probe,
     local_protocol: u16,
 ) -> (String, String) {
     let what = if release == "latest" {
@@ -1485,18 +1533,27 @@ fn bootstrap_report(
     } else {
         format!("gritty {release}")
     };
-    let verdict = match remote_protocol {
-        Some(v) if v == local_protocol => format!("protocol v{v}, matches this machine"),
-        Some(v) => format!(
-            "protocol v{v}, but this machine speaks v{local_protocol} -- upgrade one side before connecting"
+    let line = match probe {
+        Probe::Version(v) if v == local_protocol => {
+            format!("installed {what} on {ssh_dest} (protocol v{v}, matches this machine)")
+        }
+        Probe::Version(v) => format!(
+            "installed {what} on {ssh_dest} (protocol v{v}, but this machine speaks v{local_protocol} -- upgrade one side before connecting)"
         ),
-        None => "could not confirm the installed version; try `gritty refresh` after connecting"
-            .to_string(),
+        Probe::NotOnPath => format!(
+            "installed {what} on {ssh_dest}, but {install_dir} is not on the PATH gritty uses over ssh \
+             (~/bin, ~/.local/bin, ~/.cargo/bin, ...) -- reinstall with --install-dir ~/.local/bin or symlink it there"
+        ),
+        Probe::Unknown => format!(
+            "installed {what} on {ssh_dest} (could not confirm the installed version; try `gritty refresh` after connecting)"
+        ),
     };
-    (
-        format!("installed {what} on {ssh_dest} ({verdict})"),
-        format!("next: gritty connect {connection_name}:<name>"),
-    )
+    // A daemon already running there is still the old binary until restarted.
+    let next = format!(
+        "next: gritty connect {connection_name}:<name> \
+         (or `gritty refresh {connection_name}` first if a daemon was already running there)"
+    );
+    (line, next)
 }
 
 /// `gritty bootstrap`: install the given release on the remote via install.sh
@@ -1531,20 +1588,24 @@ pub async fn bootstrap(
 
     // Post-install probe through the same PATH prefix the tunnel will use, so
     // this also proves the install dir is reachable non-interactively.
-    let remote_protocol =
-        remote_exec(&dest, "gritty protocol-version", ssh_options, true, connect_timeout)
+    let probe =
+        match remote_exec(&dest, "gritty protocol-version", ssh_options, true, connect_timeout)
             .await
-            .ok()
-            .and_then(|out| out.trim().parse::<u16>().ok());
+        {
+            Ok(out) => parse_probe_output(&out),
+            Err(e) if e.downcast_ref::<RemoteGrittyMissing>().is_some() => Probe::NotOnPath,
+            Err(_) => Probe::Unknown,
+        };
     let (line, next) = bootstrap_report(
         connection_name,
         &dest.ssh_dest(),
         release,
-        remote_protocol,
+        install_dir,
+        probe,
         crate::protocol::PROTOCOL_VERSION,
     );
-    match remote_protocol {
-        Some(v) if v == crate::protocol::PROTOCOL_VERSION => ui::success(&line),
+    match probe {
+        Probe::Version(v) if v == crate::protocol::PROTOCOL_VERSION => ui::success(&line),
         _ => ui::warn(&line),
     }
     ui::detail(&next);
@@ -2609,8 +2670,10 @@ mod tests {
         // Pinning to the local release is what keeps a fresh remote on the
         // same protocol as the laptop that bootstrapped it; `latest` opts out.
         let cmd = install_command("~/.local/bin", "0.15.5");
-        assert!(cmd.starts_with("GRITTY_INSTALL_DIR=\"$HOME\"/.local/bin sh -c \""), "{cmd}");
-        assert!(cmd.ends_with("\" sh 0.15.5"), "{cmd}");
+        assert!(
+            cmd.contains("GRITTY_INSTALL_DIR=\"$HOME\"/.local/bin sh -c \"$s\" sh 0.15.5"),
+            "{cmd}"
+        );
         assert!(install_command("/opt/bin", "latest").ends_with("\" sh latest"));
         // A hostile release string can't break out of the command line.
         let cmd = install_command("/opt/bin", "1.0; touch pwned");
@@ -2618,23 +2681,80 @@ mod tests {
     }
 
     #[test]
+    fn install_command_fetches_the_script_before_running_it() {
+        // `sh -c "$(curl ...)"` runs an empty command -- exit 0 -- when the
+        // fetch fails; capturing into a variable first carries curl's status
+        // to ssh, and so to bootstrap's "remote install failed".
+        let cmd = install_command("~/.local/bin", "0.15.5");
+        assert!(cmd.starts_with(&format!("s=$(curl -sSfL {INSTALL_SCRIPT_URL}) || {{")), "{cmd}");
+        assert!(!cmd.contains("sh -c \"$("), "{cmd}");
+    }
+
+    #[test]
     fn bootstrap_report_confirms_the_protocol_and_says_what_to_run_next() {
-        let (line, next) = bootstrap_report("devbox", "user@devbox", "0.15.5", Some(23), 23);
+        let report = |release, probe| {
+            bootstrap_report("devbox", "user@devbox", release, "~/.local/bin", probe, 23)
+        };
+        let (line, next) = report("0.15.5", Probe::Version(23));
         assert_eq!(
             line,
             "installed gritty 0.15.5 on user@devbox (protocol v23, matches this machine)"
         );
-        assert_eq!(next, "next: gritty connect devbox:<name>");
+        // A daemon already running there is still the old binary: `connect`
+        // for a fresh host, `refresh` for an upgrade.
+        assert!(next.starts_with("next: gritty connect devbox:<name>"), "{next}");
+        assert!(next.contains("gritty refresh devbox"), "{next}");
 
-        let (line, _) = bootstrap_report("devbox", "user@devbox", "0.15.5", Some(22), 23);
+        let (line, _) = report("0.15.5", Probe::Version(22));
         assert!(
             line.contains("protocol v22") && line.contains("this machine speaks v23"),
             "{line}"
         );
 
-        let (line, _) = bootstrap_report("devbox", "user@devbox", "latest", None, 23);
+        let (line, _) = report("latest", Probe::Unknown);
         assert!(line.contains("installed gritty (latest) on user@devbox"), "{line}");
         assert!(line.contains("could not confirm"), "{line}");
+    }
+
+    #[test]
+    fn bootstrap_report_names_an_install_dir_the_tunnel_cannot_see() {
+        // "could not confirm; try refresh" would send the user down the
+        // wrong path: the binary is fine, the tunnel's fixed PATH prefix
+        // just doesn't include where it went.
+        let (line, _) = bootstrap_report(
+            "devbox",
+            "user@devbox",
+            "0.15.5",
+            "/opt/gritty",
+            Probe::NotOnPath,
+            23,
+        );
+        assert!(line.contains("/opt/gritty is not on the PATH gritty uses over ssh"), "{line}");
+        assert!(line.contains("--install-dir ~/.local/bin"), "{line}");
+        assert!(!line.contains("could not confirm"), "{line}");
+    }
+
+    #[test]
+    fn probe_output_takes_the_last_line() {
+        // A remote rc file that echoes to stdout lands in front of the
+        // version; the answer is the last line, not the whole transcript.
+        assert_eq!(parse_probe_output("23"), Probe::Version(23));
+        assert_eq!(parse_probe_output("Welcome to devbox\nmotd noise\n23\n"), Probe::Version(23));
+        assert_eq!(parse_probe_output(""), Probe::Unknown);
+        assert_eq!(parse_probe_output("error: unrecognized subcommand"), Probe::Unknown);
+    }
+
+    #[test]
+    fn destination_starting_with_dash_is_rejected() {
+        // ssh gets the destination after its options with no `--`, so a
+        // leading dash would be parsed as an option (`-oProxyCommand=...`)
+        // and the command string would become the hostname.
+        for bad in ["-oProxyCommand=touch /tmp/pwned", "-u@host", "-"] {
+            let err = Destination::parse(bad).unwrap_err().to_string();
+            assert!(err.contains("must not start with '-'"), "{bad}: {err}");
+        }
+        assert!(Destination::parse("user@host-with-dash").is_ok());
+        assert!(Destination::parse("user@[::1]:22").is_ok());
     }
 
     #[test]
