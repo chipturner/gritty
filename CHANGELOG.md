@@ -8,6 +8,14 @@ protocol interoperate with their neighbors.
 
 ## Unreleased
 
+- **Reconnect no longer types terminal query answers into the shell.** A
+  program that fingerprinted the terminal at startup (neovim, Claude Code:
+  `CSI > q`, `CSI c`, `CSI ? 2026 $ p`, OSC color queries, ...) left those
+  query bytes in the session's history. Replaying them on reconnect made the
+  terminal answer again, and the answers landed at the prompt as garbage
+  (`>|ghostty 1.3.162;22;52c2026;2$y`, with zsh reading the leading `ESC P`
+  as history-search and recalling the previous command). Replays are now
+  scrubbed of such queries; the live relay is untouched.
 - **`bootstrap` no longer reports an install that never happened.** When
   the remote could not fetch `install.sh` (github.com reachable but
   raw.githubusercontent.com not, say), the remote command exited 0 and

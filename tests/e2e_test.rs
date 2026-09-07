@@ -3154,6 +3154,152 @@ async fn reconnect_resumes_incrementally_from_offset() {
     let _ = timeout(Duration::from_secs(3), server).await;
 }
 
+/// Terminal capability queries (DA1, XTVERSION, DECRQM -- the burst neovim
+/// and other TUIs send at startup) are answered by the terminal. Replaying
+/// them makes the terminal answer again, and with the original asker gone
+/// the answers land in the shell prompt as garbage. A fresh viewer's
+/// scrollback replay must not contain them, while the live relay must pass
+/// them through untouched (the asker is waiting for its answer).
+#[tokio::test]
+async fn fresh_reconnect_strips_terminal_queries_from_scrollback() {
+    let (client_tx, mut framed, server, meta) = setup_session().await;
+    wait_for_shell(&mut framed).await;
+    settle(&mut framed).await;
+
+    framed
+        .send(Frame::Data(Bytes::from(
+            "printf '\\033[>q\\033[c\\033[?2026$p\\033[c'; echo QUERY_\"DO\"NE\n",
+        )))
+        .await
+        .unwrap();
+    let live = read_until_contains(&mut framed, "QUERY_DONE", Duration::from_secs(5)).await;
+    assert!(
+        contains_bytes(&live, b"\x1b[c"),
+        "live relay must pass queries through, got: {:?}",
+        String::from_utf8_lossy(&live)
+    );
+
+    drop(framed);
+    wait_detached(&meta).await;
+
+    let (server_stream, client_stream) = UnixStream::pair().unwrap();
+    client_tx
+        .send(ClientConn::Active {
+            framed: Framed::new(server_stream, FrameCodec),
+            client_name: String::new(),
+            capabilities: 0,
+            cols: 80,
+            rows: 24,
+            rendered_offset: 0,
+            line_dirty: false,
+            is_fresh: true,
+        })
+        .unwrap();
+    let mut framed = Framed::new(client_stream, FrameCodec);
+
+    let replayed = read_until_contains(&mut framed, "QUERY_DONE", Duration::from_secs(5)).await;
+    assert_no_queries(&replayed);
+    let replayed_str = String::from_utf8_lossy(&replayed);
+    assert!(replayed_str.contains("QUERY_DONE"), "scrollback should replay, got: {replayed_str:?}");
+    assert!(replayed_str.contains(RECONNECT_DIVIDER), "divider expected, got: {replayed_str:?}");
+
+    let _ = framed.send(Frame::Data(Bytes::from("exit\n"))).await;
+    let _ = timeout(Duration::from_secs(3), server).await;
+}
+
+/// Same for an auto-reconnect whose offset predates the query burst: the
+/// history tail is replayed with the queries scrubbed. Scrubbing changes the
+/// byte count, so the tail goes out as `Notice` (uncounted) and the `Resume`
+/// jumps the client straight to the server's current offset.
+#[tokio::test]
+async fn clean_reconnect_strips_terminal_queries_from_history() {
+    let (client_tx, mut framed, server, meta) = setup_session().await;
+    wait_for_shell(&mut framed).await;
+    settle(&mut framed).await;
+    read_available_data(&mut framed, Duration::from_millis(300)).await;
+    let before_burst = server_stream_offset(&mut framed).await;
+
+    framed
+        .send(Frame::Data(Bytes::from(
+            "printf '\\033[>q\\033[c\\033[?2026$p\\033[c'; echo QUERY_\"DO\"NE\n",
+        )))
+        .await
+        .unwrap();
+    read_until_contains(&mut framed, "QUERY_DONE", Duration::from_secs(5)).await;
+    read_available_data(&mut framed, Duration::from_millis(300)).await;
+    let total = server_stream_offset(&mut framed).await;
+
+    drop(framed);
+    wait_detached(&meta).await;
+
+    let (server_stream, client_stream) = UnixStream::pair().unwrap();
+    client_tx
+        .send(ClientConn::Active {
+            framed: Framed::new(server_stream, FrameCodec),
+            client_name: String::new(),
+            capabilities: 0,
+            cols: 80,
+            rows: 24,
+            rendered_offset: before_burst,
+            line_dirty: false,
+            is_fresh: false,
+        })
+        .unwrap();
+    let mut framed = Framed::new(client_stream, FrameCodec);
+
+    match timeout(Duration::from_secs(2), framed.next()).await {
+        Ok(Some(Ok(Frame::Resume { offset }))) => {
+            assert_eq!(offset, total, "resume should land the client at the server's offset");
+        }
+        other => panic!("expected Resume frame first, got {other:?}"),
+    }
+    let mut replayed = Vec::new();
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    while !contains_bytes(&replayed, b"QUERY_DONE") {
+        let now = tokio::time::Instant::now();
+        assert!(
+            now < deadline,
+            "replay never arrived, got: {:?}",
+            String::from_utf8_lossy(&replayed)
+        );
+        match timeout(deadline - now, framed.next()).await {
+            Ok(Some(Ok(Frame::Notice(data)))) => replayed.extend_from_slice(&data),
+            Ok(Some(Ok(Frame::Data(data)))) => {
+                panic!(
+                    "scrubbed replay must be Notice, not Data: {:?}",
+                    String::from_utf8_lossy(&data)
+                )
+            }
+            Ok(Some(Ok(_))) => {}
+            other => panic!("stream ended: {other:?}"),
+        }
+    }
+    assert_no_queries(&replayed);
+    assert!(
+        !contains_bytes(&replayed, b"READY:"),
+        "replay must start at the client's offset, got: {:?}",
+        String::from_utf8_lossy(&replayed)
+    );
+
+    let _ = framed.send(Frame::Data(Bytes::from("exit\n"))).await;
+    let _ = timeout(Duration::from_secs(3), server).await;
+}
+
+fn contains_bytes(haystack: &[u8], needle: &[u8]) -> bool {
+    haystack.windows(needle.len()).any(|w| w == needle)
+}
+
+fn assert_no_queries(replayed: &[u8]) {
+    for query in [b"\x1b[>q".as_slice(), b"\x1b[c", b"\x1b[?2026$p"] {
+        assert!(
+            !contains_bytes(replayed, query),
+            "replay must not contain {:?}, got: {:?}",
+            String::from_utf8_lossy(query),
+            String::from_utf8_lossy(replayed)
+        );
+    }
+}
+
 /// A `line_dirty` auto-reconnect (the client painted a reconnect status line,
 /// so its cursor parked at column 0 of the current line) must restore the
 /// cursor's column and SGR state WITHOUT clearing or repainting the line --

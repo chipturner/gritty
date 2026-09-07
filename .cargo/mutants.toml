@@ -11,6 +11,7 @@ examine_globs = [
     "src/naming.rs",
     "src/alt_screen.rs",
     "src/line_shadow.rs",
+    "src/query_filter.rs",
     "src/scrollback.rs",
     "src/config.rs",
     "src/runinfo.rs",

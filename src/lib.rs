@@ -9,6 +9,7 @@ pub mod naming;
 pub mod net_watch;
 pub mod procscan;
 pub mod protocol;
+pub mod query_filter;
 pub mod runinfo;
 pub mod scrollback;
 pub mod security;

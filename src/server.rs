@@ -1,6 +1,7 @@
 use crate::alt_screen::AltScreenTracker;
 use crate::line_shadow::LineShadow;
 use crate::protocol::{Frame, FrameCodec, IDLE_EVICT_TIMEOUT};
+use crate::query_filter::QueryFilter;
 use crate::scrollback::ScrollbackBuffer;
 use bytes::Bytes;
 use futures_util::{SinkExt, StreamExt};
@@ -1865,9 +1866,7 @@ async fn send_reconnect_replay(
             let divider = replay_divider(cols, None);
             let msg = if line_dirty { format!("\r\x1b[K{divider}") } else { divider };
             send_framed_timed(framed, Frame::Notice(Bytes::from(msg))).await?;
-            for line in scrollback.lines_and_partial() {
-                send_framed_timed(framed, Frame::Notice(line)).await?;
-            }
+            send_scrubbed(framed, scrollback.lines_and_partial()).await?;
             scrollback.clear();
         }
         ReplayPlan::Clean { offset } => {
@@ -1879,7 +1878,10 @@ async fn send_reconnect_replay(
             if cols > 0 && rows > 0 {
                 apply_winsize(async_master, cols, rows);
             }
-            send_framed_timed(framed, Frame::Resume { offset }).await?;
+            // The replayed tail goes out scrubbed (see `send_scrubbed`), so
+            // its byte count no longer matches the stream's: jump the client
+            // straight to the end instead of letting it count Data bytes.
+            send_framed_timed(framed, Frame::Resume { offset: history.total() }).await?;
             if let Some(restore) = restore {
                 // The client erased its status line and moved the cursor back
                 // up onto the line where `offset` left it -- at column 0 (see
@@ -1894,15 +1896,13 @@ async fn send_reconnect_replay(
             }
             // The heart of the seamless resume: exactly the bytes produced
             // while the client was gone, nothing it has already rendered.
-            for chunk in history.slice_from(offset) {
-                send_framed_timed(framed, Frame::Data(chunk)).await?;
-            }
+            send_scrubbed(framed, history.slice_from(offset)).await?;
         }
         ReplayPlan::Truncated { offset, dropped } => {
             if cols > 0 && rows > 0 {
                 apply_winsize(async_master, cols, rows);
             }
-            send_framed_timed(framed, Frame::Resume { offset }).await?;
+            send_framed_timed(framed, Frame::Resume { offset: history.total() }).await?;
             let marker = format!(
                 "\x1b[2m\u{25b8} {} lost while disconnected\x1b[0m\r\n",
                 humansize::format_size(dropped, humansize::BINARY),
@@ -1921,10 +1921,32 @@ async fn send_reconnect_replay(
                 Frame::Notice(Bytes::from(format!("\x1b[?1049l{lead}{marker}"))),
             )
             .await?;
-            for chunk in history.slice_from(offset) {
-                send_framed_timed(framed, Frame::Data(chunk)).await?;
-            }
+            send_scrubbed(framed, history.slice_from(offset)).await?;
         }
+    }
+    Ok(())
+}
+
+/// Replay retained output with terminal capability queries stripped
+/// (`QueryFilter`): replaying a DA1 / XTVERSION / DECRQM probe makes the
+/// client's terminal answer it again, and the answer lands in the shell as
+/// typed garbage. Scrubbing changes the byte count, so the replay is sent as
+/// `Notice` (rendered, not counted) after a `Resume` that already placed the
+/// client at the stream's end.
+async fn send_scrubbed(
+    framed: &mut Framed<UnixStream, FrameCodec>,
+    chunks: impl IntoIterator<Item = Bytes>,
+) -> io::Result<()> {
+    let mut filter = QueryFilter::new();
+    for chunk in chunks {
+        let scrubbed = filter.scrub(&chunk);
+        if !scrubbed.is_empty() {
+            send_framed_timed(framed, Frame::Notice(Bytes::from(scrubbed))).await?;
+        }
+    }
+    let tail = filter.finish();
+    if !tail.is_empty() {
+        send_framed_timed(framed, Frame::Notice(Bytes::from(tail))).await?;
     }
     Ok(())
 }
