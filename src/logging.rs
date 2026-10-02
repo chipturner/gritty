@@ -105,14 +105,13 @@ const LOG_LEVELS: [&str; 3] = ["gritty=info", "gritty=debug", "gritty=trace"];
 
 /// Cycle to the next log level. Called from the daemon's SIGUSR1 handler.
 pub fn cycle_log_level() {
-    let idx = LOG_LEVEL_INDEX
-        .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |i| {
-            Some((i + 1) % LOG_LEVELS.len() as u8)
-        })
-        .unwrap_or(0);
-    let next = ((idx + 1) % LOG_LEVELS.len() as u8) as usize;
+    // Load-then-store is not atomic. That is sound because the daemon's signal
+    // loop is the only caller. `AtomicU8::update` would be atomic, but it needs
+    // Rust 1.95, which is above the MSRV.
+    let next_level_idx = (LOG_LEVEL_INDEX.load(Ordering::Relaxed) + 1) % LOG_LEVELS.len() as u8;
+    LOG_LEVEL_INDEX.store(next_level_idx, Ordering::Relaxed);
     if let Some(reload) = LOG_RELOAD.get() {
-        reload(LOG_LEVELS[next]);
+        reload(LOG_LEVELS[next_level_idx as usize]);
     }
 }
 
@@ -475,6 +474,17 @@ mod tests {
         assert!(TERMINAL_OWNED.load(Ordering::Relaxed));
         set_terminal_owned(false);
         assert!(!TERMINAL_OWNED.load(Ordering::Relaxed));
+    }
+
+    #[test]
+    fn cycle_log_level_wraps_from_trace_back_to_info() {
+        assert_eq!(current_log_level_name(), "info");
+        cycle_log_level();
+        assert_eq!(current_log_level_name(), "debug");
+        cycle_log_level();
+        assert_eq!(current_log_level_name(), "trace");
+        cycle_log_level();
+        assert_eq!(current_log_level_name(), "info");
     }
 
     #[test]
