@@ -2092,7 +2092,8 @@ pub async fn run(
     // Set stdin to non-blocking for AsyncFd — guard restores on drop.
     // Declared BEFORE async_stdin so it drops AFTER AsyncFd (reverse drop order).
     let nb_guard = NonBlockGuard::set(stdin_borrowed)?;
-    let async_stdin = AsyncFd::new(io::stdin())?;
+    // SAFETY: fd 0 is open for the life of the process; nothing here closes or replaces it.
+    let async_stdin = unsafe { AsyncFd::register(io::stdin()) }.map_err(io::Error::from)?;
     // dup() stdout so we get an independent fd for AsyncFd (stdin may share the same fd).
     // Set O_NONBLOCK explicitly: when stdout is a separate OFD (pipe/redirect), stdin's
     // NonBlockGuard doesn't cover it and write() would block the relay loop.
@@ -2102,7 +2103,8 @@ pub async fn run(
         let flags = fcntl(&stdout_fd, FcntlArg::F_GETFL)?;
         fcntl(&stdout_fd, FcntlArg::F_SETFL(OFlag::from_bits_truncate(flags) | OFlag::O_NONBLOCK))?;
     }
-    let async_stdout = AsyncFd::new(stdout_fd)?;
+    // SAFETY: the AsyncFd owns the dup'd fd, so it stays open and unchanged until drop.
+    let async_stdout = unsafe { AsyncFd::register(stdout_fd) }.map_err(io::Error::from)?;
 
     // Mirrors the server's alt-screen tracker so we can suppress our own
     // reconnect chrome when a TUI is running -- those writes would otherwise

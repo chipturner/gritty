@@ -2073,7 +2073,8 @@ pub async fn run(
     oflags |= nix::fcntl::OFlag::O_NONBLOCK;
     nix::fcntl::fcntl(&master, nix::fcntl::FcntlArg::F_SETFL(oflags))?;
 
-    let async_master = AsyncFd::new(master)?;
+    // SAFETY: the AsyncFd owns the PTY master, so it stays open and unchanged until drop.
+    let async_master = unsafe { AsyncFd::register(master) }.map_err(io::Error::from)?;
     let mut buf = vec![0u8; 4096];
     // Always-on byte history of PTY output. Unlike the old detached-only ring
     // buffer, this is populated whether or not a client is attached, so a
