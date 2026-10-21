@@ -317,6 +317,24 @@ fn attach_relays_shell_io_and_tilde_dot_detaches() {
 }
 
 #[test]
+fn detach_returns_terminal_modes_to_their_defaults() {
+    let daemon = Daemon::start();
+    let mut pty = attach_ready(&daemon, "modes");
+
+    // A program in the session turns on mouse reporting and is still running
+    // (here: never turned it off) when the user detaches.
+    pty.send("printf '\\033[?1003h\\033[?1006h'; echo MOUSE:$((1+1))\n");
+    pty.expect("MOUSE:2");
+    pty.send("\n~.");
+    let detached_at = pty.expect("detached");
+    pty.wait_exit();
+
+    // Without the reset the local shell inherits a terminal that types a
+    // mouse report at the prompt for every pointer movement.
+    pty.expect_from(detached_at, &gritty::term_modes::default_mode_sequence());
+}
+
+#[test]
 fn detached_session_keeps_running_and_reattach_replays_it() {
     let daemon = Daemon::start();
     let mut first = attach_ready(&daemon, "persist");
@@ -347,8 +365,10 @@ fn shell_exit_ends_the_client_cleanly() {
     pty.send("exit 0\n");
     let status = pty.wait_exit();
     assert!(status.success(), "{status:?}; transcript:\n{}", pty.transcript());
-    // No raw-mode residue: the exit path resets SGR and re-shows the cursor.
-    assert!(pty.transcript().contains("\x1b[?25h"), "cursor-show reset missing");
+    // No raw-mode residue: the exit path resets SGR and the private modes,
+    // which re-shows the cursor.
+    let handback = format!("\x1b[0m{}", gritty::term_modes::default_mode_sequence());
+    assert!(pty.transcript().contains(&handback), "terminal handback missing");
 }
 
 #[test]

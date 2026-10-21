@@ -912,6 +912,17 @@ async fn send_init_frames(
     true
 }
 
+/// What gritty writes when it hands the terminal back to the local shell:
+/// leave the alt screen, clear attributes, and return the private modes a
+/// session program may have changed (mouse reporting, bracketed paste, cursor
+/// visibility, ...) to their defaults. `?1049l` only when the alt screen is
+/// live -- it is not a no-op on the main screen (see `AltScreenState`).
+fn terminal_handback_sequence(in_alt_screen: bool) -> String {
+    let leave_alt_screen = if in_alt_screen { "\x1b[?1049l" } else { "" };
+    let default_modes = crate::term_modes::default_mode_sequence();
+    format!("{leave_alt_screen}\x1b[0m{default_modes}")
+}
+
 /// The client's `AltScreenTracker` plus a shared flag mirroring its state, so
 /// `TerminalResetGuard` -- a `Drop` guard that cannot borrow the tracker --
 /// knows at exit time whether the alt screen is actually active. The gating
@@ -2112,21 +2123,17 @@ pub async fn run(
     // exit-path resets below know whether `\x1b[?1049l` is warranted.
     let mut alt_screen = AltScreenState::new();
 
-    // PTY output (vim/htop/less) may leave the alt-screen active or the cursor
-    // hidden. RawModeGuard only restores termios, not in-band DEC private modes,
-    // so emit reset escapes on every exit path via Drop. `?1049l` only when the
-    // tracker says the alt screen is live -- see `AltScreenState`.
+    // PTY output (vim/htop/less) may leave the alt-screen active, the cursor
+    // hidden or mouse reporting on. RawModeGuard only restores termios, not
+    // in-band DEC private modes, so emit reset escapes on every exit path via
+    // Drop.
     struct TerminalResetGuard {
         alt_active: Arc<AtomicBool>,
     }
     impl Drop for TerminalResetGuard {
         fn drop(&mut self) {
-            let seq: &[u8] = if self.alt_active.load(Ordering::Relaxed) {
-                b"\x1b[?1049l\x1b[0m\x1b[?25h"
-            } else {
-                b"\x1b[0m\x1b[?25h"
-            };
-            let _ = io::stdout().write_all(seq);
+            let seq = terminal_handback_sequence(self.alt_active.load(Ordering::Relaxed));
+            let _ = io::stdout().write_all(seq.as_bytes());
             let _ = io::stdout().flush();
         }
     }
@@ -3125,17 +3132,11 @@ pub async fn tail(
         }
     };
 
-    // Reset terminal state: clear attributes, show cursor, and -- only if the
-    // tailed stream actually entered it -- exit alt-screen. An unsolicited
-    // `?1049l` is not a no-op on the main screen (see `AltScreenState`).
+    // The tailed stream's mode changes reached this terminal too.
     {
         use tokio::io::AsyncWriteExt;
-        let seq: &[u8] = if alt_screen.in_alternate_screen() {
-            b"\x1b[?1049l\x1b[0m\x1b[?25h"
-        } else {
-            b"\x1b[0m\x1b[?25h"
-        };
-        let _ = stdout.write_all(seq).await;
+        let seq = terminal_handback_sequence(alt_screen.in_alternate_screen());
+        let _ = stdout.write_all(seq.as_bytes()).await;
     }
     Ok(code)
 }

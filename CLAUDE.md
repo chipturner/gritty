@@ -52,7 +52,7 @@ just quicktest                        # manual 3-pane tmux test
 
 Single-socket: all communication (control + session relay) through one Unix domain socket per server. Hello/HelloAck version handshake, then control frame declares intent, server routes accordingly.
 
-Nineteen modules -- eighteen behind a lib crate (`src/lib.rs` hosts shared helpers + `spawn_traced()` + `FORWARDED_ENV_KEYS`) plus the binary-private `commands` -- with thin binary entry (`src/main.rs`):
+Twenty modules -- nineteen behind a lib crate (`src/lib.rs` hosts shared helpers + `spawn_traced()` + `FORWARDED_ENV_KEYS`) plus the binary-private `commands` -- with thin binary entry (`src/main.rs`):
 
 | Module | Responsibility |
 |--------|----------------|
@@ -64,6 +64,7 @@ Nineteen modules -- eighteen behind a lib crate (`src/lib.rs` hosts shared helpe
 | `connect` | Self-backgrounding SSH tunnel supervisor (implements `tunnel-create`) |
 | `net_watch` | macOS network path-change notifications (advisory; inert stub elsewhere) |
 | `alt_screen` | `AltScreenTracker`: detects alternate screen mode for smart reconnect |
+| `term_modes` | `PrivateModeScanner` (the `CSI ? Pm h/l` parser, shared with `alt_screen`) and `TermModeTracker`: the private modes (mouse reporting, focus events, bracketed paste, cursor visibility, ...) a session's programs have set. The server sends them to every (re)attaching client; the client returns them to defaults when it hands the terminal back |
 | `line_shadow` | `LineShadow`: cursor-state emulator (column + SGR, no cell contents) for the non-destructive cursor restore on `line_dirty` reconnects |
 | `query_filter` | `QueryFilter`: streaming scrubber that drops terminal capability queries (DA, DSR, XTVERSION, DECRQM, OSC color/clipboard, XTGETTCAP, kitty probes) from *replayed* bytes so the client's terminal doesn't answer them a second time into the shell. Never applied to the live relay |
 | `runinfo` | `.info` sidecars (protocol version + git hash) so `doctor`/`refresh` detect stale processes |

@@ -3349,11 +3349,15 @@ async fn reconnect_line_dirty_restores_cursor_without_repaint() {
         other => panic!("expected Resume frame first, got {other:?}"),
     }
 
-    // The frame right after Resume is the cursor-restore Notice.
-    let restore = match timeout(Duration::from_secs(2), framed.next()).await {
+    // Resume is followed by the terminal-mode sync Notice, then the
+    // cursor-restore Notice.
+    let mut next_notice_fn = async || match timeout(Duration::from_secs(2), framed.next()).await {
         Ok(Some(Ok(Frame::Notice(bytes)))) => bytes,
-        other => panic!("expected cursor-restore Notice after Resume, got {other:?}"),
+        other => panic!("expected a Notice after Resume, got {other:?}"),
     };
+    let mode_sync = next_notice_fn().await;
+    assert_eq!(final_mode_state(&mode_sync, 1003), Some(false), "got {mode_sync:?}");
+    let restore = next_notice_fn().await;
     let restore_str = String::from_utf8_lossy(&restore).into_owned();
     assert!(
         !restore_str.contains("\x1b[K"),
@@ -3418,6 +3422,81 @@ async fn reconnect_sends_ctrl_l_on_alternate_screen() {
     );
 
     // Leave alt screen and exit cleanly
+    framed.send(Frame::Data(Bytes::from("printf '\\033[?1049l'\n"))).await.unwrap();
+    let _ = framed.send(Frame::Data(Bytes::from("exit\n"))).await;
+    let _ = timeout(Duration::from_secs(3), server).await;
+}
+
+/// Whether `output` leaves private mode `mode` set, reset, or untouched.
+fn final_mode_state(output: &[u8], mode: u16) -> Option<bool> {
+    use gritty::term_modes::{ModeEvent, PrivateModeScanner};
+    let mut state = None;
+    PrivateModeScanner::new().scan(output, |event| {
+        if let ModeEvent::Changed { mode: changed, is_set } = event
+            && changed == mode
+        {
+            state = Some(is_set);
+        }
+    });
+    state
+}
+
+#[tokio::test]
+async fn reconnect_syncs_terminal_modes_the_replay_does_not_carry() {
+    let (client_tx, mut framed, server, meta) = setup_session().await;
+    wait_for_shell(&mut framed).await;
+    settle(&mut framed).await;
+
+    // A "TUI" on the alt screen turns on all-motion mouse reporting. The alt
+    // screen reconnect replays no history, so only the mode sync can tell the
+    // next client's terminal about it.
+    framed.send(Frame::Data(Bytes::from("printf '\\033[?1049h\\033[?1003h'\n"))).await.unwrap();
+    read_until_contains(&mut framed, "\x1b[?1003h", Duration::from_secs(5)).await;
+    drop(framed);
+    wait_detached(&meta).await;
+
+    let attach_fn = || {
+        let (server_stream, client_stream) = UnixStream::pair().unwrap();
+        client_tx
+            .send(ClientConn::Active {
+                framed: Framed::new(server_stream, FrameCodec),
+                client_name: String::new(),
+                capabilities: 0,
+                cols: 80,
+                rows: 24,
+                rendered_offset: 0,
+                line_dirty: false,
+                is_fresh: true,
+            })
+            .unwrap();
+        Framed::new(client_stream, FrameCodec)
+    };
+
+    let mut framed = attach_fn();
+    let output = read_available_data(&mut framed, Duration::from_millis(500)).await;
+    assert_eq!(
+        final_mode_state(&output, 1003),
+        Some(true),
+        "a client attaching to a mouse-enabled TUI must get mouse reporting, got: {:?}",
+        String::from_utf8_lossy(&output)
+    );
+
+    // The TUI turns the mouse off again. A terminal that still has it on (a
+    // client that missed those bytes) must be told to turn it off.
+    framed.send(Frame::Data(Bytes::from("printf '\\033[?1003l'\n"))).await.unwrap();
+    read_until_contains(&mut framed, "\x1b[?1003l", Duration::from_secs(5)).await;
+    drop(framed);
+    wait_detached(&meta).await;
+
+    let mut framed = attach_fn();
+    let output = read_available_data(&mut framed, Duration::from_millis(500)).await;
+    assert_eq!(
+        final_mode_state(&output, 1003),
+        Some(false),
+        "a reconnect must turn off mouse reporting the session no longer wants, got: {:?}",
+        String::from_utf8_lossy(&output)
+    );
+
     framed.send(Frame::Data(Bytes::from("printf '\\033[?1049l'\n"))).await.unwrap();
     let _ = framed.send(Frame::Data(Bytes::from("exit\n"))).await;
     let _ = timeout(Duration::from_secs(3), server).await;

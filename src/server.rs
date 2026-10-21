@@ -3,6 +3,7 @@ use crate::line_shadow::LineShadow;
 use crate::protocol::{Frame, FrameCodec, IDLE_EVICT_TIMEOUT};
 use crate::query_filter::QueryFilter;
 use crate::scrollback::ScrollbackBuffer;
+use crate::term_modes::TermModeTracker;
 use bytes::Bytes;
 use futures_util::{SinkExt, StreamExt};
 use nix::pty::openpty;
@@ -1734,6 +1735,7 @@ async fn force_tui_redraw(
     framed: &mut Framed<UnixStream, FrameCodec>,
     tail_tx: &broadcast::Sender<TailEvent>,
     alt_screen: &mut AltScreenTracker,
+    term_modes: &mut TermModeTracker,
     scrollback: &mut ScrollbackBuffer,
     history: &mut History,
     cols: u16,
@@ -1765,6 +1767,7 @@ async fn force_tui_redraw(
                         Ok(Ok(n)) => {
                             let chunk = Bytes::copy_from_slice(&buf[..n]);
                             alt_screen.scan(&chunk);
+                            term_modes.scan(&chunk);
                             // Skip scrollback capture while in alt-screen: TUI
                             // apps (vim, htop) repaint full screens every
                             // frame and poison scrollback with one-shot
@@ -1809,6 +1812,7 @@ async fn send_reconnect_replay(
     history: &mut History,
     scrollback: &mut ScrollbackBuffer,
     alt_screen: &mut AltScreenTracker,
+    term_modes: &mut TermModeTracker,
     rendered_offset: u64,
     line_dirty: bool,
     is_fresh: bool,
@@ -1823,9 +1827,10 @@ async fn send_reconnect_replay(
         history.total(),
     );
     debug!(?plan, rendered_offset, line_dirty, is_fresh, "reconnect replay");
+    let mode_sync = Bytes::from(term_modes.sync_sequence());
     match plan {
         ReplayPlan::AltRedraw { offset } => {
-            send_framed_timed(framed, Frame::Resume { offset }).await?;
+            send_resume(framed, offset, mode_sync).await?;
             // No `\r\x1b[K` here even when `line_dirty`: a client that painted
             // a status line has already erased it and stepped the cursor back
             // up onto its original row (`\r\x1b[K\x1b[A` on the reconnect
@@ -1847,6 +1852,7 @@ async fn send_reconnect_replay(
                     framed,
                     tail_tx,
                     alt_screen,
+                    term_modes,
                     scrollback,
                     history,
                     cols,
@@ -1860,7 +1866,7 @@ async fn send_reconnect_replay(
             if cols > 0 && rows > 0 {
                 apply_winsize(async_master, cols, rows);
             }
-            send_framed_timed(framed, Frame::Resume { offset }).await?;
+            send_resume(framed, offset, mode_sync).await?;
             // Fence the replayed context with a dim rule. Reuse the status
             // line's row if the client painted one; the rule starts with `\r`.
             let divider = replay_divider(cols, None);
@@ -1881,7 +1887,7 @@ async fn send_reconnect_replay(
             // The replayed tail goes out scrubbed (see `send_scrubbed`), so
             // its byte count no longer matches the stream's: jump the client
             // straight to the end instead of letting it count Data bytes.
-            send_framed_timed(framed, Frame::Resume { offset: history.total() }).await?;
+            send_resume(framed, history.total(), mode_sync).await?;
             if let Some(restore) = restore {
                 // The client erased its status line and moved the cursor back
                 // up onto the line where `offset` left it -- at column 0 (see
@@ -1902,7 +1908,7 @@ async fn send_reconnect_replay(
             if cols > 0 && rows > 0 {
                 apply_winsize(async_master, cols, rows);
             }
-            send_framed_timed(framed, Frame::Resume { offset: history.total() }).await?;
+            send_resume(framed, history.total(), mode_sync).await?;
             let marker = format!(
                 "\x1b[2m\u{25b8} {} lost while disconnected\x1b[0m\r\n",
                 humansize::format_size(dropped, humansize::BINARY),
@@ -1925,6 +1931,23 @@ async fn send_reconnect_replay(
         }
     }
     Ok(())
+}
+
+/// Sends the client's new stream offset, then the private modes (mouse
+/// reporting, bracketed paste, ...) its terminal should have. No replay
+/// carries them reliably: the alt-screen and fresh-viewer replays skip
+/// history, a truncated one has lost part of it, and a client restarted on
+/// the same terminal inherits whatever its predecessor left set. The sync
+/// goes before the replay because a replay can end inside an escape sequence
+/// that the live stream completes, and replayed mode changes are newer than
+/// the modes they overwrite.
+async fn send_resume(
+    framed: &mut Framed<UnixStream, FrameCodec>,
+    offset: u64,
+    mode_sync: Bytes,
+) -> io::Result<()> {
+    send_framed_timed(framed, Frame::Resume { offset }).await?;
+    send_framed_timed(framed, Frame::Notice(mode_sync)).await
 }
 
 /// Replay retained output with terminal capability queries stripped
@@ -2310,6 +2333,7 @@ pub async fn run(
     // Outer loop: accept clients via channel. PTY persists across reconnects.
     // First iteration skips client-wait (first client already connected above).
     let mut alt_screen = AltScreenTracker::new();
+    let mut term_modes = TermModeTracker::new();
     let mut scrollback = ScrollbackBuffer::new();
     let mut first_client = true;
     let mut pending_input: VecDeque<Bytes> = VecDeque::new();
@@ -2386,6 +2410,7 @@ pub async fn run(
                             Ok(Ok(n)) => {
                                 let chunk = Bytes::copy_from_slice(&buf[..n]);
                                 alt_screen.scan(&chunk);
+                                term_modes.scan(&chunk);
                                 // Capture detached output into both history
                                 // (for offset-based resume) and scrollback
                                 // (main-screen context for a fresh viewer).
@@ -2418,6 +2443,7 @@ pub async fn run(
                         info!(code, "shell exited while awaiting client");
                         for chunk in drain_pty_final(&async_master, &mut buf) {
                             alt_screen.scan(&chunk);
+                            term_modes.scan(&chunk);
                             if !alt_screen.in_alternate_screen() {
                                 scrollback.push(&chunk);
                             }
@@ -2528,6 +2554,7 @@ pub async fn run(
                 &mut history,
                 &mut scrollback,
                 &mut alt_screen,
+                &mut term_modes,
                 attach_offset,
                 attach_line_dirty,
                 attach_is_fresh,
@@ -2668,6 +2695,7 @@ pub async fn run(
                                     &mut history,
                                     &mut scrollback,
                                     &mut alt_screen,
+                                    &mut term_modes,
                                     rendered_offset,
                                     line_dirty,
                                     is_fresh,
@@ -2797,6 +2825,7 @@ pub async fn run(
                                 debug!(len = n, "pty -> socket");
                                 let chunk = Bytes::copy_from_slice(&buf[..n]);
                                 alt_screen.scan(&chunk);
+                                term_modes.scan(&chunk);
                                 if !alt_screen.in_alternate_screen() {
                                     scrollback.push(&chunk);
                                 }

@@ -15,6 +15,7 @@ pub mod scrollback;
 pub mod security;
 pub mod server;
 pub mod table;
+pub mod term_modes;
 pub mod ui;
 
 /// `tokio::spawn`, but the task inherits the caller's current tracing span.

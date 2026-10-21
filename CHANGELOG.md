@@ -8,6 +8,19 @@ protocol interoperate with their neighbors.
 
 ## Unreleased
 
+- **Mouse reporting and other terminal modes no longer go stale.** Programs
+  switch modes on your terminal (mouse reporting, focus events, bracketed
+  paste, cursor visibility, application cursor keys), and gritty only
+  tracked the alternate screen. A mode could outlive the program that set
+  it: detach or lose the session while a mouse-aware TUI is running and the
+  local shell got a mouse report typed at the prompt for every pointer
+  movement; reconnect after the TUI exited with more than the history
+  window of output in between and the same happened inside the session.
+  The reverse also happened: attaching to a running TUI from a new terminal
+  gave it no mouse. The server now tracks these modes and sends them on
+  every attach and reconnect, and the client returns them to their defaults
+  on every exit, `tail` included. Both ends need the new build for the full
+  fix; the wire protocol is unchanged.
 - **Reconnect no longer types terminal query answers into the shell.** A
   program that fingerprinted the terminal at startup (neovim, Claude Code:
   `CSI > q`, `CSI c`, `CSI ? 2026 $ p`, OSC color queries, ...) left those

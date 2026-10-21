@@ -6,25 +6,11 @@
 //! - `\x1b[?47h` / `\x1b[?47l` (legacy)
 //! - `\x1b[?1047h` / `\x1b[?1047l` (legacy)
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum ScanState {
-    Normal,
-    Esc,
-    Bracket,
-    Question,
-    Param,
-}
+use crate::term_modes::{ModeEvent, PrivateModeScanner};
 
 pub struct AltScreenTracker {
-    state: ScanState,
-    param_buf: [u8; 8],
-    param_len: usize,
+    scanner: PrivateModeScanner,
     in_alt: bool,
-    /// Set when a parameter in the CSI currently being parsed matched a tracked
-    /// alt-screen mode. The enter/leave direction is only known at the `h`/`l`
-    /// terminator, so the match is remembered across `;` separators and the
-    /// direction is applied once, at the terminator.
-    pending_alt: bool,
 }
 
 impl Default for AltScreenTracker {
@@ -35,13 +21,7 @@ impl Default for AltScreenTracker {
 
 impl AltScreenTracker {
     pub fn new() -> Self {
-        Self {
-            state: ScanState::Normal,
-            param_buf: [0; 8],
-            param_len: 0,
-            in_alt: false,
-            pending_alt: false,
-        }
+        Self { scanner: PrivateModeScanner::new(), in_alt: false }
     }
 
     pub fn in_alternate_screen(&self) -> bool {
@@ -50,73 +30,16 @@ impl AltScreenTracker {
 
     /// Scan a chunk of PTY output bytes, updating alternate screen state.
     pub fn scan(&mut self, data: &[u8]) {
-        for &b in data {
-            match self.state {
-                ScanState::Normal => {
-                    if b == 0x1b {
-                        self.state = ScanState::Esc;
-                    }
+        let in_alt = &mut self.in_alt;
+        self.scanner.scan(data, |event| {
+            // Standard `1049`, legacy `1047` / `47`.
+            if let ModeEvent::Changed { mode: 1049 | 1047 | 47, is_set: entering } = event {
+                if *in_alt != entering {
+                    tracing::trace!(entering, "alt-screen transition");
                 }
-                ScanState::Esc => {
-                    if b == b'[' {
-                        self.state = ScanState::Bracket;
-                    } else {
-                        self.state = ScanState::Normal;
-                    }
-                }
-                ScanState::Bracket => {
-                    if b == b'?' {
-                        // Start of a fresh `\x1b[?...` private-mode sequence.
-                        self.pending_alt = false;
-                        self.state = ScanState::Question;
-                    } else {
-                        self.state = ScanState::Normal;
-                    }
-                }
-                ScanState::Question => {
-                    if b.is_ascii_digit() {
-                        self.param_buf[0] = b;
-                        self.param_len = 1;
-                        self.state = ScanState::Param;
-                    } else {
-                        self.state = ScanState::Normal;
-                    }
-                }
-                ScanState::Param => {
-                    if b.is_ascii_digit() {
-                        if self.param_len < self.param_buf.len() {
-                            self.param_buf[self.param_len] = b;
-                            self.param_len += 1;
-                        } else {
-                            // Param too long -- can't be one of ours
-                            self.state = ScanState::Normal;
-                            self.param_len = 0;
-                        }
-                    } else if b == b';' {
-                        // Parameter separator: the h/l direction is not known
-                        // yet. Remember whether this param was a tracked mode
-                        // and apply the direction at the terminator -- a
-                        // multi-param DECRST like `\x1b[?1049;2004l` must leave
-                        // alt-screen, not enter it.
-                        if self.param_is_tracked() {
-                            self.pending_alt = true;
-                        }
-                        self.param_len = 0;
-                        // Stay in the param-parsing machine for the next param.
-                        self.state = ScanState::Question;
-                    } else if b == b'h' {
-                        self.commit_param(true);
-                        self.state = ScanState::Normal;
-                    } else if b == b'l' {
-                        self.commit_param(false);
-                        self.state = ScanState::Normal;
-                    } else {
-                        self.param_len = 0;
-                        self.state = ScanState::Normal;
-                    }
-                }
+                *in_alt = entering;
             }
-        }
+        });
     }
 
     /// Record an alt-screen leave that gritty itself wrote to the terminal
@@ -125,30 +48,7 @@ impl AltScreenTracker {
     /// sequence's ESC as sequence garbage. Any such partial parse is discarded.
     pub fn note_left(&mut self) {
         self.in_alt = false;
-        self.state = ScanState::Normal;
-        self.param_len = 0;
-        self.pending_alt = false;
-    }
-
-    /// Whether the param currently in `param_buf` names a tracked alt-screen
-    /// mode (standard `1049`, legacy `1047` / `47`).
-    fn param_is_tracked(&self) -> bool {
-        matches!(&self.param_buf[..self.param_len], b"1049" | b"1047" | b"47")
-    }
-
-    /// Apply the CSI terminator: if any param in this sequence named a tracked
-    /// mode, set `in_alt` to the terminator's direction (`h` = enter, `l` =
-    /// leave). Resets the per-sequence parse state.
-    fn commit_param(&mut self, entering: bool) {
-        if self.pending_alt || self.param_is_tracked() {
-            let prev = self.in_alt;
-            self.in_alt = entering;
-            if prev != entering {
-                tracing::trace!(entering, "alt-screen transition");
-            }
-        }
-        self.param_len = 0;
-        self.pending_alt = false;
+        self.scanner.reset();
     }
 }
 

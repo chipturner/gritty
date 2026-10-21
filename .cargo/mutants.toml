@@ -13,6 +13,7 @@ examine_globs = [
     "src/line_shadow.rs",
     "src/query_filter.rs",
     "src/scrollback.rs",
+    "src/term_modes.rs",
     "src/config.rs",
     "src/runinfo.rs",
 ]
