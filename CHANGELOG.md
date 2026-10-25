@@ -8,6 +8,13 @@ protocol interoperate with their neighbors.
 
 ## Unreleased
 
+- **Agent forwarding can stop when you walk away.** A new
+  `agent-idle-timeout` config key (per host or in `[defaults]`, e.g.
+  `"10m"`) makes an attached `-A` client refuse agent requests once you
+  have not typed in that terminal for that long. A laptop left attached
+  overnight no longer lets the remote host sign with your keys, and your
+  next keystroke turns forwarding back on. Off by default; client-side
+  only, so the wire protocol is unchanged.
 - **Mouse reporting and other terminal modes no longer go stale.** Programs
   switch modes on your terminal (mouse reporting, focus events, bracketed
   paste, cursor visibility, application cursor keys), and gritty only

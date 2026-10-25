@@ -27,6 +27,7 @@ pub struct ClientConfig {
     pub env_vars: Vec<(String, String)>,
     pub no_escape: bool,
     pub forward_agent: bool,
+    pub agent_idle_timeout: Option<Duration>,
     pub forward_open: bool,
     pub oauth_redirect: bool,
     pub oauth_timeout: u64,
@@ -747,6 +748,17 @@ fn link_is_stale(last_activity: std::time::SystemTime, hb_timeout: Duration) -> 
     wall_elapsed(last_activity, std::time::SystemTime::now()) > hb_timeout
 }
 
+/// True when the user has not typed into this client for longer than
+/// `idle_timeout`, so a forwarded-agent request must be refused. Wall-clock
+/// time, so a closed laptop lid counts as idle.
+fn is_agent_idle(
+    last_input_at: std::time::SystemTime,
+    idle_timeout: Option<Duration>,
+    now: std::time::SystemTime,
+) -> bool {
+    idle_timeout.is_some_and(|timeout| wall_elapsed(last_input_at, now) > timeout)
+}
+
 /// Events from local agent connection tasks to the relay loop.
 enum AgentEvent {
     Data { channel_id: u32, data: Bytes },
@@ -976,6 +988,9 @@ struct ClientRelay<'a> {
     agent: &'a mut ClientAgentState,
     agent_event_tx: &'a mpsc::UnboundedSender<AgentEvent>,
     agent_socket: Option<&'a str>,
+    agent_idle_timeout: Option<Duration>,
+    /// Wall-clock time of the last keystroke; persists across reconnects.
+    last_input_at: &'a mut std::time::SystemTime,
     tunnel: &'a mut ClientTunnelState,
     tunnel_event_tx: &'a mpsc::UnboundedSender<ClientTunnelEvent>,
     oauth_redirect: bool,
@@ -1107,7 +1122,12 @@ impl ClientRelay<'_> {
                 return Ok(ControlFlow::Break(RelayExit::Exit(1)));
             }
             Some(Ok(Frame::AgentOpen { channel_id })) => {
-                if let Some(sock_path) =
+                let now = std::time::SystemTime::now();
+                if is_agent_idle(*self.last_input_at, self.agent_idle_timeout, now) {
+                    let idle_secs = wall_elapsed(*self.last_input_at, now).as_secs();
+                    info!(channel_id, idle_secs, "agent request refused: agent-idle-timeout");
+                    self.notify(framed, Frame::AgentClose { channel_id }).await;
+                } else if let Some(sock_path) =
                     self.agent_socket.filter(|_| self.agent_open_limiter.check())
                 {
                     match tokio::net::UnixStream::connect(sock_path).await {
@@ -1732,6 +1752,8 @@ async fn relay(
     raw_guard: &RawModeGuard,
     nb_guard: &NonBlockGuard,
     agent_socket: Option<&str>,
+    agent_idle_timeout: Option<Duration>,
+    last_input_at: &mut std::time::SystemTime,
     oauth_redirect: bool,
     oauth_timeout: u64,
     forward_open: bool,
@@ -1779,6 +1801,8 @@ async fn relay(
         agent: &mut agent,
         agent_event_tx: &agent_event_tx,
         agent_socket,
+        agent_idle_timeout,
+        last_input_at,
         tunnel: &mut tunnel,
         tunnel_event_tx: &tunnel_event_tx,
         oauth_redirect,
@@ -1811,6 +1835,7 @@ async fn relay(
                     }
                     Ok(Ok(n)) => {
                         debug!(len = n, "stdin → socket");
+                        *relay.last_input_at = std::time::SystemTime::now();
                         // Wake-from-suspend fast path: the heartbeat tick is
                         // monotonic and may not fire for up to hb_interval
                         // after wake, so a keystroke would otherwise stall in
@@ -2082,6 +2107,7 @@ pub async fn run(
         env_vars,
         no_escape,
         forward_agent,
+        agent_idle_timeout,
         forward_open,
         oauth_redirect,
         oauth_timeout,
@@ -2190,6 +2216,8 @@ pub async fn run(
     // reconnect. Persists across reconnects so the next `Attach` can ask the
     // server to replay only what we missed.
     let mut rendered_offset: u64 = 0;
+    // Starts at launch: typing the `connect` command is the first keystroke.
+    let mut last_input_at = std::time::SystemTime::now();
 
     loop {
         // Reset every reconnect: a fresh TCP/UDS connection is a fresh liveness
@@ -2217,6 +2245,8 @@ pub async fn run(
                 &raw_guard,
                 &nb_guard,
                 agent_socket.as_deref(),
+                agent_idle_timeout,
+                &mut last_input_at,
                 oauth_redirect,
                 oauth_timeout,
                 forward_open,
@@ -3606,6 +3636,29 @@ mod tests {
         let t0 = std::time::SystemTime::UNIX_EPOCH + Duration::from_secs(1_700_000_000);
         let earlier = t0 - Duration::from_secs(60);
         assert_eq!(wall_elapsed(t0, earlier), Duration::ZERO);
+    }
+
+    #[test]
+    fn agent_idle_gate_without_timeout_never_refuses() {
+        let typed_at = std::time::SystemTime::UNIX_EPOCH;
+        let now = typed_at + Duration::from_secs(86_400);
+        assert!(!is_agent_idle(typed_at, None, now));
+    }
+
+    #[test]
+    fn agent_idle_gate_refuses_only_past_the_timeout() {
+        let typed_at = std::time::SystemTime::UNIX_EPOCH + Duration::from_secs(1_700_000_000);
+        let timeout = Some(Duration::from_secs(600));
+        assert!(!is_agent_idle(typed_at, timeout, typed_at + Duration::from_secs(600)));
+        assert!(is_agent_idle(typed_at, timeout, typed_at + Duration::from_secs(601)));
+    }
+
+    // A clock stepped backward is no evidence that the user stopped typing.
+    #[test]
+    fn agent_idle_gate_counts_a_backward_clock_as_active() {
+        let typed_at = std::time::SystemTime::UNIX_EPOCH + Duration::from_secs(1_700_000_000);
+        let earlier = typed_at - Duration::from_secs(3600);
+        assert!(!is_agent_idle(typed_at, Some(Duration::from_secs(1)), earlier));
     }
 
     #[test]

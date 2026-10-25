@@ -145,6 +145,8 @@ laptop$ gritty receive - | tar xzf -
 
 **Agent socket without `-A`:** `SSH_AUTH_SOCK` is always exported, but the underlying socket only has a listener while an `-A` client is attached. Without agent forwarding, a tool connecting to it (e.g. `ssh-add -l`) gets "cannot connect to agent" (exit 2) -- so a login script that checks whether an agent is reachable will correctly conclude there is none and can start its own. Probe reachability (`ssh-add -l`; exit 2 means no agent) rather than mere presence of `SSH_AUTH_SOCK`.
 
+**Agent idle timeout:** with `agent-idle-timeout = "10m"` (per host or in `[defaults]`), an attached `-A` client refuses agent requests once you have not typed in that terminal for 10 minutes. The clock is wall-clock time, so a closed laptop lid counts as idle. Your next keystroke re-enables forwarding. A refused request looks like an agent that hangs up. `ssh-add -l` fails with exit 1, and `git push` falls back to other auth or fails with `Permission denied (publickey)`. The client logs each refusal at info level. Use this to keep a laptop that stays attached while you are away from signing for whatever runs on the remote host.
+
 **Forwarded to sessions:** `TERM`, `COLORTERM`, `LANG`, and the `LC_*` locale categories are carried from the client to the session's login shell (mirroring SSH's default `SendEnv LANG LC_*`), so a remote session renders UTF-8 correctly even when the remote daemon's own environment lacks your locale.
 
 ## Port forwarding
@@ -175,6 +177,9 @@ gritty works out of the box with no config file. Optionally, set persistent defa
 # Global defaults for all sessions/connections.
 [defaults]
 # forward-agent = false
+# agent-idle-timeout = "never"   # with forward-agent: refuse agent requests once
+                                  # you haven't typed in this terminal for this
+                                  # long (e.g. "10m"). See "Agent idle timeout".
 # forward-open = true
 # no-escape = false
 # oauth-redirect = true

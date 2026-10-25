@@ -161,7 +161,7 @@ gritty is designed so that a compromised remote server cannot leverage the sessi
 - **Port forwarding is client-initiated only.** The `lf`/`rf` commands talk to the client process through a local forward socket and the client sends `PortForwardRequest` frames to the server. The server cannot initiate port forwards on its own.
 - **URL opening is opt-out and rate limited.** `OpenUrl` frames are forwarded by default; disable with `--no-forward-open` (or `forward-open = false` in config). Rate limited to 2 opens per 30 seconds.
 - **Clipboard is push-only.** The server can push to the client clipboard (`ClipboardSet`, rate limited to 5 per 30s), but cannot read it -- `ClipboardGet` always returns empty.
-- **Agent forwarding is opt-in.** SSH agent forwarding defaults to off; enable with `-A` or `forward-agent = true` in config. `AgentOpen` is rate limited to 10 per 30 seconds.
+- **Agent forwarding is opt-in.** SSH agent forwarding defaults to off; enable with `-A` or `forward-agent = true` in config. `AgentOpen` is rate limited to 10 per 30 seconds. `agent-idle-timeout` makes the client refuse agent requests after you stop typing in that terminal for a while.
 - **Tunnel creation is rate limited.** `TunnelListen` frames are rate limited to 2 per 30 seconds.
 - **Audit logging.** All security-sensitive operations (forwarding requests, clipboard access, agent connections) are logged at info/warn level on both client and server.
 

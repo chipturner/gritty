@@ -135,6 +135,8 @@ fn base_env(dir: &Path) -> Vec<(&'static str, String)> {
         ("TERM", "xterm-256color".to_string()),
         // Plain text in the transcript so assertions need no SGR stripping.
         ("NO_COLOR", "1".to_string()),
+        // `-A` clients forward to this path, never the developer's real agent.
+        ("SSH_AUTH_SOCK", dir.join("agent.sock").to_str().unwrap().to_string()),
     ]
 }
 
@@ -478,6 +480,58 @@ fn stalled_daemon_is_detected_by_heartbeat_and_recovered_from() {
     pty.send("echo ALIVE:$((3+3))\n");
     pty.expect_from(mark, "ALIVE:6");
     assert!(pty.is_running());
+}
+
+#[test]
+fn forwarded_agent_answers_while_the_user_is_typing() {
+    require_socat();
+    let daemon = Daemon::start();
+    daemon.write_config("[defaults]\nagent-idle-timeout = \"5m\"\n");
+    let _agent = FakeAgent::start(&daemon.dir.path().join("agent.sock"));
+    let mut pty = daemon.connect(&["-A", "local:agent-live"]);
+    probe_ready(&mut pty);
+
+    pty.send("socat -u UNIX-CONNECT:\"$SSH_AUTH_SOCK\" -\n");
+    pty.expect(FakeAgent::GREETING);
+}
+
+#[test]
+fn forwarded_agent_is_refused_after_the_idle_timeout() {
+    require_socat();
+    let daemon = Daemon::start();
+    daemon.write_config("[defaults]\nagent-idle-timeout = \"1s\"\n");
+    let _agent = FakeAgent::start(&daemon.dir.path().join("agent.sock"));
+    let mut pty = daemon.connect(&["-A", "local:agent-idle"]);
+    probe_ready(&mut pty);
+
+    // The `sleep 2` is the idle window under test: the user types nothing
+    // for longer than the 1s timeout before the agent request arrives.
+    pty.send("sleep 2; socat -u UNIX-CONNECT:\"$SSH_AUTH_SOCK\" -; echo AGENT-DONE:$((1+1))\n");
+    pty.expect("AGENT-DONE:2");
+    pty.expect_logged("agent request refused");
+    assert!(!pty.transcript().contains(FakeAgent::GREETING), "{}", pty.diagnostics());
+}
+
+// ---------------------------------------------------------------------------
+// FakeAgent: stands in for the local ssh-agent behind `SSH_AUTH_SOCK`.
+// ---------------------------------------------------------------------------
+
+struct FakeAgent;
+
+impl FakeAgent {
+    const GREETING: &str = "FAKE-AGENT-GREETING";
+
+    /// Greet every connection and hang up. The thread lives until the test
+    /// process exits.
+    fn start(path: &Path) -> Self {
+        let listener = std::os::unix::net::UnixListener::bind(path).expect("bind fake agent");
+        std::thread::spawn(move || {
+            for mut stream in listener.incoming().flatten() {
+                let _ = writeln!(stream, "{}", Self::GREETING);
+            }
+        });
+        Self
+    }
 }
 
 // ---------------------------------------------------------------------------

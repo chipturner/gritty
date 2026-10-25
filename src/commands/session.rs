@@ -55,6 +55,7 @@ fn client_config(
         env_vars: vec![],
         no_escape: settings.no_escape,
         forward_agent: settings.forward_agent,
+        agent_idle_timeout: settings.agent_idle_timeout,
         forward_open: settings.forward_open,
         oauth_redirect: settings.oauth_redirect,
         oauth_timeout: settings.oauth_timeout,

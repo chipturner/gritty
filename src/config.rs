@@ -1,5 +1,6 @@
 use std::collections::HashMap;
 use std::path::PathBuf;
+use std::time::Duration;
 
 use serde::Deserialize;
 
@@ -31,6 +32,34 @@ pub fn parse_linger(s: &str) -> anyhow::Result<u64> {
         ),
         secs => Ok(secs),
     }
+}
+
+/// Parse an `agent-idle-timeout` value: `"never"` (no gate) or a non-zero
+/// duration such as `"10m"`. A zero timeout would refuse every agent
+/// request, which is what `--no-forward-agent` already says.
+pub fn parse_agent_idle_timeout(s: &str) -> anyhow::Result<Option<Duration>> {
+    if s.eq_ignore_ascii_case("never") {
+        return Ok(None);
+    }
+    match crate::parse_duration(s)? {
+        0 => anyhow::bail!(
+            "agent-idle-timeout of 0 refuses every request -- use \"never\" to turn the gate off, or drop forward-agent"
+        ),
+        secs => Ok(Some(Duration::from_secs(secs))),
+    }
+}
+
+/// Parse one config layer's string value (durations are strings so users can
+/// write `"30m"` / `"never"`). A malformed value warns and yields `None`, so
+/// the next layer in the precedence chain applies.
+fn parse_layer<T>(
+    key: &str,
+    raw: Option<&str>,
+    parse: fn(&str) -> anyhow::Result<T>,
+    warnings: &mut Vec<String>,
+) -> Option<T> {
+    let raw = raw?;
+    parse(raw).map_err(|e| warnings.push(format!("ignoring {key} = {raw:?}: {e}"))).ok()
 }
 
 /// Clamp the heartbeat interval/timeout to the three invariants the client and
@@ -88,6 +117,9 @@ fn clamp_heartbeat(raw_interval: u64, raw_timeout: u64) -> (u64, u64, Vec<String
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SessionSettings {
     pub forward_agent: bool,
+    /// Refuse forwarded-agent requests once this long has passed since the
+    /// last keystroke in this client. `None` = forward whenever attached.
+    pub agent_idle_timeout: Option<Duration>,
     pub forward_open: bool,
     pub no_escape: bool,
     pub oauth_redirect: bool,
@@ -120,6 +152,7 @@ impl Default for SessionSettings {
     fn default() -> Self {
         Self {
             forward_agent: false,
+            agent_idle_timeout: None,
             forward_open: true,
             no_escape: false,
             oauth_redirect: true,
@@ -165,6 +198,9 @@ pub struct ConfigFile {
 #[serde(default, deny_unknown_fields, rename_all = "kebab-case")]
 pub struct Defaults {
     pub forward_agent: Option<bool>,
+    /// `"never"` or a duration (`"10m"`). See
+    /// [`SessionSettings::agent_idle_timeout`].
+    pub agent_idle_timeout: Option<String>,
     pub forward_open: Option<bool>,
     pub no_escape: Option<bool>,
     pub oauth_redirect: Option<bool>,
@@ -277,19 +313,8 @@ impl ConfigFile {
         let (heartbeat_interval, heartbeat_timeout, mut warnings) =
             clamp_heartbeat(raw_interval, raw_timeout);
 
-        // Linger durations are stored as strings in config (so users can
-        // write `"30m"` / `"never"`); a malformed value warns and is skipped
-        // so the next layer in the precedence chain applies.
-        let mut resolve_linger = |key: &str, raw: Option<&str>| -> Option<u64> {
-            let raw = raw?;
-            match parse_linger(raw) {
-                Ok(secs) => Some(secs),
-                Err(e) => {
-                    warnings.push(format!("ignoring {key} = {raw:?}: {e}"));
-                    None
-                }
-            }
-        };
+        let mut resolve_linger =
+            |key: &str, raw: Option<&str>| parse_layer(key, raw, parse_linger, &mut warnings);
         let h_linger = resolve_linger("linger", h.and_then(|h| h.linger.as_deref()));
         let h_unnamed =
             resolve_linger("linger-unnamed", h.and_then(|h| h.linger_unnamed.as_deref()));
@@ -302,6 +327,22 @@ impl ConfigFile {
         // `[defaults] linger-unnamed` is set.
         let linger_unnamed = h_unnamed.or(h_linger).or(d_unnamed).or(d_linger).unwrap_or(0);
 
+        // The outer `Option` is "this layer set it"; the inner one is the
+        // value, so a host's `"never"` overrides a `[defaults]` duration.
+        let h_agent_idle = parse_layer(
+            "agent-idle-timeout",
+            h.and_then(|h| h.agent_idle_timeout.as_deref()),
+            parse_agent_idle_timeout,
+            &mut warnings,
+        );
+        let d_agent_idle = parse_layer(
+            "agent-idle-timeout",
+            d.agent_idle_timeout.as_deref(),
+            parse_agent_idle_timeout,
+            &mut warnings,
+        );
+        let agent_idle_timeout = h_agent_idle.or(d_agent_idle).flatten();
+
         if warn {
             for w in &warnings {
                 ui::warn(w);
@@ -310,6 +351,7 @@ impl ConfigFile {
 
         SessionSettings {
             forward_agent: h.and_then(|h| h.forward_agent).or(d.forward_agent).unwrap_or(false),
+            agent_idle_timeout,
             forward_open: h.and_then(|h| h.forward_open).or(d.forward_open).unwrap_or(true),
             no_escape: pick(h.and_then(|h| h.no_escape), d.no_escape),
             oauth_redirect: h.and_then(|h| h.oauth_redirect).or(d.oauth_redirect).unwrap_or(true),
@@ -965,6 +1007,51 @@ mod tests {
         .unwrap();
         let s = cfg.resolve_session_inner(None, false);
         assert_eq!(s.linger, 0);
+    }
+
+    #[test]
+    fn parse_agent_idle_timeout_accepts_never_and_durations() {
+        assert_eq!(parse_agent_idle_timeout("never").unwrap(), None);
+        assert_eq!(parse_agent_idle_timeout("10m").unwrap(), Some(Duration::from_secs(600)));
+        // 0 would refuse every agent request -- that is `--no-forward-agent`.
+        let e = parse_agent_idle_timeout("0s").unwrap_err().to_string();
+        assert!(e.contains("never"), "wrong error for 0s: {e}");
+    }
+
+    #[test]
+    fn agent_idle_timeout_defaults_to_never() {
+        let cfg: ConfigFile = toml::from_str("").unwrap();
+        assert_eq!(cfg.resolve_session(None).agent_idle_timeout, None);
+    }
+
+    #[test]
+    fn agent_idle_timeout_host_never_overrides_default() {
+        let cfg: ConfigFile = toml::from_str(
+            r#"
+            [defaults]
+            agent-idle-timeout = "10m"
+            [host.lab]
+            agent-idle-timeout = "never"
+        "#,
+        )
+        .unwrap();
+        assert_eq!(cfg.resolve_session(None).agent_idle_timeout, Some(Duration::from_secs(600)));
+        assert_eq!(cfg.resolve_session(Some("lab")).agent_idle_timeout, None);
+    }
+
+    #[test]
+    fn agent_idle_timeout_malformed_host_value_falls_through_to_default() {
+        let cfg: ConfigFile = toml::from_str(
+            r#"
+            [defaults]
+            agent-idle-timeout = "5m"
+            [host.work]
+            agent-idle-timeout = "5 m"
+        "#,
+        )
+        .unwrap();
+        let s = cfg.resolve_session_inner(Some("work"), false);
+        assert_eq!(s.agent_idle_timeout, Some(Duration::from_secs(300)));
     }
 
     // A large heartbeat_interval must not drive the resolved timeout below

@@ -9,6 +9,9 @@
 # Global defaults for all sessions and tunnels.
 [defaults]
 # forward-agent = false
+# agent-idle-timeout = "never"  # with forward-agent: refuse agent requests once
+#                               # you haven't typed in this terminal for this
+#                               # long (e.g. "10m")
 # forward-open = true
 # no-escape = false
 # oauth-redirect = true

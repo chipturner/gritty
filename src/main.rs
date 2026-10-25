@@ -1096,6 +1096,7 @@ async fn run(cli: Cli, config: gritty::config::ConfigFile) -> anyhow::Result<()>
                 } else {
                     forward_agent || resolved.forward_agent
                 },
+                agent_idle_timeout: resolved.agent_idle_timeout,
                 forward_open: if no_forward_open {
                     false
                 } else {
